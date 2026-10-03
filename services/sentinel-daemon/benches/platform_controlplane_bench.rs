@@ -101,6 +101,7 @@ fn synthetic_ebpf_snapshot(names: &[String]) -> MetricsSnapshot {
     MetricsSnapshot {
         stalled_agents,
         io_metrics,
+        io_collection_source: None,
         network_metrics: HashMap::new(),
         psi_metrics: HashMap::new(),
         cycle_duration: std::time::Duration::from_micros(250),

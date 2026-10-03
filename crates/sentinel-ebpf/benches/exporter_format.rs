@@ -84,6 +84,7 @@ fn build_snapshot(n: usize, special: bool) -> MetricsSnapshot {
     MetricsSnapshot {
         stalled_agents,
         io_metrics,
+        io_collection_source: Some("agent_cgroup_io_stat"),
         network_metrics,
         psi_metrics,
         cycle_duration: Duration::from_micros(500),

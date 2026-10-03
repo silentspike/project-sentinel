@@ -1,15 +1,17 @@
 //! Metric collector that polls eBPF maps or userspace sources.
 //!
 //! In kernel mode: reads Per-CPU Hash Maps and Ring Buffer via aya.
-//! In userspace mode: reads /proc/{pid}/io and cgroup io.stat files.
+//! In both modes: agent-parent cgroup io.stat owns I/O bytes and operations.
+//! /proc and BPF activity supplement health only, never agent I/O totals.
 //!
 //! Polling interval: 1s for hash maps, event-driven for ring buffer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tracing::{debug, trace, warn};
 
 use crate::loader::MonitoringMode;
@@ -25,6 +27,8 @@ pub struct MetricsSnapshot {
     pub stalled_agents: Vec<StalledAgent>,
     /// I/O metrics per cgroup.
     pub io_metrics: HashMap<u64, IoSnapshot>,
+    /// Authoritative source, present only after a valid current-cycle observation.
+    pub io_collection_source: Option<&'static str>,
     /// Network metrics per destination.
     pub network_metrics: HashMap<String, NetworkSnapshot>,
     /// PSI metrics per agent.
@@ -103,9 +107,11 @@ pub struct EbpfCollector {
     ring_buffer_drops: u64,
     last_collect: Option<Instant>,
     /// Previous /proc/PID/io values for delta tracking.
-    prev_proc_io: HashMap<u64, ProcIoData>,
-    /// Previous cgroup io.stat values for delta tracking (cgroup_id -> (rbytes, wbytes)).
-    prev_cgroup_io: HashMap<u64, (u64, u64)>,
+    prev_proc_io: HashMap<u64, ProcIoBaseline>,
+    /// Cgroups with a valid parent io.stat observation in the current cycle.
+    observed_io_cgroups: HashSet<u64>,
+    /// Real parent-directory identity; the same path can be removed and recreated.
+    parent_identities: HashMap<u64, (u64, u64)>,
     /// Whether we've already warned about /proc/PID/io permission denied.
     proc_io_permission_warned: bool,
     #[cfg(feature = "ebpf")]
@@ -129,7 +135,8 @@ impl EbpfCollector {
             ring_buffer_drops: 0,
             last_collect: None,
             prev_proc_io: HashMap::new(),
-            prev_cgroup_io: HashMap::new(),
+            observed_io_cgroups: HashSet::new(),
+            parent_identities: HashMap::new(),
             proc_io_permission_warned: false,
             #[cfg(feature = "ebpf")]
             loaded_probes: None,
@@ -162,7 +169,8 @@ impl EbpfCollector {
             ring_buffer_drops: 0,
             last_collect: None,
             prev_proc_io: HashMap::new(),
-            prev_cgroup_io: HashMap::new(),
+            observed_io_cgroups: HashSet::new(),
+            parent_identities: HashMap::new(),
             proc_io_permission_warned: false,
             loaded_probes: Some(probes),
         }
@@ -193,7 +201,9 @@ impl EbpfCollector {
         self.ring_buffer_drops
     }
 
-    /// Registers an agent for monitoring.
+    /// Upserts only the exact stable agent name and parent path.
+    /// An unchanged parent inode preserves I/O totals/frontiers across runtime IDs;
+    /// foreign names/paths cannot replace an existing registration.
     ///
     /// Sets an initial health timestamp so the agent has a 30s grace period
     /// before stall detection kicks in. Without this, agents that haven't
@@ -201,6 +211,44 @@ impl EbpfCollector {
     /// `last_write`), but the first recorded write followed by 30s inactivity
     /// would immediately trigger a false stall.
     pub fn register_agent(&mut self, mapping: AgentCgroupMapping) {
+        if self.agent_mappings.iter().any(|old| {
+            (old.cgroup_id == mapping.cgroup_id
+                || old.agent_name == mapping.agent_name
+                || old.cgroup_path == mapping.cgroup_path)
+                && (old.agent_name != mapping.agent_name || old.cgroup_path != mapping.cgroup_path)
+        }) {
+            warn!(agent = %mapping.agent_name, cgroup = %mapping.cgroup_path,
+                "Refusing conflicting agent monitoring registration");
+            return;
+        }
+        if let Some(index) = self.agent_mappings.iter().position(|old| {
+            old.agent_name == mapping.agent_name && old.cgroup_path == mapping.cgroup_path
+        }) {
+            let old_id = self.agent_mappings[index].cgroup_id;
+            if old_id == mapping.cgroup_id {
+                let _ = self.refresh_parent_identity(old_id, &mapping.cgroup_path);
+                if let Some(pid) = mapping.pid {
+                    self.update_agent_pid(old_id, pid);
+                }
+                return;
+            }
+            let identity = read_parent_identity(&mapping.cgroup_path).ok();
+            let verified_identity = self.parent_identities.remove(&old_id);
+            // Unknown metadata quarantines the transferred frontier until a successful
+            // observation confirms the identity; it is not evidence of a new parent.
+            if identity.is_none() || identity == verified_identity {
+                self.io_profiler.rekey(old_id, mapping.cgroup_id);
+            } else {
+                self.io_profiler.untrack(old_id);
+            }
+            self.observed_io_cgroups.remove(&old_id);
+            if let Some(identity) = identity.or(verified_identity) {
+                self.parent_identities.insert(mapping.cgroup_id, identity);
+            }
+            self.health_checker.untrack(old_id);
+            self.prev_proc_io.remove(&old_id);
+            self.agent_mappings.remove(index);
+        }
         let now = current_secs();
         debug!(
             agent = %mapping.agent_name,
@@ -209,26 +257,46 @@ impl EbpfCollector {
             "Registered agent for eBPF monitoring"
         );
         self.health_checker.record_write(mapping.cgroup_id, now);
+        let _ = self.refresh_parent_identity(mapping.cgroup_id, &mapping.cgroup_path);
         self.agent_mappings.push(mapping);
+    }
+
+    fn refresh_parent_identity(&mut self, cgroup_id: u64, path: &str) -> Result<()> {
+        let identity = read_parent_identity(path)?;
+        if self.parent_identities.get(&cgroup_id) != Some(&identity) {
+            self.io_profiler.untrack(cgroup_id);
+            self.observed_io_cgroups.remove(&cgroup_id);
+            self.prev_proc_io.remove(&cgroup_id);
+            self.health_checker.record_write(cgroup_id, current_secs());
+            self.parent_identities.insert(cgroup_id, identity);
+        }
+        Ok(())
     }
 
     /// Updates the PID for a registered agent (after process start).
     ///
-    /// Enables userspace I/O tracking via `/proc/{pid}/io`.
+    /// Resolves current owned membership; a caller-provided PID is not ownership proof.
     pub fn update_agent_pid(&mut self, cgroup_id: u64, pid: u32) {
+        let resolved_pid = self
+            .agent_mappings
+            .iter()
+            .find(|mapping| mapping.cgroup_id == cgroup_id)
+            .and_then(|mapping| resolve_agent_runtime_pid(&mapping.cgroup_path));
+        self.set_agent_runtime_pid(cgroup_id, resolved_pid);
+        debug!(cgroup_id, requested_pid = pid, pid = ?resolved_pid,
+            "Agent PID reconciled with current cgroup membership");
+    }
+
+    fn set_agent_runtime_pid(&mut self, cgroup_id: u64, pid: Option<u32>) {
         if let Some(mapping) = self
             .agent_mappings
             .iter_mut()
             .find(|m| m.cgroup_id == cgroup_id)
         {
-            let resolved_pid = resolve_agent_runtime_pid(&mapping.cgroup_path).unwrap_or(pid);
-            mapping.pid = Some(resolved_pid);
-            debug!(
-                agent = %mapping.agent_name,
-                requested_pid = pid,
-                pid = resolved_pid,
-                "Agent PID updated for eBPF monitoring"
-            );
+            if mapping.pid != pid || pid.is_none() {
+                self.prev_proc_io.remove(&cgroup_id);
+            }
+            mapping.pid = pid;
         }
     }
 
@@ -238,7 +306,8 @@ impl EbpfCollector {
         self.health_checker.untrack(cgroup_id);
         self.io_profiler.untrack(cgroup_id);
         self.prev_proc_io.remove(&cgroup_id);
-        self.prev_cgroup_io.remove(&cgroup_id);
+        self.observed_io_cgroups.remove(&cgroup_id);
+        self.parent_identities.remove(&cgroup_id);
     }
 
     /// Read-only ownership probe used by lifecycle reconciliation and tests.
@@ -255,10 +324,14 @@ impl EbpfCollector {
     pub fn collect(&mut self) -> Result<MetricsSnapshot> {
         let start = Instant::now();
 
-        match self.mode {
-            MonitoringMode::Userspace => self.collect_userspace()?,
-            MonitoringMode::Kernel => self.collect_kernel()?,
+        if self.mode == MonitoringMode::Kernel {
+            if let Err(error) = self.collect_kernel() {
+                warn!(error = %error, "Kernel diagnostics unavailable; parent I/O accounting remains authoritative");
+            }
         }
+        // Apply fresh parent/proc activity after potentially older BPF health timestamps.
+        // Parent io.stat remains the exclusive bytes/ops source in either mode.
+        self.collect_userspace()?;
 
         let cycle_duration = start.elapsed();
         self.last_collect = Some(start);
@@ -299,6 +372,9 @@ impl EbpfCollector {
         Ok(MetricsSnapshot {
             stalled_agents: stalled,
             io_metrics,
+            io_collection_source: (!self.agent_mappings.is_empty()
+                && self.observed_io_cgroups.len() == self.agent_mappings.len())
+            .then_some("agent_cgroup_io_stat"),
             network_metrics,
             psi_metrics,
             cycle_duration,
@@ -307,125 +383,127 @@ impl EbpfCollector {
         })
     }
 
-    /// Userspace collection: reads /proc/{pid}/io and cgroup io.stat for each agent.
+    /// Parent io.stat is the exclusive bytes/ops source; proc data is liveness only.
     fn collect_userspace(&mut self) -> Result<()> {
-        let now = current_secs();
+        self.collect_userspace_at(current_secs())
+    }
 
-        // Collect into a vec first to satisfy borrow checker (self.prev_* is mutated below)
-        let mappings: Vec<_> = self.agent_mappings.clone();
-
+    fn collect_userspace_at(&mut self, now: u64) -> Result<()> {
+        self.observed_io_cgroups.clear();
+        let mappings = self.agent_mappings.clone();
         for mapping in &mappings {
-            // Agent health + I/O: check /proc/{pid}/io for VFS-level activity.
-            if let Some(pid) = mapping.pid {
-                match read_proc_io(pid) {
-                    Ok(io_data) => {
-                        let prev = self.prev_proc_io.entry(mapping.cgroup_id).or_default();
-                        // Use rchar/wchar (VFS-level) as primary metric — captures
-                        // buffered I/O that never reaches the block layer.
-                        let delta_read = if io_data.rchar > 0 {
-                            io_data.rchar.saturating_sub(prev.rchar)
-                        } else {
-                            io_data.read_bytes.saturating_sub(prev.read_bytes)
-                        };
-                        let delta_write = if io_data.wchar > 0 {
-                            io_data.wchar.saturating_sub(prev.wchar)
-                        } else {
-                            io_data.write_bytes.saturating_sub(prev.write_bytes)
-                        };
-                        *prev = io_data;
-
-                        // Only mark agent as alive if there's actual I/O activity.
-                        if delta_read > 0 || delta_write > 0 {
-                            self.health_checker.record_write(mapping.cgroup_id, now);
-                        }
-
-                        if delta_read > 0 {
-                            self.io_profiler.record_read(
-                                mapping.cgroup_id,
-                                &mapping.agent_name,
-                                delta_read,
-                            );
-                        }
-                        if delta_write > 0 {
-                            self.io_profiler.record_write(
-                                mapping.cgroup_id,
-                                &mapping.agent_name,
-                                delta_write,
-                            );
-                        }
+            let observation = self
+                .refresh_parent_identity(mapping.cgroup_id, &mapping.cgroup_path)
+                .and_then(|()| {
+                    let devices = read_cgroup_io_stat(&mapping.cgroup_path)?;
+                    if Some(read_parent_identity(&mapping.cgroup_path)?)
+                        != self.parent_identities.get(&mapping.cgroup_id).copied()
+                    {
+                        bail!("Parent cgroup identity changed during observation");
                     }
-                    Err(e) => {
-                        if !self.proc_io_permission_warned {
-                            let is_permission = e
-                                .root_cause()
-                                .downcast_ref::<std::io::Error>()
-                                .is_some_and(|io| {
-                                    io.kind() == std::io::ErrorKind::PermissionDenied
-                                });
-                            if is_permission {
-                                warn!(
-                                    pid,
-                                    "Cannot read /proc/{pid}/io: permission denied. \
-                                     Add AmbientCapabilities=CAP_SYS_PTRACE to systemd unit."
-                                );
-                                self.proc_io_permission_warned = true;
-                            }
-                        }
+                    Ok(devices)
+                });
+            match observation {
+                Ok(devices) => {
+                    let previous = self
+                        .io_profiler
+                        .get_metrics(mapping.cgroup_id)
+                        .map(|m| [m.read_ops, m.write_ops, m.read_bytes, m.write_bytes])
+                        .unwrap_or_default();
+                    self.io_profiler.record_cgroup_snapshot(
+                        mapping.cgroup_id,
+                        &mapping.agent_name,
+                        &devices,
+                    );
+                    self.observed_io_cgroups.insert(mapping.cgroup_id);
+                    if self
+                        .io_profiler
+                        .get_metrics(mapping.cgroup_id)
+                        .is_some_and(|m| {
+                            [m.read_ops, m.write_ops, m.read_bytes, m.write_bytes]
+                                .iter()
+                                .zip(previous)
+                                .any(|(current, prior)| *current > prior)
+                        })
+                    {
+                        self.health_checker.record_write(mapping.cgroup_id, now);
                     }
+                }
+                Err(error) => {
+                    debug!(agent = %mapping.agent_name, error = %error,
+                        "Agent parent io.stat unavailable; retaining frontier without exporting stale totals");
                 }
             }
 
-            // I/O from cgroup io.stat (if available).
-            if let Ok(io_stat) = read_cgroup_io_stat(&mapping.cgroup_path) {
-                // Aggregate across devices
-                let total_rbytes: u64 = io_stat.iter().map(|(_, (r, _))| r).sum();
-                let total_wbytes: u64 = io_stat.iter().map(|(_, (_, w))| w).sum();
-
-                for (device, stats) in &io_stat {
-                    trace!(
-                        cgroup = %mapping.agent_name,
-                        device = %device,
-                        rbytes = stats.0,
-                        wbytes = stats.1,
-                        "cgroup io.stat"
-                    );
-                }
-
-                // Delta tracking for cgroup io.stat
-                let prev = self
-                    .prev_cgroup_io
-                    .entry(mapping.cgroup_id)
-                    .or_insert((0, 0));
-                let delta_read = total_rbytes.saturating_sub(prev.0);
-                let delta_write = total_wbytes.saturating_sub(prev.1);
-                *prev = (total_rbytes, total_wbytes);
-
-                if delta_read > 0 {
-                    self.io_profiler.record_read(
-                        mapping.cgroup_id,
-                        &mapping.agent_name,
-                        delta_read,
-                    );
-                }
-                if delta_write > 0 {
-                    self.io_profiler.record_write(
-                        mapping.cgroup_id,
-                        &mapping.agent_name,
-                        delta_write,
-                    );
+            let pid = resolve_agent_runtime_pid(&mapping.cgroup_path);
+            self.set_agent_runtime_pid(mapping.cgroup_id, pid);
+            if let Some(pid) = pid {
+                match read_proc_observation(pid) {
+                    Ok((start_time, data)) => {
+                        let current_pid = resolve_agent_runtime_pid(&mapping.cgroup_path);
+                        if current_pid == Some(pid) {
+                            self.record_proc_health(mapping.cgroup_id, pid, start_time, data, now);
+                        } else {
+                            self.set_agent_runtime_pid(mapping.cgroup_id, current_pid);
+                        }
+                    }
+                    Err(error) => {
+                        // A gap invalidates liveness deltas, but never changes the parent I/O frontier.
+                        self.prev_proc_io.remove(&mapping.cgroup_id);
+                        if !self.proc_io_permission_warned
+                            && error
+                                .root_cause()
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                        {
+                            warn!(pid, "Cannot read process I/O for agent liveness");
+                            self.proc_io_permission_warned = true;
+                        }
+                    }
                 }
             }
         }
-
         Ok(())
+    }
+
+    fn record_proc_health(
+        &mut self,
+        cgroup_id: u64,
+        pid: u32,
+        start_time: u64,
+        data: ProcIoData,
+        now: u64,
+    ) {
+        let previous = self.prev_proc_io.insert(
+            cgroup_id,
+            ProcIoBaseline {
+                pid,
+                start_time,
+                data,
+            },
+        );
+        if previous.is_some_and(|prev| {
+            prev.pid == pid
+                && prev.start_time == start_time
+                && data
+                    .counters()
+                    .iter()
+                    .zip(prev.data.counters())
+                    .any(|(current, prior)| {
+                        current.checked_sub(prior).is_some_and(|delta| delta > 0)
+                    })
+        }) {
+            self.health_checker.record_write(cgroup_id, now);
+        }
     }
 
     /// Kernel collection: reads BPF maps via aya.
     ///
     /// Reads:
     /// 1. AGENT_HEALTH Per-CPU Hash Map → max timestamp per cgroup (stall detection)
-    /// 2. IO_STATS Per-CPU Hash Map → sum counters per cgroup (IOPS/throughput)
-    /// 3. TCP_EVENTS Ring Buffer → drain TCP connect/close events
+    /// 2. TCP_EVENTS Ring Buffer -> drain TCP connect/close events
+    ///
+    /// IO_STATS is not an agent-owned counter source.
     ///
     /// BPF maps contain ALL system cgroups. Only registered Sentinel agents
     /// are processed — system cgroups (sshd, systemd, etc.) are filtered out.
@@ -433,7 +511,6 @@ impl EbpfCollector {
         #[cfg(feature = "ebpf")]
         {
             use aya::maps::{PerCpuHashMap, RingBuf};
-            use std::collections::HashSet;
 
             let probes = match &mut self.loaded_probes {
                 Some(p) => p,
@@ -481,41 +558,8 @@ impl EbpfCollector {
                 );
             }
 
-            // 2. I/O profiling: Per-CPU Hash Map (cgroup_id → IoStats)
-            //    Sum read_ops/write_ops/read_bytes/write_bytes across CPUs.
-            //    Only processes registered agent cgroups.
-            if let Some(map) = probes.io_profile.map("IO_STATS") {
-                let map: PerCpuHashMap<_, u64, BpfIoStats> =
-                    PerCpuHashMap::try_from(map).context("IO_STATS map")?;
-                for (cgroup_id, per_cpu_values) in map.iter().flatten() {
-                    // Skip system cgroups
-                    if !registered_cgroups.contains(&cgroup_id) {
-                        continue;
-                    }
-                    let mut total = BpfIoStats::default();
-                    for cpu_val in per_cpu_values.iter() {
-                        total.read_ops += cpu_val.read_ops;
-                        total.write_ops += cpu_val.write_ops;
-                        total.read_bytes += cpu_val.read_bytes;
-                        total.write_bytes += cpu_val.write_bytes;
-                    }
-                    // Safe unwrap: cgroup_id is in registered_cgroups, so it's in agent_mappings
-                    let name = self
-                        .agent_mappings
-                        .iter()
-                        .find(|m| m.cgroup_id == cgroup_id)
-                        .map(|m| m.agent_name.as_str())
-                        .unwrap_or("unknown");
-                    if total.read_bytes > 0 {
-                        self.io_profiler
-                            .record_read(cgroup_id, name, total.read_bytes);
-                    }
-                    if total.write_bytes > 0 {
-                        self.io_profiler
-                            .record_write(cgroup_id, name, total.write_bytes);
-                    }
-                }
-            }
+            // IO_STATS deliberately excluded: block completion runs in a task that
+            // need not own the request. Only parent io.stat can attribute agent I/O.
 
             // 3. Network: Ring Buffer → drain TCP events
             if let Some(map) = probes.network.map_mut("TCP_EVENTS") {
@@ -559,120 +603,6 @@ impl EbpfCollector {
             warn!("Kernel mode requested but ebpf feature not compiled in");
         }
 
-        // 4. Supplement with cgroup io.stat + /proc/{pid}/io (available in both modes).
-        //    BPF block:block_rq_complete only tracks block device I/O.
-        //    cgroup io.stat provides cgroup-level I/O regardless of BPF.
-        //    /proc/{pid}/io provides VFS-level I/O (buffered, pipes, page cache).
-        //    Both also update health_checker for stall detection — critical because
-        //    the BPF fentry/vfs_write probe may not see activity for agents doing
-        //    only buffered I/O through pipes.
-        let supplement_now = current_secs();
-        let mappings: Vec<_> = self.agent_mappings.clone();
-        for mapping in &mappings {
-            if let Ok(io_stat) = read_cgroup_io_stat(&mapping.cgroup_path) {
-                let total_rbytes: u64 = io_stat.iter().map(|(_, (r, _))| r).sum();
-                let total_wbytes: u64 = io_stat.iter().map(|(_, (_, w))| w).sum();
-
-                // Delta tracking for cgroup io.stat
-                let prev = self
-                    .prev_cgroup_io
-                    .entry(mapping.cgroup_id)
-                    .or_insert((0, 0));
-                let delta_read = total_rbytes.saturating_sub(prev.0);
-                let delta_write = total_wbytes.saturating_sub(prev.1);
-                *prev = (total_rbytes, total_wbytes);
-
-                if delta_read > 0 {
-                    self.io_profiler.record_read(
-                        mapping.cgroup_id,
-                        &mapping.agent_name,
-                        delta_read,
-                    );
-                }
-                if delta_write > 0 {
-                    self.io_profiler.record_write(
-                        mapping.cgroup_id,
-                        &mapping.agent_name,
-                        delta_write,
-                    );
-                }
-                // cgroup I/O activity → agent is alive (supplements BPF stall detection)
-                if delta_read > 0 || delta_write > 0 {
-                    self.health_checker
-                        .record_write(mapping.cgroup_id, supplement_now);
-                }
-            }
-
-            // Also try /proc/PID/io if pid is known (supplements BPF block I/O).
-            // Uses VFS-level rchar/wchar which includes page cache hits — critical for
-            // agent processes that do buffered I/O never reaching the block layer.
-            if let Some(pid) = mapping.pid {
-                match read_proc_io(pid) {
-                    Ok(io_data) => {
-                        let prev = self.prev_proc_io.entry(mapping.cgroup_id).or_default();
-                        // Use rchar/wchar (VFS-level) as primary, fall back to read_bytes/write_bytes
-                        let delta_read = if io_data.rchar > 0 {
-                            io_data.rchar.saturating_sub(prev.rchar)
-                        } else {
-                            io_data.read_bytes.saturating_sub(prev.read_bytes)
-                        };
-                        let delta_write = if io_data.wchar > 0 {
-                            io_data.wchar.saturating_sub(prev.wchar)
-                        } else {
-                            io_data.write_bytes.saturating_sub(prev.write_bytes)
-                        };
-                        *prev = io_data;
-
-                        if delta_read > 0 {
-                            self.io_profiler.record_read(
-                                mapping.cgroup_id,
-                                &mapping.agent_name,
-                                delta_read,
-                            );
-                        }
-                        if delta_write > 0 {
-                            self.io_profiler.record_write(
-                                mapping.cgroup_id,
-                                &mapping.agent_name,
-                                delta_write,
-                            );
-                        }
-                        // VFS-level I/O activity → agent is alive
-                        if delta_read > 0 || delta_write > 0 {
-                            self.health_checker
-                                .record_write(mapping.cgroup_id, supplement_now);
-                        }
-                    }
-                    Err(e) => {
-                        if !self.proc_io_permission_warned {
-                            let is_permission = e
-                                .root_cause()
-                                .downcast_ref::<std::io::Error>()
-                                .is_some_and(|io| {
-                                    io.kind() == std::io::ErrorKind::PermissionDenied
-                                });
-                            if is_permission {
-                                warn!(
-                                    pid,
-                                    "Cannot read /proc/{pid}/io: permission denied. \
-                                     Add AmbientCapabilities=CAP_SYS_PTRACE to systemd unit \
-                                     for VFS-level I/O metrics."
-                                );
-                                self.proc_io_permission_warned = true;
-                            } else {
-                                debug!(
-                                    agent = %mapping.agent_name,
-                                    pid,
-                                    error = %e,
-                                    "/proc/{pid}/io read failed"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -681,6 +611,7 @@ impl EbpfCollector {
         self.io_profiler
             .all_metrics()
             .iter()
+            .filter(|(cgroup_id, _)| self.observed_io_cgroups.contains(*cgroup_id))
             .map(|(cgroup_id, m)| {
                 (
                     *cgroup_id,
@@ -724,21 +655,21 @@ impl EbpfCollector {
         for mapping in &self.agent_mappings {
             let reader = PsiReader::new(&mapping.cgroup_path);
 
-            let cpu = match reader.read_cpu_pressure() {
+            let cpu = match reader.read_measured_cpu_pressure() {
                 Ok(v) => Some(v),
                 Err(e) => {
                     log_psi_error(&mapping.agent_name, "cpu.pressure", &e);
                     None
                 }
             };
-            let memory = match reader.read_memory_pressure() {
+            let memory = match reader.read_measured_memory_pressure() {
                 Ok(v) => Some(v),
                 Err(e) => {
                     log_psi_error(&mapping.agent_name, "memory.pressure", &e);
                     None
                 }
             };
-            let io = match reader.read_io_pressure() {
+            let io = match reader.read_measured_io_pressure() {
                 Ok(v) => Some(v),
                 Err(e) => {
                     log_psi_error(&mapping.agent_name, "io.pressure", &e);
@@ -746,21 +677,16 @@ impl EbpfCollector {
                 }
             };
 
-            // Partial PSI: use whatever is available, default missing values to 0.
-            // Previously required ALL three (cpu+mem+io) to succeed — a single
-            // missing file caused the entire agent to be skipped (P4 regression).
-            if cpu.is_some() || memory.is_some() || io.is_some() {
-                let zero = sentinel_common::psi::PsiMetrics::default();
-                let cpu_ref = cpu.as_ref().unwrap_or(&zero);
-                let mem_ref = memory.as_ref().unwrap_or(&zero);
-                let io_ref = io.as_ref().unwrap_or(&zero);
-                let stress = crate::psi::combined_stress_factor(cpu_ref, mem_ref, io_ref);
+            // A composite measurement requires all three real inputs; fallbacks
+            // belong to BioEngine/scheduling, not the telemetry export.
+            if let (Some(cpu), Some(memory), Some(io)) = (cpu, memory, io) {
+                let stress = crate::psi::combined_stress_factor(&cpu, &memory, &io);
                 psi_map.insert(
                     mapping.agent_name.clone(),
                     PsiSnapshot {
-                        cpu_avg10: cpu_ref.avg10,
-                        memory_avg10: mem_ref.avg10,
-                        io_avg10: io_ref.avg10,
+                        cpu_avg10: cpu.avg10,
+                        memory_avg10: memory.avg10,
+                        io_avg10: io.avg10,
                         combined_stress: stress,
                     },
                 );
@@ -772,8 +698,21 @@ impl EbpfCollector {
 }
 
 fn resolve_agent_runtime_pid(cgroup_path: &str) -> Option<u32> {
-    let procs_path = format!("{cgroup_path}/cgroup.procs");
-    let entries = fs::read_to_string(procs_path).ok()?;
+    let runtime_path = format!("{cgroup_path}/runtime");
+    let entries = match fs::read_to_string(format!("{runtime_path}/cgroup.procs")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Legacy layouts may have the runtime directly in the parent. An
+            // existing but unreadable/empty runtime leaf never authorizes fallback.
+            match fs::metadata(&runtime_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::read_to_string(format!("{cgroup_path}/cgroup.procs")).ok()?
+                }
+                _ => return None,
+            }
+        }
+        Err(_) => return None,
+    };
     let mut candidates = Vec::new();
     for line in entries.lines() {
         let line = line.trim();
@@ -781,8 +720,8 @@ fn resolve_agent_runtime_pid(cgroup_path: &str) -> Option<u32> {
             continue;
         }
         let pid = match line.parse::<u32>() {
-            Ok(pid) => pid,
-            Err(_) => continue,
+            Ok(pid) if pid > 0 => pid,
+            _ => continue,
         };
         let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
             .ok()
@@ -819,26 +758,81 @@ struct ProcIoData {
     write_bytes: u64,
 }
 
+impl ProcIoData {
+    fn counters(self) -> [u64; 4] {
+        [self.rchar, self.wchar, self.read_bytes, self.write_bytes]
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcIoBaseline {
+    pid: u32,
+    start_time: u64,
+    data: ProcIoData,
+}
+
+fn read_parent_identity(path: &str) -> Result<(u64, u64)> {
+    let metadata = fs::metadata(path).with_context(|| format!("Reading parent cgroup {path}"))?;
+    if !metadata.is_dir() {
+        bail!("Parent cgroup is not a directory: {path}");
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn read_proc_start_time(pid: u32) -> Result<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, fields) = stat.rsplit_once(')').context("Invalid process stat")?;
+    fields
+        .split_whitespace()
+        .nth(19)
+        .context("Missing process start time")?
+        .parse()
+        .context("Invalid process start time")
+}
+
+fn read_proc_observation(pid: u32) -> Result<(u64, ProcIoData)> {
+    let start_time = read_proc_start_time(pid)?;
+    let data = read_proc_io(pid)?;
+    if read_proc_start_time(pid)? != start_time {
+        bail!("Process identity changed during observation");
+    }
+    Ok((start_time, data))
+}
+
 /// Reads /proc/{pid}/io for a process.
 fn read_proc_io(pid: u32) -> Result<ProcIoData> {
     let path = format!("/proc/{pid}/io");
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("Reading /proc/{pid}/io"))?;
 
-    let mut data = ProcIoData::default();
+    let mut counters = [None; 4];
     for line in content.lines() {
-        if let Some(val) = line.strip_prefix("rchar: ") {
-            data.rchar = val.trim().parse().unwrap_or(0);
-        } else if let Some(val) = line.strip_prefix("wchar: ") {
-            data.wchar = val.trim().parse().unwrap_or(0);
-        } else if let Some(val) = line.strip_prefix("read_bytes: ") {
-            data.read_bytes = val.trim().parse().unwrap_or(0);
-        } else if let Some(val) = line.strip_prefix("write_bytes: ") {
-            data.write_bytes = val.trim().parse().unwrap_or(0);
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let index = match key {
+            "rchar" => 0,
+            "wchar" => 1,
+            "read_bytes" => 2,
+            "write_bytes" => 3,
+            _ => continue,
+        };
+        if counters[index].is_some() {
+            bail!("Duplicate process I/O counter");
         }
+        counters[index] = Some(
+            value
+                .trim()
+                .parse::<u64>()
+                .context("Invalid process I/O counter")?,
+        );
     }
-
-    Ok(data)
+    Ok(ProcIoData {
+        rchar: counters[0].context("Missing process rchar")?,
+        wchar: counters[1].context("Missing process wchar")?,
+        read_bytes: counters[2].context("Missing process read_bytes")?,
+        write_bytes: counters[3].context("Missing process write_bytes")?,
+    })
 }
 
 /// Logs PSI read errors with appropriate severity.
@@ -862,50 +856,72 @@ fn log_psi_error(agent: &str, file: &str, error: &anyhow::Error) {
     }
 }
 
-/// Reads cgroup io.stat file.
-/// Returns Vec<(device, (rbytes, wbytes))>.
-fn read_cgroup_io_stat(cgroup_path: &str) -> Result<Vec<(String, (u64, u64))>> {
+/// Reads authoritative parent cgroup counters in rios/wios/rbytes/wbytes order.
+fn read_cgroup_io_stat(cgroup_path: &str) -> Result<HashMap<String, [u64; 4]>> {
     let path = format!("{cgroup_path}/io.stat");
-    let content = std::fs::read_to_string(&path).with_context(|| format!("Reading {path}"))?;
+    let content = fs::read_to_string(&path).with_context(|| format!("Reading {path}"))?;
+    parse_cgroup_io_stat(&content)
+}
 
-    let mut results = Vec::new();
+fn parse_cgroup_io_stat(content: &str) -> Result<HashMap<String, [u64; 4]>> {
+    let mut devices = HashMap::new();
+    let mut totals = [0u64; 4];
     for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
+        let mut parts = line.split_whitespace();
+        let Some(device) = parts.next() else { continue };
+        let (major, minor) = device.split_once(':').context("Invalid io.stat device")?;
+        for component in [major, minor] {
+            if component.is_empty() || !component.bytes().all(|c| c.is_ascii_digit()) {
+                bail!("Invalid io.stat device: {device}");
+            }
+            component
+                .parse::<u32>()
+                .context("Invalid io.stat device number")?;
         }
-        let device = parts[0].to_string();
-        let mut rbytes = 0u64;
-        let mut wbytes = 0u64;
-        for part in &parts[1..] {
-            if let Some(val) = part.strip_prefix("rbytes=") {
-                rbytes = val.parse().unwrap_or(0);
-            } else if let Some(val) = part.strip_prefix("wbytes=") {
-                wbytes = val.parse().unwrap_or(0);
+        let mut counters = [None; 4];
+        let mut fields = HashSet::new();
+        for part in parts {
+            let (key, value) = part.split_once('=').context("Invalid io.stat field")?;
+            if key.is_empty()
+                || !fields.insert(key)
+                || value.is_empty()
+                || !value.bytes().all(|c| c.is_ascii_digit())
+            {
+                bail!("Invalid or duplicate io.stat field: {part}");
+            }
+            let value = value.parse::<u64>().context("Invalid io.stat counter")?;
+            let index = match key {
+                "rios" => Some(0),
+                "wios" => Some(1),
+                "rbytes" => Some(2),
+                "wbytes" => Some(3),
+                _ => None,
+            };
+            if let Some(index) = index {
+                counters[index] = Some(value);
             }
         }
-        results.push((device, (rbytes, wbytes)));
+        // Linux blkcg_print_one_stat legitimately emits only the device when all
+        // read/write counters are zero. A partially populated row is not that case.
+        let counters = if fields.is_empty() {
+            [0; 4]
+        } else {
+            [
+                counters[0].context("Missing io.stat rios")?,
+                counters[1].context("Missing io.stat wios")?,
+                counters[2].context("Missing io.stat rbytes")?,
+                counters[3].context("Missing io.stat wbytes")?,
+            ]
+        };
+        if devices.insert(device.to_string(), counters).is_some() {
+            bail!("Duplicate io.stat device: {device}");
+        }
+        for (total, value) in totals.iter_mut().zip(counters) {
+            *total = total.checked_add(value).context("io.stat total overflow")?;
+        }
     }
-
-    Ok(results)
+    Ok(devices)
 }
-
-/// BPF IoStats struct matching the kernel-side definition in io_profile.rs.
-/// Must match the `#[repr(C)]` layout in sentinel-ebpf-probes.
-#[cfg(feature = "ebpf")]
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct BpfIoStats {
-    read_ops: u64,
-    write_ops: u64,
-    read_bytes: u64,
-    write_bytes: u64,
-}
-
-#[cfg(feature = "ebpf")]
-// SAFETY: `BpfIoStats` is `#[repr(C)]`, contains only integer fields, has no
-// references or drop glue, and matches the kernel-side eBPF map value layout.
-unsafe impl aya::Pod for BpfIoStats {}
 
 /// BPF TcpEvent struct matching the kernel-side definition in network.rs.
 #[cfg(feature = "ebpf")]
@@ -996,6 +1012,7 @@ mod tests {
         });
         // Record writes for both registered and unregistered cgroups
         let old_time = current_secs().saturating_sub(60);
+        collector.health_checker.untrack(100);
         collector.health_checker.record_write(100, old_time); // registered, stalled
         collector.health_checker.record_write(999, old_time); // unregistered, stalled
 
@@ -1007,22 +1024,533 @@ mod tests {
         assert!(snapshot.stalled_agents[0].seconds_since_write >= 30);
     }
 
+    struct IoFixture(std::path::PathBuf);
+
+    impl IoFixture {
+        fn new(contents: &str) -> Self {
+            let root = std::env::var_os("RUNNER_TEMP")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| "/work/tmp/project-sentinel".into());
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = root.join(format!("ebpf-io-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("io.stat"), contents).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for IoFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mapping(fixture: &IoFixture, cgroup_id: u64, pid: Option<u32>) -> AgentCgroupMapping {
+        AgentCgroupMapping {
+            agent_name: "io-fixture".into(),
+            cgroup_path: fixture.0.to_str().unwrap().into(),
+            cgroup_id,
+            pid,
+        }
+    }
+
+    fn counters(snapshot: &MetricsSnapshot, id: u64) -> [u64; 4] {
+        let io = snapshot.io_metrics.get(&id).unwrap();
+        [io.read_ops, io.write_ops, io.read_bytes, io.write_bytes]
+    }
+
     #[test]
-    fn delta_tracking_prevents_double_counting() {
+    fn stale_kernel_timestamp_cannot_rewind_parent_activity_in_the_next_cycle() {
+        let fixture = IoFixture::new("8:0 rbytes=100 wbytes=0 rios=1 wios=0\n");
+        let mut collector = EbpfCollector::new(MonitoringMode::Kernel);
+        collector.register_agent(mapping(&fixture, 1, None));
+        collector.health_checker.untrack(1);
+        // First cycle: old kernel activity followed by new authoritative parent I/O.
+        collector.health_checker.record_write(1, 90);
+        collector.collect_userspace_at(100).unwrap();
+        assert_eq!(
+            collector.health_checker.seconds_since_last_write(1, 100),
+            Some(0)
+        );
+        // Second cycle: the kernel repeats its old timestamp, and no new parent I/O occurs.
+        collector.health_checker.record_write(1, 90);
+        collector.collect_userspace_at(110).unwrap();
+        assert_eq!(
+            collector.health_checker.seconds_since_last_write(1, 110),
+            Some(10)
+        );
+        assert_eq!(collector.snapshot_io()[&1].read_bytes, 100);
+    }
+
+    #[test]
+    fn metadata_gap_preserves_missing_device_history_with_or_without_runtime_rekey() {
+        for rekey in [false, true] {
+            let fixture = IoFixture::new(
+                "8:0 rbytes=100 wbytes=0 rios=1 wios=0\n8:1 rbytes=200 wbytes=0 rios=2 wios=0\n",
+            );
+            let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+            collector.register_agent(mapping(&fixture, 1, None));
+            assert_eq!(counters(&collector.collect().unwrap(), 1), [3, 0, 300, 0]);
+            let identity = collector.parent_identities[&1];
+            let parked = IoFixture(fixture.0.with_extension("metadata-gap"));
+            fs::rename(&fixture.0, &parked.0).unwrap();
+            let unavailable = collector.collect().unwrap();
+            assert_eq!(unavailable.io_collection_source, None);
+            assert!(unavailable.io_metrics.is_empty());
+            assert_eq!(collector.parent_identities.get(&1), Some(&identity));
+            let id = if rekey {
+                collector.register_agent(mapping(&fixture, 2, None));
+                assert!(!collector.is_agent_registered(1));
+                assert!(collector.is_agent_registered(2));
+                assert!(collector.collect().unwrap().io_collection_source.is_none());
+                2
+            } else {
+                1
+            };
+            assert_eq!(collector.parent_identities.get(&id), Some(&identity));
+            fs::write(
+                parked.0.join("io.stat"),
+                "8:0 rbytes=150 wbytes=0 rios=2 wios=0\n",
+            )
+            .unwrap();
+            fs::rename(&parked.0, &fixture.0).unwrap();
+            let recovered = collector.collect().unwrap();
+            assert_eq!(recovered.io_collection_source, Some("agent_cgroup_io_stat"));
+            // A advances from 100 to 150; disappeared B's 200 remains accounted, not replayed/lost.
+            assert_eq!(counters(&recovered, id), [4, 0, 350, 0]);
+            assert_eq!(counters(&collector.collect().unwrap(), id), [4, 0, 350, 0]);
+        }
+    }
+
+    #[test]
+    fn unknown_metadata_rekey_resets_only_after_a_different_parent_is_observed() {
+        let fixture = IoFixture::new("8:0 rbytes=100 wbytes=0 rios=1 wios=0\n");
         let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
-        // Simulate cgroup io.stat delta tracking
-        let prev = collector.prev_cgroup_io.entry(1).or_insert((0, 0));
-        assert_eq!(*prev, (0, 0));
+        collector.register_agent(mapping(&fixture, 1, None));
+        collector.collect().unwrap();
+        let identity = collector.parent_identities[&1];
+        let parked = IoFixture(fixture.0.with_extension("old-parent"));
+        fs::rename(&fixture.0, &parked.0).unwrap();
+        collector.register_agent(mapping(&fixture, 2, None));
+        assert_eq!(collector.parent_identities.get(&2), Some(&identity));
+        assert_eq!(
+            collector.io_profiler.get_metrics(2).unwrap().read_bytes,
+            100
+        );
+        assert!(collector.collect().unwrap().io_collection_source.is_none());
+        fs::create_dir(&fixture.0).unwrap();
+        fs::write(
+            fixture.0.join("io.stat"),
+            "8:0 rbytes=50 wbytes=0 rios=1 wios=0\n",
+        )
+        .unwrap();
+        let recovered = collector.collect().unwrap();
+        assert_ne!(collector.parent_identities[&2], identity);
+        assert_eq!(counters(&recovered, 2), [1, 0, 50, 0]);
+        assert_eq!(recovered.io_collection_source, Some("agent_cgroup_io_stat"));
+    }
 
-        // First "read": cumulative = 1000
-        let delta = 1000u64.saturating_sub(prev.0);
-        assert_eq!(delta, 1000);
-        *prev = (1000, 0);
+    #[test]
+    fn explicitly_empty_runtime_membership_cannot_use_an_unrelated_pid_for_health() {
+        let fixture = IoFixture::new("");
+        let pid = std::process::id();
+        fs::create_dir(fixture.0.join("runtime")).unwrap();
+        fs::write(fixture.0.join("runtime/cgroup.procs"), "").unwrap();
+        fs::write(fixture.0.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(mapping(&fixture, 1, Some(pid)));
+        collector.health_checker.untrack(1);
+        collector.health_checker.record_write(1, 0);
+        collector.record_proc_health(
+            1,
+            pid,
+            read_proc_start_time(pid).unwrap(),
+            ProcIoData::default(),
+            0,
+        );
+        collector.update_agent_pid(1, pid);
+        assert!(collector.prev_proc_io.is_empty());
+        assert_eq!(collector.agent_mappings[0].pid, None);
+        collector.collect_userspace_at(100).unwrap();
+        collector.collect_userspace_at(110).unwrap();
+        assert_eq!(
+            collector.health_checker.seconds_since_last_write(1, 110),
+            Some(110)
+        );
+        assert_eq!(collector.health_checker.stalled_agents(110), vec![1]);
+        assert!(collector.prev_proc_io.is_empty());
+        assert_eq!(collector.snapshot_io()[&1].read_bytes, 0);
+    }
 
-        // Second "read": cumulative = 1500
-        let delta = 1500u64.saturating_sub(prev.0);
-        assert_eq!(delta, 500); // Only 500 new bytes
-        *prev = (1500, 0);
+    fn write_pressure(fixture: &IoFixture, file: &str, avg10: u64) {
+        fs::write(
+            fixture.0.join(file),
+            format!(
+            "some avg10={avg10} avg60=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0\n",
+        ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn composite_psi_requires_all_actual_valid_inputs_and_recovers_measured_zero() {
+        let fixture = IoFixture::new("");
+        let partial = IoFixture::new("");
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(mapping(&fixture, 1, None));
+        let mut other = mapping(&partial, 2, None);
+        other.agent_name = "partial-pressure".into();
+        collector.register_agent(other);
+        write_pressure(&partial, "cpu.pressure", 0);
+        write_pressure(&fixture, "cpu.pressure", 80);
+        write_pressure(&fixture, "memory.pressure", 40);
+        let missing = collector.collect().unwrap();
+        assert!(missing.psi_metrics.is_empty());
+        assert!(!crate::exporter::MetricsExporter::export_snapshot(&missing)
+            .contains("sentinel_agent_cpu_pressure_stress{"));
+        write_pressure(&fixture, "io.pressure", 20);
+        let observed = collector.collect().unwrap();
+        assert_eq!(observed.psi_metrics.len(), 1);
+        assert!(!observed.psi_metrics.contains_key("partial-pressure"));
+        assert!((observed.psi_metrics["io-fixture"].combined_stress - 0.56).abs() < 0.0001);
+        assert!(crate::exporter::MetricsExporter::export_snapshot(&observed)
+            .contains("sentinel_agent_cpu_pressure_stress{agent=\"io-fixture\"} 0.5600"));
+        for invalid in [
+            "some",
+            "some avg10=0 avg60=0 total=0",
+            "some avg10=0 avg60=0 avg300=0 total=0 avg10=1",
+            "some avg10=NaN avg60=0 avg300=0 total=0",
+            "some avg10=101 avg60=0 avg300=0 total=0",
+        ] {
+            fs::write(fixture.0.join("io.pressure"), invalid).unwrap();
+            let unavailable = collector.collect().unwrap();
+            assert!(unavailable.psi_metrics.is_empty(), "{invalid}");
+            assert!(
+                !crate::exporter::MetricsExporter::export_snapshot(&unavailable)
+                    .contains("sentinel_agent_cpu_pressure_stress{")
+            );
+        }
+        for file in ["cpu.pressure", "memory.pressure", "io.pressure"] {
+            write_pressure(&fixture, file, 0);
+        }
+        let zero = collector.collect().unwrap();
+        assert_eq!(zero.psi_metrics.len(), 1);
+        assert_eq!(zero.psi_metrics["io-fixture"].combined_stress, 0.0);
+        assert!(crate::exporter::MetricsExporter::export_snapshot(&zero)
+            .contains("sentinel_agent_cpu_pressure_stress{agent=\"io-fixture\"} 0.0000"));
+    }
+
+    #[test]
+    fn parent_cgroup_covers_runtime_and_commands_in_both_modes_once() {
+        let fixture = IoFixture::new("8:0 rbytes=100 wbytes=300 rios=7 wios=11\n");
+        for (child, stat) in [
+            ("runtime", "8:0 rbytes=60 wbytes=100 rios=3 wios=4\n"),
+            ("commands", "8:0 rbytes=40 wbytes=200 rios=4 wios=7\n"),
+        ] {
+            fs::create_dir(fixture.0.join(child)).unwrap();
+            fs::write(fixture.0.join(child).join("io.stat"), stat).unwrap();
+        }
+        for mode in [MonitoringMode::Userspace, MonitoringMode::Kernel] {
+            let mut collector = EbpfCollector::new(mode);
+            collector.register_agent(mapping(&fixture, 1, Some(std::process::id())));
+            let snapshot = collector.collect().unwrap();
+            assert_eq!(snapshot.io_collection_source, Some("agent_cgroup_io_stat"));
+            assert_eq!(counters(&snapshot, 1), [7, 11, 100, 300]);
+            assert_eq!(
+                counters(&collector.collect().unwrap(), 1),
+                [7, 11, 100, 300]
+            );
+            assert_eq!(collector.io_profiler.all_metrics().len(), 1);
+        }
+    }
+
+    #[test]
+    fn proc_unavailable_and_recovery_never_overlap_parent_io() {
+        let fixture = IoFixture::new("8:0 rbytes=1234 wbytes=5678 rios=5 wios=9\n");
+        fs::write(
+            fixture.0.join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(mapping(&fixture, 1, Some(std::process::id())));
+        assert_eq!(
+            counters(&collector.collect().unwrap(), 1),
+            [5, 9, 1234, 5678]
+        );
+        fs::write(fixture.0.join("cgroup.procs"), format!("{}\n", u32::MAX)).unwrap();
+        collector.update_agent_pid(1, u32::MAX);
+        assert_eq!(
+            counters(&collector.collect().unwrap(), 1),
+            [5, 9, 1234, 5678]
+        );
+        assert!(!collector.prev_proc_io.contains_key(&1));
+        fs::write(
+            fixture.0.join("io.stat"),
+            "8:0 rbytes=1254 wbytes=5708 rios=8 wios=13\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.0.join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        collector.update_agent_pid(1, std::process::id());
+        assert_eq!(
+            counters(&collector.collect().unwrap(), 1),
+            [8, 13, 1254, 5708]
+        );
+        assert_eq!(
+            counters(&collector.collect().unwrap(), 1),
+            [8, 13, 1254, 5708]
+        );
+    }
+
+    #[test]
+    fn empty_device_only_and_explicit_zero_stats_are_real_observations() {
+        for contents in ["", "8:0\n", "8:0 rbytes=0 wbytes=0 rios=0 wios=0\n"] {
+            let fixture = IoFixture::new(contents);
+            let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+            collector.register_agent(mapping(&fixture, 1, None));
+            let snapshot = collector.collect().unwrap();
+            assert_eq!(snapshot.io_collection_source, Some("agent_cgroup_io_stat"));
+            assert_eq!(counters(&snapshot, 1), [0; 4]);
+            let output = crate::exporter::MetricsExporter::export_snapshot(&snapshot);
+            assert!(
+                output.contains("sentinel_io_collection_source{source=\"agent_cgroup_io_stat\"} 1")
+            );
+            assert!(output.contains("sentinel_io_ops_total{cgroup_id=\"1\",cgroup_name=\"io-fixture\",direction=\"read\"} 0"));
+        }
+    }
+
+    #[test]
+    fn missing_and_malformed_stats_hide_stale_source_and_retain_exact_frontier() {
+        let fixture = IoFixture::new("8:0 rbytes=100 wbytes=200 rios=3 wios=4\n");
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(mapping(&fixture, 1, Some(std::process::id())));
+        assert_eq!(counters(&collector.collect().unwrap(), 1), [3, 4, 100, 200]);
+        fs::remove_file(fixture.0.join("io.stat")).unwrap();
+        let missing = collector.collect().unwrap();
+        assert!(missing.io_metrics.is_empty());
+        assert_eq!(missing.io_collection_source, None);
+        for contents in [
+            "8:0 rbytes=100 wbytes=200\n",
+            "8:0 rbytes=bad wbytes=200 rios=3 wios=4\n",
+            "8:0 rbytes=100 wbytes=200 rios=3 wios=4\n8:1 rios=1\n",
+        ] {
+            fs::write(fixture.0.join("io.stat"), contents).unwrap();
+            let snapshot = collector.collect().unwrap();
+            assert!(snapshot.io_metrics.is_empty());
+            assert_eq!(snapshot.io_collection_source, None);
+            assert!(
+                !crate::exporter::MetricsExporter::export_snapshot(&snapshot)
+                    .contains("sentinel_io_collection_source")
+            );
+        }
+        fs::write(
+            fixture.0.join("io.stat"),
+            "8:0 rbytes=150 wbytes=250 rios=5 wios=7\n",
+        )
+        .unwrap();
+        assert_eq!(counters(&collector.collect().unwrap(), 1), [5, 7, 150, 250]);
+    }
+
+    #[test]
+    fn partial_registered_agent_coverage_never_claims_global_source() {
+        let observed = IoFixture::new("");
+        let missing = IoFixture::new("");
+        fs::remove_file(missing.0.join("io.stat")).unwrap();
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        assert_eq!(collector.collect().unwrap().io_collection_source, None);
+        collector.register_agent(mapping(&observed, 1, None));
+        let mut other = mapping(&missing, 2, None);
+        other.agent_name = "other-agent".into();
+        collector.register_agent(other);
+        let snapshot = collector.collect().unwrap();
+        assert_eq!(snapshot.io_metrics.len(), 1);
+        assert_eq!(snapshot.io_collection_source, None);
+        assert!(
+            !crate::exporter::MetricsExporter::export_snapshot(&snapshot)
+                .contains("sentinel_io_collection_source")
+        );
+        fs::write(missing.0.join("io.stat"), "").unwrap();
+        assert_eq!(
+            collector.collect().unwrap().io_collection_source,
+            Some("agent_cgroup_io_stat")
+        );
+    }
+
+    #[test]
+    fn parser_rejects_partial_malformed_duplicate_and_overflow_samples() {
+        for contents in [
+            "not-a-device\n",
+            "8:0 rbytes=1\n",
+            "8:0 rbytes=-1 wbytes=0 rios=0 wios=0\n",
+            "8:0 rbytes=1.5 wbytes=0 rios=0 wios=0\n",
+            "8:0 rbytes=1 wbytes=0 rios=bad wios=0\n",
+            "8:0 rbytes=1 wbytes=0 rios=0 wios=0 rbytes=2\n",
+            "8:0 rbytes=1 wbytes=0 rios=0 wios=0 dios=bad\n",
+            "8:0\n8:0\n",
+            "8:0 rbytes=18446744073709551615 wbytes=0 rios=0 wios=0\n8:1 rbytes=1 wbytes=0 rios=0 wios=0\n",
+        ] {
+            assert!(parse_cgroup_io_stat(contents).is_err(), "{contents}");
+        }
+        let devices =
+            parse_cgroup_io_stat("8:0 wios=9 rios=7 wbytes=200 rbytes=100 dbytes=0 dios=0\n8:1\n")
+                .unwrap();
+        assert_eq!(devices["8:0"], [7, 9, 100, 200]);
+        assert_eq!(devices["8:1"], [0; 4]);
+    }
+
+    #[test]
+    fn runtime_reincarnation_transfers_same_parent_frontier_not_lifetime_total_twice() {
+        let fixture = IoFixture::new("8:0 rbytes=100 wbytes=200 rios=3 wios=4\n");
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(mapping(&fixture, 1, None));
+        collector.collect().unwrap();
+        collector.record_proc_health(1, 100, 10, ProcIoData::default(), current_secs());
+        collector.register_agent(mapping(&fixture, 2, None));
+        assert!(!collector.is_agent_registered(1));
+        assert!(collector.is_agent_registered(2));
+        assert!(!collector.prev_proc_io.contains_key(&1));
+        assert!(collector
+            .health_checker
+            .seconds_since_last_write(1, current_secs())
+            .is_none());
+        let snapshot = collector.collect().unwrap();
+        assert!(!snapshot.io_metrics.contains_key(&1));
+        assert_eq!(counters(&snapshot, 2), [3, 4, 100, 200]);
+        fs::write(
+            fixture.0.join("io.stat"),
+            "8:0 rbytes=150 wbytes=250 rios=5 wios=7\n",
+        )
+        .unwrap();
+        assert_eq!(counters(&collector.collect().unwrap(), 2), [5, 7, 150, 250]);
+    }
+
+    #[test]
+    fn recreated_parent_path_does_not_inherit_old_inode_counters() {
+        let fixture = IoFixture::new("8:0 rbytes=100 wbytes=200 rios=3 wios=4\n");
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(mapping(&fixture, 1, None));
+        collector.collect().unwrap();
+        let retired = IoFixture(fixture.0.with_extension("retired"));
+        fs::rename(&fixture.0, &retired.0).unwrap();
+        fs::create_dir(&fixture.0).unwrap();
+        fs::write(
+            fixture.0.join("io.stat"),
+            "8:0 rbytes=20 wbytes=30 rios=1 wios=2\n",
+        )
+        .unwrap();
+        assert_ne!(
+            read_parent_identity(fixture.0.to_str().unwrap()).unwrap(),
+            read_parent_identity(retired.0.to_str().unwrap()).unwrap()
+        );
+        collector.register_agent(mapping(&fixture, 2, None));
+        assert!(!collector.is_agent_registered(1));
+        assert_eq!(counters(&collector.collect().unwrap(), 2), [1, 2, 20, 30]);
+    }
+
+    #[test]
+    fn exact_owner_upsert_is_idempotent_and_foreign_name_or_path_cannot_replace_it() {
+        let fixture = IoFixture::new("8:0 rbytes=100 wbytes=200 rios=3 wios=4\n");
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(mapping(&fixture, 1, None));
+        collector.collect().unwrap();
+        collector.health_checker.untrack(1);
+        collector
+            .health_checker
+            .record_write(1, current_secs().saturating_sub(60));
+        collector.register_agent(mapping(&fixture, 1, None));
+        assert_eq!(collector.collect().unwrap().stalled_agents.len(), 1);
+        let mut foreign = mapping(&fixture, 2, None);
+        foreign.agent_name = "foreign".into();
+        collector.register_agent(foreign);
+        let mut foreign = mapping(&fixture, 2, None);
+        foreign.cgroup_path.push_str("/foreign");
+        collector.register_agent(foreign);
+        assert!(collector.is_agent_registered(1));
+        assert!(!collector.is_agent_registered(2));
+        assert_eq!(collector.agent_mappings.len(), 1);
+        assert_eq!(counters(&collector.collect().unwrap(), 1), [3, 4, 100, 200]);
+    }
+
+    #[test]
+    fn runtime_pid_preferred_over_parent_and_commands_sibling() {
+        let fixture = IoFixture::new("");
+        fs::create_dir(fixture.0.join("runtime")).unwrap();
+        fs::create_dir(fixture.0.join("commands")).unwrap();
+        fs::write(fixture.0.join("cgroup.procs"), "4001\n").unwrap();
+        fs::write(fixture.0.join("runtime/cgroup.procs"), "2001\n").unwrap();
+        fs::write(fixture.0.join("commands/cgroup.procs"), "9001\n").unwrap();
+        assert_eq!(
+            resolve_agent_runtime_pid(fixture.0.to_str().unwrap()),
+            Some(2001)
+        );
+        fs::write(fixture.0.join("runtime/cgroup.procs"), "").unwrap();
+        assert_eq!(resolve_agent_runtime_pid(fixture.0.to_str().unwrap()), None);
+        fs::remove_file(fixture.0.join("runtime/cgroup.procs")).unwrap();
+        assert_eq!(resolve_agent_runtime_pid(fixture.0.to_str().unwrap()), None);
+        fs::write(fixture.0.join("runtime/cgroup.procs"), "0\ninvalid\n").unwrap();
+        assert_eq!(resolve_agent_runtime_pid(fixture.0.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn pid_update_and_pid_reuse_reset_proc_liveness_baseline_not_parent_io() {
+        let fixture = IoFixture::new("8:0 rbytes=100 wbytes=200 rios=3 wios=4\n");
+        fs::write(fixture.0.join("cgroup.procs"), "1001\n").unwrap();
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(mapping(&fixture, 1, Some(1001)));
+        collector.collect().unwrap();
+        let sample = ProcIoData {
+            rchar: 100,
+            wchar: 200,
+            ..Default::default()
+        };
+        collector.record_proc_health(1, 1001, 10, sample, 100);
+        fs::write(fixture.0.join("cgroup.procs"), "1002\n").unwrap();
+        collector.update_agent_pid(1, 1002);
+        assert!(!collector.prev_proc_io.contains_key(&1));
+        collector.health_checker.untrack(1);
+        collector.health_checker.record_write(1, 100);
+        collector.record_proc_health(1, 1002, 20, sample, 101);
+        let previous_health = collector.health_checker.seconds_since_last_write(1, 1000);
+        collector.record_proc_health(
+            1,
+            1002,
+            21,
+            ProcIoData {
+                rchar: 1000,
+                wchar: 2000,
+                ..Default::default()
+            },
+            102,
+        );
+        assert_eq!(
+            collector.health_checker.seconds_since_last_write(1, 1000),
+            previous_health
+        );
+        assert_eq!(collector.prev_proc_io[&1].start_time, 21);
+        collector.record_proc_health(
+            1,
+            1002,
+            21,
+            ProcIoData {
+                rchar: 1001,
+                wchar: 2001,
+                ..Default::default()
+            },
+            103,
+        );
+        assert_eq!(
+            collector.health_checker.seconds_since_last_write(1, 1000),
+            Some(897)
+        );
+        assert_eq!(counters(&collector.collect().unwrap(), 1), [3, 4, 100, 200]);
     }
 
     #[test]
@@ -1034,6 +1562,7 @@ mod tests {
         collector
             .io_profiler
             .record_write(1, "sentinel/agent-01", 8192);
+        collector.observed_io_cgroups.insert(1);
 
         let snapshot = collector.snapshot_io();
         let io = snapshot.get(&1).unwrap();

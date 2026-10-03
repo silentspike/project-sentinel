@@ -34,7 +34,7 @@ use sentinel_common::nano_runtime::{
 use sentinel_common::nano_runtime::{RUNTIME_ECS_NATIVE, RUNTIME_MICROVM, RUNTIME_WASM_WASMTIME};
 use sentinel_common::{AgentId, AgentIdBounds, OperatorCommand, Perception};
 use sentinel_ebpf::collector::MetricsSnapshot;
-use sentinel_ebpf::EbpfCollector;
+use sentinel_ebpf::{AgentCgroupMapping, EbpfCollector};
 use sentinel_ecs::{
     apply_personality, create_simulation_world, despawn_agent_from_world, spawn_agent,
     spawn_prepared_agent, ActionReceiver, LimboEventStore, PerceptionSender, SimulationTime,
@@ -945,32 +945,30 @@ fn process_workbench_dispatch(
                 )
             }
         };
+        let result = synchronize_workbench_command_result(result, || {
+            let guard = publication_guard
+                .as_ref()
+                .map_err(|error| anyhow!("workbench observation authority: {error}"))?;
+            owner_registry
+                .validate(guard)
+                .context("workbench publication World authority became stale")?;
+            let agent_id = affected_agent_id
+                .ok_or_else(|| anyhow::anyhow!("workbench runtime owner is unavailable"))?;
+            let (handle, resources) = runtimes.observe(agent_id)?;
+            synchronize_workbench_runtime_observation(
+                agent_id,
+                &handle,
+                &resources,
+                sandbox_handles,
+                security_runtime_state,
+                ebpf_collector,
+                owner_registry,
+                guard,
+            )?;
+            Ok(())
+        });
         let result = result.and_then(|update| {
             let publication_guard = publication_guard?;
-            owner_registry
-                .validate(&publication_guard)
-                .context("workbench publication World authority became stale")?;
-            // Durable terminal replay has no runtime transition to synchronize.
-            // Its coordinator has already revalidated current record authority.
-            if !update.replayed
-                || update.records.is_empty()
-                || !update
-                    .records
-                    .iter()
-                    .all(|record| record.state.is_terminal())
-            {
-                let agent_id = affected_agent_id
-                    .ok_or_else(|| anyhow::anyhow!("workbench runtime owner is unavailable"))?;
-                let (handle, resources) = runtimes.observe(agent_id)?;
-                let (cgroup_id, pid) = synchronize_workbench_runtime_observation(
-                    agent_id,
-                    &handle,
-                    &resources,
-                    sandbox_handles,
-                    security_runtime_state,
-                )?;
-                ebpf_collector.update_agent_pid(cgroup_id, pid);
-            }
             publish_workbench_records_with_world_authority(
                 owner_registry,
                 &publication_guard,
@@ -984,6 +982,32 @@ fn process_workbench_dispatch(
             warn!("workbench requester disconnected before receiving its durable outcome");
         }
     }
+}
+
+fn synchronize_workbench_command_result(
+    result: Result<crate::workbench::WorkbenchCoordinatorUpdate>,
+    observe: impl FnOnce() -> Result<()>,
+) -> Result<crate::workbench::WorkbenchCoordinatorUpdate> {
+    let terminal_replay = result.as_ref().is_ok_and(|update| {
+        update.replayed
+            && !update.records.is_empty()
+            && update
+                .records
+                .iter()
+                .all(|record| record.state.is_terminal())
+    });
+    if terminal_replay {
+        return result;
+    }
+    // Errors can follow an actual runtime recycle; retain the command error
+    // while synchronizing observations without publishing success or retrying.
+    let observation = observe();
+    if result.is_err() {
+        if let Err(error) = &observation {
+            warn!(%error, "failed workbench command retained an unsynchronized runtime observation");
+        }
+    }
+    result.and_then(|update| observation.map(|()| update))
 }
 
 fn publish_workbench_records_with_world_authority(
@@ -1006,6 +1030,9 @@ fn synchronize_workbench_runtime_observation(
     resources: &NanoRuntimeResources,
     sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    ebpf_collector: &mut EbpfCollector,
+    owner_registry: &sentinel_common::OwnerRegistry,
+    guard: &sentinel_common::OwnerWriteGuard,
 ) -> Result<(u64, u32)> {
     anyhow::ensure!(
         handle.agent_id == Some(agent_id)
@@ -1041,6 +1068,9 @@ fn synchronize_workbench_runtime_observation(
         "workbench runtime observation conflicts with the retained owner"
     );
 
+    owner_registry
+        .validate(guard)
+        .context("workbench observation World authority became stale")?;
     sandbox.cgroup_created = resources.cgroup_created;
     sandbox.cgroup_id = resources.cgroup_id;
     sandbox.io_available = resources.io_available;
@@ -1049,6 +1079,12 @@ fn synchronize_workbench_runtime_observation(
     sandbox.network_isolated = resources.network_isolated;
     snapshot.runtime_pid = Some(pid);
     snapshot.bwrap_pid = Some(pid);
+    ebpf_collector.register_agent(AgentCgroupMapping {
+        agent_name: sandbox.agent_name.clone(),
+        cgroup_path: sentinel_sandbox::cgroup_path(&sandbox.agent_name),
+        cgroup_id,
+        pid: Some(pid),
+    });
     Ok((cgroup_id, pid))
 }
 
@@ -8947,6 +8983,15 @@ fn ecs_tick_loop(
     let psi_mem_gauge =
         sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_mem_avg10");
     let psi_io_gauge = sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_io_avg10");
+    let psi_sample_gauges = [
+        "sentinel_psi_cpu_sample_available",
+        "sentinel_psi_mem_sample_available",
+        "sentinel_psi_io_sample_available",
+    ]
+    .map(|name| sentinel_telemetry::MetricsRegistry::global().gauge(name));
+    for gauge in &psi_sample_gauges {
+        gauge.set(0);
+    }
     // Per-Phase-Histogramme (#381): leer wenn phase_timing deaktiviert.
     let phase_histograms: Vec<std::sync::Arc<sentinel_telemetry::Histogram>> =
         if phase_timing_enabled {
@@ -12158,9 +12203,18 @@ fn ecs_tick_loop(
         tick_rate_effective_gauge.set(effective_rate.as_millis() as i64);
         // PSI avg10 in Promille (×10) um eine Dezimalstelle Praezision zu erhalten.
         // Dashboard teilt durch 1000 fuer Fraktion [0,1].
+        for gauge in &psi_sample_gauges {
+            gauge.set(0);
+        }
         psi_cpu_gauge.set((adaptive_tick.cpu_avg10() * 10.0) as i64);
         psi_mem_gauge.set((adaptive_tick.mem_avg10() * 10.0) as i64);
         psi_io_gauge.set((adaptive_tick.io_avg10() * 10.0) as i64);
+        for (gauge, available) in psi_sample_gauges
+            .iter()
+            .zip(adaptive_tick.observation_available())
+        {
+            gauge.set(i64::from(available));
+        }
     }
 
     // ── Graceful Shutdown mit Timing-Instrumentierung (AC-4 #255) ──
@@ -12623,6 +12677,17 @@ mod tests {
     fn workbench_recycle_refreshes_runtime_observations_before_publication() {
         let (agent_id, handle, resources, mut sandbox_handles, security_runtime_state) =
             workbench_recycle_observation_fixture();
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(AgentCgroupMapping {
+            agent_name: "Laura Petersen".to_string(),
+            cgroup_path: sentinel_sandbox::cgroup_path("Laura Petersen"),
+            cgroup_id: 6_055,
+            pid: Some(10_055),
+        });
+        let owner = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+        let guard = owner
+            .issue(sentinel_common::StateTransferScope::World)
+            .unwrap();
 
         let observed = synchronize_workbench_runtime_observation(
             agent_id,
@@ -12630,10 +12695,15 @@ mod tests {
             &resources,
             &mut sandbox_handles,
             &security_runtime_state,
+            &mut collector,
+            &owner,
+            &guard,
         )
         .unwrap();
 
         assert_eq!(observed, (7_055, 20_055));
+        assert!(!collector.is_agent_registered(6_055));
+        assert!(collector.is_agent_registered(7_055));
         let sandbox = &sandbox_handles[&agent_id];
         assert_eq!(sandbox.cgroup_id, Some(7_055));
         assert!(sandbox.cgroup_created);
@@ -12673,6 +12743,17 @@ mod tests {
         let (agent_id, handle, mut resources, mut sandbox_handles, security_runtime_state) =
             workbench_recycle_observation_fixture();
         resources.instance_id = Some(uuid::Uuid::new_v4());
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(AgentCgroupMapping {
+            agent_name: "Laura Petersen".to_string(),
+            cgroup_path: sentinel_sandbox::cgroup_path("Laura Petersen"),
+            cgroup_id: 6_055,
+            pid: Some(10_055),
+        });
+        let owner = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+        let guard = owner
+            .issue(sentinel_common::StateTransferScope::World)
+            .unwrap();
 
         let error = synchronize_workbench_runtime_observation(
             agent_id,
@@ -12680,10 +12761,15 @@ mod tests {
             &resources,
             &mut sandbox_handles,
             &security_runtime_state,
+            &mut collector,
+            &owner,
+            &guard,
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("not bound to its adapter owner"));
+        assert!(collector.is_agent_registered(6_055));
+        assert!(!collector.is_agent_registered(7_055));
         let sandbox = &sandbox_handles[&agent_id];
         assert_eq!(sandbox.cgroup_id, Some(6_055));
         assert!(!sandbox.io_available);
@@ -12691,6 +12777,117 @@ mod tests {
         let security = security_runtime_state.read().unwrap();
         assert_eq!(security[&agent_id.0].runtime_pid, Some(10_055));
         assert_eq!(security[&agent_id.0].bwrap_pid, Some(10_055));
+    }
+
+    #[test]
+    fn workbench_recycle_observation_rejects_stale_world_without_mutation() {
+        let (agent_id, handle, resources, mut sandbox_handles, security_runtime_state) =
+            workbench_recycle_observation_fixture();
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(AgentCgroupMapping {
+            agent_name: "Laura Petersen".to_string(),
+            cgroup_path: sentinel_sandbox::cgroup_path("Laura Petersen"),
+            cgroup_id: 6_055,
+            pid: Some(10_055),
+        });
+        let owner = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+        let guard = owner
+            .issue(sentinel_common::StateTransferScope::World)
+            .unwrap();
+        owner.close_owner_readiness();
+
+        let error = synchronize_workbench_runtime_observation(
+            agent_id,
+            &handle,
+            &resources,
+            &mut sandbox_handles,
+            &security_runtime_state,
+            &mut collector,
+            &owner,
+            &guard,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("World authority became stale"));
+        assert_eq!(sandbox_handles[&agent_id].cgroup_id, Some(6_055));
+        assert_eq!(sandbox_handles[&agent_id].bwrap_pid, Some(10_055));
+        assert_eq!(
+            security_runtime_state.read().unwrap()[&agent_id.0].runtime_pid,
+            Some(10_055)
+        );
+        assert!(collector.is_agent_registered(6_055));
+        assert!(!collector.is_agent_registered(7_055));
+    }
+
+    #[test]
+    fn workbench_failed_command_observes_recycle_and_preserves_original_error() {
+        let (agent_id, handle, resources, mut sandbox_handles, security_runtime_state) =
+            workbench_recycle_observation_fixture();
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(AgentCgroupMapping {
+            agent_name: "Laura Petersen".to_string(),
+            cgroup_path: sentinel_sandbox::cgroup_path("Laura Petersen"),
+            cgroup_id: 6_055,
+            pid: Some(10_055),
+        });
+        let owner = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+        let guard = owner
+            .issue(sentinel_common::StateTransferScope::World)
+            .unwrap();
+        let error = synchronize_workbench_command_result(
+            Err(anyhow!("injected coordinator failure after recycle")),
+            || {
+                synchronize_workbench_runtime_observation(
+                    agent_id,
+                    &handle,
+                    &resources,
+                    &mut sandbox_handles,
+                    &security_runtime_state,
+                    &mut collector,
+                    &owner,
+                    &guard,
+                )
+                .map(|_| ())
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "injected coordinator failure after recycle"
+        );
+        assert_eq!(sandbox_handles[&agent_id].cgroup_id, Some(7_055));
+        assert_eq!(
+            security_runtime_state.read().unwrap()[&agent_id.0].runtime_pid,
+            Some(20_055)
+        );
+        assert!(!collector.is_agent_registered(6_055));
+        assert!(collector.is_agent_registered(7_055));
+        let error =
+            synchronize_workbench_command_result(Err(anyhow!("original command error")), || {
+                Err(anyhow!("observation error"))
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "original command error");
+    }
+
+    #[test]
+    fn workbench_success_without_observation_does_not_become_publishable() {
+        let update = crate::workbench::WorkbenchCoordinatorUpdate {
+            records: Vec::new(),
+            runtime_state: None,
+            replayed: true,
+            caller_result: None,
+        };
+        let mut observations = 0;
+        let error = synchronize_workbench_command_result(Ok(update), || {
+            observations += 1;
+            Err(anyhow!("runtime observation unavailable"))
+        })
+        .err()
+        .unwrap();
+        assert_eq!(observations, 1, "empty replay is not a terminal replay");
+        assert_eq!(error.to_string(), "runtime observation unavailable");
     }
 
     #[test]

@@ -229,6 +229,15 @@ impl MetricsExporter {
             snapshot.ring_buffer_drops,
         ));
 
+        let io_available = snapshot.io_collection_source == Some("agent_cgroup_io_stat");
+        if io_available {
+            output.push_str(
+                "# HELP sentinel_io_collection_source Authoritative agent-wide I/O source\n",
+            );
+            output.push_str("# TYPE sentinel_io_collection_source gauge\n");
+            output.push_str("sentinel_io_collection_source{source=\"agent_cgroup_io_stat\"} 1\n");
+        }
+
         // Stalled agents (with agent name and seconds since last write).
         output.push_str("# HELP sentinel_agent_stalled Whether agent is stalled (1=stalled)\n");
         output.push_str("# TYPE sentinel_agent_stalled gauge\n");
@@ -260,7 +269,7 @@ impl MetricsExporter {
         output.push_str("# TYPE sentinel_io_ops_total counter\n");
         output.push_str("# HELP sentinel_io_bytes_total Total I/O bytes per cgroup\n");
         output.push_str("# TYPE sentinel_io_bytes_total counter\n");
-        for (cgroup_id, io) in &snapshot.io_metrics {
+        for (cgroup_id, io) in snapshot.io_metrics.iter().filter(|_| io_available) {
             let name = escape_label_value(&io.cgroup_name);
             output.push_str(&format!(
                 "sentinel_io_ops_total{{cgroup_id=\"{}\",cgroup_name=\"{}\",direction=\"read\"}} {}\n",
@@ -442,6 +451,7 @@ mod tests {
         let snapshot = MetricsSnapshot {
             stalled_agents: vec![],
             io_metrics: HashMap::new(),
+            io_collection_source: None,
             network_metrics: HashMap::new(),
             psi_metrics: HashMap::new(),
             cycle_duration: Duration::from_micros(100),
@@ -452,6 +462,39 @@ mod tests {
         assert!(output.contains("sentinel_ebpf_monitoring_mode{mode=\"userspace\"} 1"));
         assert!(output.contains("sentinel_ebpf_collector_cycle_microseconds 100"));
         assert!(output.contains("sentinel_agent_stalled_total 0"));
+        assert!(!output.contains("sentinel_io_collection_source"));
+    }
+
+    #[test]
+    fn absent_or_foreign_source_cannot_export_stale_agent_io_samples() {
+        use crate::collector::IoSnapshot;
+        use std::collections::HashMap;
+
+        for source in [None, Some("block_rq_complete"), Some("proc_vfs")] {
+            let snapshot = MetricsSnapshot {
+                stalled_agents: vec![],
+                io_metrics: HashMap::from([(
+                    1,
+                    IoSnapshot {
+                        cgroup_name: "agent".into(),
+                        read_ops: 3,
+                        write_ops: 4,
+                        read_bytes: 100,
+                        write_bytes: 200,
+                    },
+                )]),
+                io_collection_source: source,
+                network_metrics: HashMap::new(),
+                psi_metrics: HashMap::new(),
+                cycle_duration: Duration::from_micros(100),
+                mode: MonitoringMode::Userspace,
+                ring_buffer_drops: 0,
+            };
+            let output = MetricsExporter::export_snapshot(&snapshot);
+            assert!(!output.contains("sentinel_io_collection_source"));
+            assert!(!output.contains("sentinel_io_bytes_total{"));
+            assert!(!output.contains("sentinel_io_ops_total{"));
+        }
     }
 
     #[test]
@@ -504,6 +547,7 @@ mod tests {
                 seconds_since_write: 65,
             }],
             io_metrics,
+            io_collection_source: Some("agent_cgroup_io_stat"),
             network_metrics,
             psi_metrics,
             cycle_duration: Duration::from_micros(500),
@@ -517,6 +561,7 @@ mod tests {
             .contains("sentinel_agent_last_write_seconds{cgroup_id=\"42\",agent=\"AGENT-07\"} 65"));
         assert!(output.contains("sentinel_agent_stalled_total 1"));
         assert!(output.contains("cgroup_name=\"agent-01\""));
+        assert!(output.contains("sentinel_io_collection_source{source=\"agent_cgroup_io_stat\"} 1"));
         assert!(output
             .contains("sentinel_llm_requests_total{destination=\"api.anthropic.com:443\"} 10"));
         assert!(output
@@ -643,6 +688,7 @@ mod tests {
                 seconds_since_write: 65,
             }],
             io_metrics,
+            io_collection_source: Some("agent_cgroup_io_stat"),
             network_metrics,
             psi_metrics: HashMap::new(),
             cycle_duration: Duration::from_micros(100),
@@ -685,6 +731,7 @@ mod tests {
                 seconds_since_write: 40,
             }],
             io_metrics: HashMap::new(),
+            io_collection_source: None,
             network_metrics: HashMap::new(),
             psi_metrics,
             cycle_duration: Duration::from_micros(100),

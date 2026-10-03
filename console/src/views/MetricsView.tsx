@@ -3,6 +3,9 @@ import { apiJson, type EbpfMetrics, type PipelineMetrics, type TickMetrics } fro
 import { activeAgentCount, consoleStore } from "../stores/console";
 import { formatBucket, formatBytes, formatMs, formatNumber } from "./format";
 
+const METRICS_REFRESH_MS = 5_000;
+const METRICS_REQUEST_TIMEOUT_MS = 4_000;
+
 const BENCHMARK_ROWS = [
   ["Physics", "26.86% schneller", "RoomPhysicsWorkspace ohne per-tick HashMap-Allokation"],
   ["Perception", "26.34% schneller", "generate_perception_into mit wiederverwendeten Puffern"],
@@ -21,34 +24,103 @@ function MetricCard(props: { label: string; value: string; tone?: "warn" | "dang
   );
 }
 
+function measuredValue(value: number | null | undefined, kind: "count" | "duration" | "ratio"): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+  if (kind === "count" && !Number.isSafeInteger(value)) return null;
+  if (kind === "ratio" && value > 1) return null;
+  return value;
+}
+
+function measuredText(value: number | null, format: (value: number) => string): string {
+  return value == null ? "N/A" : format(value);
+}
+
 export function MetricsView(): JSX.Element {
   const [ebpf, setEbpf] = createSignal<EbpfMetrics | null>(null);
+  const [ebpfLoaded, setEbpfLoaded] = createSignal(false);
   const [pipeline, setPipeline] = createSignal<PipelineMetrics | null>(null);
+  const [pipelineLoaded, setPipelineLoaded] = createSignal(false);
   const [tick, setTick] = createSignal<TickMetrics | null>(null);
+  const [tickLoaded, setTickLoaded] = createSignal(false);
+  let generation = 0;
+  let disposed = false;
+  let controllers: AbortController[] = [];
+  const timeouts = new Set<number>();
 
-  const loadExtras = async () => {
-    const [ebpfResult, pipelineResult, tickResult] = await Promise.allSettled([
-      apiJson<EbpfMetrics>("/api/metrics/ebpf"),
-      apiJson<PipelineMetrics>("/api/metrics/pipeline"),
-      apiJson<TickMetrics>("/api/metrics/tick"),
-    ]);
-    setEbpf(ebpfResult.status === "fulfilled" ? ebpfResult.value : { available: false, mode: "unavailable", stalled_count: 0, stalled_agents: [], prometheus: "offline" });
-    setPipeline(pipelineResult.status === "fulfilled" ? pipelineResult.value : { available: false, gateway: "offline", providers: [] });
-    setTick(tickResult.status === "fulfilled" ? tickResult.value : { available: false, tick_duration_ms: 0, tick_rate_effective_ms: 0, psi_cpu_avg10: 0, psi_mem_avg10: 0, psi_io_avg10: 0, prometheus: "offline" });
+  const cancelRequests = () => {
+    for (const timeout of timeouts) window.clearTimeout(timeout);
+    timeouts.clear();
+    for (const controller of controllers) controller.abort();
+    controllers = [];
+  };
+
+  const loadExtras = () => {
+    if (disposed) return;
+    const currentGeneration = ++generation;
+    cancelRequests();
+
+    const load = <T,>(path: string, publish: (value: T | null) => void) => {
+      const controller = new AbortController();
+      controllers.push(controller);
+      let settled = false;
+      const finish = (value: T | null) => {
+        if (settled || disposed || currentGeneration !== generation || controller.signal.aborted) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        timeouts.delete(timeout);
+        publish(value);
+      };
+      const timeout = window.setTimeout(() => {
+        finish(null);
+        controller.abort();
+      }, METRICS_REQUEST_TIMEOUT_MS);
+      timeouts.add(timeout);
+      void apiJson<T>(path, { signal: controller.signal }).then(finish, () => finish(null));
+    };
+
+    load<EbpfMetrics>("/api/metrics/ebpf", (value) => {
+      setEbpf(value);
+      setEbpfLoaded(true);
+    });
+    load<PipelineMetrics>("/api/metrics/pipeline", (value) => {
+      setPipeline(value);
+      setPipelineLoaded(true);
+    });
+    load<TickMetrics>("/api/metrics/tick", (value) => {
+      setTick(value);
+      setTickLoaded(true);
+    });
+  };
+
+  const resource = () => ebpf()?.available === true ? ebpf() : null;
+  const agentBlockIo = () => resource()?.io_source === "agent_cgroup_io_stat" ? resource() : null;
+  const tickResource = () => tick()?.available === true ? tick() : null;
+  const stalledCount = () => measuredValue(resource()?.stalled_count, "count");
+  const ringBufferDrops = () => measuredValue(resource()?.ring_buffer_drops, "count");
+  const mode = () => {
+    const value = resource()?.mode;
+    return typeof value === "string" && value.trim() && !["unknown", "unavailable", "offline"].includes(value.trim().toLowerCase())
+      ? value.trim()
+      : "N/A";
   };
 
   onMount(() => {
     void loadExtras();
-    const timer = window.setInterval(() => void loadExtras(), 5_000);
-    onCleanup(() => window.clearInterval(timer));
+    const timer = window.setInterval(() => void loadExtras(), METRICS_REFRESH_MS);
+    onCleanup(() => {
+      disposed = true;
+      ++generation;
+      window.clearInterval(timer);
+      cancelRequests();
+    });
   });
 
   return (
     <section class="col view-panel" data-testid="view-metrics">
       <div class="col__head view-head">
         <span>Metrics</span>
-        <span class={`pill ${pipeline()?.available ? "pill-ok" : "pill-warn"}`}>
-          {pipeline()?.available ? "Gateway ok" : "Gateway offline"}
+        <span class={`pill ${pipeline()?.available ? "pill-ok" : pipelineLoaded() ? "pill-warn" : ""}`}>
+          {!pipelineLoaded() ? "Gateway loading" : pipeline()?.available ? "Gateway ok" : "Gateway offline"}
         </span>
       </div>
       <div class="col__body view-body">
@@ -63,7 +135,7 @@ export function MetricsView(): JSX.Element {
               <MetricCard label="Chaos Events" value={formatNumber(kpi().chaos_events)} tone={kpi().chaos_events > 0 ? "warn" : undefined} />
               <MetricCard label="Schichtwechsel" value={formatNumber(kpi().shift_changes)} />
               <MetricCard label="Nightrun Events" value={formatNumber(kpi().nightrun_events)} />
-              <MetricCard label="Tick Count" value={formatNumber(kpi().tick_count)} />
+              <MetricCard label="Tick Count" value={measuredText(measuredValue(kpi().tick_count, "count"), formatNumber)} />
               <MetricCard label="Bucket" value={formatBucket(kpi().bucket_start)} />
             </div>
           )}
@@ -71,19 +143,25 @@ export function MetricsView(): JSX.Element {
 
         <section class="metrics-section">
           <h3>eBPF</h3>
+          <span class="muted" role="status" data-testid="ebpf-status">
+            {!ebpfLoaded() ? "Loading" : resource() ? "Scrape available" : "Offline"}
+          </span>
           <div class="metrics-grid metrics-grid--compact">
-            <MetricCard label="Mode" value={ebpf()?.available ? ebpf()?.mode ?? "unknown" : "N/A"} tone={ebpf()?.available ? "ok" : "warn"} />
-            <MetricCard label="Stalled Agents" value={formatNumber(ebpf()?.stalled_count ?? 0)} tone={(ebpf()?.stalled_count ?? 0) > 0 ? "danger" : undefined} />
-            <MetricCard label="Collection Cycle" value={`${formatNumber(ebpf()?.collection_cycle_us ?? 0)} µs`} />
-            <MetricCard label="Ring Buffer Drops" value={formatNumber(ebpf()?.ring_buffer_drops ?? 0)} tone={(ebpf()?.ring_buffer_drops ?? 0) > 0 ? "warn" : undefined} />
-            <MetricCard label="I/O Read" value={formatBytes(ebpf()?.io_read_bytes)} />
-            <MetricCard label="I/O Write" value={formatBytes(ebpf()?.io_write_bytes)} />
-            <MetricCard label="Avg PSI Stress" value={`${((ebpf()?.avg_stress ?? 0) * 100).toFixed(1)}%`} />
+            <MetricCard label="Mode" value={mode()} />
+            <MetricCard label="Stalled Agents" value={measuredText(stalledCount(), formatNumber)} tone={(stalledCount() ?? 0) > 0 ? "danger" : undefined} />
+            <MetricCard label="Collection Cycle" value={measuredText(measuredValue(resource()?.collection_cycle_us, "duration"), (value) => `${value} µs`)} />
+            <MetricCard label="Ring Buffer Drops" value={measuredText(ringBufferDrops(), formatNumber)} tone={(ringBufferDrops() ?? 0) > 0 ? "warn" : undefined} />
+            <MetricCard label="I/O Source" value={agentBlockIo() ? "Agent cgroup block I/O" : "N/A"} />
+            <MetricCard label="Agent-wide Block I/O Read Total" value={measuredText(measuredValue(agentBlockIo()?.io_read_bytes, "count"), formatBytes)} />
+            <MetricCard label="Agent-wide Block I/O Write Total" value={measuredText(measuredValue(agentBlockIo()?.io_write_bytes, "count"), formatBytes)} />
+            <MetricCard label="Avg PSI Stress" value={measuredText(measuredValue(resource()?.avg_stress, "ratio"), (value) => `${(value * 100).toFixed(1)}%`)} />
           </div>
-          <Show when={(ebpf()?.stalled_agents ?? []).length > 0}>
+          <Show when={(resource()?.stalled_agents ?? []).length > 0}>
             <div class="metric-detail-list">
               <strong>Stalled Agents:</strong>
-              <For each={ebpf()?.stalled_agents ?? []}>{(agent) => <span class="pill">{agent.agent}{agent.seconds ? ` (${agent.seconds}s)` : ""}</span>}</For>
+              <For each={resource()?.stalled_agents ?? []}>
+                {(agent) => <span class="pill">{agent.agent} ({measuredText(measuredValue(agent.seconds, "duration"), (value) => `${value}s`)})</span>}
+              </For>
             </div>
           </Show>
         </section>
@@ -92,7 +170,7 @@ export function MetricsView(): JSX.Element {
           <h3>Pipeline</h3>
           <Show
             when={pipeline()?.available}
-            fallback={<div class="degraded-panel" data-testid="pipeline-offline">Gateway offline</div>}
+            fallback={<div class="degraded-panel" data-testid="pipeline-offline">{pipelineLoaded() ? "Gateway offline" : "Gateway loading"}</div>}
           >
             <div class="provider-table">
               <div class="provider-table__head">Provider</div>
@@ -115,12 +193,15 @@ export function MetricsView(): JSX.Element {
 
         <section class="metrics-section">
           <h3>Tick / PSI</h3>
+          <span class="muted" role="status" data-testid="tick-status">
+            {!tickLoaded() ? "Loading" : tickResource() ? "Scrape available" : "Offline"}
+          </span>
           <div class="metrics-grid metrics-grid--compact">
-            <MetricCard label="Tick Duration" value={formatMs(tick()?.tick_duration_ms ?? 0)} tone={tick()?.available ? undefined : "warn"} />
-            <MetricCard label="Effective Rate" value={formatMs(tick()?.tick_rate_effective_ms ?? 0)} />
-            <MetricCard label="PSI CPU" value={`${((tick()?.psi_cpu_avg10 ?? 0) * 100).toFixed(1)}%`} />
-            <MetricCard label="PSI Mem" value={`${((tick()?.psi_mem_avg10 ?? 0) * 100).toFixed(1)}%`} />
-            <MetricCard label="PSI IO" value={`${((tick()?.psi_io_avg10 ?? 0) * 100).toFixed(1)}%`} />
+            <MetricCard label="Tick Duration" value={measuredText(measuredValue(tickResource()?.tick_duration_ms, "duration"), formatMs)} />
+            <MetricCard label="Effective Rate" value={measuredText(measuredValue(tickResource()?.tick_rate_effective_ms, "duration"), formatMs)} />
+            <MetricCard label="PSI CPU" value={measuredText(measuredValue(tickResource()?.psi_cpu_avg10, "ratio"), (value) => `${(value * 100).toFixed(1)}%`)} />
+            <MetricCard label="PSI Mem" value={measuredText(measuredValue(tickResource()?.psi_mem_avg10, "ratio"), (value) => `${(value * 100).toFixed(1)}%`)} />
+            <MetricCard label="PSI IO" value={measuredText(measuredValue(tickResource()?.psi_io_avg10, "ratio"), (value) => `${(value * 100).toFixed(1)}%`)} />
           </div>
         </section>
 
