@@ -94,6 +94,19 @@ dispatch and leadership continuation still requires its current role, profile,
 assignment, deadline and budget. Corrupt or missing durable lineage makes
 health unavailable rather than silently omitting the affected session.
 
+Customer progress is separate from company work state. The authenticated,
+tenant-scoped overview reads only the exact current assignment's validated
+journal head. It shows fixed labels for a missing private observation, unknown
+model or tool outcome, and a ready model round whose active work window is
+expired, spent or too short to admit a call. A window pause does not promise
+another leadership review or a continuation; an unknown effect is not a budget
+pause and cannot be retried from this view. Normal, in-flight and completed
+states receive no invented progress label. Changed assignment/profile bindings
+or failed integrity reads cannot substitute stale progress. The frontend accepts
+only canonical status/label pairs and suppresses previous progress after a
+failed refresh. These reads do not grant calls, reset counters, issue commands,
+alter journals or complete work.
+
 ### Opt-in model work proposals
 
 The first M1 bridge is selected by `SENTINEL_MODEL_WORKBENCH_ENABLED=true`.
