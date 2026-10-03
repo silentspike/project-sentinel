@@ -102,7 +102,7 @@ impl CompanyEntity for ResumeReviewMembershipLeaf {
 }
 
 // Leaf verification deliberately has no project, journal, policy or review dependencies.
-fn require_leaf_event<T: serde::de::DeserializeOwned + Serialize + PartialEq>(
+pub(super) fn require_leaf_event<T: serde::de::DeserializeOwned + Serialize + PartialEq>(
     connection: &Connection,
     tenant: &TenantId,
     project: &ProjectId,
@@ -647,6 +647,47 @@ fn fresh_source(
     now_ms: u64,
     unknown_proof: Option<&str>,
 ) -> Result<(AdaptiveResumeSourceV1, u16, u64), WorkflowError> {
+    let (source, session) = fresh_resume_source(
+        connection,
+        tenant,
+        project_id,
+        session_id,
+        now_ms,
+        unknown_proof,
+    )?;
+    let capacity = session
+        .grant
+        .max_model_calls
+        .checked_sub(session.model_calls)
+        .ok_or_else(corrupt)?
+        .min(
+            session
+                .grant
+                .max_tool_calls
+                .checked_sub(session.tool_calls)
+                .ok_or_else(corrupt)?,
+        )
+        .min(
+            ADAPTIVE_RESUME_MAX_REVIEWS
+                .checked_sub(source.base_review_count)
+                .ok_or_else(corrupt)?,
+        );
+    if capacity == 0 {
+        return Err(transition());
+    }
+    Ok((source, capacity, session.grant.max_call_duration_ms))
+}
+
+// Source authentication is shared, but capacity policy belongs to its issuer.
+// An exhausted root grant must not prevent a separately authorized funding proposal.
+pub(super) fn fresh_resume_source(
+    connection: &Connection,
+    tenant: &TenantId,
+    project_id: &ProjectId,
+    session_id: Uuid,
+    now_ms: u64,
+    unknown_proof: Option<&str>,
+) -> Result<(AdaptiveResumeSourceV1, crate::AdaptiveSessionV1), WorkflowError> {
     let project: ProjectV1 =
         get_entity(connection, tenant, "project", &project_id.0)?.ok_or_else(not_found)?;
     let (session, root_entry_digest, head_entry_digest) =
@@ -711,10 +752,7 @@ fn fresh_source(
         return Err(unauthorized());
     }
     let subject = match &session.cursor {
-        AdaptiveCursorV1::ReadyForModel
-            if session.model_calls >= session.active_model_ceiling()
-                || now_ms >= session.active_deadline_ms() =>
-        {
+        AdaptiveCursorV1::ReadyForModel if session.model_window_exhausted_at(now_ms) => {
             if unknown_proof.is_some() {
                 return Err(unauthorized());
             }
@@ -767,26 +805,6 @@ fn fresh_source(
             .map_or(0, |state| state.authorizations.len()),
     )
     .map_err(|_| corrupt())?;
-    let capacity = session
-        .grant
-        .max_model_calls
-        .checked_sub(session.model_calls)
-        .ok_or_else(corrupt)?
-        .min(
-            session
-                .grant
-                .max_tool_calls
-                .checked_sub(session.tool_calls)
-                .ok_or_else(corrupt)?,
-        )
-        .min(
-            ADAPTIVE_RESUME_MAX_REVIEWS
-                .checked_sub(base_review_count)
-                .ok_or_else(corrupt)?,
-        );
-    if capacity == 0 {
-        return Err(transition());
-    }
     let project_payload_digest: String = connection.query_row(
         "SELECT payload_digest FROM company_entities WHERE tenant_id=?1 AND entity_kind='project' AND entity_id=?2",
         params![tenant.0, project_id.0], |row| row.get(0),
@@ -814,7 +832,7 @@ fn fresh_source(
         subject,
     };
     source.validate()?;
-    Ok((source, capacity, session.grant.max_call_duration_ms))
+    Ok((source, session))
 }
 
 fn conflict() -> WorkflowError {

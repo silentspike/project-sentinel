@@ -988,6 +988,9 @@ impl WorkflowApi {
             Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => return Ok(false),
             Err(_) => return Err("adaptive recovery session unavailable"),
         };
+        if session.active_work_funding().is_some() {
+            return Ok(false);
+        }
         let effect = match &session.cursor {
             AdaptiveCursorV1::ModelPending { effect }
             | AdaptiveCursorV1::ModelUnknown { effect }
@@ -1249,7 +1252,7 @@ impl WorkflowApi {
                 Ok(None)
             }
             AdaptiveCursorV1::ReadyForTool { .. }
-                if session.tool_calls >= session.grant.max_tool_calls =>
+                if session.tool_calls >= session.funded_tool_call_ceiling() =>
             {
                 Ok(None)
             }
@@ -1823,6 +1826,9 @@ impl WorkflowApi {
             None => !matches!(session.cursor, AdaptiveCursorV1::ReadyForModel),
         };
         if retain_legacy {
+            if session.active_work_funding().is_some() {
+                return Err("funded adaptive session requires sealed working memory");
+            }
             context.validate_dispatch(now_unix_ms())?;
             context.prompt()?;
             return Ok(context);
@@ -1837,6 +1843,26 @@ impl WorkflowApi {
             )
             .map_err(|_| "adaptive working memory journal unavailable")?
             .ok_or("adaptive working memory journal missing")?;
+        if source.root_model_ceiling != session.grant.max_model_calls
+            || source.root_tool_ceiling != session.grant.max_tool_calls
+            || source.work_funding.as_deref() != session.active_work_funding()
+        {
+            return Err("adaptive working memory original root or adopted funding changed");
+        }
+        if let Some(epoch) = &source.work_funding {
+            let receipt = self
+                .store
+                .adaptive_work_funding(
+                    &binding.grant.authority.tenant_id,
+                    binding.grant.session_id,
+                    epoch.receipt.request.operation_id,
+                )
+                .map_err(|_| "adaptive adopted funding receipt unavailable")?
+                .ok_or("adaptive adopted funding receipt missing")?;
+            if receipt != epoch.receipt {
+                return Err("adaptive adopted funding receipt changed");
+            }
+        }
         context.working_memory = Some(working_memory::compose(
             source,
             context.observation.as_ref(),
