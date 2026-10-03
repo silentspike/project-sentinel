@@ -263,6 +263,42 @@ where
         )
     }
 
+    /// Final company provider admission; replay returns evidence, not dispatch permission.
+    pub fn advance_company_adaptive_model_with_clock<Clock: FnMut() -> u64>(
+        &self,
+        session_id: uuid::Uuid,
+        expected_version: u64,
+        operation_id: uuid::Uuid,
+        command: &crate::AdaptiveTransitionV1,
+        authority: &crate::RuntimeAuthoritySnapshotV1,
+        clock: Clock,
+    ) -> Result<(bool, crate::AdaptiveSessionV1), WorkflowError> {
+        if !matches!(command, crate::AdaptiveTransitionV1::ClaimModel { .. }) {
+            return Err(authority_conflict());
+        }
+        require_ready(
+            self.organization.readiness(),
+            WorkflowErrorCode::OrganizationUnavailable,
+        )?;
+        let current = self
+            .organization
+            .authority_snapshot(
+                &authority.tenant_id,
+                &authority.project_id,
+                &authority.work_item_id,
+                authority.agent_id,
+            )
+            .map_err(map_organization_error)?;
+        self.store.advance_company_adaptive_model_with_clock(
+            session_id,
+            expected_version,
+            operation_id,
+            command,
+            &current,
+            clock,
+        )
+    }
+
     pub fn reconcile_execution(
         &self,
         request: &PendingExecutionV1,

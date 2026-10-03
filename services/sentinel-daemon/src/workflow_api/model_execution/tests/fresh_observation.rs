@@ -844,6 +844,9 @@ fn continued_unknown_retains_observation_but_requires_inspection_only_generation
         prompt.contains("No mutations, commands, tests, packaging, collaboration, or completion")
     );
     assert!(prompt.contains("historical observation"));
+    assert!(prompt.contains("when the layout or path is unknown"));
+    assert!(prompt.contains("directly inspect a known scoped file with inspect_file"));
+    assert!(!prompt.contains("before inspecting a named file"));
     assert!(!prompt.contains("Continue the assigned work using"));
     assert!(!prompt.contains("propose_completion={"));
     assert!(!prompt.contains("collaborate={"));
@@ -862,12 +865,34 @@ fn continued_unknown_retains_observation_but_requires_inspection_only_generation
 fn fresh_observe_restores_full_catalog_and_normal_continuation_prompt() {
     let mut fixture = Fixture::continued_unknown_with_observation();
     let before = fixture.context();
-    fixture.inspect_and_observe(now_unix_ms(), "fresh observation");
+    let continued = fixture.session.clone();
+    let inspected_at = now_unix_ms();
+    fixture.inspect_and_observe(inspected_at, "fresh observation");
     assert!(!fixture.session.requires_fresh_observation());
+    assert_eq!(fixture.session.grant, continued.grant);
+    assert_eq!(fixture.session.model_calls, continued.model_calls + 1);
+    assert_eq!(fixture.session.tool_calls, continued.tool_calls + 1);
+    assert_eq!(
+        fixture.session.active_deadline_ms(),
+        continued.active_deadline_ms()
+    );
+    assert_eq!(
+        fixture.session.active_model_ceiling(),
+        continued.active_model_ceiling()
+    );
     let context = fixture.context();
     assert!(!context.fresh_observation_required);
     assert_legacy_context_bytes(&context);
     assert_ne!(context.observation, before.observation);
+    assert_eq!(
+        context.binding.previous_observation,
+        fixture.session.last_observation
+    );
+    let memory = context.working_memory.as_ref().unwrap();
+    assert!(!memory.source.rows.is_empty());
+    assert!(memory.source.rows.iter().all(|row| {
+        row.tool_kind == sentinel_workflow::AdaptiveWorkingMemoryToolKindV1::InspectFile
+    }));
     let (profile, _) = fixture
         .api
         .authority
@@ -885,9 +910,76 @@ fn fresh_observe_restores_full_catalog_and_normal_continuation_prompt() {
     let prompt = context.prompt().unwrap();
     assert!(prompt.starts_with("Continue the assigned work using"));
     assert!(prompt.contains("fresh observation"));
+    assert!(prompt.contains("when the layout or path is unknown"));
+    assert!(prompt.contains("directly inspect a known scoped file with inspect_file"));
+    assert!(prompt.contains(
+        "Do not repeat discovery solely because another model call begins within the same inspected window."
+    ));
+    assert!(!prompt.contains("before inspecting a named file"));
     assert!(prompt.contains("write_file"));
     assert!(prompt.contains("propose_completion={"));
     assert!(prompt.contains("collaborate={"));
+
+    let fresh_observation = fixture.session.last_observation.clone();
+    let write_at = now_unix_ms().max(inspected_at + 1);
+    assert_eq!(
+        fixture.session.model_admission_at(write_at),
+        sentinel_workflow::AdaptiveModelAdmissionV1::Admissible
+    );
+    let effect = fixture.claim_model(write_at);
+    let tool = WorkbenchTool::WriteFile {
+        path: "src/main.rs".into(),
+        content: "// next same-window edit\n".into(),
+        expected_sha256: None,
+    };
+    let tool_digest = adaptive_tool_digest(&tool).unwrap();
+    fixture.advance(
+        AdaptiveTransitionV1::ResolveModel {
+            effect,
+            result_digest: "b".repeat(64),
+            decision: AdaptiveModelDecisionV1::Tool {
+                tool: tool.clone(),
+                tool_digest: tool_digest.clone(),
+            },
+        },
+        write_at,
+    );
+    let adapter = fixture.api.workbench.as_ref().unwrap();
+    let effect = adapter
+        .adaptive_tool_effect(&fixture.session, &tool)
+        .unwrap();
+    adapter
+        .build_adaptive_request(&fixture.session, &effect, &tool)
+        .unwrap();
+    fixture.advance(
+        AdaptiveTransitionV1::ClaimTool {
+            effect,
+            tool_digest,
+        },
+        write_at,
+    );
+    assert!(matches!(
+        &fixture.session.cursor,
+        AdaptiveCursorV1::ToolPending {
+            tool: WorkbenchTool::WriteFile { .. },
+            ..
+        }
+    ));
+    assert!(!fixture.session.requires_fresh_observation());
+    assert_eq!(fixture.session.last_observation, fresh_observation);
+    assert_eq!(fixture.session.grant, continued.grant);
+    assert_eq!(fixture.session.model_calls, continued.model_calls + 2);
+    assert_eq!(fixture.session.tool_calls, continued.tool_calls + 2);
+    assert_eq!(
+        fixture
+            .session
+            .continuation
+            .as_ref()
+            .unwrap()
+            .authorizations,
+        continued.continuation.as_ref().unwrap().authorizations
+    );
+    assert_eq!(fixture.read(), fixture.session);
 }
 
 #[test]

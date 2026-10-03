@@ -67,6 +67,25 @@ and customer authorities accept it. The productive adapters use the same Gateway
 subscription claim and Workbench authority paths; source tests do not substitute
 for activation and live acceptance on the reviewed single-node release.
 
+Queue scheduling selects which employee assignment may begin a model round.
+Reauthorization of that selected round is a different operation: it resolves
+the exact persisted tenant, project, work item, assignment, session, allowance
+and effect. Another eligible project for the same employee cannot replace that
+binding during provider I/O or the Gateway dispatch claim. Reauthorization
+never creates a session or reconciles a tool; missing or changed bindings fail
+closed. Current role/profile authority, reservation ownership, request/context
+digests, deadline, remaining budget and the one-shot dispatch claim remain
+mandatory. This does not authorize retrying an unknown provider outcome.
+The final company model claim rechecks its persisted active assignment and
+allowance inside the claim transaction, so a concurrent reassignment cannot
+authorize a new effect using a snapshot read before that transaction.
+
+Fresh inspection is required for each resumed window. A known scoped file may
+be inspected directly; directory discovery is needed when its layout or path
+is unknown. After the authenticated inspection clears that window's fence,
+another model call does not by itself require repeating discovery. New windows
+still require fresh inspection; historical observations cannot clear the fence.
+
 ### Opt-in model work proposals
 
 The first M1 bridge is selected by `SENTINEL_MODEL_WORKBENCH_ENABLED=true`.
