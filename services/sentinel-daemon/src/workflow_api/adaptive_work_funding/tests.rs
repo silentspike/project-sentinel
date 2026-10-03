@@ -504,10 +504,19 @@ fn funding_context_rejects_marker_epoch_subject_and_legacy_combinations_without_
                 .is_err(),
             "{field}"
         );
-        assert!(
-            api.prepare_leadership_review(&changed.binding).is_err(),
-            "{field}"
-        );
+        if changed.binding == context.binding {
+            // Rehydration uses the persisted source, not the tampered DTO.
+            assert_eq!(
+                api.prepare_leadership_review(&changed.binding).unwrap(),
+                context,
+                "{field}"
+            );
+        } else {
+            assert!(
+                api.prepare_leadership_review(&changed.binding).is_err(),
+                "{field}"
+            );
+        }
     }
     let mut changed = context.clone();
     changed.binding.grant.work_funding = None;
@@ -652,10 +661,10 @@ fn funded_subscription_callback_keeps_one_lane_one_claim_and_exact_selection() {
         403
     );
     assert!(api.leadership_review_for_agent(agent).unwrap().is_none());
-    assert!(api
-        .adaptive_provider_authority(source.grant.authority.agent_id)
-        .unwrap()
-        .is_none());
+    assert_eq!(
+        api.adaptive_provider_authority(source.grant.authority.agent_id),
+        Err("agent has no project subscription work authority")
+    );
 }
 
 #[test]
@@ -997,15 +1006,11 @@ fn genuine_continue_adopts_same_session_and_preserves_root_memory_with_exact_eff
     // Shape-only private prompt regression: spending under adopted funding can
     // exceed the original root without applying v1 checked-sub accounting.
     let mut over_root = model.clone();
-    over_root.binding.session_version = 3;
     over_root.binding.grant.max_model_calls = 8;
     let memory = over_root.working_memory.as_mut().unwrap();
-    memory.source.provider_version = 3;
-    memory.source.head_version = 3;
     memory.source.model_calls = 5;
     memory.source.tool_calls = 5;
     memory.source.active_model_ceiling = 8;
-    memory.source.continuation_windows = 2;
     over_root.validate_dispatch(now_unix_ms()).unwrap();
     assert!(over_root
         .prompt()

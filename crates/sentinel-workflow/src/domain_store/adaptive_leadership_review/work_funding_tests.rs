@@ -221,12 +221,10 @@ fn historical_v1_resume_policy_reviews_and_authorizations_coexist_with_funding()
     let mut operator = f.leader.clone();
     operator.kind = CompanyPrincipalKindV1::Operator;
     operator.agent_id = None;
-    let mut request = f.store.adaptive_resume_policy_draft(
+    let request = f.store.adaptive_resume_policy_draft(
         &operator, &f.grant.project_id, f.grant.session_id, Uuid::new_v4(),
         "original-v1-policy", now + 3_600_000, now,
     ).unwrap();
-    request.limits.total_review_ceiling = request.source.base_review_count + 3;
-    request.limits.total_window_ceiling = request.source.base_window_count + 3;
     let policy = f.store.authorize_adaptive_resume_policy_with_unknown_proof(
         &operator, &request, now, |_, _| Ok(DIGEST.into()),
     ).unwrap().1;
