@@ -834,6 +834,7 @@ mod tests {
             }),
             recovery_epoch: None,
             resume_policy: None,
+            work_funding: None,
         }
     }
 

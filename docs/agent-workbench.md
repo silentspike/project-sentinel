@@ -107,6 +107,44 @@ only canonical status/label pairs and suppresses previous progress after a
 failed refresh. These reads do not grant calls, reset counters, issue commands,
 alter journals or complete work.
 
+### Same-session funding request boundary
+
+`AdaptiveWorkFundingRequestV1` describes an explicitly finite proposal for
+additional developer model/tool capacity and bounded leadership reviews/work
+windows. It names the original session and exact source/head, retains original
+call ceilings and spending, and permits only a ready model cursor. Unknown
+model/tool effects cannot become a funding shortcut. Operator role and tenant,
+checked call/review/window limits, immutable request identity and usable time
+slack are validated before any future issuance.
+
+Request validation does not authenticate the supplied source or grant capacity.
+The store's issuer compares that source against the authoritative
+journal and current project in a pinned transaction, then atomically records
+only an immutable receipt and its event. Identical replay returns that same
+receipt after expiry or later session changes; a changed request or issuer is
+not a replay. Receipt proof checks use issuance time, not current expiry.
+
+Issuance implies neither dispatch permission nor a leadership `Continue`.
+The registered operator command is distinct from a real leadership review:
+the review names one immutable funding epoch and its next global ordinal in
+the sealed evidence. Its exact membership is event-backed. Only a genuine
+completed `Continue` can adopt the epoch in the same transaction as the
+journal continuation and provider allowance. The adoption proof depends on
+the immutable review membership, not a mutable latest-policy pointer; journal
+replay verifies that proof without recursively loading the journal itself.
+
+Existing grants, v1 resume policies, review decisions and their historical
+proof bytes remain unchanged. Original call ceilings remain separate from
+the authenticated funded ceilings; spending is cumulative and never refunded.
+A successor proposal requires the exact adopted predecessor and current
+journal, and cannot replace an unadopted proposal. A funded refusal, expired
+review or retirement on the same head cannot trigger an automatic reroll.
+Only actual progress in an adopted epoch permits another finite review.
+Unknown effects, stale authority and mixed recovery/local-adoption contracts
+remain fail-closed. Public endpoints, events and projections do not expose
+private source snapshots, credentials or model observations. Unit evidence
+does not prove that a paused live employee has resumed or delivered work.
+
 ### Opt-in model work proposals
 
 The first M1 bridge is selected by `SENTINEL_MODEL_WORKBENCH_ENABLED=true`.
