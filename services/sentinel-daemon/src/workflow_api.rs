@@ -7,6 +7,8 @@ mod adaptive_continuation;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/adaptive_continuation.rs"]
 mod adaptive_continuation_tests;
+#[cfg(feature = "llm")]
+mod adaptive_resume_policy;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/adaptive_tool_poll.rs"]
 mod adaptive_tool_poll_tests;
@@ -118,6 +120,7 @@ pub const ADAPTIVE_RECOVERY_PATH: &str = "/agent/workflow/adaptive-recovery";
 pub const ADAPTIVE_REVIEW_EPOCH_PATH: &str = "/operator/workflow/adaptive-review-epochs";
 pub const ADAPTIVE_BUDGET_REVIEW_EXTENSION_PATH: &str =
     "/operator/workflow/adaptive-budget-review-extensions";
+pub const ADAPTIVE_RESUME_POLICY_PATH: &str = "/operator/workflow/adaptive-resume-policy";
 pub const ADAPTIVE_LOCAL_ADOPTION_PATH: &str = "/operator/workflow/adaptive-local-adoptions";
 pub const SOURCE_REVIEW_PATH: &str = "/agent/workflow/source-reviews";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
@@ -3516,6 +3519,10 @@ impl WorkflowApi {
                 self.budget_review_extension_http(&principal, method, path, body)
             }
             #[cfg(feature = "llm")]
+            ("GET" | "POST", ADAPTIVE_RESUME_POLICY_PATH) => {
+                self.adaptive_resume_policy_http(&principal, method, path, body)
+            }
+            #[cfg(feature = "llm")]
             ("GET" | "POST", ADAPTIVE_LOCAL_ADOPTION_PATH) => {
                 self.local_adoption_http(&principal, method, path, body)
             }
@@ -4147,6 +4154,15 @@ impl WorkflowApi {
     ) -> Result<Option<ProviderUsageBinding>, &'static str> {
         let (binding, inactive_adaptive_work) =
             self.selected_provider_usage_binding_with_queue_state(agent_id)?;
+        self.validate_selected_provider_usage_binding(&binding, inactive_adaptive_work)?;
+        Ok(binding)
+    }
+
+    fn validate_selected_provider_usage_binding(
+        &self,
+        binding: &Option<ProviderUsageBinding>,
+        inactive_adaptive_work: bool,
+    ) -> Result<(), &'static str> {
         if self.subscription_allowance_id.is_some()
             && !(binding.is_none() && inactive_adaptive_work)
             && !binding
@@ -4155,7 +4171,7 @@ impl WorkflowApi {
         {
             return Err("agent has no project subscription work authority");
         }
-        Ok(binding)
+        Ok(())
     }
 
     fn selected_provider_usage_binding_for_agent(
@@ -4170,6 +4186,8 @@ impl WorkflowApi {
         &self,
         agent_id: AgentId,
     ) -> Result<(Option<ProviderUsageBinding>, bool), &'static str> {
+        #[cfg(all(test, feature = "llm"))]
+        model_execution::tests::record_provider_selection();
         if !self.enabled {
             return Ok((None, false));
         }
@@ -5551,6 +5569,57 @@ impl WorkflowApi {
 }
 
 #[cfg(feature = "llm")]
+impl WorkflowApi {
+    fn prepare_non_project_provider_candidate(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<crate::llm_bridge::bridge::PreparedProviderCandidate>, &'static str> {
+        use crate::llm_bridge::bridge::PreparedProviderCandidate;
+        use model_execution::{ModelExecutionContext, ProviderExecutionAuthority};
+
+        if let Some(call) = self.leadership_review_for_agent(agent_id)? {
+            let binding = adaptive_leadership_review::LeadershipAuthority::from_call(&call);
+            let context = self.prepare_leadership_review(&binding)?;
+            return Ok(Some(PreparedProviderCandidate {
+                authority: Some(ProviderExecutionAuthority::AdaptiveLeadershipReview(
+                    Box::new(binding),
+                )),
+                prepared_context: Some(ModelExecutionContext::AdaptiveLeadershipReview(Box::new(
+                    context,
+                ))),
+            }));
+        }
+        if let Some(call) = self.fresh_request_sales_call(agent_id, now_unix_ms())? {
+            let binding = model_execution::RequestSalesAuthority {
+                schema_version: 2,
+                allowance_id: call.allowance_id,
+                grant: call.grant,
+            };
+            let context = self.prepare_request_sales(&binding)?;
+            return Ok(Some(PreparedProviderCandidate {
+                authority: Some(ProviderExecutionAuthority::RequestSales(Box::new(binding))),
+                prepared_context: Some(ModelExecutionContext::RequestSales(Box::new(context))),
+            }));
+        }
+        if let Some(call) = self.project_planning_call(agent_id, now_unix_ms())? {
+            let binding = model_execution::ProjectPlanningAuthority {
+                schema_version: 4,
+                allowance_id: call.allowance_id,
+                grant: call.grant,
+            };
+            let context = self.prepare_project_planning(&binding)?;
+            return Ok(Some(PreparedProviderCandidate {
+                authority: Some(ProviderExecutionAuthority::ProjectPlanning(Box::new(
+                    binding,
+                ))),
+                prepared_context: Some(ModelExecutionContext::ProjectPlanning(Box::new(context))),
+            }));
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "llm")]
 impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
     fn allows_unbound_provider_usage(&self) -> bool {
         self.subscription_allowance_id.is_none() && self.request_sales_tenant.is_none()
@@ -5597,6 +5666,74 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         Ok(self
             .selected_provider_usage_binding_for_agent(agent_id)?
             .is_some())
+    }
+
+    fn prepare_provider_usage_candidate(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<crate::llm_bridge::bridge::PreparedProviderCandidate>, &'static str> {
+        use crate::llm_bridge::bridge::{PreparedProviderCandidate, ProviderUsageAuthority};
+        use model_execution::ProviderExecutionAuthority;
+
+        if let Some(candidate) = self.prepare_non_project_provider_candidate(agent_id)? {
+            return Ok(Some(candidate));
+        }
+        let (binding, inactive_adaptive_work) =
+            self.selected_provider_usage_binding_with_queue_state(agent_id)?;
+        if binding.is_none() && !self.allows_unbound_provider_usage() {
+            return Ok(None);
+        }
+        self.validate_selected_provider_usage_binding(&binding, inactive_adaptive_work)?;
+        let unbound = || PreparedProviderCandidate {
+            authority: None,
+            prepared_context: None,
+        };
+        let Some(binding) = binding else {
+            return Ok(Some(unbound()));
+        };
+        let (adaptive, reconciled_tools) =
+            self.adaptive_provider_authority_from_binding(binding.clone(), true)?;
+        if let Some(authority) = adaptive {
+            return Ok(Some(PreparedProviderCandidate {
+                authority: Some(ProviderExecutionAuthority::Adaptive(Box::new(authority))),
+                prepared_context: None,
+            }));
+        }
+        // Tool reconciliation may change the selected head or finish its project.
+        // Only that path needs another selection before considering other work.
+        let binding = if reconciled_tools {
+            let Some(current) = self.provider_usage_binding_for_agent(agent_id)? else {
+                return Ok(Some(unbound()));
+            };
+            current
+        } else {
+            binding
+        };
+        if binding
+            .subscription_grant
+            .as_ref()
+            .is_some_and(|grant| grant.max_calls > 1)
+            || self.binding_has_continued_adaptive_session(&binding)?
+        {
+            return Ok(Some(unbound()));
+        }
+        Ok(Some(PreparedProviderCandidate {
+            authority: Some(
+                ProviderUsageAuthority {
+                    tenant_id: binding.tenant_id,
+                    project_id: binding.project_id,
+                    work_item_id: binding.work_item_id,
+                    reservation_id: binding.reservation_id,
+                    assignment_id: binding.assignment_id,
+                    assignment_version: binding.assignment_version,
+                    agent_id: binding.agent_id,
+                    provider: binding.provider,
+                    subscription_grant: binding.subscription_grant,
+                }
+                .into(),
+            ),
+            prepared_context: None,
+        }))
     }
 
     fn model_work_context(
@@ -5725,36 +5862,8 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         &self,
         agent_id: AgentId,
     ) -> Result<Option<model_execution::ProviderExecutionAuthority>, &'static str> {
-        if let Some(call) = self.leadership_review_for_agent(agent_id)? {
-            let binding = adaptive_leadership_review::LeadershipAuthority::from_call(&call);
-            self.prepare_leadership_review(&binding)?;
-            return Ok(Some(
-                model_execution::ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(
-                    binding,
-                )),
-            ));
-        }
-        if let Some(call) = self.fresh_request_sales_call(agent_id, now_unix_ms())? {
-            let binding = model_execution::RequestSalesAuthority {
-                schema_version: 2,
-                allowance_id: call.allowance_id,
-                grant: call.grant,
-            };
-            self.prepare_request_sales(&binding)?;
-            return Ok(Some(
-                model_execution::ProviderExecutionAuthority::RequestSales(Box::new(binding)),
-            ));
-        }
-        if let Some(call) = self.project_planning_call(agent_id, now_unix_ms())? {
-            let binding = model_execution::ProjectPlanningAuthority {
-                schema_version: 4,
-                allowance_id: call.allowance_id,
-                grant: call.grant,
-            };
-            self.prepare_project_planning(&binding)?;
-            return Ok(Some(
-                model_execution::ProviderExecutionAuthority::ProjectPlanning(Box::new(binding)),
-            ));
+        if let Some(candidate) = self.prepare_non_project_provider_candidate(agent_id)? {
+            return Ok(candidate.authority);
         }
         if let Some(binding) = self.adaptive_provider_authority(agent_id)? {
             return Ok(Some(model_execution::ProviderExecutionAuthority::Adaptive(
@@ -6027,6 +6136,7 @@ fn is_workflow_path(path: &str) -> bool {
             | ADAPTIVE_RECOVERY_PATH
             | ADAPTIVE_REVIEW_EPOCH_PATH
             | ADAPTIVE_BUDGET_REVIEW_EXTENSION_PATH
+            | ADAPTIVE_RESUME_POLICY_PATH
             | ADAPTIVE_LOCAL_ADOPTION_PATH
             | SOURCE_REVIEW_PATH
             | REQUEST_PROVIDER_ABANDON_PATH

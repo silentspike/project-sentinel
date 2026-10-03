@@ -24,6 +24,7 @@ RUST_SCHEMA_AUTHORITY_PATHS = {
 }
 
 RUST_SCHEMA_OPEN = re.compile(r"(?:sentinel_limbo::)?EventStore::open\s*\(")
+RUST_TEST_FILE = re.compile(r"\A\s*#!\[cfg\(test\)\]\s*(?:\n|\Z)")
 RUST_TEST_MODULE = re.compile(
     r"(?m)^\s*#\[cfg\(test\)\]\s*\n\s*"
     r"(?:pub(?:\s*\((?:crate|super|self)\))?\s+)?mod\s+tests\s*\{"
@@ -87,6 +88,8 @@ def _source_files(root: Path, suffix: str) -> list[Path]:
 
 def _production_rust(relative: Path, text: str) -> str:
     if "tests" in relative.parts or "benches" in relative.parts:
+        return ""
+    if RUST_TEST_FILE.match(text):
         return ""
     match = RUST_TEST_MODULE.search(text)
     return text[: match.start()] if match else text
@@ -205,6 +208,8 @@ def check(
             ):
                 continue
             text = path.read_text(encoding="utf-8")
+            if suffix == ".rs":
+                text = _production_rust(relative, text)
             for match in insert_pattern.finditer(text):
                 if "SELECT" in text[match.end() : match.end() + 400]:
                     continue

@@ -403,6 +403,15 @@ impl WorkflowApi {
         request: &DispatchRequest,
         now_ms: u64,
     ) -> Result<u64, &'static str> {
+        self.claim_adaptive_dispatch_with_clock(request, now_ms, now_unix_ms)
+    }
+
+    fn claim_adaptive_dispatch_with_clock(
+        &self,
+        request: &DispatchRequest,
+        now_ms: u64,
+        mut clock: impl FnMut() -> u64,
+    ) -> Result<u64, &'static str> {
         let Some(RequestSubject::AdaptiveSession {
             session_id,
             effect_id,
@@ -464,14 +473,31 @@ impl WorkflowApi {
         {
             return Err("adaptive model claim changed or was consumed");
         }
-        self.claim_fresh_adaptive_model(&binding, request, now_ms)
+        let now_ms = clock();
+        context.validate_dispatch(now_ms)?;
+        if session.model_admission_at(now_ms)
+            != sentinel_workflow::AdaptiveModelAdmissionV1::Admissible
+        {
+            return Err("adaptive model admission unavailable");
+        }
+        self.claim_fresh_adaptive_model_with_clock(&binding, request, clock)
     }
 
+    #[cfg(test)]
     fn claim_fresh_adaptive_model(
         &self,
         binding: &super::model_execution::AdaptiveProviderAuthority,
         request: &DispatchRequest,
         now_ms: u64,
+    ) -> Result<u64, &'static str> {
+        self.claim_fresh_adaptive_model_with_clock(binding, request, || now_ms)
+    }
+
+    fn claim_fresh_adaptive_model_with_clock(
+        &self,
+        binding: &super::model_execution::AdaptiveProviderAuthority,
+        request: &DispatchRequest,
+        clock: impl FnMut() -> u64,
     ) -> Result<u64, &'static str> {
         let Some(RequestSubject::AdaptiveSession {
             session_id,
@@ -486,9 +512,9 @@ impl WorkflowApi {
             &request.request_id,
             *session_version,
         );
-        let (replayed, _) = self
+        let (replayed, claimed) = self
             .core
-            .advance_adaptive_session(
+            .advance_adaptive_session_with_clock(
                 *session_id,
                 *session_version,
                 operation_id,
@@ -503,17 +529,19 @@ impl WorkflowApi {
                         .map(|value| value.observation_digest.clone()),
                 },
                 &binding.grant.authority,
-                now_ms,
+                clock,
             )
             .map_err(|_| "adaptive model claim denied")?;
         // A durable replay proves the earlier claim, not permission for new provider I/O.
         if replayed {
             return Err("adaptive model claim already consumed");
         }
-        Ok(binding
-            .grant
-            .deadline_ms
-            .min(now_ms.saturating_add(binding.grant.max_call_duration_ms)))
+        let effective = claimed.effective_grant();
+        Ok(effective.deadline_ms.min(
+            claimed
+                .updated_at_ms
+                .saturating_add(effective.max_call_duration_ms),
+        ))
     }
 
     fn claim_sales_dispatch(
@@ -965,6 +993,129 @@ mod tests {
             Err("adaptive model claim already consumed"),
         );
         assert_eq!(discovery_state(&path, &events), claimed_state);
+    }
+
+    #[test]
+    fn adaptive_dispatch_returns_deadline_from_the_final_committed_session_clock() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, binding, _) = super::super::model_work::configured_adaptive_test_api(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        );
+        let body = reserved_adaptive_request(&api, &binding);
+        let request: DispatchRequest = serde_json::from_slice(&body).unwrap();
+        let validated_at = now_unix_ms() + 1_000;
+        let committed_at = validated_at + 1_000;
+        assert!(committed_at + binding.grant.max_call_duration_ms < binding.grant.deadline_ms);
+        let sampled = std::cell::Cell::new(0);
+        let deadline = api
+            .claim_adaptive_dispatch_with_clock(&request, now_unix_ms(), || {
+                let index = sampled.get();
+                sampled.set(index + 1);
+                if index == 0 {
+                    validated_at
+                } else {
+                    committed_at
+                }
+            })
+            .unwrap();
+        assert!(sampled.get() >= 2);
+        let session = api
+            .store
+            .adaptive_session_for_authority(&binding.grant.authority)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.updated_at_ms, committed_at);
+        assert_eq!(
+            deadline,
+            committed_at + session.effective_grant().max_call_duration_ms
+        );
+    }
+
+    #[test]
+    fn amended_adaptive_dispatch_denies_insufficient_slack_before_any_developer_claim() {
+        for changes_inside_store in [false, true] {
+            let (temp, api, session) =
+                super::super::adaptive_resume_policy::tests::continued_policy_fixture(false);
+            let path = temp.path().join("company.sqlite");
+            let events = temp.path().join("events.sqlite");
+            let binding = api
+                .adaptive_provider_authority_for_claim(session.grant.authority.agent_id)
+                .unwrap()
+                .unwrap();
+            let body = reserved_adaptive_request(&api, &binding);
+            let request: DispatchRequest = serde_json::from_slice(&body).unwrap();
+            let policy = session
+                .continuation
+                .as_ref()
+                .unwrap()
+                .authorizations
+                .last()
+                .unwrap()
+                .resume_policy
+                .as_ref()
+                .unwrap();
+            let boundary = session.active_deadline_ms()
+                - session.effective_call_duration_ms()
+                - policy.limits.dispatch_margin_ms;
+            assert_eq!(
+                session.model_admission_at(boundary),
+                sentinel_workflow::AdaptiveModelAdmissionV1::Admissible
+            );
+            assert_eq!(
+                session.model_admission_at(boundary + 1),
+                sentinel_workflow::AdaptiveModelAdmissionV1::InsufficientSlack
+            );
+            let before = discovery_state(&path, &events);
+            let sampled = std::cell::Cell::new(0);
+            assert!(api
+                .claim_adaptive_dispatch_with_clock(&request, now_unix_ms(), || {
+                    let index = sampled.get();
+                    sampled.set(index + 1);
+                    if changes_inside_store && index == 0 {
+                        boundary
+                    } else {
+                        boundary + 1
+                    }
+                })
+                .is_err());
+            assert!(sampled.get() >= if changes_inside_store { 2 } else { 1 });
+            assert_eq!(discovery_state(&path, &events), before);
+            assert_eq!(
+                api.store
+                    .adaptive_session_for_authority(&session.grant.authority)
+                    .unwrap(),
+                Some(session)
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_dispatch_resamples_clock_after_validation_without_claiming_expired_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, binding, _) =
+            super::super::model_work::configured_adaptive_test_api(&path, &events);
+        let body = reserved_adaptive_request(&api, &binding);
+        let request: DispatchRequest = serde_json::from_slice(&body).unwrap();
+        let before = discovery_state(&path, &events);
+        let sampled = std::cell::Cell::new(0);
+        assert!(api
+            .claim_adaptive_dispatch_with_clock(&request, now_unix_ms(), || {
+                sampled.set(sampled.get() + 1);
+                binding.grant.deadline_ms
+            })
+            .is_err());
+        assert_eq!(sampled.get(), 1);
+        assert_eq!(discovery_state(&path, &events), before);
+        let session = api
+            .core
+            .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.version, binding.session_version);
+        assert_eq!(session.cursor, AdaptiveCursorV1::ReadyForModel);
     }
 
     #[test]

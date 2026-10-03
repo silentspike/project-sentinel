@@ -166,6 +166,36 @@ class EventAppendBoundaryTest(unittest.TestCase):
         errors = MODULE.check(root, rust_inventory={}, go_inventory={})
         self.assertEqual(sum("may not own event DDL" in error for error in errors), 1)
 
+    def test_external_test_file_requires_explicit_file_guard(self):
+        root = self.fixture()
+        rust = root / "services/example/tests.rs"
+        rust.parent.mkdir(parents=True)
+        body = (
+            'fn fixture() { let _ = EventStore::open(":memory:");\n'
+            'store.append_event(&event);\n'
+            'sql!("INSERT INTO events (event_id) VALUES (?)"); }\n'
+        )
+        rust.write_text("#![cfg(test)]\n" + body, encoding="utf-8")
+        self.assertEqual(MODULE.check(root, rust_inventory={}, go_inventory={}), [])
+        rust.write_text(body, encoding="utf-8")
+        errors = MODULE.check(root, rust_inventory={}, go_inventory={})
+        self.assertTrue(any("may not own event DDL" in error for error in errors))
+        self.assertTrue(any("unclassified Rust append_event" in error for error in errors))
+        self.assertTrue(any("raw events-table insert" in error for error in errors))
+
+    def test_commented_or_late_file_guard_does_not_hide_production(self):
+        for prefix in ["// #![cfg(test)]\n", 'const NOTE: &str = "#![cfg(test)]";\n']:
+            with self.subTest(prefix=prefix):
+                root = self.fixture()
+                rust = root / "services/example/tests.rs"
+                rust.parent.mkdir(parents=True)
+                rust.write_text(
+                    prefix + 'fn production() { let _ = EventStore::open("events.db"); }\n',
+                    encoding="utf-8",
+                )
+                self.assertTrue(any("may not own event DDL" in error
+                    for error in MODULE.check(root, rust_inventory={}, go_inventory={})))
+
 
 if __name__ == "__main__":
     unittest.main()

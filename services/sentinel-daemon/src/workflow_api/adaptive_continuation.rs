@@ -43,6 +43,7 @@ fn validate_audit(payload: &[u8]) -> Result<(), EventContractError> {
         || continuation.review_id != call.grant.review_id
         || continuation.session_id != call.grant.session_id
         || continuation.source_session_version != call.grant.expected_session_version
+        || continuation.resume_policy != call.grant.resume_policy
         || audit.result.resolution_event_id != Some(continuation.resolution_event_id)
     {
         return Err(invalid());
@@ -214,6 +215,7 @@ impl WorkflowApi {
         call: &AdaptiveLeadershipReviewCallV1,
         proposed: &CompleteAdaptiveLeadershipReviewCallV1,
     ) -> Result<CompleteAdaptiveLeadershipReviewCallV1, &'static str> {
+        self.validate_resume_policy_review(call)?;
         self.store
             .validate_adaptive_leadership_recovery_decision(call, &proposed.decision)
             .map_err(|_| "recovery continuation exceeds immutable authority")?;

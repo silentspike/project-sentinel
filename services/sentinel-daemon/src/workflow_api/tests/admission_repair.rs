@@ -503,7 +503,9 @@ fn admission_repair_only_subsequent_fixture_decision_creates_bounded_continuatio
         admissible: true,
     };
     persist(&api, &completion, &context, &request_id, &digest, true);
-    api.accept_leadership_review(&completion, &context, &request_id, &digest)
+    // Success semantics use a fixed clock; expiry has separate boundary tests.
+    let decision_at = now_unix_ms();
+    api.accept_leadership_review_at(&completion, &context, &request_id, &digest, decision_at)
         .unwrap();
     let next = api
         .store

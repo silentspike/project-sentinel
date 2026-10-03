@@ -1,6 +1,10 @@
 //! Append-only rounds reuse the existing FULL/WAL operation journal and backup boundary.
 
 use super::*;
+use crate::domain_store::adaptive_resume_policy::{
+    read_resume_policy_leaf, require_resume_authorization_membership,
+    require_resume_review_membership,
+};
 use crate::{
     adaptive_collaboration_digest, adaptive_continuation_provider_digest,
     AdaptiveContinuationAuthorizationV1, AdaptiveContinuationSourceV1, AdaptiveEffectV1,
@@ -491,6 +495,25 @@ impl WorkflowStore {
         current: &RuntimeAuthoritySnapshotV1,
         now_ms: u64,
     ) -> Result<(bool, AdaptiveSessionV1), WorkflowError> {
+        self.advance_adaptive_session_with_clock(
+            session_id,
+            expected_version,
+            operation_id,
+            command,
+            current,
+            || now_ms,
+        )
+    }
+
+    pub fn advance_adaptive_session_with_clock<Clock: FnMut() -> u64>(
+        &self,
+        session_id: Uuid,
+        expected_version: u64,
+        operation_id: Uuid,
+        command: &AdaptiveTransitionV1,
+        current: &RuntimeAuthoritySnapshotV1,
+        mut clock: Clock,
+    ) -> Result<(bool, AdaptiveSessionV1), WorkflowError> {
         current.validate()?;
         if operation_id.is_nil() || matches!(command, AdaptiveTransitionV1::ContinueGoverned { .. })
         {
@@ -560,6 +583,7 @@ impl WorkflowStore {
         {
             return Err(authority_conflict());
         }
+        let now_ms = clock();
         let next = session.transition(command, now_ms)?;
         append(
             &tx,
@@ -690,6 +714,17 @@ pub(crate) fn continue_adaptive_session_in_transaction(
     current.validate()?;
     review.grant.validate(review.grant_issued_at_unix_ms)?;
     review.context.validate(&review.grant)?;
+    if authorization.resume_policy != review.grant.resume_policy {
+        return Err(authority_conflict());
+    }
+    if review.grant.resume_policy.is_some() {
+        require_resume_review_membership(
+            tx,
+            &review.grant,
+            &review.context_digest()?,
+            review.operation_id,
+        )?;
+    }
     WorkflowStore::require_recovery_epoch_review(tx, review)?;
     WorkflowStore::require_adaptive_budget_review_source(tx, review)?;
     if matches!(review.grant.schema_version, 3 | 4) && authorization.local_adoption.is_some() {
@@ -765,6 +800,17 @@ pub(crate) fn continue_adaptive_session_in_transaction(
     {
         return Err(authority_conflict());
     }
+    if let Some(binding) = &review.grant.resume_policy {
+        let receipt = read_resume_policy_leaf(tx, &current.tenant_id, session.grant.session_id)?
+            .ok_or_else(authority_conflict)?;
+        receipt.validate_binding(binding)?;
+        require_resume_policy_anchor(tx, &receipt, &session)?;
+        if now_ms >= binding.limits.expires_at_unix_ms {
+            return Err(authority_conflict());
+        }
+    } else if read_resume_policy_leaf(tx, &current.tenant_id, authorization.session_id)?.is_some() {
+        return Err(authority_conflict());
+    }
     let fresh = &fresh_allowance.grant;
     let source_work = review
         .context
@@ -806,7 +852,8 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         || fresh.catalog_digest != session.grant.catalog_digest
         || fresh.token_policy != review.grant.token_policy
         || fresh.max_calls != authorization.additional_model_calls
-        || fresh.max_calls > policy_allowance.grant.max_calls
+        || (review.grant.resume_policy.is_none()
+            && fresh.max_calls > policy_allowance.grant.max_calls)
         || (matches!(review.grant.schema_version, 3 | 4)
             && session
                 .model_calls
@@ -817,7 +864,15 @@ pub(crate) fn continue_adaptive_session_in_transaction(
             != session
                 .grant
                 .max_call_duration_ms
-                .min(policy_allowance.grant.max_duration_ms)
+                .min(
+                    review
+                        .grant
+                        .resume_policy
+                        .as_ref()
+                        .map_or(policy_allowance.grant.max_duration_ms, |binding| {
+                            binding.limits.max_call_duration_ms
+                        }),
+                )
                 .min(authorization.deadline_ms - authorization.issued_at_ms)
         || fresh.expires_at_unix_ms != authorization.deadline_ms
         || adaptive_continuation_provider_digest(fresh_allowance, current)?
@@ -881,6 +936,73 @@ pub(crate) fn continue_adaptive_session_in_transaction(
     )?;
     update_head(tx, &session, &next)?;
     Ok((false, next))
+}
+
+/// Validated journal head and immutable root, without loading leadership reviews.
+pub(crate) fn adaptive_resume_journal_source(
+    connection: &Connection,
+    session_id: Uuid,
+) -> Result<Option<(AdaptiveSessionV1, String, String)>, WorkflowError> {
+    let Some((session, head_digest)) = load(connection, session_id)? else {
+        return Ok(None);
+    };
+    require_head(connection, &session)?;
+    let (root_digest, _) = evidence_entry(connection, &namespace(session_id), 1)?;
+    Ok(Some((session, root_digest, head_digest)))
+}
+
+pub(crate) fn require_resume_policy_anchor(
+    connection: &Connection,
+    receipt: &crate::AdaptiveResumePolicyReceiptV1,
+    session: &AdaptiveSessionV1,
+) -> Result<(), WorkflowError> {
+    let source = &receipt.request.source;
+    if session.grant.session_id != source.session_id
+        || session.grant.authority != source.assignee_authority
+        || session.version < source.expected_session_version
+        || session.model_calls < source.base_model_calls
+        || session.tool_calls < source.base_tool_calls
+        || session
+            .continuation
+            .as_ref()
+            .map_or(0, |state| state.authorizations.len())
+            < usize::from(source.base_window_count)
+        || receipt.request.limits.max_call_duration_ms != session.grant.max_call_duration_ms
+    {
+        return Err(authority_conflict());
+    }
+    let ns = namespace(source.session_id);
+    let root =
+        read_operation(connection, &ns, &format!("{:020}", 1))?.ok_or_else(authority_conflict)?;
+    let anchor = read_operation(
+        connection,
+        &ns,
+        &format!("{:020}", source.expected_session_version),
+    )?
+    .ok_or_else(authority_conflict)?;
+    let root_entry: Entry = decode(&root.1)?;
+    let anchor_entry: Entry = decode(&anchor.1)?;
+    if root.0 != source.root_entry_digest
+        || anchor.0 != source.head_entry_digest
+        || root.0 != canonical_sha256("sentinel.workflow.adaptive-entry.v1", &root_entry)?
+        || anchor.0 != canonical_sha256("sentinel.workflow.adaptive-entry.v1", &anchor_entry)?
+        || root_entry.session.grant != session.grant
+        || anchor_entry.session.grant != session.grant
+        || anchor_entry.session.version != source.expected_session_version
+        || anchor_entry.session.model_calls != source.base_model_calls
+        || anchor_entry.session.tool_calls != source.base_tool_calls
+        || crate::adaptive_budget_history_digest(&anchor_entry.session.continuation)?
+            != source.continuation_history_digest
+        || anchor_entry
+            .session
+            .continuation
+            .as_ref()
+            .map_or(0, |state| state.authorizations.len())
+            != usize::from(source.base_window_count)
+    {
+        return Err(authority_conflict());
+    }
+    Ok(())
 }
 
 fn read_company_entity<T: DeserializeOwned>(
@@ -1209,6 +1331,17 @@ fn load_with_feedback_uncached(
                 if entry.previous_digest.as_ref() == Some(prior_digest)
                     && entry.recovery_feedback.is_none() =>
             {
+                if let Some(AdaptiveTransitionV1::ContinueGoverned { authorization }) =
+                    &entry.command
+                {
+                    if authorization.resume_policy.is_some() {
+                        require_resume_authorization_membership(
+                            connection,
+                            authorization,
+                            &prior.grant.authority,
+                        )?;
+                    }
+                }
                 prior.transition(
                     entry.command.as_ref().ok_or_else(corrupt_store)?,
                     entry.session.updated_at_ms,
@@ -1944,6 +2077,7 @@ mod continuation_tests {
         let review_grant = AdaptiveLeadershipReviewGrantV1 {
             schema_version: 1,
             recovery_epoch: None,
+            resume_policy: None,
             subject: None,
             review_id: crate::adaptive_leadership_review_id(root.session_id, 3, &fingerprint)
                 .unwrap(),

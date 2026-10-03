@@ -132,6 +132,12 @@ pub mod bridge {
         })
     }
 
+    #[derive(Debug)]
+    pub struct PreparedProviderCandidate {
+        pub authority: Option<ProviderExecutionAuthority>,
+        pub prepared_context: Option<ModelWorkContext>,
+    }
+
     pub trait ProviderUsageAuthorityResolver: Send + Sync {
         fn allows_unbound_provider_usage(&self) -> bool {
             true
@@ -145,6 +151,20 @@ pub mod bridge {
             &self,
             agent_id: AgentId,
         ) -> Result<Option<ProviderExecutionAuthority>, &'static str>;
+
+        /// Contexts not already required by resolution stay deferred until recovery.
+        fn prepare_provider_usage_candidate(
+            &self,
+            agent_id: AgentId,
+        ) -> Result<Option<PreparedProviderCandidate>, &'static str> {
+            if !self.is_provider_usage_candidate(agent_id)? {
+                return Ok(None);
+            }
+            Ok(Some(PreparedProviderCandidate {
+                authority: self.resolve_provider_usage_authority(agent_id)?,
+                prepared_context: None,
+            }))
+        }
 
         /// Validate a chosen authority; adapters may separate this from scheduling.
         fn validate_provider_usage_authority(
@@ -1609,6 +1629,41 @@ pub mod bridge {
         Ok(())
     }
 
+    fn initial_model_work_context(
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        authority: Option<&ProviderExecutionAuthority>,
+        prepared_context: Option<ModelWorkContext>,
+    ) -> Result<Option<ModelWorkContext>, &'static str> {
+        if let Some(context) = prepared_context {
+            if authority != Some(&context.binding()) {
+                return Err("prepared model work authority changed");
+            }
+            return Ok(Some(context));
+        }
+        match (resolver, authority) {
+            (Some(resolver), Some(authority)) => resolver.model_work_context(authority),
+            _ => Ok(None),
+        }
+    }
+
+    fn log_provider_preparation_duration(
+        agent_id: AgentId,
+        phase: &'static str,
+        started: Instant,
+        bound: bool,
+        accepted: bool,
+    ) {
+        const SLOW_PREPARATION_MS: u128 = 1_000;
+        let elapsed_ms = started.elapsed().as_millis();
+        if bound && elapsed_ms >= SLOW_PREPARATION_MS {
+            warn!(agent = %agent_id, phase, elapsed_ms, accepted,
+                "Slow initial provider preparation");
+        } else {
+            debug!(agent = %agent_id, phase, elapsed_ms, bound, accepted,
+                "Initial provider preparation finished");
+        }
+    }
+
     fn validate_gateway_completion_authority(
         resolver: Option<&dyn ProviderUsageAuthorityResolver>,
         expected: Option<&ProviderExecutionAuthority>,
@@ -2087,27 +2142,36 @@ pub mod bridge {
                     continue;
                 }
 
-                if let Some(resolver) = config.provider_usage_authority.as_ref() {
-                    match resolver.is_provider_usage_candidate(agent_id) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(reason) => {
-                            error!(agent = %agent_id, reason, "Provider usage candidate selection failed closed");
+                let selection_started = Instant::now();
+                let candidate = match config.provider_usage_authority.as_ref() {
+                    Some(resolver) => match resolver.prepare_provider_usage_candidate(agent_id) {
+                        Ok(Some(candidate)) => candidate,
+                        Ok(None) => {
+                            debug!(agent = %agent_id,
+                                elapsed_ms = selection_started.elapsed().as_millis(),
+                                outcome = "skipped", "Provider candidate selection finished");
                             continue;
                         }
-                    }
-                }
-
-                let usage_authority = match config.provider_usage_authority.as_ref() {
-                    Some(resolver) => match resolver.resolve_provider_usage_authority(agent_id) {
-                        Ok(value) => value,
                         Err(reason) => {
-                            error!(agent = %agent_id, reason, "Provider usage authority resolution failed closed");
+                            error!(agent = %agent_id, reason,
+                                elapsed_ms = selection_started.elapsed().as_millis(),
+                                "Provider candidate preparation failed closed");
                             continue;
                         }
                     },
-                    None => None,
+                    None => PreparedProviderCandidate {
+                        authority: None,
+                        prepared_context: None,
+                    },
                 };
+                log_provider_preparation_duration(
+                    agent_id,
+                    "selection",
+                    selection_started,
+                    candidate.authority.is_some(),
+                    true,
+                );
+                let usage_authority = candidate.authority;
                 if usage_authority
                     .as_ref()
                     .is_some_and(|authority| authority.agent_id() != agent_id)
@@ -2180,20 +2244,25 @@ pub mod bridge {
                     &request_id,
                     usage_authority.as_ref(),
                 );
-                let model_work = match (
+                let preparation_started = Instant::now();
+                let preparation = initial_model_work_context(
                     config.provider_usage_authority.as_deref(),
                     usage_authority.as_ref(),
-                ) {
-                    (Some(resolver), Some(authority)) => {
-                        match resolver.model_work_context(authority) {
-                            Ok(context) => context,
-                            Err(reason) => {
-                                warn!(agent = %agent_id, reason, "Model work context unavailable");
-                                continue;
-                            }
-                        }
+                    candidate.prepared_context,
+                );
+                log_provider_preparation_duration(
+                    agent_id,
+                    "context",
+                    preparation_started,
+                    usage_authority.is_some(),
+                    preparation.is_ok(),
+                );
+                let model_work = match preparation {
+                    Ok(context) => context,
+                    Err(reason) => {
+                        warn!(agent = %agent_id, reason, "Model work context unavailable");
+                        continue;
                     }
-                    _ => None,
                 };
                 if let Some(context) = &model_work {
                     if let Err(reason) = bind_model_work_request(&mut request, context) {
@@ -5038,6 +5107,8 @@ pub mod bridge {
             unbound_allowed: bool,
             selection_calls: std::sync::atomic::AtomicUsize,
             validation_calls: std::sync::atomic::AtomicUsize,
+            context_calls: std::sync::atomic::AtomicUsize,
+            selected: tokio::sync::Notify,
             checked: tokio::sync::Notify,
         }
 
@@ -5050,6 +5121,8 @@ pub mod bridge {
                     unbound_allowed: true,
                     selection_calls: std::sync::atomic::AtomicUsize::new(0),
                     validation_calls: std::sync::atomic::AtomicUsize::new(0),
+                    context_calls: std::sync::atomic::AtomicUsize::new(0),
+                    selected: tokio::sync::Notify::new(),
                     checked: tokio::sync::Notify::new(),
                 }
             }
@@ -5065,6 +5138,7 @@ pub mod bridge {
                 agent_id: AgentId,
             ) -> Result<Option<ProviderExecutionAuthority>, &'static str> {
                 self.selection_calls.fetch_add(1, Ordering::SeqCst);
+                self.selected.notify_one();
                 Ok(if agent_id == self.context.binding().agent_id() {
                     self.scheduled.clone()
                 } else {
@@ -5088,8 +5162,128 @@ pub mod bridge {
                 &self,
                 expected: &ProviderExecutionAuthority,
             ) -> Result<Option<ModelWorkContext>, &'static str> {
+                self.context_calls.fetch_add(1, Ordering::SeqCst);
                 Ok((expected == &self.context.binding()).then(|| self.context.clone()))
             }
+        }
+
+        struct CandidateProbeResolver {
+            candidate: Result<bool, &'static str>,
+            authority: Result<Option<ProviderExecutionAuthority>, &'static str>,
+            resolution_calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl ProviderUsageAuthorityResolver for CandidateProbeResolver {
+            fn is_provider_usage_candidate(&self, _: AgentId) -> Result<bool, &'static str> {
+                self.candidate
+            }
+
+            fn resolve_provider_usage_authority(
+                &self,
+                _: AgentId,
+            ) -> Result<Option<ProviderExecutionAuthority>, &'static str> {
+                self.resolution_calls.fetch_add(1, Ordering::SeqCst);
+                self.authority.clone()
+            }
+
+            fn model_work_context(
+                &self,
+                _: &ProviderExecutionAuthority,
+            ) -> Result<Option<ModelWorkContext>, &'static str> {
+                panic!("legacy candidate preparation must defer context until recovery");
+            }
+        }
+
+        #[test]
+        fn candidate_preparation_default_preserves_skip_errors_and_unbound_authority() {
+            let mut resolver = CandidateProbeResolver {
+                candidate: Ok(false),
+                authority: Err("resolution unavailable"),
+                resolution_calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            assert!(resolver
+                .prepare_provider_usage_candidate(AgentId(7))
+                .unwrap()
+                .is_none());
+            assert_eq!(resolver.resolution_calls.load(Ordering::SeqCst), 0);
+            resolver.candidate = Err("candidate unavailable");
+            assert_eq!(
+                resolver
+                    .prepare_provider_usage_candidate(AgentId(7))
+                    .unwrap_err(),
+                "candidate unavailable"
+            );
+            assert_eq!(resolver.resolution_calls.load(Ordering::SeqCst), 0);
+            resolver.candidate = Ok(true);
+            assert_eq!(
+                resolver
+                    .prepare_provider_usage_candidate(AgentId(7))
+                    .unwrap_err(),
+                "resolution unavailable"
+            );
+            assert_eq!(resolver.resolution_calls.load(Ordering::SeqCst), 1);
+            resolver.authority = Ok(None);
+            let candidate = resolver
+                .prepare_provider_usage_candidate(AgentId(7))
+                .unwrap()
+                .unwrap();
+            assert!(candidate.authority.is_none());
+            assert!(candidate.prepared_context.is_none());
+            assert_eq!(resolver.resolution_calls.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn prepared_context_is_reused_initially_but_rechecked_before_dispatch() {
+            let context: ModelWorkContext = crate::workflow_api::model_work::test_context().into();
+            let expected = context.binding();
+            let mut resolver = ExactValidationResolver::new(context.clone());
+            assert_eq!(
+                initial_model_work_context(Some(&resolver), Some(&expected), Some(context.clone()))
+                    .unwrap(),
+                Some(context.clone())
+            );
+            assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 0);
+            validate_unreserved_provider_authority(
+                Some(&resolver),
+                Some(&expected),
+                expected.agent_id(),
+                Some(&context),
+            )
+            .unwrap();
+            assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 1);
+
+            let ModelWorkContext::Project(current) = &mut resolver.context else {
+                panic!("project fixture");
+            };
+            current.task.objective.push_str(" changed after queuing");
+            assert!(validate_unreserved_provider_authority(
+                Some(&resolver),
+                Some(&expected),
+                expected.agent_id(),
+                Some(&context),
+            )
+            .is_err());
+            let store = EventStore::open(":memory:").unwrap();
+            let id = expected.request_id();
+            let digest = "a".repeat(64);
+            assert!(store
+                .reserve_request(&id, &digest, &expected.agent_id().to_string())
+                .unwrap());
+            assert!(validate_pre_dispatch_provider_authority(
+                &store,
+                Some(&resolver),
+                Some(&expected),
+                expected.agent_id(),
+                &id,
+                &digest,
+                Some(&context),
+            )
+            .is_err());
+            assert!(store.get_completion(&id).unwrap().is_none());
+            assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 3);
+            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 3);
+            assert_eq!(resolver.selection_calls.load(Ordering::SeqCst), 0);
+            assert!(initial_model_work_context(None, None, Some(context)).is_err());
         }
 
         struct SelectionErrorResolver;
@@ -5759,6 +5953,70 @@ pub mod bridge {
                 personality_type: "E".to_string(),
                 has_operator_impulse: false,
             }
+        }
+
+        #[tokio::test]
+        async fn reserved_model_recovery_precedes_deferred_context_preparation() {
+            let dir = tempfile::tempdir().unwrap();
+            let context: ModelWorkContext = crate::workflow_api::model_work::test_context().into();
+            let expected = context.binding();
+            let resolver = Arc::new(ExactValidationResolver::new(context));
+            let store = Arc::new(EventStore::open(":memory:").unwrap());
+            let id = expected.request_id();
+            let digest = "a".repeat(64);
+            assert!(store
+                .reserve_request(&id, &digest, &expected.agent_id().to_string())
+                .unwrap());
+            let reserved = store.get_completion(&id).unwrap().unwrap();
+            let state = Arc::new(
+                StateStore::open(dir.path().join("state.redb").to_str().unwrap()).unwrap(),
+            );
+            let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (gateway_url, provider_task) =
+                start_mock_agent_provider(Arc::clone(&provider_calls), None, None).await;
+            let config = LlmBridgeConfig {
+                gateway_url,
+                credential: "test-credential".into(),
+                min_ticks_between_calls: 0,
+                usage_v2_enabled: true,
+                completion_retry_interval: Duration::from_secs(3600),
+                provider_usage_authority: Some(resolver.clone()),
+                ..Default::default()
+            };
+            let (perception_tx, perception_rx) = mpsc::channel();
+            let (action_tx, _action_rx) = mpsc::channel();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let bridge = tokio::spawn(run_llm_bridge_with_store(
+                config,
+                perception_rx,
+                action_tx,
+                Arc::new(BridgeTelemetry::default()),
+                state,
+                Arc::clone(&store),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
+                shutdown_rx,
+                Arc::new(RwLock::new(true)),
+            ));
+            let mut perception = recovery_test_perception();
+            perception.agent_id = expected.agent_id();
+            perception_tx.send(perception).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), resolver.selected.notified())
+                .await
+                .expect("candidate was not selected");
+            shutdown_tx.send(true).unwrap();
+            drop(perception_tx);
+            tokio::time::timeout(Duration::from_secs(2), bridge)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolver.selection_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(store.get_completion(&id).unwrap().unwrap(), reserved);
+            provider_task.abort();
         }
 
         #[tokio::test]
