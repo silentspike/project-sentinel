@@ -449,14 +449,15 @@ mod tests {
                     std::task::Poll::Pending
                 }),
             );
-            let failure = tokio::time::timeout(
-                Duration::from_secs(2),
-                pump_live_messages(&state, stream),
-            )
-            .await
-            .expect("consumer error must return to the bounded reconnect loop")
-            .unwrap_err();
-            assert_eq!(failure.to_string(), format!("nats live consumer failed: {kind}"));
+            let failure =
+                tokio::time::timeout(Duration::from_secs(2), pump_live_messages(&state, stream))
+                    .await
+                    .expect("consumer error must return to the bounded reconnect loop")
+                    .unwrap_err();
+            assert_eq!(
+                failure.to_string(),
+                format!("nats live consumer failed: {kind}")
+            );
             assert_eq!(failure.root_cause().to_string(), kind.to_string());
             assert_eq!(polls_after_error.load(Ordering::SeqCst), 0);
         }
