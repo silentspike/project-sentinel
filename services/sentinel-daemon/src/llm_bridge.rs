@@ -2165,7 +2165,11 @@ pub mod bridge {
                     },
                 };
                 log_provider_preparation_duration(
-                    agent_id, "selection", selection_started, candidate.authority.is_some(), true,
+                    agent_id,
+                    "selection",
+                    selection_started,
+                    candidate.authority.is_some(),
+                    true,
                 );
                 let usage_authority = candidate.authority;
                 if usage_authority
@@ -2247,7 +2251,10 @@ pub mod bridge {
                     candidate.prepared_context,
                 );
                 log_provider_preparation_duration(
-                    agent_id, "context", preparation_started, usage_authority.is_some(),
+                    agent_id,
+                    "context",
+                    preparation_started,
+                    usage_authority.is_some(),
                     preparation.is_ok(),
                 );
                 let model_work = match preparation {
@@ -5194,22 +5201,32 @@ pub mod bridge {
                 authority: Err("resolution unavailable"),
                 resolution_calls: std::sync::atomic::AtomicUsize::new(0),
             };
-            assert!(resolver.prepare_provider_usage_candidate(AgentId(7)).unwrap().is_none());
+            assert!(resolver
+                .prepare_provider_usage_candidate(AgentId(7))
+                .unwrap()
+                .is_none());
             assert_eq!(resolver.resolution_calls.load(Ordering::SeqCst), 0);
             resolver.candidate = Err("candidate unavailable");
             assert_eq!(
-                resolver.prepare_provider_usage_candidate(AgentId(7)).unwrap_err(),
+                resolver
+                    .prepare_provider_usage_candidate(AgentId(7))
+                    .unwrap_err(),
                 "candidate unavailable"
             );
             assert_eq!(resolver.resolution_calls.load(Ordering::SeqCst), 0);
             resolver.candidate = Ok(true);
             assert_eq!(
-                resolver.prepare_provider_usage_candidate(AgentId(7)).unwrap_err(),
+                resolver
+                    .prepare_provider_usage_candidate(AgentId(7))
+                    .unwrap_err(),
                 "resolution unavailable"
             );
             assert_eq!(resolver.resolution_calls.load(Ordering::SeqCst), 1);
             resolver.authority = Ok(None);
-            let candidate = resolver.prepare_provider_usage_candidate(AgentId(7)).unwrap().unwrap();
+            let candidate = resolver
+                .prepare_provider_usage_candidate(AgentId(7))
+                .unwrap()
+                .unwrap();
             assert!(candidate.authority.is_none());
             assert!(candidate.prepared_context.is_none());
             assert_eq!(resolver.resolution_calls.load(Ordering::SeqCst), 2);
@@ -5227,8 +5244,12 @@ pub mod bridge {
             );
             assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 0);
             validate_unreserved_provider_authority(
-                Some(&resolver), Some(&expected), expected.agent_id(), Some(&context),
-            ).unwrap();
+                Some(&resolver),
+                Some(&expected),
+                expected.agent_id(),
+                Some(&context),
+            )
+            .unwrap();
             assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 1);
 
             let ModelWorkContext::Project(current) = &mut resolver.context else {
@@ -5236,16 +5257,28 @@ pub mod bridge {
             };
             current.task.objective.push_str(" changed after queuing");
             assert!(validate_unreserved_provider_authority(
-                Some(&resolver), Some(&expected), expected.agent_id(), Some(&context),
-            ).is_err());
+                Some(&resolver),
+                Some(&expected),
+                expected.agent_id(),
+                Some(&context),
+            )
+            .is_err());
             let store = EventStore::open(":memory:").unwrap();
             let id = expected.request_id();
             let digest = "a".repeat(64);
-            assert!(store.reserve_request(&id, &digest, &expected.agent_id().to_string()).unwrap());
+            assert!(store
+                .reserve_request(&id, &digest, &expected.agent_id().to_string())
+                .unwrap());
             assert!(validate_pre_dispatch_provider_authority(
-                &store, Some(&resolver), Some(&expected), expected.agent_id(),
-                &id, &digest, Some(&context),
-            ).is_err());
+                &store,
+                Some(&resolver),
+                Some(&expected),
+                expected.agent_id(),
+                &id,
+                &digest,
+                Some(&context),
+            )
+            .is_err());
             assert!(store.get_completion(&id).unwrap().is_none());
             assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 3);
             assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 3);
@@ -5931,7 +5964,9 @@ pub mod bridge {
             let store = Arc::new(EventStore::open(":memory:").unwrap());
             let id = expected.request_id();
             let digest = "a".repeat(64);
-            assert!(store.reserve_request(&id, &digest, &expected.agent_id().to_string()).unwrap());
+            assert!(store
+                .reserve_request(&id, &digest, &expected.agent_id().to_string())
+                .unwrap());
             let reserved = store.get_completion(&id).unwrap().unwrap();
             let state = Arc::new(
                 StateStore::open(dir.path().join("state.redb").to_str().unwrap()).unwrap(),
@@ -5967,11 +6002,15 @@ pub mod bridge {
             perception.agent_id = expected.agent_id();
             perception_tx.send(perception).unwrap();
             tokio::time::timeout(Duration::from_secs(2), resolver.selected.notified())
-                .await.expect("candidate was not selected");
+                .await
+                .expect("candidate was not selected");
             shutdown_tx.send(true).unwrap();
             drop(perception_tx);
             tokio::time::timeout(Duration::from_secs(2), bridge)
-                .await.unwrap().unwrap().unwrap();
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             assert_eq!(resolver.selection_calls.load(Ordering::SeqCst), 1);
             assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 0);
             assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 0);

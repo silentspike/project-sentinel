@@ -31,17 +31,32 @@ fn fused_adaptive_candidate_selects_once_and_defers_context_without_cross_reques
         &temp.path().join("events.sqlite"),
     );
     PROVIDER_PREPARATION_COUNTS.with(|counts| counts.set((0, 0)));
-    let candidate = api.prepare_provider_usage_candidate(AgentId(6)).unwrap().unwrap();
+    let candidate = api
+        .prepare_provider_usage_candidate(AgentId(6))
+        .unwrap()
+        .unwrap();
     let expected = ProviderExecutionAuthority::Adaptive(Box::new(authority));
     assert_eq!(candidate.authority.as_ref(), Some(&expected));
     assert!(candidate.prepared_context.is_none());
-    assert_eq!(PROVIDER_PREPARATION_COUNTS.with(|counts| counts.get()), (1, 0));
+    assert_eq!(
+        PROVIDER_PREPARATION_COUNTS.with(|counts| counts.get()),
+        (1, 0)
+    );
     assert!(api.model_work_context(&expected).unwrap().is_some());
-    assert_eq!(PROVIDER_PREPARATION_COUNTS.with(|counts| counts.get()), (1, 1));
-    let next = api.prepare_provider_usage_candidate(AgentId(6)).unwrap().unwrap();
+    assert_eq!(
+        PROVIDER_PREPARATION_COUNTS.with(|counts| counts.get()),
+        (1, 1)
+    );
+    let next = api
+        .prepare_provider_usage_candidate(AgentId(6))
+        .unwrap()
+        .unwrap();
     assert_eq!(next.authority.as_ref(), Some(&expected));
     assert!(next.prepared_context.is_none());
-    assert_eq!(PROVIDER_PREPARATION_COUNTS.with(|counts| counts.get()), (2, 1));
+    assert_eq!(
+        PROVIDER_PREPARATION_COUNTS.with(|counts| counts.get()),
+        (2, 1)
+    );
 }
 
 #[test]
@@ -50,21 +65,32 @@ fn fused_candidates_preserve_sales_planning_routing_and_disjoint_exclusion() {
         let temp = tempfile::tempdir().unwrap();
         let (api, expected) = if planning {
             let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
-            (api, ModelExecutionContext::ProjectPlanning(Box::new(context)))
+            (
+                api,
+                ModelExecutionContext::ProjectPlanning(Box::new(context)),
+            )
         } else {
             let (api, context) = fixture(&temp.path().join("company.sqlite"));
             (api, ModelExecutionContext::RequestSales(Box::new(context)))
         };
         assert!(!api.is_provider_usage_candidate(AgentId(6)).unwrap());
         assert!(api.resolve_provider_usage_authority(AgentId(6)).is_err());
-        assert!(api.prepare_provider_usage_candidate(AgentId(6)).unwrap().is_none());
-        let candidate = api.prepare_provider_usage_candidate(expected.binding().agent_id())
-            .unwrap().unwrap();
+        assert!(api
+            .prepare_provider_usage_candidate(AgentId(6))
+            .unwrap()
+            .is_none());
+        let candidate = api
+            .prepare_provider_usage_candidate(expected.binding().agent_id())
+            .unwrap()
+            .unwrap();
         assert_eq!(candidate.authority.as_ref(), Some(&expected.binding()));
         assert_eq!(candidate.prepared_context, Some(expected));
 
         let binding = super::super::model_work::assign_test_work_from(&api, Some(1), 1_000);
-        let candidate = api.prepare_provider_usage_candidate(binding.agent_id).unwrap().unwrap();
+        let candidate = api
+            .prepare_provider_usage_candidate(binding.agent_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(candidate.authority.unwrap().project(), Some(&binding));
         assert!(candidate.prepared_context.is_none());
     }
@@ -76,7 +102,8 @@ fn fused_eligible_candidate_propagates_store_and_journal_corruption() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("company.sqlite");
         let (api, authority, _) = super::super::model_work::configured_adaptive_test_api(
-            &database, &temp.path().join("events.sqlite"),
+            &database,
+            &temp.path().join("events.sqlite"),
         );
         let connection = rusqlite::Connection::open(&database).unwrap();
         if journal {

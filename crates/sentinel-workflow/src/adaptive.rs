@@ -80,11 +80,16 @@ impl AdaptiveContinuationAuthorizationV1 {
             validate_resume_policy_binding(binding)?;
             let limits = &binding.limits;
             if self.local_adoption.is_some()
-                || !matches!(self.source, AdaptiveContinuationSourceV1::ModelUnknown
-                    | AdaptiveContinuationSourceV1::BudgetWindowExhausted { .. })
+                || !matches!(
+                    self.source,
+                    AdaptiveContinuationSourceV1::ModelUnknown
+                        | AdaptiveContinuationSourceV1::BudgetWindowExhausted { .. }
+                )
                 || self.deadline_ms > limits.expires_at_unix_ms
                 || self.deadline_ms - self.issued_at_ms > limits.max_window_ms
-                || limits.max_call_duration_ms.checked_add(limits.dispatch_margin_ms)
+                || limits
+                    .max_call_duration_ms
+                    .checked_add(limits.dispatch_margin_ms)
                     .is_none_or(|minimum| self.deadline_ms - self.issued_at_ms < minimum)
             {
                 return Err(invalid());
@@ -150,7 +155,9 @@ pub(crate) fn validate_resume_policy_binding(
         || !(1_000..=120_000).contains(&limits.max_call_duration_ms)
         || !(1_000..=ADAPTIVE_CONTINUATION_MAX_WINDOW_MS).contains(&limits.max_window_ms)
         || limits.dispatch_margin_ms == 0
-        || limits.max_call_duration_ms.checked_add(limits.dispatch_margin_ms)
+        || limits
+            .max_call_duration_ms
+            .checked_add(limits.dispatch_margin_ms)
             .is_none_or(|minimum| minimum > limits.max_window_ms)
         || limits.expires_at_unix_ms == 0
         || limits.expires_at_unix_ms > i64::MAX as u64
@@ -512,17 +519,23 @@ impl AdaptiveSessionV1 {
                     .as_ref()
                     .map(|state| state.authorizations.as_slice())
                     .unwrap_or(&[]);
-                let window_limit = authorization.resume_policy.as_ref().map_or(
-                    ADAPTIVE_CONTINUATION_MAX_WINDOWS,
-                    |binding| usize::from(binding.limits.total_window_ceiling),
-                );
+                let window_limit = authorization
+                    .resume_policy
+                    .as_ref()
+                    .map_or(ADAPTIVE_CONTINUATION_MAX_WINDOWS, |binding| {
+                        usize::from(binding.limits.total_window_ceiling)
+                    });
                 if let Some(binding) = &authorization.resume_policy {
                     if binding.limits.max_call_duration_ms != self.grant.max_call_duration_ms
-                        || history.iter().filter_map(|prior| prior.resume_policy.as_ref())
-                            .any(|prior| prior.policy_id != binding.policy_id
-                                || prior.receipt_digest != binding.receipt_digest
-                                || prior.limits != binding.limits
-                                || prior.ordinal >= binding.ordinal)
+                        || history
+                            .iter()
+                            .filter_map(|prior| prior.resume_policy.as_ref())
+                            .any(|prior| {
+                                prior.policy_id != binding.policy_id
+                                    || prior.receipt_digest != binding.receipt_digest
+                                    || prior.limits != binding.limits
+                                    || prior.ordinal >= binding.ordinal
+                            })
                     {
                         return Err(invalid());
                     }
@@ -845,7 +858,9 @@ impl AdaptiveSessionV1 {
         if let Some(state) = &self.continuation {
             for authorization in &state.authorizations {
                 if let Some(binding) = &authorization.resume_policy {
-                    duration = self.grant.max_call_duration_ms
+                    duration = self
+                        .grant
+                        .max_call_duration_ms
                         .min(binding.limits.max_call_duration_ms);
                     continue;
                 }
@@ -890,10 +905,12 @@ impl AdaptiveSessionV1 {
     pub fn model_window_exhausted_at(&self, now_ms: u64) -> bool {
         matches!(self.cursor, AdaptiveCursorV1::ReadyForModel)
             && now_ms >= self.updated_at_ms
-            && matches!(self.model_admission_at(now_ms),
+            && matches!(
+                self.model_admission_at(now_ms),
                 AdaptiveModelAdmissionV1::CallsExhausted
                     | AdaptiveModelAdmissionV1::DeadlineExpired
-                    | AdaptiveModelAdmissionV1::InsufficientSlack)
+                    | AdaptiveModelAdmissionV1::InsufficientSlack
+            )
     }
 
     pub fn model_admission_at(&self, now_ms: u64) -> AdaptiveModelAdmissionV1 {
@@ -906,11 +923,15 @@ impl AdaptiveSessionV1 {
         if now_ms >= self.active_deadline_ms() {
             return AdaptiveModelAdmissionV1::DeadlineExpired;
         }
-        if let Some(binding) = self.continuation.as_ref()
+        if let Some(binding) = self
+            .continuation
+            .as_ref()
             .and_then(|state| state.authorizations.last())
             .and_then(|authorization| authorization.resume_policy.as_ref())
         {
-            if self.effective_call_duration_ms().checked_add(binding.limits.dispatch_margin_ms)
+            if self
+                .effective_call_duration_ms()
+                .checked_add(binding.limits.dispatch_margin_ms)
                 .is_none_or(|minimum| self.active_deadline_ms() - now_ms < minimum)
             {
                 return AdaptiveModelAdmissionV1::InsufficientSlack;
@@ -920,11 +941,13 @@ impl AdaptiveSessionV1 {
     }
 
     pub(crate) fn continuation_window_limit(&self) -> usize {
-        self.continuation.as_ref()
+        self.continuation
+            .as_ref()
             .and_then(|state| state.authorizations.last())
             .and_then(|authorization| authorization.resume_policy.as_ref())
-            .map_or(ADAPTIVE_CONTINUATION_MAX_WINDOWS,
-                |binding| usize::from(binding.limits.total_window_ceiling))
+            .map_or(ADAPTIVE_CONTINUATION_MAX_WINDOWS, |binding| {
+                usize::from(binding.limits.total_window_ceiling)
+            })
     }
 
     pub fn requires_fresh_observation(&self) -> bool {
@@ -1159,12 +1182,21 @@ pub(crate) mod continuation_tests {
     #[test]
     fn unamended_admission_preserves_legacy_short_slack_and_clock_boundaries() {
         let initial = AdaptiveSessionV1::initial(grant()).unwrap();
-        assert_eq!(initial.model_admission_at(NOW + 999), AdaptiveModelAdmissionV1::Admissible);
-        assert_eq!(initial.model_admission_at(NOW + 1_000), AdaptiveModelAdmissionV1::DeadlineExpired);
+        assert_eq!(
+            initial.model_admission_at(NOW + 999),
+            AdaptiveModelAdmissionV1::Admissible
+        );
+        assert_eq!(
+            initial.model_admission_at(NOW + 1_000),
+            AdaptiveModelAdmissionV1::DeadlineExpired
+        );
         assert!(!initial.model_window_exhausted_at(NOW - 1));
         let mut spent = initial;
         spent.model_calls = spent.grant.max_model_calls;
-        assert_eq!(spent.model_admission_at(NOW + 1), AdaptiveModelAdmissionV1::CallsExhausted);
+        assert_eq!(
+            spent.model_admission_at(NOW + 1),
+            AdaptiveModelAdmissionV1::CallsExhausted
+        );
         assert!(spent.model_window_exhausted_at(NOW + 1));
     }
 

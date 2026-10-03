@@ -3,12 +3,12 @@
 #[cfg(feature = "llm")]
 mod adaptive_budget_review_extension;
 #[cfg(feature = "llm")]
-mod adaptive_resume_policy;
-#[cfg(feature = "llm")]
 mod adaptive_continuation;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/adaptive_continuation.rs"]
 mod adaptive_continuation_tests;
+#[cfg(feature = "llm")]
+mod adaptive_resume_policy;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/adaptive_tool_poll.rs"]
 mod adaptive_tool_poll_tests;
@@ -5581,9 +5581,9 @@ impl WorkflowApi {
             let binding = adaptive_leadership_review::LeadershipAuthority::from_call(&call);
             let context = self.prepare_leadership_review(&binding)?;
             return Ok(Some(PreparedProviderCandidate {
-                authority: Some(ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(
-                    binding,
-                ))),
+                authority: Some(ProviderExecutionAuthority::AdaptiveLeadershipReview(
+                    Box::new(binding),
+                )),
                 prepared_context: Some(ModelExecutionContext::AdaptiveLeadershipReview(Box::new(
                     context,
                 ))),
@@ -5609,7 +5609,9 @@ impl WorkflowApi {
             };
             let context = self.prepare_project_planning(&binding)?;
             return Ok(Some(PreparedProviderCandidate {
-                authority: Some(ProviderExecutionAuthority::ProjectPlanning(Box::new(binding))),
+                authority: Some(ProviderExecutionAuthority::ProjectPlanning(Box::new(
+                    binding,
+                ))),
                 prepared_context: Some(ModelExecutionContext::ProjectPlanning(Box::new(context))),
             }));
         }
@@ -5716,18 +5718,20 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
             return Ok(Some(unbound()));
         }
         Ok(Some(PreparedProviderCandidate {
-            authority: Some(ProviderUsageAuthority {
-                tenant_id: binding.tenant_id,
-                project_id: binding.project_id,
-                work_item_id: binding.work_item_id,
-                reservation_id: binding.reservation_id,
-                assignment_id: binding.assignment_id,
-                assignment_version: binding.assignment_version,
-                agent_id: binding.agent_id,
-                provider: binding.provider,
-                subscription_grant: binding.subscription_grant,
-            }
-            .into()),
+            authority: Some(
+                ProviderUsageAuthority {
+                    tenant_id: binding.tenant_id,
+                    project_id: binding.project_id,
+                    work_item_id: binding.work_item_id,
+                    reservation_id: binding.reservation_id,
+                    assignment_id: binding.assignment_id,
+                    assignment_version: binding.assignment_version,
+                    agent_id: binding.agent_id,
+                    provider: binding.provider,
+                    subscription_grant: binding.subscription_grant,
+                }
+                .into(),
+            ),
             prepared_context: None,
         }))
     }

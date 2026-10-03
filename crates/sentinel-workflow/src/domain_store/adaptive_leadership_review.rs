@@ -1,7 +1,7 @@
-use super::*;
 use super::adaptive_resume_policy::{
     insert_resume_review_membership, read_resume_policy_leaf, require_resume_review_membership,
 };
+use super::*;
 #[path = "adaptive_budget_review_extension.rs"]
 pub(crate) mod budget_review_extension;
 #[path = "adaptive_leadership_recovery.rs"]
@@ -133,10 +133,11 @@ fn budget_limit_causes(
         .continuation
         .as_ref()
         .is_some_and(|state| {
-            state.authorizations.len() >= grant.resume_policy.as_ref().map_or(
-                crate::adaptive::ADAPTIVE_CONTINUATION_MAX_WINDOWS,
-                |binding| usize::from(binding.limits.total_window_ceiling),
-            )
+            state.authorizations.len()
+                >= grant.resume_policy.as_ref().map_or(
+                    crate::adaptive::ADAPTIVE_CONTINUATION_MAX_WINDOWS,
+                    |binding| usize::from(binding.limits.total_window_ceiling),
+                )
         })
     {
         causes.push(AdaptiveBudgetWindowLimitCauseV1::WindowLimit);
@@ -492,10 +493,16 @@ fn require_fresh_resume_review_source(
     call: &AdaptiveLeadershipReviewCallV1,
 ) -> Result<(), WorkflowError> {
     let receipt = read_resume_policy_leaf(
-        connection, &call.grant.leadership_principal.tenant_id, call.grant.session_id,
+        connection,
+        &call.grant.leadership_principal.tenant_id,
+        call.grant.session_id,
     )?;
     let Some(binding) = &call.grant.resume_policy else {
-        return if receipt.is_some() { Err(unauthorized()) } else { Ok(()) };
+        return if receipt.is_some() {
+            Err(unauthorized())
+        } else {
+            Ok(())
+        };
     };
     let receipt = receipt.ok_or_else(unauthorized)?;
     if binding.policy_id != receipt.policy_id
@@ -512,24 +519,37 @@ fn require_fresh_resume_review_source(
     let anchor = &receipt.request.source;
     if call.context.source_session.version == anchor.expected_session_version {
         if call.context.source_project.version != anchor.expected_project_version
-            || bytes_digest("sentinel.workflow.company-entity-row.v1",
-                &encode(&call.context.source_project)?)? != anchor.project_payload_digest
+            || bytes_digest(
+                "sentinel.workflow.company-entity-row.v1",
+                &encode(&call.context.source_project)?,
+            )? != anchor.project_payload_digest
         {
             return Err(unauthorized());
         }
         match (&anchor.subject, &call.grant.subject) {
-            (crate::AdaptiveResumeSubjectV1::ReadyForModel { active_allowance_digest },
-                Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }))
-                if active_allowance_digest == &budget.active_allowance_digest => {}
-            (crate::AdaptiveResumeSubjectV1::ModelUnknown { effect, sealed_unknown_proof_digest },
+            (
+                crate::AdaptiveResumeSubjectV1::ReadyForModel {
+                    active_allowance_digest,
+                },
+                Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }),
+            ) if active_allowance_digest == &budget.active_allowance_digest => {}
+            (
+                crate::AdaptiveResumeSubjectV1::ModelUnknown {
+                    effect,
+                    sealed_unknown_proof_digest,
+                },
                 Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel {
-                    effect: actual, sealed_unknown_proof_digest: proof }))
-                if effect == actual && sealed_unknown_proof_digest == proof => {}
+                    effect: actual,
+                    sealed_unknown_proof_digest: proof,
+                }),
+            ) if effect == actual && sealed_unknown_proof_digest == proof => {}
             _ => return Err(unauthorized()),
         }
     }
     crate::store::adaptive::require_resume_policy_anchor(
-        connection, &receipt, &call.context.source_session,
+        connection,
+        &receipt,
+        &call.context.source_session,
     )?;
     Ok(())
 }
@@ -566,9 +586,12 @@ fn require_budget_source_uncached(
         || budget.observed_at_ms < source.updated_at_ms
         || budget.model_calls_exhausted != (source.model_calls >= source.active_model_ceiling())
         || budget.deadline_expired != (budget.observed_at_ms >= source.active_deadline_ms())
-        || budget.dispatch_slack_insufficient != (source.model_admission_at(budget.observed_at_ms)
-            == crate::AdaptiveModelAdmissionV1::InsufficientSlack)
-        || !(budget.model_calls_exhausted || budget.deadline_expired || budget.dispatch_slack_insufficient)
+        || budget.dispatch_slack_insufficient
+            != (source.model_admission_at(budget.observed_at_ms)
+                == crate::AdaptiveModelAdmissionV1::InsufficientSlack)
+        || !(budget.model_calls_exhausted
+            || budget.deadline_expired
+            || budget.dispatch_slack_insufficient)
     {
         return Err(unauthorized());
     }
@@ -739,7 +762,8 @@ fn validate_continuation(
         || authorization.abandoned_model_effect != abandoned
         || authorization.source != expected_source
         || authorization.additional_model_calls != *additional_model_calls
-        || (call.grant.resume_policy.is_none() && !matches!(call.grant.schema_version, 3 | 4)
+        || (call.grant.resume_policy.is_none()
+            && !matches!(call.grant.schema_version, 3 | 4)
             && *additional_model_calls > current.grant.max_calls)
         || *additional_model_calls > source.grant.max_model_calls
         || source
@@ -750,11 +774,12 @@ fn validate_continuation(
             .deadline_ms
             .checked_sub(authorization.issued_at_ms)
             != Some(*window_ms)
-        || (call.grant.resume_policy.is_none() && source
-            .grant
-            .deadline_ms
-            .checked_sub(source.grant.created_at_ms)
-            .is_none_or(|window| *window_ms > window))
+        || (call.grant.resume_policy.is_none()
+            && source
+                .grant
+                .deadline_ms
+                .checked_sub(source.grant.created_at_ms)
+                .is_none_or(|window| *window_ms > window))
         || (call.grant.resume_policy.is_none()
             && allowance.grant.max_duration_ms > policy.grant.max_duration_ms)
         || allowance.grant.max_concurrent > policy.grant.max_concurrent
@@ -766,7 +791,8 @@ fn validate_continuation(
                 .dispatched_at_unix_ms
         || (authorization.local_adoption.is_none()
             && authorization.issued_at_ms >= call.grant.expires_at_unix_ms)
-        || (call.grant.resume_policy.is_none() && !matches!(call.grant.schema_version, 3 | 4)
+        || (call.grant.resume_policy.is_none()
+            && !matches!(call.grant.schema_version, 3 | 4)
             && authorization.issued_at_ms < source.active_deadline_ms())
         || (matches!(call.grant.schema_version, 3 | 4)
             && (authorization.issued_at_ms < source.updated_at_ms
@@ -816,7 +842,10 @@ fn require_subject_time(
         if !matches!(call.grant.schema_version, 3 | 4)
             || now_ms < budget.observed_at_ms
             || now_ms < call.context.source_session.updated_at_ms
-            || !call.context.source_session.model_window_exhausted_at(now_ms)
+            || !call
+                .context
+                .source_session
+                .model_window_exhausted_at(now_ms)
         {
             return Err(transition());
         }
@@ -859,7 +888,8 @@ fn commit_continuation_allowance(
         authorization.additional_model_calls,
     )?;
     if prior.allowance_id == allowance.allowance_id
-        || (call.grant.resume_policy.is_none() && !matches!(call.grant.schema_version, 3 | 4)
+        || (call.grant.resume_policy.is_none()
+            && !matches!(call.grant.schema_version, 3 | 4)
             && allowance.grant.max_calls > prior.grant.max_calls)
         || (call.grant.resume_policy.is_none()
             && allowance.grant.max_duration_ms > policy.grant.max_duration_ms)
@@ -1068,7 +1098,8 @@ fn validate_persisted_governed_allowance_uncached(
         get_entity(connection, &project.tenant_id, KIND, &ids[0])?.ok_or_else(corrupt)?;
     validate_governed_allowance_receipt(&receipt, allowance).map_err(|_| corrupt())?;
     if receipt.grant.resume_policy.is_none() {
-        require_budget_source(connection, &receipt.grant, &receipt.context).map_err(|_| corrupt())?;
+        require_budget_source(connection, &receipt.grant, &receipt.context)
+            .map_err(|_| corrupt())?;
     }
     let authorization = receipt.continuation.as_ref().ok_or_else(corrupt)?;
     let prior = receipt
@@ -1332,7 +1363,10 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
     fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
         if self.grant.resume_policy.is_some() {
             return require_resume_review_membership(
-                connection, &self.grant, &self.context_digest()?, self.operation_id,
+                connection,
+                &self.grant,
+                &self.context_digest()?,
+                self.operation_id,
             );
         }
         WorkflowStore::require_recovery_epoch_review(connection, self)?;
@@ -1476,7 +1510,10 @@ impl WorkflowStore {
     ) -> Result<(), WorkflowError> {
         if call.grant.resume_policy.is_some() {
             require_resume_review_membership(
-                connection, &call.grant, &call.context_digest()?, call.operation_id,
+                connection,
+                &call.grant,
+                &call.context_digest()?,
+                call.operation_id,
             )
         } else {
             require_budget_source(connection, &call.grant, &call.context)
@@ -1594,44 +1631,62 @@ impl WorkflowStore {
         context.validate(grant)?;
         let existing = calls_for_session(&transaction, &leader.tenant_id, grant.session_id)?;
         if let Some(binding) = &grant.resume_policy {
-            let receipt = read_resume_policy_leaf(&transaction, &leader.tenant_id, grant.session_id)?
-                .ok_or_else(unauthorized)?;
+            let receipt =
+                read_resume_policy_leaf(&transaction, &leader.tenant_id, grant.session_id)?
+                    .ok_or_else(unauthorized)?;
             receipt.validate_binding(binding)?;
             let expected_count = usize::from(binding.ordinal) - 1;
             if now_ms >= binding.limits.expires_at_unix_ms
                 || existing.len() != expected_count
                 || existing.len() >= usize::from(binding.limits.total_review_ceiling)
-                || context.source_session.model_calls >= context.source_session.grant.max_model_calls
+                || context.source_session.model_calls
+                    >= context.source_session.grant.max_model_calls
                 || context.source_session.tool_calls >= context.source_session.grant.max_tool_calls
-                || context.source_session.continuation.as_ref().map_or(0,
-                    |state| state.authorizations.len()) >= usize::from(binding.limits.total_window_ceiling)
-                || existing.iter().any(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
-                || existing.iter().any(|call| call.grant.resume_policy.as_ref().is_some_and(|prior|
-                        prior.policy_id == binding.policy_id && prior.receipt_digest == binding.receipt_digest)
-                    && call.context.source_session == context.source_session
-                    && matches!(call.decision.as_ref().map(|decision| &decision.decision),
-                        Some(AdaptiveLeadershipReviewDecisionKindV1::KeepUnknown { .. }
-                            | AdaptiveLeadershipReviewDecisionKindV1::DeferBudget { .. })))
+                || context
+                    .source_session
+                    .continuation
+                    .as_ref()
+                    .map_or(0, |state| state.authorizations.len())
+                    >= usize::from(binding.limits.total_window_ceiling)
+                || existing
+                    .iter()
+                    .any(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
+                || existing.iter().any(|call| {
+                    call.grant.resume_policy.as_ref().is_some_and(|prior| {
+                        prior.policy_id == binding.policy_id
+                            && prior.receipt_digest == binding.receipt_digest
+                    }) && call.context.source_session == context.source_session
+                        && matches!(
+                            call.decision.as_ref().map(|decision| &decision.decision),
+                            Some(
+                                AdaptiveLeadershipReviewDecisionKindV1::KeepUnknown { .. }
+                                    | AdaptiveLeadershipReviewDecisionKindV1::DeferBudget { .. }
+                            )
+                        )
+                })
             {
                 return Err(transition());
             }
         } else {
-            if read_resume_policy_leaf(&transaction, &leader.tenant_id, grant.session_id)?.is_some() {
+            if read_resume_policy_leaf(&transaction, &leader.tenant_id, grant.session_id)?.is_some()
+            {
                 return Err(unauthorized());
             }
-            let (global_review_limit, head_review_limit, extension_expiry) =
-                if grant.schema_version == 3 {
-                    budget_review_extension::limits_for_review(&transaction, grant, context, now_ms)?
-                } else {
-                    (
-                        ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
-                        ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
-                        None,
-                    )
-                };
+            let (global_review_limit, head_review_limit, extension_expiry) = if grant.schema_version
+                == 3
+            {
+                budget_review_extension::limits_for_review(&transaction, grant, context, now_ms)?
+            } else {
+                (
+                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                    None,
+                )
+            };
             if grant.schema_version == 3 {
                 require_budget_source(&transaction, grant, context)?;
-                if context.source_session.model_calls >= context.source_session.grant.max_model_calls
+                if context.source_session.model_calls
+                    >= context.source_session.grant.max_model_calls
                     || context
                         .source_session
                         .continuation
@@ -1655,7 +1710,9 @@ impl WorkflowStore {
             }
             let same_head: Vec<_> = existing
                 .iter()
-                .filter(|call| call.grant.expected_session_version == grant.expected_session_version)
+                .filter(|call| {
+                    call.grant.expected_session_version == grant.expected_session_version
+                })
                 .collect();
             if same_head
                 .iter()
@@ -1703,7 +1760,11 @@ impl WorkflowStore {
         require_current_source(&transaction, &call)?;
         if call.grant.resume_policy.is_some() {
             insert_resume_review_membership(
-                &transaction, &call.grant, call.operation_id, &call.context_digest()?, now_ms,
+                &transaction,
+                &call.grant,
+                call.operation_id,
+                &call.context_digest()?,
+                now_ms,
             )?;
         }
         store_call(&transaction, &call, "adaptive_leadership_review_authorized")?;
@@ -1724,7 +1785,12 @@ impl WorkflowStore {
             return Err(unauthorized());
         }
         self.authorize_adaptive_leadership_review_call(
-            leader, operation_id, allowance_id, grant, context, now_ms,
+            leader,
+            operation_id,
+            allowance_id,
+            grant,
+            context,
+            now_ms,
         )
     }
 
