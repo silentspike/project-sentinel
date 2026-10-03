@@ -4618,6 +4618,13 @@ impl WorkflowApi {
         let Some(session) = session else {
             return Ok(None);
         };
+        Ok(Self::customer_session_progress(&session, now_unix_ms()))
+    }
+
+    fn customer_session_progress(
+        session: &AdaptiveSessionV1,
+        now_ms: u64,
+    ) -> Option<serde_json::Value> {
         let (status, label) = match &session.cursor {
             AdaptiveCursorV1::Blocked { reason_code }
                 if reason_code == "no_private_observation" =>
@@ -4630,9 +4637,15 @@ impl WorkflowApi {
             AdaptiveCursorV1::ModelUnknown { .. } => {
                 ("model_outcome_unknown", "Model outcome unknown.")
             }
-            _ => return Ok(None),
+            AdaptiveCursorV1::ToolUnknown { .. } => {
+                ("tool_outcome_unknown", "Tool outcome unknown.")
+            }
+            AdaptiveCursorV1::ReadyForModel if session.model_window_exhausted_at(now_ms) => {
+                ("paused_work_window", "Paused: work window unavailable.")
+            }
+            _ => return None,
         };
-        Ok(Some(serde_json::json!({"status": status, "label": label})))
+        Some(serde_json::json!({"status": status, "label": label}))
     }
 
     fn customer_request(&self, principal: &BoundPrincipal, path: &str) -> WorkflowHttpResponse {
@@ -6525,6 +6538,252 @@ mod tests {
         let response = api.customer_overview(&customer, CUSTOMER_OVERVIEW_PATH);
         assert_eq!(response.status, 200);
         serde_json::from_slice(&response.body).unwrap()
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn customer_progress_reports_window_denial_without_changing_admission_or_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, ready) = adaptive_recovery::tests::fixture(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+            false,
+        );
+        let paused = Some(serde_json::json!({
+            "status": "paused_work_window", "label": "Paused: work window unavailable."
+        }));
+        assert!(WorkflowApi::customer_session_progress(&ready, ready.updated_at_ms).is_none());
+        assert!(WorkflowApi::customer_session_progress(&ready, ready.updated_at_ms - 1).is_none());
+        assert!(
+            WorkflowApi::customer_session_progress(&ready, ready.active_deadline_ms() - 1)
+                .is_none()
+        );
+        assert_eq!(
+            WorkflowApi::customer_session_progress(&ready, ready.active_deadline_ms()),
+            paused
+        );
+        assert_eq!(
+            WorkflowApi::customer_session_progress(&ready, ready.active_deadline_ms() + 1),
+            paused
+        );
+
+        let mut exhausted = ready.clone();
+        exhausted.model_calls = exhausted.active_model_ceiling();
+        assert_eq!(
+            WorkflowApi::customer_session_progress(&exhausted, exhausted.updated_at_ms),
+            paused
+        );
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "a".repeat(64),
+        };
+        // No in-flight or terminal state may be mislabeled as waiting for funding.
+        for cursor in [
+            AdaptiveCursorV1::ModelPending {
+                effect: effect.clone(),
+            },
+            AdaptiveCursorV1::CompletionProposed {
+                artifact_digest: "b".repeat(64),
+            },
+            AdaptiveCursorV1::Blocked {
+                reason_code: "private_reason".into(),
+            },
+            AdaptiveCursorV1::Cancelled,
+        ] {
+            exhausted.cursor = cursor;
+            assert!(WorkflowApi::customer_session_progress(
+                &exhausted,
+                ready.active_deadline_ms() + 1
+            )
+            .is_none());
+        }
+        assert_eq!(
+            api.store
+                .adaptive_session(ready.grant.session_id, &ready.grant.authority)
+                .unwrap(),
+            Some(ready)
+        );
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn customer_progress_spent_window_read_preserves_project_events_and_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, mut session) = adaptive_recovery::tests::fixture(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+            false,
+        );
+        let tool = WorkbenchTool::InspectFile {
+            path: "README.md".into(),
+            max_bytes: 1024,
+        };
+        let tool_digest = sentinel_workflow::adaptive_tool_digest(&tool).unwrap();
+        for _ in 0..session.grant.max_model_calls {
+            let effect = AdaptiveEffectV1 {
+                id: Uuid::new_v4(),
+                request_digest: "a".repeat(64),
+            };
+            let previous_observation_digest = session
+                .last_observation
+                .as_ref()
+                .map(|value| value.observation_digest.clone());
+            session = customer_progress_advance(
+                &api,
+                &session,
+                AdaptiveTransitionV1::ClaimModel {
+                    effect: effect.clone(),
+                    previous_observation_digest,
+                },
+            );
+            session = customer_progress_advance(
+                &api,
+                &session,
+                AdaptiveTransitionV1::ResolveModel {
+                    effect,
+                    result_digest: "b".repeat(64),
+                    decision: sentinel_workflow::AdaptiveModelDecisionV1::Tool {
+                        tool: tool.clone(),
+                        tool_digest: tool_digest.clone(),
+                    },
+                },
+            );
+            let effect = AdaptiveEffectV1 {
+                id: Uuid::new_v4(),
+                request_digest: "c".repeat(64),
+            };
+            session = customer_progress_advance(
+                &api,
+                &session,
+                AdaptiveTransitionV1::ClaimTool {
+                    effect: effect.clone(),
+                    tool_digest: tool_digest.clone(),
+                },
+            );
+            session = customer_progress_advance(
+                &api,
+                &session,
+                AdaptiveTransitionV1::ObserveTool {
+                    observation: sentinel_workflow::AdaptiveObservationRefV1 {
+                        effect,
+                        observation_digest: "d".repeat(64),
+                    },
+                },
+            );
+        }
+        assert!(matches!(session.cursor, AdaptiveCursorV1::ReadyForModel));
+        assert_eq!(session.model_calls, session.grant.max_model_calls);
+        let projects = api.store.company_projects().unwrap();
+        let cursor = api.store.company_event_cursor().unwrap();
+        for _ in 0..2 {
+            let body = customer_progress_body(&api);
+            let work = &body["projects"][0]["work_items"][0];
+            assert_eq!(work["state"], "assigned");
+            assert_eq!(
+                work["adaptive_progress"],
+                serde_json::json!({
+                    "status":"paused_work_window", "label":"Paused: work window unavailable."
+                })
+            );
+            assert!(!body
+                .to_string()
+                .contains(&session.grant.session_id.to_string()));
+            assert_eq!(api.store.company_projects().unwrap(), projects);
+            assert_eq!(api.store.company_event_cursor().unwrap(), cursor);
+            assert_eq!(
+                api.store
+                    .adaptive_session(session.grant.session_id, &session.grant.authority)
+                    .unwrap(),
+                Some(session.clone())
+            );
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn customer_progress_unknown_tool_is_read_only_and_never_a_window_pause() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, ready) = adaptive_recovery::tests::fixture(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+            false,
+        );
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "a".repeat(64),
+        };
+        let pending = customer_progress_advance(
+            &api,
+            &ready,
+            AdaptiveTransitionV1::ClaimModel {
+                effect: effect.clone(),
+                previous_observation_digest: None,
+            },
+        );
+        let tool = WorkbenchTool::InspectFile {
+            path: "README.md".into(),
+            max_bytes: 1024,
+        };
+        let tool_digest = sentinel_workflow::adaptive_tool_digest(&tool).unwrap();
+        let proposed = customer_progress_advance(
+            &api,
+            &pending,
+            AdaptiveTransitionV1::ResolveModel {
+                effect,
+                result_digest: "b".repeat(64),
+                decision: sentinel_workflow::AdaptiveModelDecisionV1::Tool {
+                    tool,
+                    tool_digest: tool_digest.clone(),
+                },
+            },
+        );
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "c".repeat(64),
+        };
+        let pending = customer_progress_advance(
+            &api,
+            &proposed,
+            AdaptiveTransitionV1::ClaimTool {
+                effect: effect.clone(),
+                tool_digest,
+            },
+        );
+        assert!(customer_progress_body(&api)["projects"][0]["work_items"][0]
+            .get("adaptive_progress")
+            .is_none());
+        let unknown =
+            customer_progress_advance(&api, &pending, AdaptiveTransitionV1::MarkUnknown { effect });
+        let projects = api.store.company_projects().unwrap();
+        let cursor = api.store.company_event_cursor().unwrap();
+        let expected =
+            serde_json::json!({"status":"tool_outcome_unknown", "label":"Tool outcome unknown."});
+        assert_eq!(
+            WorkflowApi::customer_session_progress(&unknown, unknown.active_deadline_ms() + 1),
+            Some(expected.clone())
+        );
+        let body = customer_progress_body(&api);
+        assert_eq!(
+            body["projects"][0]["work_items"][0]["adaptive_progress"],
+            expected
+        );
+        let bytes = body.to_string();
+        for private in [
+            unknown.grant.session_id.to_string(),
+            "request_digest".into(),
+            "tool_digest".into(),
+            "max_bytes".into(),
+        ] {
+            assert!(!bytes.contains(&private));
+        }
+        assert_eq!(api.store.company_projects().unwrap(), projects);
+        assert_eq!(api.store.company_event_cursor().unwrap(), cursor);
+        assert_eq!(
+            api.store
+                .adaptive_session(unknown.grant.session_id, &unknown.grant.authority)
+                .unwrap(),
+            Some(unknown)
+        );
     }
 
     #[cfg(feature = "llm")]

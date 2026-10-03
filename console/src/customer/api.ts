@@ -54,6 +54,8 @@ export function customerPreviewAvailable(delivery: CustomerDelivery, now: number
 }
 export type CustomerAdaptiveProgress =
   | { status: "paused_internal_observation"; label: "Paused: awaiting internal observation." }
+  | { status: "paused_work_window"; label: "Paused: work window unavailable." }
+  | { status: "tool_outcome_unknown"; label: "Tool outcome unknown." }
   | { status: "model_outcome_unknown"; label: "Model outcome unknown." };
 export interface CustomerWorkProgress { work_item_id: string; state: string; adaptive_progress?: CustomerAdaptiveProgress }
 export interface ProjectProgress { project_id: string; request_id: string; state: string; version: number; work_items: CustomerWorkProgress[]; deliveries?: CustomerDelivery[] }
@@ -61,6 +63,8 @@ export interface ProjectProgress { project_id: string; request_id: string; state
 export function customerAdaptiveProgressLabel(value: CustomerAdaptiveProgress | undefined): string | undefined {
   if (value?.status === "paused_internal_observation" && value.label === "Paused: awaiting internal observation.") return value.label;
   if (value?.status === "model_outcome_unknown" && value.label === "Model outcome unknown.") return value.label;
+  if (value?.status === "paused_work_window" && value.label === "Paused: work window unavailable.") return value.label;
+  if (value?.status === "tool_outcome_unknown" && value.label === "Tool outcome unknown.") return value.label;
   return undefined;
 }
 export interface Overview { requests: CustomerRequest[]; proposals: Proposal[]; projects?: ProjectProgress[] }

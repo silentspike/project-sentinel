@@ -122,6 +122,8 @@ describe("customer work progress", () => {
   it.each([
     { status: "paused_internal_observation", label: "Paused: awaiting internal observation." },
     { status: "model_outcome_unknown", label: "Model outcome unknown." },
+    { status: "paused_work_window", label: "Paused: work window unavailable." },
+    { status: "tool_outcome_unknown", label: "Tool outcome unknown." },
   ] as const)("shows $status separately from company state without work actions", async progress => {
     const value = structuredClone(overview);
     value.projects![0].work_items = [{ work_item_id: "website", state: "assigned", adaptive_progress: progress }];
@@ -155,6 +157,8 @@ describe("customer work progress", () => {
   it.each([
     { status: "model_outcome_unknown", label: "private-provider-secret /work/private token=secret" },
     { status: "provider_quota", label: "private-provider-secret /work/private token=secret" },
+    { status: "paused_work_window", label: "Model outcome unknown." },
+    { status: "tool_outcome_unknown", label: "Paused: work window unavailable." },
   ])("never renders unrecognized status or noncanonical label: $status", async progress => {
     const value = structuredClone(overview);
     value.projects![0].work_items = [{ work_item_id: "website", state: "assigned",
@@ -197,6 +201,8 @@ describe("customer work progress", () => {
   it.each([
     { status: "paused_internal_observation", label: "Paused: awaiting internal observation." },
     { status: "model_outcome_unknown", label: "Model outcome unknown." },
+    { status: "paused_work_window", label: "Paused: work window unavailable." },
+    { status: "tool_outcome_unknown", label: "Tool outcome unknown." },
   ] as const)("suppresses stale $status after a 503 and restores progress only after refresh succeeds", async progress => {
     const value = structuredClone(overview);
     value.projects![0].work_items = [{ work_item_id: "website", state: "assigned", adaptive_progress: progress }];

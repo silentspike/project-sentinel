@@ -1,5 +1,10 @@
 # Changelog
 
+- Show a fixed customer execution pause when a current adaptive model window
+  cannot admit work, and distinguish an unknown tool outcome from that pause.
+  Keep business state, authority, spending and unknown-effect recovery unchanged;
+  suppress stale or noncanonical progress instead of implying completion (#856).
+
 - Inspect adaptive runtime health from validated durable heads and journals,
   independently of current execution-profile and assignment admission.
   Preserve historical unknown model/tool effects and fail on broken lineage;
