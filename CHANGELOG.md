@@ -1,5 +1,11 @@
 # Changelog
 
+- Preserve mounted desktop panels and unsaved editor state when splitting,
+  resizing or closing neighboring panes. Keep keyboard/pointer gutters and
+  nested minimum dimensions, constrain Control form fields to their tracks,
+  and align loaded agent configuration fields without changing save authority.
+  Add production-store lifecycle and layout regressions (#856).
+
 - Add finite, operator-scoped same-session work-funding proposals and immutable
   receipt/event storage. Authenticate the exact journal/project source at
   issuance, preserve replay after expiry, and reject unknown effects, source

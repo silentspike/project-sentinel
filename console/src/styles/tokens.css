@@ -509,7 +509,7 @@ input, select { font: inherit; color: var(--text); background: var(--surface-0);
 .control-shell, .timetravel-shell { display: grid; gap: 12px; }
 .control-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(310px, 100%), 1fr));
   gap: 12px;
 }
 .control-card {
@@ -550,10 +550,18 @@ input, select { font: inherit; color: var(--text); background: var(--surface-0);
 .form-grid--three { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
 .form-grid label, .control-stack label {
   display: grid;
+  min-width: 0;
   gap: 4px;
   color: var(--text-muted);
   font-size: 12px;
 }
+.form-grid input:not([type="checkbox"]), .form-grid select, .form-grid textarea,
+.control-stack input:not([type="checkbox"]), .control-stack select {
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+.control-stack input[type="range"] { margin: 0; }
 .form-grid textarea {
   min-height: 82px;
   resize: vertical;

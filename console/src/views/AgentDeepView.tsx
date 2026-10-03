@@ -147,13 +147,11 @@ function Donut(props: { data: { label: string; value: number }[] }): JSX.Element
   );
 }
 
-export function AgentDeepView(): JSX.Element {
-  // The agent id comes from the shared selection (an AgentsView click), with a `#deep=<id>` URL-hash
-  // fallback for deep-linking. Consume-and-clear the shared signal so a stale click never overrides
-  // this panel's agent on a later re-open.
-  const initial = selectedAgentId() ?? readDeepLinkAgentId();
+export function AgentDeepView(props: { initialAgentId?: number } = {}): JSX.Element {
+  // Product clicks carry a tile-local target; legacy selection and URL deep links remain fallbacks.
+  const initial = props.initialAgentId ?? selectedAgentId() ?? readDeepLinkAgentId();
   const [agentId] = createSignal<number | null>(initial);
-  setSelectedAgentId(null);
+  if (props.initialAgentId == null) setSelectedAgentId(null);
 
   const aggregateId = createMemo(() =>
     agentId() != null ? `AGENT-${String(agentId()).padStart(2, "0")}` : "",
