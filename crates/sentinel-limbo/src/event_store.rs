@@ -8071,7 +8071,7 @@ mod tests {
                             )
                             .unwrap();
                         }
-                        "error" => changed.expected_error.push_str(" "),
+                        "error" => changed.expected_error.push(' '),
                         "reason" => changed.reason_code = "schema_correction".into(),
                         "attempts" => changed.expected_attempt_count += 1,
                         "created" => changed.expected_created_at_ms += 1,
