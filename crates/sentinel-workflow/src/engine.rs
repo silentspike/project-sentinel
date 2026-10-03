@@ -139,6 +139,33 @@ where
         self.store.adaptive_session(session_id, &current)
     }
 
+    pub fn adaptive_working_memory_source(
+        &self,
+        session_id: uuid::Uuid,
+        provider_version: u64,
+        effect_id: uuid::Uuid,
+        authority: &crate::RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<crate::AdaptiveWorkingMemorySourceV1>, WorkflowError> {
+        require_ready(
+            self.organization.readiness(),
+            WorkflowErrorCode::OrganizationUnavailable,
+        )?;
+        let current = self
+            .organization
+            .authority_snapshot(
+                &authority.tenant_id,
+                &authority.project_id,
+                &authority.work_item_id,
+                authority.agent_id,
+            )
+            .map_err(map_organization_error)?;
+        if current != *authority {
+            return Err(authority_conflict());
+        }
+        self.store
+            .adaptive_working_memory_source(session_id, provider_version, effect_id, &current)
+    }
+
     pub fn adaptive_session_for_authority(
         &self,
         authority: &crate::RuntimeAuthoritySnapshotV1,

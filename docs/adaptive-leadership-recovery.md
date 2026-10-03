@@ -44,6 +44,45 @@ fund inspection alone, so leadership must explicitly budget useful subsequent
 work. Exact committed replay returns the original receipt after later head
 advancement without granting new authority or rewinding the session.
 
+## Working Memory And Accounting Reconsideration
+
+Employee model contexts include a private, bounded projection of the same
+validated adaptive journal: observed tool kinds, scoped labels, observation
+pointers and numeric results. File contents, command arguments and stdout do
+not enter this history. The latest observation and latest test are retained
+when older rows are omitted. An unavailable observation proves no success;
+revoked or invalid observation authority rejects the read. A successful tool
+does not imply a passing test: exit codes and native test outcomes remain
+separate. History never grants access, replaces fresh inspection, or proves
+completion. Previously sealed model contexts retain their exact old bytes.
+
+New policy-bound leadership contexts distinguish the immutable root budget,
+current work-window allowance, actual windows issued and review ordinal. These
+are different counters: review17 does not mean seventeen windows were issued,
+and one remaining call in an old window does not mean only one remains in the
+original root budget. The projection is sealed in the call's evidence before
+context hashing; an old unmarked call retains its original prompt.
+
+`/operator/workflow/adaptive-accounting-reconsideration` supports exactly one
+explicit reconsideration for an original session's completed schema-3
+DeferBudget under its existing finite resume policy. Only a registered Operator
+Project Manager or Technical Lead may request it. GET with `project_id`,
+`session_id` and `refused_review_id` returns a redacted, server-bound draft
+without issuing authority. POST accepts that typed draft and atomically seals
+the original refusal, current project/journal/policy/authority, corrected
+accounting and one designated ordinary review. Its deadline is at most five
+minutes and cannot outlive the original policy.
+
+The receipt, event, membership and designated call commit together. Root
+ceilings, consumed calls, prior decisions and employee work remain unchanged.
+Issuance is not Continue and creates no employee window. The real leader may
+independently Continue within the existing policy or Defer again. Automatic
+refusal reconciliation remains blocked. A failed, expired, unresolved or
+deferred correction permanently consumes its opportunity; another operation,
+head, restart or release cannot refill it. Exact replay returns the original
+receipt without renewing its clock or counters. Public responses omit raw
+model content, private observations, tool catalogues and principal credentials.
+
 ## Normal Review Extension
 
 `/operator/workflow/adaptive-budget-review-extensions` is a separate operator

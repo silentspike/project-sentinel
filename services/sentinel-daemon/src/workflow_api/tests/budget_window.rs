@@ -1327,6 +1327,12 @@ impl Fixture {
             .expect("reconciliation must issue the exact review head");
         let context = LeadershipContext {
             binding: LeadershipAuthority::from_call(&call),
+            accounting: LeadershipContext::accounting_projection(
+                &LeadershipAuthority::from_call(&call),
+                &call.context,
+            )
+            .unwrap(),
+            accounting_correction: None,
             context_digest: call.context_digest().unwrap(),
             source: call.context,
             private_observation: None,

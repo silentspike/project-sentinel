@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use uuid::Uuid;
 
+mod adaptive_accounting_reconsideration;
 mod adaptive_leadership_local_adoption;
 mod adaptive_leadership_review;
 pub(crate) mod adaptive_resume_policy;

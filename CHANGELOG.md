@@ -1,5 +1,12 @@
 # Changelog
 
+- Give adaptive employees bounded, private journal working memory with observed
+  tool outcomes and explicit root/window spending. Preserve sealed historical
+  model contexts, fresh inspection and failed-test truth. Permit one explicit
+  operator accounting reconsideration of a retained leadership refusal within
+  the original finite policy; never reset work, refund spending, fabricate a
+  decision or automatically retry until agreement (#856).
+
 - Accept the actual retained Adaptive completion envelope, which omits the
   leadership-only redundant response hash. Seal its full payload and raw
   content digest without rewriting the response; reject every malformed or

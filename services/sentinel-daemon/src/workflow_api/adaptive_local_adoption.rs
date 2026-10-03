@@ -265,7 +265,10 @@ impl WorkflowApi {
                 .ok_or("local adoption model response missing")?,
         )
         .map_err(|_| "local adoption model response invalid")?;
+        let (accounting, accounting_correction) = self.leadership_accounting_fields(&call)?;
         let expected = LeadershipContext {
+            accounting,
+            accounting_correction,
             private_observation: None,
             binding: LeadershipAuthority::from_call(&call),
             source: call.context.clone(),
@@ -639,6 +642,12 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let context = LeadershipContext {
+                accounting: LeadershipContext::accounting_projection(
+                    &LeadershipAuthority::from_call(&epoch_call),
+                    &epoch_call.context,
+                )
+                .unwrap(),
+                accounting_correction: None,
                 private_observation: None,
                 binding: LeadershipAuthority::from_call(&epoch_call),
                 context_digest: epoch_call.context_digest().unwrap(),
@@ -1347,6 +1356,12 @@ mod tests {
             let mut f = LocalFixture::with_assignee_state(unknown, false, true);
             let context = LeadershipContext {
                 binding: LeadershipAuthority::from_call(&f.pending),
+                accounting: LeadershipContext::accounting_projection(
+                    &LeadershipAuthority::from_call(&f.pending),
+                    &f.pending.context,
+                )
+                .unwrap(),
+                accounting_correction: None,
                 source: f.pending.context.clone(),
                 context_digest: f.pending.context_digest().unwrap(),
                 private_observation: None,
@@ -1385,6 +1400,12 @@ mod tests {
             let mut f = LocalFixture::with_assignee_state(unknown, false, true);
             let context = LeadershipContext {
                 binding: LeadershipAuthority::from_call(&f.pending),
+                accounting: LeadershipContext::accounting_projection(
+                    &LeadershipAuthority::from_call(&f.pending),
+                    &f.pending.context,
+                )
+                .unwrap(),
+                accounting_correction: None,
                 source: f.pending.context.clone(),
                 context_digest: f.pending.context_digest().unwrap(),
                 private_observation: None,
