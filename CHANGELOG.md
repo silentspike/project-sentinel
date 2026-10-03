@@ -1,5 +1,10 @@
 # Changelog
 
+- Recreate failed dashboard NATS live consumers with bounded backoff instead
+  of polling a deleted consumer forever. Refresh connected clients from the
+  current agent, room and KPI projections on each subscription; keep idle
+  reads suppressed and never replay business effects or the event backlog (#856).
+
 - Show a fixed customer execution pause when a current adaptive model window
   cannot admit work, and distinguish an unknown tool outcome from that pause.
   Keep business state, authority, spending and unknown-effect recovery unchanged;

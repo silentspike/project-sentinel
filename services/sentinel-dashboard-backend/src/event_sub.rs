@@ -15,6 +15,9 @@
 //! **Consumer: ephemeral** (kein `durable_name`) + **`DeliverPolicy::New`** — ab Connect nur NEUE
 //! Events, KEIN Backlog-Replay des 7-Tage-Streams; der Connect-Snapshot (`wt.rs`) deckt den
 //! Ist-Zustand. `InactiveThreshold` raeumt den Consumer nach Disconnect serverseitig auf.
+//! A failed pull stream is discarded and recreated through the bounded reconnect loop.
+//! Every new subscription refreshes all live projections for already connected clients;
+//! this repairs missed notifications without replaying events or business effects.
 
 use std::time::Duration;
 
@@ -244,8 +247,20 @@ async fn subscribe_and_pump(state: &AppState) -> anyhow::Result<()> {
         "event subscriber: subscribed to SENTINEL_EVENTS (ephemeral, DeliverPolicy::New)"
     );
 
-    let mut messages = consumer.messages().await?;
-    let mut dirty = DirtyModels::default();
+    pump_live_messages(state, consumer.messages().await?).await
+}
+
+async fn pump_live_messages<S>(state: &AppState, mut messages: S) -> anyhow::Result<()>
+where
+    S: futures::Stream<
+            Item = Result<
+                async_nats::jetstream::Message,
+                async_nats::jetstream::consumer::pull::MessagesError,
+            >,
+        > + Unpin,
+{
+    // DeliverPolicy::New skips events lost during disconnect; refresh existing clients too.
+    let mut dirty = classify("config_applied");
     let mut tick = tokio::time::interval(Duration::from_millis(150));
 
     loop {
@@ -254,7 +269,10 @@ async fn subscribe_and_pump(state: &AppState) -> anyhow::Result<()> {
                 Some(Ok(msg)) => {
                     dirty.merge(classify(event_type_from_subject(msg.subject.as_str())));
                 }
-                Some(Err(e)) => tracing::warn!(error = %e, "nats message error, continue"),
+                Some(Err(e)) => {
+                    let context = format!("nats live consumer failed: {}", e.kind());
+                    return Err(anyhow::Error::new(e).context(context));
+                },
                 None => anyhow::bail!("nats messages stream ended"),
             },
             _ = tick.tick() => {
@@ -409,6 +427,105 @@ fn push_kpi(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn live_consumer_errors_exit_before_polling_the_dead_stream_again() {
+        use async_nats::jetstream::consumer::pull::{MessagesError, MessagesErrorKind};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let state = crate::AppState::new(crate::Config::from_env()).unwrap();
+        for kind in [
+            MessagesErrorKind::NoResponders,
+            MessagesErrorKind::MissingHeartbeat,
+            MessagesErrorKind::ConsumerDeleted,
+            MessagesErrorKind::Pull,
+            MessagesErrorKind::PushBasedConsumer,
+            MessagesErrorKind::Other,
+        ] {
+            let polls_after_error = AtomicUsize::new(0);
+            let stream = futures::stream::iter([Err(MessagesError::new(kind))]).chain(
+                futures::stream::poll_fn(|_| {
+                    polls_after_error.fetch_add(1, Ordering::SeqCst);
+                    std::task::Poll::Pending
+                }),
+            );
+            let failure = tokio::time::timeout(
+                Duration::from_secs(2),
+                pump_live_messages(&state, stream),
+            )
+            .await
+            .expect("consumer error must return to the bounded reconnect loop")
+            .unwrap_err();
+            assert_eq!(failure.to_string(), format!("nats live consumer failed: {kind}"));
+            assert_eq!(failure.root_cause().to_string(), kind.to_string());
+            assert_eq!(polls_after_error.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_consumer_end_returns_to_the_reconnect_loop() {
+        let state = crate::AppState::new(crate::Config::from_env()).unwrap();
+        let failure = tokio::time::timeout(
+            Duration::from_secs(2),
+            pump_live_messages(&state, futures::stream::empty()),
+        )
+        .await
+        .expect("ended consumer must not leave a ticking zombie task")
+        .unwrap_err();
+        assert_eq!(failure.to_string(), "nats messages stream ended");
+    }
+
+    #[tokio::test]
+    async fn live_consumer_reconnect_refreshes_existing_clients_without_a_new_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("projection.db");
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE agent_live_view (agent_id INTEGER PRIMARY KEY,name TEXT NOT NULL,role TEXT NOT NULL,\
+             shift_set INTEGER NOT NULL,status TEXT NOT NULL,current_room TEXT,in_transit INTEGER NOT NULL,\
+             transit_target TEXT,last_action TEXT,last_action_tick INTEGER,hunger REAL NOT NULL,energy REAL NOT NULL,\
+             stress REAL NOT NULL,bladder REAL NOT NULL,social_need REAL NOT NULL,caffeine_mg REAL NOT NULL,mood TEXT,\
+             last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+             INSERT INTO agent_live_view VALUES (36,'Nils','Developer',1,'active','office',0,NULL,NULL,NULL,\
+             0.2,0.8,0.1,0.0,0.0,0.0,'focused',5,100);\
+             CREATE TABLE room_live_view (room_id TEXT PRIMARY KEY,occupant_count INTEGER NOT NULL,\
+             transit_count INTEGER NOT NULL,active_chaos TEXT,active_smells TEXT,temperature REAL,\
+             co2_ppm REAL,noise_db REAL,last_event_tick INTEGER,last_event_id INTEGER NOT NULL,\
+             updated_at INTEGER NOT NULL);\
+             INSERT INTO room_live_view VALUES ('office',1,0,'[]','[]',22.0,650.0,40.0,7,11,1200);\
+             CREATE TABLE kpi_1m (bucket_start INTEGER PRIMARY KEY,active_agents INTEGER NOT NULL,\
+             total_actions INTEGER NOT NULL,total_transits INTEGER NOT NULL,chaos_events INTEGER NOT NULL,\
+             tick_count INTEGER NOT NULL,shift_changes INTEGER NOT NULL,nightrun_events INTEGER NOT NULL,\
+             updated_at INTEGER NOT NULL);\
+             INSERT INTO kpi_1m VALUES (1000,1,30,4,1,60,0,0,1100);"
+        ).unwrap();
+        let projection_before = std::fs::read(&db).unwrap();
+        let mut config = crate::Config::from_env();
+        config.projection_db = db.to_string_lossy().into_owned();
+        let state = crate::AppState::new(config).unwrap();
+        let mut receiver = state.broadcast_tx.subscribe();
+        let pump_state = state.clone();
+        let pump = tokio::spawn(async move {
+            pump_live_messages(&pump_state, futures::stream::pending()).await
+        });
+        let mut frames = std::collections::BTreeMap::new();
+        for _ in 0..3 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("reconnect must refresh all live projections")
+                .unwrap();
+            let (topic, value): (String, serde_json::Value) =
+                crate::codec::decode_frame_as(&frame).unwrap();
+            frames.insert(topic, value);
+        }
+        pump.abort();
+        assert!(pump.await.unwrap_err().is_cancelled());
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames["agent_live"]["agents"][0]["name"], "Nils");
+        assert_eq!(frames["room_live"]["rooms"][0]["room_id"], "office");
+        assert_eq!(frames["kpi"]["kpi"]["active_agents"], 1);
+        assert_eq!(std::fs::read(&db).unwrap(), projection_before);
+    }
 
     /// Alle Event-Typen aus `sentinel_common::DomainEventPayload::event_type_str()` (SSOT-Spiegel,
     /// events.rs:366-400). Neue Varianten faengt der Fail-safe-Default ab (siehe
