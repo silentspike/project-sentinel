@@ -14,6 +14,9 @@ pub const ADAPTIVE_SCHEMA_MAX_CORRECTIONS: u16 = 2;
 pub const ADAPTIVE_TOOL_MAX_BYTES: usize = 256 * 1024;
 pub const ADAPTIVE_CONTINUATION_MAX_WINDOWS: usize = 3;
 pub const ADAPTIVE_CONTINUATION_MAX_WINDOW_MS: u64 = 300_000;
+pub const ADAPTIVE_WORKING_MEMORY_MAX_ROWS: usize = 16;
+pub const ADAPTIVE_WORKING_MEMORY_MAX_LABEL_BYTES: usize = 256;
+pub const ADAPTIVE_WORKING_MEMORY_MAX_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -374,6 +377,180 @@ pub struct AdaptiveFirstUnknownModelJournalEvidenceV1 {
 pub struct AdaptiveObservationRefV1 {
     pub effect: AdaptiveEffectV1,
     pub observation_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveWorkingMemoryToolKindV1 {
+    ListDirectory,
+    InspectFile,
+    WriteFile,
+    ApplyPatch,
+    RunCommand,
+    RunTests,
+    PackageArtifact,
+}
+
+/// Historical action pointers only: no tool contents, arguments or output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveWorkingMemoryCompletedRowV1 {
+    pub session_version: u64,
+    pub entry_digest: String,
+    pub recorded_at_ms: u64,
+    pub tool_kind: AdaptiveWorkingMemoryToolKindV1,
+    pub tool_digest: String,
+    pub target: Option<String>,
+    pub program: Option<String>,
+    pub suite_id: Option<String>,
+    pub labels_omitted: bool,
+    pub observation: AdaptiveObservationRefV1,
+}
+
+impl AdaptiveWorkingMemoryCompletedRowV1 {
+    fn validate_labels(&self) -> Result<(), WorkflowError> {
+        use AdaptiveWorkingMemoryToolKindV1 as Kind;
+        let valid = match self.tool_kind {
+            Kind::ListDirectory | Kind::InspectFile | Kind::WriteFile | Kind::ApplyPatch => {
+                self.program.is_none()
+                    && self.suite_id.is_none()
+                    && self.target.as_ref().map_or(self.labels_omitted, |path| {
+                        WorkbenchTool::ListDirectory {
+                            path: path.clone(),
+                            after: None,
+                            max_entries: 1,
+                        }
+                        .validate_shape()
+                        .is_ok()
+                            && (self.tool_kind == Kind::ListDirectory || path != ".")
+                    })
+            }
+            Kind::RunCommand | Kind::RunTests => {
+                self.target.is_none()
+                    && self
+                        .program
+                        .as_ref()
+                        .map_or(self.labels_omitted, |program| {
+                            WorkbenchTool::RunCommand {
+                                program: program.clone(),
+                                args: Vec::new(),
+                            }
+                            .validate_shape()
+                            .is_ok()
+                        })
+                    && if self.tool_kind == Kind::RunTests {
+                        self.suite_id
+                            .as_ref()
+                            .map_or(self.labels_omitted, |suite_id| {
+                                WorkbenchTool::RunTests {
+                                    suite_id: suite_id.clone(),
+                                    program: "memory".into(),
+                                    args: Vec::new(),
+                                }
+                                .validate_shape()
+                                .is_ok()
+                            })
+                    } else {
+                        self.suite_id.is_none()
+                    }
+            }
+            Kind::PackageArtifact => {
+                self.target.is_none() && self.program.is_none() && self.suite_id.is_none()
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(invalid())
+        }
+    }
+}
+
+/// Private, bounded journal projection; never execution or continuation authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveWorkingMemorySourceV1 {
+    pub schema_version: u16,
+    pub session_id: Uuid,
+    pub authority: RuntimeAuthoritySnapshotV1,
+    pub provider_version: u64,
+    pub effect_id: Uuid,
+    /// The sealed provider-prefix head, not the later model claim's current head.
+    pub head_version: u64,
+    pub head_entry_digest: String,
+    pub last_observation: Option<AdaptiveObservationRefV1>,
+    pub model_calls: u16,
+    pub tool_calls: u16,
+    pub root_model_ceiling: u16,
+    pub root_tool_ceiling: u16,
+    pub active_model_ceiling: u16,
+    pub continuation_windows: u16,
+    pub completed_tool_count: u16,
+    pub omitted_count: u16,
+    pub rows: Vec<AdaptiveWorkingMemoryCompletedRowV1>,
+}
+
+impl AdaptiveWorkingMemorySourceV1 {
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        self.authority.validate()?;
+        if self.schema_version != 1
+            || self.session_id.is_nil()
+            || self.effect_id.is_nil()
+            || self.provider_version == 0
+            || self.head_version != self.provider_version
+            || !validate_sha256(&self.head_entry_digest)
+            || !(1..=ADAPTIVE_SESSION_MAX_CALLS).contains(&self.root_model_ceiling)
+            || !(1..=ADAPTIVE_SESSION_MAX_CALLS).contains(&self.root_tool_ceiling)
+            || self.active_model_ceiling == 0
+            || self.active_model_ceiling > self.root_model_ceiling
+            || self.model_calls > self.active_model_ceiling
+            || self.tool_calls > self.root_tool_ceiling
+            || self.completed_tool_count > self.tool_calls
+            || (self.completed_tool_count > 0 && self.rows.is_empty())
+            || self.rows.len() > ADAPTIVE_WORKING_MEMORY_MAX_ROWS
+            || usize::from(self.completed_tool_count)
+                != self.rows.len() + usize::from(self.omitted_count)
+            || u64::from(self.continuation_windows) > self.head_version.saturating_sub(1)
+            || serde_json::to_vec(self).map_err(|_| invalid())?.len()
+                > ADAPTIVE_WORKING_MEMORY_MAX_BYTES
+        {
+            return Err(invalid());
+        }
+        let mut previous_version = 1;
+        let mut previous_time = 0;
+        let mut effects = BTreeSet::new();
+        for row in &self.rows {
+            if row.session_version <= previous_version
+                || row.session_version > self.provider_version
+                || row.recorded_at_ms < previous_time
+                || row.recorded_at_ms == 0
+                || row.recorded_at_ms > i64::MAX as u64
+                || !validate_sha256(&row.entry_digest)
+                || !validate_sha256(&row.tool_digest)
+                || row.observation.effect.id.is_nil()
+                || !effects.insert(row.observation.effect.id)
+                || !validate_sha256(&row.observation.effect.request_digest)
+                || !validate_sha256(&row.observation.observation_digest)
+                || [&row.target, &row.program, &row.suite_id]
+                    .into_iter()
+                    .flatten()
+                    .any(|label| {
+                        label.trim().is_empty()
+                            || label.len() > ADAPTIVE_WORKING_MEMORY_MAX_LABEL_BYTES
+                            || label.chars().any(char::is_control)
+                    })
+            {
+                return Err(invalid());
+            }
+            row.validate_labels()?;
+            previous_version = row.session_version;
+            previous_time = row.recorded_at_ms;
+        }
+        if self.rows.last().map(|row| &row.observation) != self.last_observation.as_ref() {
+            return Err(invalid());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

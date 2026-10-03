@@ -1,6 +1,8 @@
 //! Authenticated M0 company workflow and productive Workbench integration.
 
 #[cfg(feature = "llm")]
+mod adaptive_accounting_reconsideration;
+#[cfg(feature = "llm")]
 mod adaptive_budget_review_extension;
 #[cfg(feature = "llm")]
 mod adaptive_continuation;
@@ -121,6 +123,8 @@ pub const ADAPTIVE_REVIEW_EPOCH_PATH: &str = "/operator/workflow/adaptive-review
 pub const ADAPTIVE_BUDGET_REVIEW_EXTENSION_PATH: &str =
     "/operator/workflow/adaptive-budget-review-extensions";
 pub const ADAPTIVE_RESUME_POLICY_PATH: &str = "/operator/workflow/adaptive-resume-policy";
+pub const ADAPTIVE_ACCOUNTING_RECONSIDERATION_PATH: &str =
+    "/operator/workflow/adaptive-accounting-reconsideration";
 pub const ADAPTIVE_LOCAL_ADOPTION_PATH: &str = "/operator/workflow/adaptive-local-adoptions";
 pub const SOURCE_REVIEW_PATH: &str = "/agent/workflow/source-reviews";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
@@ -3523,6 +3527,10 @@ impl WorkflowApi {
                 self.adaptive_resume_policy_http(&principal, method, path, body)
             }
             #[cfg(feature = "llm")]
+            ("GET" | "POST", ADAPTIVE_ACCOUNTING_RECONSIDERATION_PATH) => {
+                self.adaptive_accounting_reconsideration_http(&principal, method, path, body)
+            }
+            #[cfg(feature = "llm")]
             ("GET" | "POST", ADAPTIVE_LOCAL_ADOPTION_PATH) => {
                 self.local_adoption_http(&principal, method, path, body)
             }
@@ -6149,6 +6157,7 @@ fn is_workflow_path(path: &str) -> bool {
             | ADAPTIVE_REVIEW_EPOCH_PATH
             | ADAPTIVE_BUDGET_REVIEW_EXTENSION_PATH
             | ADAPTIVE_RESUME_POLICY_PATH
+            | ADAPTIVE_ACCOUNTING_RECONSIDERATION_PATH
             | ADAPTIVE_LOCAL_ADOPTION_PATH
             | SOURCE_REVIEW_PATH
             | REQUEST_PROVIDER_ABANDON_PATH

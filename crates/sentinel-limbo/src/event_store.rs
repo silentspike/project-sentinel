@@ -3373,6 +3373,42 @@ impl EventStore {
         .map_err(Into::into)
     }
 
+    /// Read an exact before-send binding without reopening or adopting a result.
+    pub fn llm_model_reservation(
+        &self,
+        request_id: &str,
+        owner: &StateTransferScope,
+    ) -> anyhow::Result<Option<LlmModelReservationV1>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
+        let row: Option<(String, String, String)> = conn
+            .query_row(
+                "SELECT request_digest, owner_scope, model_binding
+                 FROM llm_completion_outbox WHERE request_id=?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((digest, scope, encoded)) = row else {
+            return Ok(None);
+        };
+        anyhow::ensure!(scope == owner.to_wire(), "model reservation owner changed");
+        if encoded.is_empty() {
+            return Ok(None);
+        }
+        let reservation: LlmModelReservationV1 = serde_json::from_str(&encoded)?;
+        reservation.validate()?;
+        anyhow::ensure!(
+            reservation.request_id == request_id
+                && reservation.request_digest == digest
+                && reservation.owner_scope == *owner,
+            "model reservation identity changed"
+        );
+        Ok(Some(reservation))
+    }
+
     /// Poll only records that can make automatic progress. Claimed and terminal
     /// records are deliberately excluded to prevent ambiguous action redelivery.
     pub fn poll_llm_completions(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>> {
@@ -6280,6 +6316,74 @@ mod tests {
             )
             .unwrap());
         store.bind_llm_model_reservation(reservation).unwrap();
+    }
+
+    #[test]
+    fn model_reservation_read_preserves_historical_rows_and_owner_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reservation-read.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let reservation = model_reservation_fixture();
+        assert!(store
+            .llm_model_reservation(&reservation.request_id, &reservation.owner_scope)
+            .unwrap()
+            .is_none());
+        reserve_schema_diagnostic(&store, &reservation);
+        let before = store.get_llm_completion(&reservation.request_id).unwrap();
+        assert_eq!(
+            store
+                .llm_model_reservation(&reservation.request_id, &reservation.owner_scope)
+                .unwrap(),
+            Some(reservation.clone())
+        );
+        assert!(store
+            .llm_model_reservation(
+                &reservation.request_id,
+                &StateTransferScope::for_agent("AGENT-08")
+            )
+            .is_err());
+        assert_eq!(
+            store.get_llm_completion(&reservation.request_id).unwrap(),
+            before
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE llm_completion_outbox SET request_digest=?2 WHERE request_id=?1",
+                params![reservation.request_id, "d".repeat(64)],
+            )
+            .unwrap();
+        assert!(store
+            .llm_model_reservation(&reservation.request_id, &reservation.owner_scope)
+            .is_err());
+    }
+
+    #[test]
+    fn model_reservation_read_rejects_malformed_binding_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reservation-read-malformed.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let reservation = model_reservation_fixture();
+        reserve_schema_diagnostic(&store, &reservation);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE llm_completion_outbox SET model_binding='invalid' WHERE request_id=?1",
+                params![reservation.request_id],
+            )
+            .unwrap();
+        let before = store.get_llm_completion(&reservation.request_id).unwrap();
+        assert!(store
+            .llm_model_reservation(&reservation.request_id, &reservation.owner_scope)
+            .is_err());
+        assert_eq!(
+            store.get_llm_completion(&reservation.request_id).unwrap(),
+            before
+        );
     }
 
     #[test]

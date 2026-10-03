@@ -782,6 +782,12 @@ fn policy_post_rejects_changed_assignment_without_writing_or_renewing() {
         .unwrap();
     let context = LeadershipContext {
         binding: LeadershipAuthority::from_call(&call),
+        accounting: LeadershipContext::accounting_projection(
+            &LeadershipAuthority::from_call(&call),
+            &call.context,
+        )
+        .unwrap(),
+        accounting_correction: None,
         source: call.context.clone(),
         context_digest: call.context_digest().unwrap(),
         private_observation: None,
