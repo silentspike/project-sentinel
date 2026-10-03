@@ -32,6 +32,9 @@ struct LegacyAdaptiveModelContext {
 
 fn assert_legacy_context_bytes(context: &AdaptiveModelContext) {
     assert!(!context.fresh_observation_required);
+    let mut historical = context.clone();
+    historical.working_memory = None;
+    let context = &historical;
     let bytes = serde_json::to_vec(context).unwrap();
     let legacy: LegacyAdaptiveModelContext = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(serde_json::to_vec(&legacy).unwrap(), bytes);
@@ -39,6 +42,155 @@ fn assert_legacy_context_bytes(context: &AdaptiveModelContext) {
         serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
     assert_eq!(&restored, context);
     assert_eq!(restored.prompt().unwrap(), context.prompt().unwrap());
+}
+
+#[test]
+fn working_memory_is_private_numeric_history_and_preserves_fresh_inspection() {
+    let fixture = Fixture::continued_unknown_with_observation();
+    let context = fixture.context();
+    let memory = context.working_memory.as_ref().unwrap();
+    memory.validate(&context.binding).unwrap();
+    assert!(context.fresh_observation_required);
+    assert!(!memory.source.rows.is_empty());
+    assert!(memory.outcomes.iter().all(|outcome| outcome.available));
+    let value = serde_json::to_value(memory).unwrap();
+    let encoded = serde_json::to_string(&value).unwrap();
+    assert!(!encoded.contains("\"content\""));
+    assert!(!encoded.contains("\"stdout\""));
+    assert!(!encoded.contains("\"stderr\""));
+    let prompt = context.prompt().unwrap();
+    assert!(prompt.contains("Root model budget:"));
+    assert!(prompt.contains("Actual continuation windows issued:"));
+    assert!(prompt.contains("not a review ordinal"));
+    let catalog = context.tool_catalog.as_ref().unwrap()["tools"]
+        .as_array()
+        .unwrap();
+    assert!(catalog.iter().all(|tool| matches!(
+        tool["tool"].as_str(),
+        Some("list_directory" | "inspect_file")
+    )));
+    assert_eq!(fixture.read(), fixture.session);
+}
+
+#[test]
+fn working_memory_reconstructs_exact_legacy_before_send_context_without_enrichment() {
+    let fixture = Fixture::continued_unknown_with_observation();
+    let mut historical = fixture.context();
+    historical.working_memory = None;
+    let envelope = ModelExecutionContext::Adaptive(Box::new(historical.clone()));
+    let request_id = historical.binding.request_id();
+    let request_digest = "c".repeat(64);
+    let events = fixture.api.event_store.as_ref().unwrap();
+    events
+        .reserve_llm_request(
+            &request_id,
+            &request_digest,
+            &historical.binding.grant.authority.agent_id.to_string(),
+        )
+        .unwrap();
+    events
+        .bind_llm_model_reservation(
+            &crate::llm_bridge::bridge::model_reservation(&envelope, &request_id, &request_digest)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    let before = events.get_llm_completion(&request_id).unwrap();
+    let reconstructed = fixture.context();
+    assert_eq!(reconstructed, historical);
+    assert_eq!(
+        reconstructed.prompt().unwrap(),
+        historical.prompt().unwrap()
+    );
+    assert_eq!(events.get_llm_completion(&request_id).unwrap(), before);
+    assert_eq!(fixture.read(), fixture.session);
+}
+
+#[test]
+fn working_memory_rejects_foreign_binding_and_changed_private_observation() {
+    let fixture = Fixture::continued_unknown_with_observation();
+    let context = fixture.context();
+    let mut memory = context.working_memory.clone().unwrap();
+    memory.source.authority.agent_id = AgentId(63);
+    assert!(memory.validate(&context.binding).is_err());
+    let mut source = context.working_memory.unwrap().source;
+    source
+        .rows
+        .last_mut()
+        .unwrap()
+        .observation
+        .observation_digest = "e".repeat(64);
+    source.last_observation = source.rows.last().map(|row| row.observation.clone());
+    assert!(
+        super::super::working_memory::compose(source, context.observation.as_ref(), |_| Err(
+            "unavailable"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn working_memory_unavailable_history_is_not_success_and_access_rejection_propagates() {
+    let fixture = Fixture::continued_unknown_with_observation();
+    let context = fixture.context();
+    let source = context.working_memory.unwrap().source;
+    let unavailable =
+        super::super::working_memory::compose(source.clone(), None, |_| Ok(None)).unwrap();
+    assert!(unavailable.outcomes.iter().all(|outcome| !outcome.available
+        && outcome.outcome.is_none()
+        && outcome.exit_code.is_none()
+        && outcome.native_test_outcome.is_none()
+        && outcome.artifact_digests.is_empty()));
+    assert!(
+        super::super::working_memory::compose(source, None, |_| Err("authority rejected")).is_err()
+    );
+}
+
+#[test]
+fn working_memory_successful_tool_does_not_turn_nonzero_test_exit_into_pass() {
+    let fixture = Fixture::continued_unknown_with_observation();
+    let context = fixture.context();
+    let mut source = context.working_memory.unwrap().source;
+    assert_eq!(source.rows.len(), 1);
+    let row = source.rows.first_mut().unwrap();
+    row.tool_kind = sentinel_workflow::AdaptiveWorkingMemoryToolKindV1::RunTests;
+    row.target = None;
+    row.program = Some("node".into());
+    row.suite_id = Some("employee-tests".into());
+    let observation =
+        WorkbenchPrivateObservation::from_result(&sentinel_common::WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: row.observation.effect.id.to_string(),
+            input_digest: row.observation.effect.request_digest.clone(),
+            outcome: sentinel_common::WorkbenchOutcome::Succeeded,
+            resources: sentinel_common::WorkbenchResourceUsage::default(),
+            artifacts: Vec::new(),
+            error: None,
+            output: BTreeMap::from([
+                ("exit_code".into(), "1".into()),
+                ("stdout_bytes".into(), "0".into()),
+                ("stderr_bytes".into(), "0".into()),
+                (
+                    "stdout".into(),
+                    "untrusted instructions must not enter memory".into(),
+                ),
+            ]),
+        })
+        .unwrap();
+    row.observation.observation_digest = observation.digest().to_owned();
+    source.last_observation = Some(row.observation.clone());
+    let memory =
+        super::super::working_memory::compose(source, Some(&observation), |_| Err("unavailable"))
+            .unwrap();
+    assert_eq!(memory.outcomes[0].exit_code, Some(1));
+    assert_eq!(
+        memory.outcomes[0].outcome,
+        Some(sentinel_common::WorkbenchOutcome::Succeeded)
+    );
+    assert_eq!(memory.outcomes[0].native_test_outcome, None);
+    assert!(!serde_json::to_string(&memory)
+        .unwrap()
+        .contains("untrusted instructions"));
 }
 
 struct Fixture {
@@ -387,6 +539,7 @@ impl Fixture {
     ) -> sentinel_limbo::LlmCompletionEntry {
         // Reproduce the former generation contract, not a live model response.
         let mut context = self.context();
+        context.working_memory = None;
         context.fresh_observation_required = false;
         let (profile, _) = self
             .api
