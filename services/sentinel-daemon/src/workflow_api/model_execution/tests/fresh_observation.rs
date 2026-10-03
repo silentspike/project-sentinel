@@ -378,9 +378,31 @@ impl Fixture {
     }
 
     fn retain_old_preinspection_write(&mut self) -> sentinel_limbo::LlmCompletionEntry {
+        self.retain_old_preinspection_write_with_digest(false)
+    }
+
+    fn retain_old_preinspection_write_with_digest(
+        &mut self,
+        include_digest: bool,
+    ) -> sentinel_limbo::LlmCompletionEntry {
         // Reproduce the former generation contract, not a live model response.
         let mut context = self.context();
         context.fresh_observation_required = false;
+        let (profile, _) = self
+            .api
+            .authority
+            .as_ref()
+            .unwrap()
+            .profile_for_binding(&context.binding.grant.authority.profile_id)
+            .unwrap();
+        context.tool_catalog = Some(
+            super::super::tool_catalog::adaptive_tool_catalog(
+                profile,
+                &context.binding.grant.authority,
+                &context.task,
+            )
+            .unwrap(),
+        );
         let binding = context.binding.clone();
         let request_id = binding.request_id();
         let digest = "c".repeat(64);
@@ -407,30 +429,6 @@ impl Fixture {
             .to_string(),
             admissible: true,
         };
-        let usage = DomainEvent::new(
-            "agent_llm_usage",
-            &binding.grant.authority.agent_id.to_string(),
-            &serde_json::json!({
-                "type": "AgentLlmUsage", "agent_id": binding.grant.authority.agent_id,
-                "tenant_id": binding.grant.authority.tenant_id,
-                "project_id": binding.grant.authority.project_id,
-                "work_item_id": binding.grant.authority.work_item_id,
-                "reservation_id": binding.grant.provider_allowance_id,
-                "assignment_id": binding.assignment_id,
-                "assignment_version": binding.grant.authority.assignment_version,
-                "provider": binding.grant.provider, "caller_role": "agent_runtime",
-                "effective_model": binding.grant.model, "requested_model": binding.grant.model,
-                "tier": "mid", "hierarchy_tier": 2, "cost_source": "provider_reported",
-                "input_tokens": 11, "output_tokens": 7, "cache_read": 0,
-                "cache_creation": 0, "cost_usd": 0.0,
-            })
-            .to_string(),
-            &request_id,
-            1,
-        )
-        .with_operation_id(&format!("llm_usage_{request_id}"))
-        .with_schema_version(3);
-        completion.validate_usage(&usage).unwrap();
         let events = self.api.event_store.as_ref().unwrap();
         events
             .reserve_llm_request(
@@ -450,22 +448,39 @@ impl Fixture {
                 .unwrap(),
             )
             .unwrap();
-        events
-            .enqueue_llm_completion(
-                &request_id,
-                &digest,
-                &serde_json::json!({
-                    "version": 2, "request_id": request_id, "request_digest": digest,
-                    "usage_event": usage, "actions": [],
-                    "model_response_digest": hex_sha256(completion.content.as_bytes()),
-                    "model_work": completion,
-                })
-                .to_string(),
-            )
+        crate::llm_bridge::bridge::retain_adaptive_gateway_completion_for_test(
+            events,
+            &self.api,
+            &completion,
+            &request_id,
+            &digest,
+        )
+        .unwrap();
+        let produced = events.get_llm_completion(&request_id).unwrap().unwrap();
+        assert_eq!(produced.attempt_count, 1);
+        assert_eq!(
+            produced.last_error.as_deref(),
+            Some("adaptive model result admission failed")
+        );
+        let mut payload: serde_json::Value = serde_json::from_str(&produced.payload).unwrap();
+        assert!(payload.get("model_response_digest").is_none());
+        assert_eq!(payload["tokens_used"], 18);
+        let usage = events
+            .event_by_operation_id(&format!("llm_usage_{request_id}"))
+            .unwrap()
             .unwrap();
-        events
-            .persist_llm_completion_usage(&request_id, &digest, &usage)
-            .unwrap();
+        completion.validate_usage(&usage).unwrap();
+        if include_digest {
+            payload["model_response_digest"] =
+                serde_json::json!(hex_sha256(completion.content.as_bytes()));
+            sentinel_limbo::rusqlite::Connection::open(self._temp.path().join("events.sqlite"))
+                .unwrap()
+                .execute(
+                    "UPDATE llm_completion_outbox SET payload=?1 WHERE request_id=?2",
+                    sentinel_limbo::rusqlite::params![payload.to_string(), request_id],
+                )
+                .unwrap();
+        }
         let ModelExecutionContext::Adaptive(context) = &completion.context else {
             unreachable!()
         };
@@ -473,7 +488,7 @@ impl Fixture {
             .api
             .accept_adaptive_model(&completion, context, &request_id, &digest)
             .is_err());
-        for _ in 0..5 {
+        for _ in 1..5 {
             events
                 .record_llm_completion_failure(
                     &request_id,
@@ -492,6 +507,10 @@ fn known_rejected_write_disposition_preserves_response_usage_grant_and_requires_
     for receipt_before_recovery in [false, true] {
         let mut fixture = Fixture::continued_unknown_with_observation();
         let entry = fixture.retain_old_preinspection_write();
+        assert!(serde_json::from_str::<serde_json::Value>(&entry.payload)
+            .unwrap()
+            .get("model_response_digest")
+            .is_none());
         let before = fixture.read();
         let events = fixture.api.event_store.as_ref().unwrap();
         let usage = events
@@ -577,7 +596,7 @@ fn known_rejected_write_disposition_preserves_response_usage_grant_and_requires_
 fn known_rejected_write_disposition_rejects_changed_raw_response_before_any_receipt_or_journal_write(
 ) {
     let mut fixture = Fixture::continued_unknown_with_observation();
-    let entry = fixture.retain_old_preinspection_write();
+    let entry = fixture.retain_old_preinspection_write_with_digest(true);
     let before = fixture.read();
     let events = fixture.api.event_store.as_ref().unwrap();
     sentinel_limbo::rusqlite::Connection::open(fixture._temp.path().join("events.sqlite")).unwrap()
@@ -601,6 +620,57 @@ fn known_rejected_write_disposition_rejects_changed_raw_response_before_any_rece
         .event_by_operation_id(&format!("llm_resolution_{}", entry.request_id))
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn known_rejected_write_optional_digest_is_exact_or_rejected_without_effects() {
+    for digest in [
+        serde_json::Value::Null,
+        serde_json::json!(123),
+        serde_json::json!(""),
+        serde_json::json!("d".repeat(64)),
+        serde_json::json!({"digest": "d".repeat(64)}),
+    ] {
+        let mut fixture = Fixture::continued_unknown_with_observation();
+        let entry = fixture.retain_old_preinspection_write();
+        let before = fixture.read();
+        let mut payload: serde_json::Value = serde_json::from_str(&entry.payload).unwrap();
+        payload["model_response_digest"] = digest;
+        sentinel_limbo::rusqlite::Connection::open(fixture._temp.path().join("events.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE llm_completion_outbox SET payload=?1 WHERE request_id=?2",
+                sentinel_limbo::rusqlite::params![payload.to_string(), entry.request_id],
+            )
+            .unwrap();
+        let changed = fixture
+            .api
+            .event_store
+            .as_ref()
+            .unwrap()
+            .get_llm_completion(&entry.request_id)
+            .unwrap()
+            .unwrap();
+        assert!(fixture
+            .api
+            .verified_known_rejection(&before, &changed)
+            .is_err());
+        assert_eq!(fixture.read(), before);
+        assert!(fixture
+            .api
+            .event_store
+            .as_ref()
+            .unwrap()
+            .event_by_operation_id(&format!("llm_resolution_{}", entry.request_id))
+            .unwrap()
+            .is_none());
+    }
+    let mut fixture = Fixture::continued_unknown_with_observation();
+    let entry = fixture.retain_old_preinspection_write_with_digest(true);
+    fixture
+        .api
+        .verified_known_rejection(&fixture.read(), &entry)
+        .unwrap();
 }
 
 #[test]
