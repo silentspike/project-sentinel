@@ -271,7 +271,7 @@ impl WorkflowApi {
         }
     }
 
-    fn adaptive_resume_policy_current_source(
+    pub(super) fn adaptive_resume_policy_current_source(
         &self,
         principal: &BoundPrincipal,
         project_id: &ProjectId,
@@ -294,6 +294,9 @@ impl WorkflowApi {
         &self,
         call: &sentinel_workflow::AdaptiveLeadershipReviewCallV1,
     ) -> Result<(), &'static str> {
+        if call.grant.work_funding.is_some() {
+            return self.validate_work_funding_review(call);
+        }
         let policy = self
             .store
             .adaptive_resume_policy(

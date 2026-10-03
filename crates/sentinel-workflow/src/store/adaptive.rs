@@ -5,6 +5,9 @@ use crate::domain_store::adaptive_resume_policy::{
     read_resume_policy_leaf, require_resume_authorization_membership,
     require_resume_review_membership,
 };
+use crate::domain_store::adaptive_work_funding::{
+    insert_funding_adoption_membership, require_funding_authorization_membership,
+};
 use crate::{
     adaptive_collaboration_digest, adaptive_continuation_provider_digest,
     AdaptiveContinuationAuthorizationV1, AdaptiveContinuationSourceV1, AdaptiveEffectV1,
@@ -26,6 +29,8 @@ mod health_inventory_tests;
 mod recovery_lineage;
 #[cfg(test)]
 mod rejected_model_tests;
+#[cfg(test)]
+mod work_funding_tests;
 #[cfg(test)]
 mod working_memory_tests;
 
@@ -304,6 +309,7 @@ impl WorkflowStore {
             completed_tool_count,
             omitted_count: completed_tool_count - rows.len() as u16,
             rows,
+            work_funding: session.active_work_funding().cloned().map(Box::new),
         };
         while serde_json::to_vec(&source)
             .map_err(|_| corrupt_store())?
@@ -1355,7 +1361,10 @@ pub(crate) fn continue_adaptive_session_in_transaction(
     current.validate()?;
     review.grant.validate(review.grant_issued_at_unix_ms)?;
     review.context.validate(&review.grant)?;
-    if authorization.resume_policy != review.grant.resume_policy {
+    if authorization.resume_policy != review.grant.resume_policy
+        || authorization.work_funding != review.grant.work_funding
+        || (authorization.work_funding.is_some() && review.grant.recovery_epoch.is_some())
+    {
         return Err(authority_conflict());
     }
     if review.grant.resume_policy.is_some() {
@@ -1449,8 +1458,16 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         if now_ms >= binding.limits.expires_at_unix_ms {
             return Err(authority_conflict());
         }
-    } else if read_resume_policy_leaf(tx, &current.tenant_id, authorization.session_id)?.is_some() {
+    } else if authorization.work_funding.is_none()
+        && read_resume_policy_leaf(tx, &current.tenant_id, authorization.session_id)?.is_some()
+    {
         return Err(authority_conflict());
+    }
+    if let Some(epoch) = &authorization.work_funding {
+        require_work_funding_anchor(tx, epoch, &session)?;
+        if now_ms >= epoch.binding.limits.expires_at_unix_ms {
+            return Err(authority_conflict());
+        }
     }
     let fresh = &fresh_allowance.grant;
     let source_work = review
@@ -1472,12 +1489,36 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         .ok_or_else(authority_conflict)?;
     let policy_allowance = match &review.grant.subject {
         Some(crate::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget })
-            if matches!(review.grant.schema_version, 3 | 4) =>
+            if matches!(review.grant.schema_version, 3..=5) =>
         {
             &budget.root_allowance
         }
         _ => captured_allowance,
     };
+    let model_ceiling = authorization
+        .work_funding
+        .as_ref()
+        .map_or(session.funded_model_call_ceiling(), |epoch| {
+            epoch.binding.limits.total_model_call_ceiling
+        });
+    let duration = authorization
+        .work_funding
+        .as_ref()
+        .map_or_else(
+            || {
+                session.grant.max_call_duration_ms.min(
+                    review
+                        .grant
+                        .resume_policy
+                        .as_ref()
+                        .map_or(policy_allowance.grant.max_duration_ms, |binding| {
+                            binding.limits.max_call_duration_ms
+                        }),
+                )
+            },
+            |epoch| epoch.binding.limits.max_call_duration_ms,
+        )
+        .min(authorization.deadline_ms - authorization.issued_at_ms);
     if fresh_allowance.allowance_id != authorization.provider_allowance_id
         || fresh_allowance.allowance_id == review.allowance_id
         || fresh_allowance.created_at_unix_ms != authorization.issued_at_ms
@@ -1494,27 +1535,15 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         || fresh.token_policy != review.grant.token_policy
         || fresh.max_calls != authorization.additional_model_calls
         || (review.grant.resume_policy.is_none()
+            && authorization.work_funding.is_none()
             && fresh.max_calls > policy_allowance.grant.max_calls)
-        || (matches!(review.grant.schema_version, 3 | 4)
+        || (matches!(review.grant.schema_version, 3..=5)
             && session
                 .model_calls
                 .checked_add(fresh.max_calls)
-                .is_none_or(|calls| calls > session.grant.max_model_calls))
+                .is_none_or(|calls| calls > model_ceiling))
         || fresh.max_concurrent != 1
-        || fresh.max_duration_ms
-            != session
-                .grant
-                .max_call_duration_ms
-                .min(
-                    review
-                        .grant
-                        .resume_policy
-                        .as_ref()
-                        .map_or(policy_allowance.grant.max_duration_ms, |binding| {
-                            binding.limits.max_call_duration_ms
-                        }),
-                )
-                .min(authorization.deadline_ms - authorization.issued_at_ms)
+        || fresh.max_duration_ms != duration
         || fresh.expires_at_unix_ms != authorization.deadline_ms
         || adaptive_continuation_provider_digest(fresh_allowance, current)?
             != authorization.provider_authority_digest
@@ -1557,6 +1586,9 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         return Err(authority_conflict());
     }
     let next = session.transition(&command, now_ms)?;
+    if authorization.work_funding.is_some() {
+        insert_funding_adoption_membership(tx, authorization, current)?;
+    }
     append(
         tx,
         &ns,
@@ -1640,6 +1672,48 @@ pub(crate) fn require_resume_policy_anchor(
             .as_ref()
             .map_or(0, |state| state.authorizations.len())
             != usize::from(source.base_window_count)
+    {
+        return Err(authority_conflict());
+    }
+    Ok(())
+}
+
+fn require_work_funding_anchor(
+    connection: &Connection,
+    epoch: &crate::AdaptiveWorkFundingEpochV1,
+    session: &AdaptiveSessionV1,
+) -> Result<(), WorkflowError> {
+    epoch.validate()?;
+    let source = &epoch.receipt.request.source;
+    let anchor = &source.resume_source;
+    let ns = namespace(session.grant.session_id);
+    let (root_digest, root) = evidence_entry(connection, &ns, 1)?;
+    let (head_digest, head) = evidence_entry(connection, &ns, anchor.expected_session_version)?;
+    if root_digest != anchor.root_entry_digest
+        || head_digest != anchor.head_entry_digest
+        || root.session.grant != session.grant
+        || head.session.grant != session.grant
+        || anchor.session_id != session.grant.session_id
+        || anchor.assignee_authority != session.grant.authority
+        || source.original_model_call_ceiling != session.grant.max_model_calls
+        || source.original_tool_call_ceiling != session.grant.max_tool_calls
+        || source.current_model_call_ceiling != head.session.funded_model_call_ceiling()
+        || source.current_tool_call_ceiling != head.session.funded_tool_call_ceiling()
+        || source.predecessor_receipt_digest.as_deref()
+            != head
+                .session
+                .active_work_funding()
+                .map(|prior| prior.binding.receipt_digest.as_str())
+        || head.session.model_calls != anchor.base_model_calls
+        || head.session.tool_calls != anchor.base_tool_calls
+        || head
+            .session
+            .continuation
+            .as_ref()
+            .map_or(0, |state| state.authorizations.len())
+            != usize::from(anchor.base_window_count)
+        || crate::adaptive_budget_history_digest(&head.session.continuation)?
+            != anchor.continuation_history_digest
     {
         return Err(authority_conflict());
     }
@@ -2383,6 +2457,14 @@ fn load_with_feedback_uncached(
                             authorization,
                             &prior.grant.authority,
                         )?;
+                    }
+                    if let Some(epoch) = &authorization.work_funding {
+                        require_funding_authorization_membership(
+                            connection,
+                            authorization,
+                            &prior.grant.authority,
+                        )?;
+                        require_work_funding_anchor(connection, epoch, prior)?;
                     }
                 }
                 if let Some(AdaptiveTransitionV1::ResumeRejectedModel {
@@ -3133,6 +3215,7 @@ mod continuation_tests {
             schema_version: 1,
             recovery_epoch: None,
             resume_policy: None,
+            work_funding: None,
             subject: None,
             review_id: crate::adaptive_leadership_review_id(root.session_id, 3, &fingerprint)
                 .unwrap(),

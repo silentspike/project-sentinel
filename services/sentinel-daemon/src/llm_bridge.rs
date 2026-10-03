@@ -2989,6 +2989,24 @@ pub mod bridge {
             {
                 Ok(Some("admission_repair"))
             }
+            Some(5)
+                if grant
+                    .get("subject")
+                    .and_then(|subject| subject.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("budget_window_exhausted")
+                    && grant
+                        .get("work_funding")
+                        .is_some_and(serde_json::Value::is_object)
+                    && grant
+                        .get("resume_policy")
+                        .is_none_or(serde_json::Value::is_null)
+                    && grant
+                        .get("recovery_epoch")
+                        .is_none_or(serde_json::Value::is_null) =>
+            {
+                Ok(Some("work_funding"))
+            }
             _ => Err("unsupported leadership review grant schema"),
         }
     }
@@ -3784,9 +3802,18 @@ pub mod bridge {
                 serde_json::json!({"schema_version": 4, "subject": {"kind": "budget_window_exhausted"}}),
                 serde_json::json!({"schema_version": 4, "subject": {"kind": "budget_window_exhausted"}, "recovery_epoch": {"schema_version": 1}}),
                 serde_json::json!({"schema_version": 4, "subject": {"kind": "unknown_model"}, "recovery_epoch": {"schema_version": 2}}),
+                serde_json::json!({"schema_version": 5, "subject": {"kind": "budget_window_exhausted"}}),
+                serde_json::json!({"schema_version": 5, "subject": {"kind": "unknown_model"}, "work_funding": {}}),
+                serde_json::json!({"schema_version": 5, "subject": {"kind": "budget_window_exhausted"}, "work_funding": {}, "resume_policy": {}}),
+                serde_json::json!({"schema_version": 5, "subject": {"kind": "budget_window_exhausted"}, "work_funding": {}, "recovery_epoch": {}}),
             ] {
                 assert!(leadership_review_kind(&grant).is_err());
             }
+            assert_eq!(
+                leadership_review_kind(&serde_json::json!({"schema_version": 5,
+                "subject": {"kind": "budget_window_exhausted"}, "work_funding": {}})),
+                Ok(Some("work_funding"))
+            );
             let dir = tempfile::tempdir().unwrap();
             let (_, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
                 &dir.path().join("company.sqlite"),

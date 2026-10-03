@@ -1,5 +1,15 @@
 # Changelog
 
+- Add finite, operator-scoped same-session work-funding proposals and immutable
+  receipt/event storage. Authenticate the exact journal/project source at
+  issuance, preserve replay after expiry, and reject unknown effects, source
+  substitution, overflow and unadopted successor epochs. Issuance changes no
+  grant, spending, journal, project or execution allowance. Bind real leadership
+  reviews and atomic continuation adoption to separate event-backed funding
+  memberships, retain original grants and historical v1 policy proofs, and
+  reject automatic same-head rerolls. Add registered operator commands and
+  private-context redaction without issuing live capacity automatically (#856).
+
 - Recreate failed dashboard NATS live consumers with bounded backoff instead
   of polling a deleted consumer forever. Refresh connected clients from the
   current agent, room and KPI projections on each subscription; keep idle

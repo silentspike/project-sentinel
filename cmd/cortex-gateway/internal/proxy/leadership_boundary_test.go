@@ -393,6 +393,7 @@ func TestLeadershipBoundaryContinuationSchemaContracts(t *testing.T) {
 		{"continuation_leadership", "keep_blocked", codexCLIContinuationLeadershipSchema, 2},
 		{"budget_leadership", "defer_budget", codexCLIBudgetLeadershipSchema, 3},
 		{"admission_repair", "defer_budget", codexCLIAdmissionRepairSchema, 4},
+		{"work_funding", "defer_budget", codexCLIWorkFundingSchema, 5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var schema map[string]any
@@ -459,6 +460,7 @@ func TestLeadershipBoundaryOutputSchemaAndLegacy(t *testing.T) {
 		{"blocked_continuation", continuationReviewTestRequest("blocked_continuation"), codexCLIContinuationLeadershipSchema},
 		{"budget_window_exhausted", continuationReviewTestRequest("budget_window_exhausted"), codexCLIBudgetLeadershipSchema},
 		{"admission_repair", continuationReviewTestRequest("admission_repair"), codexCLIAdmissionRepairSchema},
+		{"work_funding", continuationReviewTestRequest("work_funding"), codexCLIWorkFundingSchema},
 		{"legacy1", subscriptionTestRequest(), codexCLIWorkSchema},
 		{"legacy2", salesSubscriptionTestRequest(), nil},
 		{"legacy3", adaptiveSubscriptionTestRequest(), codexCLIAdaptiveSchema},

@@ -14,6 +14,8 @@ mod adaptive_resume_policy;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/adaptive_tool_poll.rs"]
 mod adaptive_tool_poll_tests;
+#[cfg(feature = "llm")]
+mod adaptive_work_funding;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/budget_review_extension.rs"]
 mod budget_review_extension_tests;
@@ -125,6 +127,7 @@ pub const ADAPTIVE_REVIEW_EPOCH_PATH: &str = "/operator/workflow/adaptive-review
 pub const ADAPTIVE_BUDGET_REVIEW_EXTENSION_PATH: &str =
     "/operator/workflow/adaptive-budget-review-extensions";
 pub const ADAPTIVE_RESUME_POLICY_PATH: &str = "/operator/workflow/adaptive-resume-policy";
+pub const ADAPTIVE_WORK_FUNDING_PATH: &str = "/operator/workflow/adaptive-work-funding";
 pub const ADAPTIVE_ACCOUNTING_RECONSIDERATION_PATH: &str =
     "/operator/workflow/adaptive-accounting-reconsideration";
 pub const ADAPTIVE_LOCAL_ADOPTION_PATH: &str = "/operator/workflow/adaptive-local-adoptions";
@@ -3529,6 +3532,10 @@ impl WorkflowApi {
                 self.adaptive_resume_policy_http(&principal, method, path, body)
             }
             #[cfg(feature = "llm")]
+            ("GET" | "POST", ADAPTIVE_WORK_FUNDING_PATH) => {
+                self.adaptive_work_funding_http(&principal, method, path, body)
+            }
+            #[cfg(feature = "llm")]
             ("GET" | "POST", ADAPTIVE_ACCOUNTING_RECONSIDERATION_PATH) => {
                 self.adaptive_accounting_reconsideration_http(&principal, method, path, body)
             }
@@ -4668,7 +4675,7 @@ impl WorkflowApi {
                 if value.customer_id
                     == principal.principal.customer_id.clone().unwrap_or_default() =>
             {
-                json(200, &value)
+                public_workflow_read(&value)
             }
             Ok(Some(_)) => json_error(
                 403,
@@ -4702,7 +4709,7 @@ impl WorkflowApi {
             .company_project(&principal.principal.tenant_id, &project_id)
         {
             Ok(Some(value)) if may_read_full_project(&value, &principal.principal) => {
-                json(200, &value)
+                public_workflow_read(&value)
             }
             Ok(Some(_)) => json_error(
                 403,
@@ -4760,7 +4767,7 @@ impl WorkflowApi {
             .company_project_projection(&principal.principal.tenant_id, &project_id)
         {
             Ok(Some(value)) if may_read_full_project(&value.project, &principal.principal) => {
-                json(200, &value)
+                public_workflow_read(&value)
             }
             Ok(Some(_)) => json_error(
                 403,
@@ -4800,8 +4807,12 @@ impl WorkflowApi {
             Ok(value) => value,
             Err(error) => return workflow_error(error),
         };
+        let events: Vec<_> = events
+            .into_iter()
+            .filter(|event| !private_work_funding_event(&event.event_type))
+            .collect();
         if principal.principal.kind == CompanyPrincipalKindV1::Operator {
-            return json(200, &events);
+            return public_workflow_read(&events);
         }
         let mut authorized = Vec::new();
         for event in events {
@@ -4824,7 +4835,7 @@ impl WorkflowApi {
                 authorized.push(event);
             }
         }
-        json(200, &authorized)
+        public_workflow_read(&authorized)
     }
 
     fn delivery_command(&self, principal: &BoundPrincipal, body: &[u8]) -> WorkflowHttpResponse {
@@ -6177,6 +6188,7 @@ fn is_workflow_path(path: &str) -> bool {
             | ADAPTIVE_REVIEW_EPOCH_PATH
             | ADAPTIVE_BUDGET_REVIEW_EXTENSION_PATH
             | ADAPTIVE_RESUME_POLICY_PATH
+            | ADAPTIVE_WORK_FUNDING_PATH
             | ADAPTIVE_ACCOUNTING_RECONSIDERATION_PATH
             | ADAPTIVE_LOCAL_ADOPTION_PATH
             | SOURCE_REVIEW_PATH
@@ -6227,6 +6239,78 @@ fn json<T: Serialize>(status: u16, value: &T) -> WorkflowHttpResponse {
     WorkflowHttpResponse {
         status,
         body: serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()),
+    }
+}
+
+fn private_work_funding_event(name: &str) -> bool {
+    matches!(
+        name,
+        "adaptive_work_funding_issued"
+            | "adaptive_work_funding_review_issued"
+            | "adaptive_work_funding_adopted"
+    )
+}
+
+// Protect future project/history embeddings too. Unfunded reads retain their
+// original serialization, including field order, rather than a Value rewrite.
+fn public_workflow_read<T: Serialize>(value: &T) -> WorkflowHttpResponse {
+    fn redact(value: &mut serde_json::Value, funded: bool) -> bool {
+        match value {
+            serde_json::Value::Array(values) => {
+                let mut changed = false;
+                for value in values {
+                    changed |= redact(value, funded);
+                }
+                changed
+            }
+            serde_json::Value::Object(fields) => {
+                let funded = funded
+                    || fields.get("work_funding").is_some_and(|v| !v.is_null())
+                    || fields
+                        .get("grant")
+                        .and_then(|v| v.get("work_funding"))
+                        .is_some_and(|v| !v.is_null())
+                    || fields
+                        .get("binding")
+                        .and_then(|v| v.get("grant"))
+                        .and_then(|v| v.get("work_funding"))
+                        .is_some_and(|v| !v.is_null())
+                    || (fields.contains_key("funding_id")
+                        && fields.contains_key("issuer_principal"));
+                let mut changed = false;
+                if funded {
+                    for key in [
+                        "source",
+                        "context",
+                        "source_project",
+                        "source_session",
+                        "resume_source",
+                        "request",
+                        "issuer_principal",
+                        "leadership_principal",
+                        "leadership_authority",
+                        "assignee_authority",
+                        "private_observation",
+                        "prompt",
+                    ] {
+                        changed |= fields.remove(key).is_some();
+                    }
+                }
+                for value in fields.values_mut() {
+                    changed |= redact(value, funded);
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+    let Ok(mut public) = serde_json::to_value(value) else {
+        return workflow_error(workflow_unavailable());
+    };
+    if redact(&mut public, false) {
+        json(200, &public)
+    } else {
+        json(200, value)
     }
 }
 

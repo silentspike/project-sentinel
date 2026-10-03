@@ -484,6 +484,7 @@ fn fixture_schema2_source(
             schema_version: 2,
             recovery_epoch: None,
             resume_policy: None,
+            work_funding: None,
             subject: Some(subject),
             review_id: sentinel_workflow::adaptive_leadership_review_id(
                 grant.session_id,
@@ -765,6 +766,7 @@ impl Fixture {
             additional_model_calls: 1,
             local_adoption: None,
             resume_policy: None,
+            work_funding: None,
         };
         let proposed = CompleteAdaptiveLeadershipReviewCallV1 {
             review_id: call.grant.review_id,
