@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/detection"
@@ -16,13 +19,19 @@ var adaptiveRequestID = regexp.MustCompile(`^company-adaptive-([0-9a-f]{8}-[0-9a
 var leadershipRequestID = regexp.MustCompile(`^company-leadership-([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$`)
 
 const (
-	maxModelWorkResponseBytes = 128 * 1024
-	maxModelWorkDuration      = 120 * time.Second
+	maxModelWorkResponseBytes          = 128 * 1024
+	maxModelWorkDuration               = 120 * time.Second
+	maxLeadershipEvidenceRefs          = 32
+	maxLeadershipEvidenceRefBytes      = 4096
+	maxLeadershipEvidenceMetadataBytes = 128 * 1024
 )
 
 // This marker selects a response contract, not execution authority. The daemon
 // derives and revalidates the actual workflow authority before admitting tools.
 func classifyModelWorkRequest(req *LLMRequest, requestID string) (bool, error) {
+	if !validFreshObservationMetadata(req.Metadata) {
+		return false, errors.New("invalid fresh observation execution subject")
+	}
 	schema, present := req.Metadata["company_execution_schema"]
 	if schema != "5" && hasLeadershipReviewMetadata(req.Metadata) {
 		return false, errors.New("mixed leadership review execution subject")
@@ -55,6 +64,9 @@ func classifyModelWorkRequest(req *LLMRequest, requestID string) (bool, error) {
 }
 
 func companyExecutionRequestIdentity(requestID string, metadata map[string]string, schema string) bool {
+	if !validFreshObservationMetadata(metadata) {
+		return false
+	}
 	switch schema {
 	case "3":
 		return adaptiveRequestIdentity(requestID, metadata)
@@ -78,6 +90,9 @@ func metadataValuesPresent(metadata map[string]string, keys ...string) bool {
 }
 
 func validCompanyExecutionSubject(metadata map[string]string, requestID, schema string) bool {
+	if !validFreshObservationMetadata(metadata) {
+		return false
+	}
 	if schema != "5" && hasLeadershipReviewMetadata(metadata) {
 		return false
 	}
@@ -108,6 +123,12 @@ func adaptiveRequestIdentity(requestID string, metadata map[string]string) bool 
 	return len(parts) == 3 && parts[1] == metadata["adaptive_session_id"] && parts[2] == metadata["adaptive_effect_id"]
 }
 
+func validFreshObservationMetadata(metadata map[string]string) bool {
+	value, present := metadata["company_execution_fresh_observation_required"]
+	return !present || (value == "true" && metadata["company_execution_schema"] == "3" &&
+		metadata["company_execution_output_kind"] == "adaptive_decision")
+}
+
 // Pre-agreement Sales work belongs to a customer request, never a synthetic
 // project. The daemon authenticates the principal and validates this version
 // against durable state; metadata alone grants no permission to call a provider.
@@ -127,7 +148,85 @@ type customerRequestExecutionSubject struct {
 func hasLeadershipReviewMetadata(metadata map[string]string) bool {
 	_, present := metadata["leadership_review_id"]
 	_, kindPresent := metadata["leadership_review_kind"]
-	return present || kindPresent || metadata["company_execution_subject"] == "adaptive_leadership_review" || metadata["company_execution_output_kind"] == "leadership_decision"
+	_, evidencePresent := metadata["leadership_evidence_refs"]
+	return present || kindPresent || evidencePresent || metadata["company_execution_subject"] == "adaptive_leadership_review" || metadata["company_execution_output_kind"] == "leadership_decision"
+}
+
+// Metadata constrains generation only; the daemon still validates evidence and authority.
+func leadershipEvidenceRefs(metadata map[string]string) ([]string, error) {
+	raw, present := metadata["leadership_evidence_refs"]
+	if !present {
+		return nil, nil
+	}
+	invalid := errors.New("invalid leadership evidence references")
+	if len(raw) > maxLeadershipEvidenceMetadataBytes || !utf8.ValidString(raw) {
+		return nil, invalid
+	}
+	var encoded []json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &encoded); err != nil || encoded == nil || len(encoded) > maxLeadershipEvidenceRefs {
+		return nil, invalid
+	}
+	refs := make([]string, 0, len(encoded))
+	seen := make(map[string]bool, len(encoded))
+	for _, value := range encoded {
+		if !validLeadershipJSONString(value) {
+			return nil, invalid
+		}
+		var ref string
+		if err := json.Unmarshal(value, &ref); err != nil || len(ref) > maxLeadershipEvidenceRefBytes ||
+			strings.TrimSpace(ref) == "" || strings.ContainsFunc(ref, unicode.IsControl) || seen[ref] {
+			return nil, invalid
+		}
+		seen[ref] = true
+		refs = append(refs, ref)
+	}
+	if len(refs) == 0 {
+		if _, subject := metadata["leadership_review_kind"]; subject {
+			return nil, invalid
+		}
+	}
+	return refs, nil
+}
+
+// encoding/json replaces unpaired UTF-16 escapes; reject them instead of changing a bound reference.
+func validLeadershipJSONString(value []byte) bool {
+	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+		return false
+	}
+	for i := 1; i < len(value)-1; i++ {
+		if value[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(value)-1 {
+			return false
+		}
+		if value[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(value)-1 {
+			return false
+		}
+		code, err := strconv.ParseUint(string(value[i+1:i+5]), 16, 16)
+		if err != nil {
+			return false
+		}
+		i += 4
+		if code >= 0xdc00 && code <= 0xdfff {
+			return false
+		}
+		if code >= 0xd800 && code <= 0xdbff {
+			if i+6 >= len(value) || value[i+1] != '\\' || value[i+2] != 'u' {
+				return false
+			}
+			low, err := strconv.ParseUint(string(value[i+3:i+7]), 16, 16)
+			if err != nil || low < 0xdc00 || low > 0xdfff {
+				return false
+			}
+			i += 6
+		}
+	}
+	return true
 }
 
 func leadershipReviewSubject(metadata map[string]string) (*customerRequestExecutionSubject, error) {
@@ -154,6 +253,9 @@ func leadershipReviewSubject(metadata map[string]string) (*customerRequestExecut
 	}
 	reviewKind, kindPresent := metadata["leadership_review_kind"]
 	if kindPresent && reviewKind != "unknown_model" && reviewKind != "blocked_continuation" && reviewKind != "budget_window_exhausted" && reviewKind != "admission_repair" {
+		return nil, invalid
+	}
+	if _, err := leadershipEvidenceRefs(metadata); err != nil {
 		return nil, invalid
 	}
 	return &customerRequestExecutionSubject{Kind: "adaptive_leadership_review", ReviewID: metadata["leadership_review_id"], ReviewKind: reviewKind}, nil

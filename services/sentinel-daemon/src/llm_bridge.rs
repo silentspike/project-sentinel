@@ -860,7 +860,7 @@ pub mod bridge {
         )
     }
 
-    fn model_reservation(
+    pub(crate) fn model_reservation(
         context: &ModelWorkContext,
         request_id: &str,
         request_digest: &str,
@@ -3036,11 +3036,35 @@ pub mod bridge {
                 "company_execution_output_kind".to_owned(),
                 "adaptive_decision".to_owned(),
             );
+            if let ModelWorkContext::Adaptive(adaptive) = context {
+                if adaptive.fresh_observation_required {
+                    request.metadata.insert(
+                        "company_execution_fresh_observation_required".to_owned(),
+                        "true".to_owned(),
+                    );
+                }
+            }
         } else if matches!(context, ModelWorkContext::AdaptiveLeadershipReview(_)) {
             request.metadata.insert(
                 "company_execution_output_kind".to_owned(),
                 "leadership_decision".to_owned(),
             );
+            if let ModelWorkContext::AdaptiveLeadershipReview(review) = context {
+                review
+                    .source
+                    .validate(&review.binding.grant)
+                    .map_err(|_| "leadership generation evidence invalid")?;
+                // A generation constraint, not authority: adoption still checks
+                // every exact reference against the sealed review context.
+                let refs = serde_json::to_string(&review.source.evidence_refs)
+                    .map_err(|_| "leadership generation evidence encoding failed")?;
+                if refs.len() > sentinel_workflow::ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES {
+                    return Err("leadership generation evidence exceeds bound");
+                }
+                request
+                    .metadata
+                    .insert("leadership_evidence_refs".to_owned(), refs);
+            }
         }
         if let Some(grant) = binding
             .project()
@@ -3720,8 +3744,20 @@ pub mod bridge {
                 "leadership_review_kind".to_owned(),
                 "unknown_model".to_owned(),
             );
+            request.metadata.insert(
+                "leadership_evidence_refs".to_owned(),
+                "[\"model-authored-foreign-reference\"]".to_owned(),
+            );
             bind_model_work_request(&mut request, &context).unwrap();
             assert!(!request.metadata.contains_key("leadership_review_kind"));
+            let ModelWorkContext::AdaptiveLeadershipReview(review) = &context else {
+                unreachable!();
+            };
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(&request.metadata["leadership_evidence_refs"])
+                    .unwrap(),
+                review.source.evidence_refs
+            );
             assert_eq!(request.metadata["company_execution_schema"], "5");
             assert_eq!(
                 request.metadata["company_execution_subject"],
@@ -3776,6 +3812,19 @@ pub mod bridge {
                     .to_string()
             );
             assert_eq!(request.model, review.binding.grant.model);
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(&request.metadata["leadership_evidence_refs"])
+                    .unwrap(),
+                review.source.evidence_refs
+            );
+            let original_digest = gateway_request_digest(&request).unwrap();
+            let mut altered = build_gateway_request(&perception, &state, &id, Some(&binding));
+            bind_model_work_request(&mut altered, &context).unwrap();
+            altered.metadata.insert(
+                "leadership_evidence_refs".to_owned(),
+                "[\"truncated-reference\"]".to_owned(),
+            );
+            assert_ne!(gateway_request_digest(&altered).unwrap(), original_digest);
             for key in [
                 "adaptive_session_id",
                 "adaptive_effect_id",
@@ -4472,8 +4521,20 @@ pub mod bridge {
             let id = agent_runtime_request_id(&first, Some(&context.binding()));
             let mut a = build_gateway_request(&first, &state, &id, Some(&context.binding()));
             let mut same = build_gateway_request(&first, &state, &id, Some(&context.binding()));
+            a.metadata.insert(
+                "company_execution_fresh_observation_required".to_owned(),
+                "true".to_owned(),
+            );
+            a.metadata.insert(
+                "leadership_evidence_refs".to_owned(),
+                "[\"foreign\"]".to_owned(),
+            );
             bind_model_work_request(&mut a, &context).unwrap();
             bind_model_work_request(&mut same, &context).unwrap();
+            assert!(!a
+                .metadata
+                .contains_key("company_execution_fresh_observation_required"));
+            assert!(!a.metadata.contains_key("leadership_evidence_refs"));
             assert_eq!(a.metadata["company_execution_output_kind"], "tool_plan");
             let mut qa_context = context.clone();
             let ModelWorkContext::Project(qa_work) = &mut qa_context else {

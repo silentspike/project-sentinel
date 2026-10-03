@@ -284,6 +284,64 @@ pub struct AdaptiveEffectV1 {
     pub request_digest: String,
 }
 
+/// Trusted retained-result evidence, not a model decision or renewed allowance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveRejectedModelReceiptV1 {
+    pub schema_version: u16,
+    pub session_id: Uuid,
+    pub source_session_version: u64,
+    pub source_entry_digest: String,
+    pub effect: AdaptiveEffectV1,
+    pub resolution_event_id: Uuid,
+    pub reason_code: String,
+    pub reservation_digest: String,
+    pub authority_binding_digest: String,
+    pub completion_payload_digest: String,
+    pub model_response_digest: String,
+    pub context_digest: String,
+    pub tool_digest: String,
+    pub usage_event_id: String,
+    pub usage_event_digest: String,
+}
+
+impl AdaptiveRejectedModelReceiptV1 {
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.schema_version != 1
+            || self.session_id.is_nil()
+            || self.source_session_version < 2
+            || self.source_session_version.checked_add(2).is_none()
+            || self.effect.id.is_nil()
+            || self.resolution_event_id.is_nil()
+            || self.reason_code != "fresh_observation_required"
+            || !valid_resolution(&self.usage_event_id)
+            || Uuid::parse_str(&self.usage_event_id)
+                .is_ok_and(|id| id.to_string() != self.usage_event_id)
+            || [
+                &self.source_entry_digest,
+                &self.effect.request_digest,
+                &self.reservation_digest,
+                &self.authority_binding_digest,
+                &self.completion_payload_digest,
+                &self.model_response_digest,
+                &self.context_digest,
+                &self.tool_digest,
+                &self.usage_event_digest,
+            ]
+            .into_iter()
+            .any(|digest| !validate_sha256(digest))
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
+        self.validate()?;
+        canonical_sha256("sentinel.workflow.adaptive-rejected-model-receipt.v1", self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdaptiveModelJournalRecordEvidenceV1 {
@@ -432,6 +490,13 @@ pub enum AdaptiveTransitionV1 {
         effect: AdaptiveEffectV1,
         resolution_event_id: String,
         reason_code: String,
+    },
+    /// Only the dedicated receipt-verifying disposition may submit this.
+    ResumeRejectedModel {
+        disposition_operation_id: Uuid,
+        expected_reason_code: String,
+        resolution_event_id: String,
+        receipt_digest: String,
     },
     ResolveBlocked {
         expected_reason_code: String,
@@ -776,6 +841,27 @@ impl AdaptiveSessionV1 {
                     resolution_event_id: resolution_event_id.clone(),
                     reason_code: reason_code.clone(),
                 }
+            }
+            (
+                Cursor::ModelRejected {
+                    resolution_event_id: recorded_event,
+                    reason_code: recorded_reason,
+                },
+                Command::ResumeRejectedModel {
+                    disposition_operation_id,
+                    expected_reason_code,
+                    resolution_event_id,
+                    receipt_digest,
+                },
+            ) if !disposition_operation_id.is_nil()
+                && expected_reason_code == "fresh_observation_required"
+                && recorded_reason == expected_reason_code
+                && recorded_event == resolution_event_id
+                && valid_resolution(resolution_event_id)
+                && validate_sha256(receipt_digest)
+                && self.requires_fresh_observation() =>
+            {
+                Cursor::ReadyForModel
             }
             (
                 Cursor::Blocked { reason_code },

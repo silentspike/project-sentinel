@@ -3,6 +3,8 @@ use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
 use sentinel_limbo::rusqlite;
 use sentinel_workflow::CustomerRequestStateV1;
 
+mod fresh_observation;
+
 thread_local! {
     static PROVIDER_PREPARATION_COUNTS: std::cell::Cell<(usize, usize)> = const {
         std::cell::Cell::new((0, 0))
