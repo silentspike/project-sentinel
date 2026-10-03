@@ -94,15 +94,18 @@ export interface JudgeAlert {
 }
 
 export interface EbpfMetrics {
+  // A successful scrape does not imply that every resource field was measured.
   available: boolean;
   mode: string;
-  stalled_count: number;
-  stalled_agents: { agent: string; seconds?: number }[];
-  collection_cycle_us?: number;
-  ring_buffer_drops?: number;
-  io_read_bytes?: number;
-  io_write_bytes?: number;
-  avg_stress?: number;
+  stalled_count?: number | null;
+  stalled_agents: { agent: string; seconds?: number | null }[];
+  collection_cycle_us?: number | null;
+  ring_buffer_drops?: number | null;
+  // Cumulative parent-agent cgroup block I/O, including runtimes and commands.
+  io_source?: "agent_cgroup_io_stat" | null;
+  io_read_bytes?: number | null;
+  io_write_bytes?: number | null;
+  avg_stress?: number | null;
   prometheus?: string;
 }
 
@@ -123,12 +126,12 @@ export interface PipelineMetrics {
 }
 
 export interface TickMetrics {
-  available: boolean;
-  tick_duration_ms: number;
-  tick_rate_effective_ms: number;
-  psi_cpu_avg10: number;
-  psi_mem_avg10: number;
-  psi_io_avg10: number;
+  available?: boolean | null;
+  tick_duration_ms?: number | null;
+  tick_rate_effective_ms?: number | null;
+  psi_cpu_avg10?: number | null;
+  psi_mem_avg10?: number | null;
+  psi_io_avg10?: number | null;
   prometheus?: string;
 }
 

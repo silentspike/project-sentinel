@@ -92,6 +92,8 @@ pub struct AdaptiveTickRate {
     last_sample_tick: u64,
     /// Ob PSI-Dateien verfuegbar sind.
     psi_available: bool,
+    /// Latest observations, independent of retained scheduling fallbacks.
+    sample_available: [bool; 3],
 }
 
 impl AdaptiveTickRate {
@@ -110,6 +112,7 @@ impl AdaptiveTickRate {
             io_psi: PsiMetrics::default(),
             last_sample_tick: 0,
             psi_available,
+            sample_available: [false; 3],
         }
     }
 
@@ -128,6 +131,7 @@ impl AdaptiveTickRate {
             io_psi: io,
             last_sample_tick: 0,
             psi_available: true,
+            sample_available: [true; 3],
         }
     }
 
@@ -136,6 +140,7 @@ impl AdaptiveTickRate {
     /// Soll jeden Tick aufgerufen werden — liest nur alle N Ticks.
     pub fn update(&mut self, tick: u64) {
         if !self.config.enabled || !self.psi_available {
+            self.sample_available = [false; 3];
             return;
         }
 
@@ -149,21 +154,7 @@ impl AdaptiveTickRate {
 
     /// Liest PSI-Werte aus /proc/pressure/.
     fn sample_psi(&mut self) {
-        if let Ok(content) = std::fs::read_to_string("/proc/pressure/cpu") {
-            if let Ok(psi) = parse_psi(&content) {
-                self.cpu_psi = psi;
-            }
-        }
-        if let Ok(content) = std::fs::read_to_string("/proc/pressure/memory") {
-            if let Ok(psi) = parse_psi(&content) {
-                self.mem_psi = psi;
-            }
-        }
-        if let Ok(content) = std::fs::read_to_string("/proc/pressure/io") {
-            if let Ok(psi) = parse_psi(&content) {
-                self.io_psi = psi;
-            }
-        }
+        self.sample_from_reader(|path| std::fs::read_to_string(path).ok());
 
         debug!(
             cpu_avg10 = format!("{:.1}", self.cpu_psi.avg10),
@@ -171,6 +162,31 @@ impl AdaptiveTickRate {
             io_avg10 = format!("{:.1}", self.io_psi.avg10),
             "PSI sample"
         );
+    }
+
+    fn sample_from_reader(&mut self, mut read: impl FnMut(&str) -> Option<String>) {
+        for (index, (path, retained)) in [
+            ("/proc/pressure/cpu", &mut self.cpu_psi),
+            ("/proc/pressure/memory", &mut self.mem_psi),
+            ("/proc/pressure/io", &mut self.io_psi),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let observation = read(path).as_deref().and_then(parse_observed_psi);
+            self.sample_available[index] = observation.is_some();
+            if let Some(psi) = observation {
+                *retained = psi;
+            }
+        }
+    }
+
+    pub fn observation_available(&self) -> [bool; 3] {
+        if self.config.enabled && self.psi_available {
+            self.sample_available
+        } else {
+            [false; 3]
+        }
     }
 
     /// Berechnet die effektive Tick-Rate basierend auf aktuellen PSI-Werten.
@@ -234,6 +250,46 @@ impl AdaptiveTickRate {
     }
 }
 
+// The shared parser defaults omitted fields to zero. Telemetry must instead
+// require a complete kernel sample before calling that value observed.
+fn parse_observed_psi(content: &str) -> Option<PsiMetrics> {
+    let mut lines = content
+        .lines()
+        .filter(|line| line.split_whitespace().next() == Some("some"));
+    let line = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    let mut seen = [false; 4];
+    for field in line.split_whitespace().skip(1) {
+        let (name, value) = field.split_once('=')?;
+        let index = match name {
+            "avg10" => 0,
+            "avg60" => 1,
+            "avg300" => 2,
+            "total" => 3,
+            _ => continue,
+        };
+        if seen[index] {
+            return None;
+        }
+        seen[index] = true;
+        if index == 3 {
+            value.parse::<u64>().ok()?;
+        } else {
+            let percentage = value.parse::<f64>().ok()?;
+            if !percentage.is_finite() || !(0.0..=100.0).contains(&percentage) {
+                return None;
+            }
+        }
+    }
+    if seen.into_iter().all(|present| present) {
+        parse_psi(line).ok()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +301,74 @@ mod tests {
             avg300: 0.0,
             total: 0,
         }
+    }
+
+    #[test]
+    fn telemetry_starts_unobserved_and_accepts_real_zero() {
+        let mut controller = AdaptiveTickRate::new(AdaptiveConfig::default());
+        assert_eq!(controller.observation_available(), [false; 3]);
+        controller.psi_available = true;
+        controller
+            .sample_from_reader(|_| Some("some avg10=0.00 avg60=0.00 avg300=0.00 total=0".into()));
+        assert_eq!(controller.observation_available(), [true; 3]);
+        assert_eq!(controller.cpu_avg10(), 0.0);
+    }
+
+    #[test]
+    fn failed_observation_hides_retained_scheduling_pressure_until_recovery() {
+        let mut controller =
+            AdaptiveTickRate::with_psi(AdaptiveConfig::default(), psi(90.0), psi(85.0), psi(75.0));
+        controller.sample_from_reader(|path| match path {
+            "/proc/pressure/cpu" => None,
+            "/proc/pressure/memory" => Some("some avg10=0".into()),
+            _ => Some("some avg10=0.00 avg60=0.00 avg300=0.00 total=0".into()),
+        });
+        assert_eq!(controller.observation_available(), [false, false, true]);
+        assert_eq!(controller.cpu_avg10(), 90.0);
+        assert!(controller.should_block_spawn());
+        assert_eq!(
+            controller.compute_effective_rate(Duration::from_secs(1)),
+            Duration::from_secs(2)
+        );
+        controller.sample_from_reader(|_| Some("some avg10=0 avg60=0 avg300=0 total=0".into()));
+        assert_eq!(controller.observation_available(), [true; 3]);
+        assert!(!controller.should_block_spawn());
+    }
+
+    #[test]
+    fn incomplete_or_nonfinite_pressure_is_not_an_observation() {
+        for sample in [
+            "some",
+            "some avg10=0 total=0",
+            "something avg10=0 avg60=0 avg300=0 total=0",
+            "some avg10=NaN avg60=0 avg300=0 total=0",
+            "some avg10=inf avg60=0 avg300=0 total=0",
+            "some avg10=-1 avg60=0 avg300=0 total=0",
+            "some avg10=101 avg60=0 avg300=0 total=0",
+            "some avg10=0 avg10=1 avg60=0 avg300=0 total=0",
+            "some avg10=0 avg60=0 avg300=0 total=0\nsome avg10=1 avg60=0 avg300=0 total=0",
+        ] {
+            assert!(parse_observed_psi(sample).is_none(), "{sample}");
+        }
+    }
+
+    #[test]
+    fn disabled_or_unavailable_sampling_is_never_reported_as_observed() {
+        let mut controller = AdaptiveTickRate::with_psi(
+            AdaptiveConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            psi(0.0),
+            psi(0.0),
+            psi(0.0),
+        );
+        controller.update(100);
+        assert_eq!(controller.observation_available(), [false; 3]);
+        controller.config.enabled = true;
+        controller.psi_available = false;
+        controller.update(200);
+        assert_eq!(controller.observation_available(), [false; 3]);
     }
 
     #[test]

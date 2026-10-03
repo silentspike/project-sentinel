@@ -34,9 +34,12 @@ impl AgentHealthChecker {
         }
     }
 
-    /// Records a write() syscall for the given cgroup.
+    /// Records activity without letting delayed observations rewind agent health.
     pub fn record_write(&mut self, cgroup_id: u64, timestamp_secs: u64) {
-        self.last_write.insert(cgroup_id, timestamp_secs);
+        self.last_write
+            .entry(cgroup_id)
+            .and_modify(|last| *last = (*last).max(timestamp_secs))
+            .or_insert(timestamp_secs);
     }
 
     /// Returns the list of stalled cgroup IDs at the given time.
@@ -140,5 +143,20 @@ mod tests {
         checker.record_write(1, 995);
         assert_eq!(checker.seconds_since_last_write(1, 1000), Some(5));
         assert!(checker.stalled_agents(1000).is_empty());
+    }
+
+    #[test]
+    fn delayed_kernel_activity_cannot_rewind_newer_activity_in_the_next_cycle() {
+        let mut checker = AgentHealthChecker::new();
+        // First cycle: kernel observation, then fresh proc/parent activity.
+        checker.record_write(1, 90);
+        checker.record_write(1, 100);
+        // Second cycle: the unchanged kernel map repeats its older timestamp.
+        checker.record_write(1, 90);
+        assert_eq!(checker.seconds_since_last_write(1, 110), Some(10));
+        assert!(checker.stalled_agents(125).is_empty());
+        checker.untrack(1);
+        checker.record_write(1, 80);
+        assert_eq!(checker.seconds_since_last_write(1, 110), Some(30));
     }
 }

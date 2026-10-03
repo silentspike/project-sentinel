@@ -156,20 +156,10 @@ pub async fn ebpf_publisher(
         let mut text = MetricsExporter::export_snapshot(&snapshot);
 
         // Global MetricsRegistry Gauges anhaengen (Tick-Dauer, PSI, etc.)
-        // Explizit alle Daemon-Gauges rendern (inkl. Nullwerte, damit Dashboard sie findet).
+        // Retained scheduling fallback values are not measured PSI samples.
         {
-            use std::fmt::Write;
             let reg = sentinel_telemetry::MetricsRegistry::global();
-            for name in &[
-                "sentinel_tick_duration_ms",
-                "sentinel_tick_rate_effective_ms",
-                "sentinel_psi_cpu_avg10",
-                "sentinel_psi_mem_avg10",
-                "sentinel_psi_io_avg10",
-            ] {
-                let g = reg.gauge(name);
-                let _ = writeln!(text, "{} {}", name, g.get());
-            }
+            render_daemon_gauges(&mut text, |name| reg.gauge(name).get());
 
             // Per-Phase-Histogramme (#381) als Prometheus-Summary anhaengen.
             let (_counters, histograms, _gauges) = reg.snapshot_raw();
@@ -279,6 +269,33 @@ pub async fn ebpf_publisher(
     );
 }
 
+fn render_daemon_gauges(text: &mut String, value: impl Fn(&str) -> i64) {
+    use std::fmt::Write;
+    for name in [
+        "sentinel_tick_duration_ms",
+        "sentinel_tick_rate_effective_ms",
+    ] {
+        let _ = writeln!(text, "{name} {}", value(name));
+    }
+    for (sample, available) in [
+        (
+            "sentinel_psi_cpu_avg10",
+            "sentinel_psi_cpu_sample_available",
+        ),
+        (
+            "sentinel_psi_mem_avg10",
+            "sentinel_psi_mem_sample_available",
+        ),
+        ("sentinel_psi_io_avg10", "sentinel_psi_io_sample_available"),
+    ] {
+        let observed = value(available);
+        let _ = writeln!(text, "{available} {observed}");
+        if observed == 1 {
+            let _ = writeln!(text, "{sample} {}", value(sample));
+        }
+    }
+}
+
 /// Rendert alle `sentinel.ecs.phase.*`-Histogramme als Prometheus-Summary (#381).
 ///
 /// Eine Metric-Family `sentinel_phase_duration_ms` mit `phase`-Label,
@@ -332,6 +349,32 @@ mod tests {
     use super::*;
     use sentinel_telemetry::metrics::HistogramSnapshot;
     use std::collections::HashMap;
+
+    #[test]
+    fn unobserved_pressure_defaults_are_not_exported_as_zero_measurements() {
+        let mut text = String::new();
+        render_daemon_gauges(&mut text, |_| 0);
+        assert!(text.contains("sentinel_tick_duration_ms 0\n"));
+        assert!(text.contains("sentinel_psi_cpu_sample_available 0\n"));
+        assert!(!text.contains("sentinel_psi_cpu_avg10"));
+        assert!(!text.contains("sentinel_psi_mem_avg10"));
+        assert!(!text.contains("sentinel_psi_io_avg10"));
+    }
+
+    #[test]
+    fn pressure_export_requires_each_observed_marker_and_preserves_real_zero() {
+        let mut text = String::new();
+        render_daemon_gauges(&mut text, |name| match name {
+            "sentinel_psi_cpu_sample_available" => 1,
+            "sentinel_psi_mem_sample_available" => 0,
+            "sentinel_psi_io_sample_available" => 2,
+            "sentinel_psi_mem_avg10" => 850,
+            _ => 0,
+        });
+        assert!(text.contains("sentinel_psi_cpu_avg10 0\n"));
+        assert!(!text.contains("sentinel_psi_mem_avg10"));
+        assert!(!text.contains("sentinel_psi_io_avg10"));
+    }
 
     fn snap(p50: f64, p95: f64, p99: f64, sum: f64, count: u64) -> HistogramSnapshot {
         HistogramSnapshot {
