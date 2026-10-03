@@ -1557,8 +1557,10 @@ pub(crate) mod work_funding_tests {
                     .map(|prior| prior.binding.receipt_digest.clone()),
             },
             limits: AdaptiveWorkFundingLimitsV1 {
-                additional_model_calls: 2,
-                additional_tool_calls: 2,
+                additional_model_calls: 2_u16
+                    .min(crate::ADAPTIVE_SESSION_MAX_CALLS - session.funded_model_call_ceiling()),
+                additional_tool_calls: 2_u16
+                    .min(crate::ADAPTIVE_SESSION_MAX_CALLS - session.funded_tool_call_ceiling()),
                 additional_reviews: 3,
                 additional_windows: 2,
                 max_window_ms: 10_000,
@@ -2104,15 +2106,21 @@ pub(crate) mod work_funding_tests {
         )
         .is_err());
 
-        let source = exhausted();
+        let mut root = grant();
+        root.max_model_calls = 1;
+        root.max_tool_calls = 2;
+        root.max_call_duration_ms = 1_000;
+        root.deadline_ms = NOW + 10_000;
+        let source = inspect(&AdaptiveSessionV1::initial(root).unwrap(), 400, NOW + 1);
         let mut epoch = epoch_for(&source, 11);
         epoch.receipt.request.limits.additional_tool_calls = 0;
         epoch.binding = epoch.receipt.binding(1).unwrap();
-        let funded = adopt(
-            &source,
-            funded_authorization(&source, epoch, source.updated_at_ms),
-        )
-        .unwrap();
+        let mut auth = funded_authorization(&source, epoch, source.updated_at_ms);
+        auth.additional_model_calls = 2;
+        let funded = adopt(&source, auth).unwrap();
+        let funded = inspect(&funded, 20_998, funded.updated_at_ms + 1);
+        assert_eq!(funded.funded_tool_call_ceiling(), 2);
+        assert_eq!(funded.tool_calls, 2);
         let pending = funded
             .transition(
                 &AdaptiveTransitionV1::ClaimModel {
