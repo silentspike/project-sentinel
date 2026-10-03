@@ -56,6 +56,12 @@ pub struct AdaptiveBudgetWindowAuthorityV1 {
     pub observed_at_ms: u64,
     pub model_calls_exhausted: bool,
     pub deadline_expired: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dispatch_slack_insufficient: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub fn adaptive_budget_allowance_digest(
@@ -83,7 +89,7 @@ impl AdaptiveBudgetWindowAuthorityV1 {
         validate_digest(&root.catalog_digest)?;
         if self.schema_version != 1
             || self.observed_at_ms == 0
-            || !(self.model_calls_exhausted || self.deadline_expired)
+            || !(self.model_calls_exhausted || self.deadline_expired || self.dispatch_slack_insufficient)
             || root.schema_version != 1
             || root.assignment_version == 0
             || root.provider != "codex-cli"
@@ -215,6 +221,8 @@ impl AdaptiveBudgetWindowAuthorityV1 {
         if !session.model_window_exhausted_at(self.observed_at_ms)
             || self.model_calls_exhausted != (session.model_calls >= session.active_model_ceiling())
             || self.deadline_expired != (self.observed_at_ms >= session.active_deadline_ms())
+            || self.dispatch_slack_insufficient != (session.model_admission_at(self.observed_at_ms)
+                == crate::AdaptiveModelAdmissionV1::InsufficientSlack)
             || self.observed_at_ms < issued_at
             || self.active_allowance_digest != adaptive_budget_allowance_digest(active)?
             || self.continuation_history_digest
@@ -236,7 +244,7 @@ impl AdaptiveBudgetWindowAuthorityV1 {
             || session.model_calls > session.active_model_ceiling()
             || session.continuation.as_ref().is_some_and(|state| {
                 state.authorizations.is_empty()
-                    || state.authorizations.len() > crate::ADAPTIVE_CONTINUATION_MAX_WINDOWS
+                    || state.authorizations.len() > session.continuation_window_limit()
             })
             || active.allowance_id != *allowance_id
             || crate::adaptive_continuation_provider_digest(active, authority)? != *provider_digest
@@ -296,6 +304,8 @@ pub struct AdaptiveLeadershipReviewGrantV1 {
     pub subject: Option<AdaptiveLeadershipReviewSubjectV2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_epoch: Option<crate::AdaptiveLeadershipRecoveryBindingV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_policy: Option<Box<crate::AdaptiveResumePolicyBindingV1>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,42 +371,62 @@ impl AdaptiveLeadershipReviewCallV1 {
             .max_model_calls
             .checked_sub(source.model_calls)
             .ok_or_else(invalid)?;
-        let (call_limit, duration_limit) = match (&self.grant.subject, self.grant.schema_version) {
-            (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3 | 4) => {
-                self.context.validate(&self.grant)?;
-                if self.schema_version != self.grant.schema_version
-                    || (self.grant.schema_version == 3 && self.grant.recovery_epoch.is_some())
-                    || (self.grant.schema_version == 4
-                        && self
-                            .grant
-                            .recovery_epoch
-                            .as_ref()
-                            .is_none_or(|binding| binding.schema_version != 2))
-                    || issued_at_ms < budget.observed_at_ms
-                    || source.continuation.as_ref().is_some_and(|state| {
-                        state.authorizations.len() >= crate::ADAPTIVE_CONTINUATION_MAX_WINDOWS
-                    })
-                    || self.grant.provider != current.grant.provider
-                    || self.grant.model != current.grant.model
-                    || self.grant.catalog_digest != current.grant.catalog_digest
-                    || self.grant.token_policy != current.grant.token_policy
-                {
-                    return Err(invalid());
-                }
-                (
-                    budget.root_allowance.grant.max_calls,
-                    budget.root_allowance.grant.max_duration_ms,
-                )
-            }
-            (_, 1 | 2)
-                if !matches!(
-                    &self.grant.subject,
-                    Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. })
-                ) =>
+        let (call_limit, duration_limit) = if let Some(binding) = &self.grant.resume_policy {
+            crate::adaptive::validate_resume_policy_binding(binding)?;
+            self.context.validate(&self.grant)?;
+            if self.grant.recovery_epoch.is_some()
+                || !matches!((&self.grant.subject, self.grant.schema_version),
+                    (Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. }), 2)
+                        | (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }), 3))
+                || binding.limits.max_call_duration_ms != source.grant.max_call_duration_ms
+                || deadline_ms > binding.limits.expires_at_unix_ms
+                || window_ms > binding.limits.max_window_ms
+                || source.continuation.as_ref().map_or(0, |state| state.authorizations.len())
+                    >= usize::from(binding.limits.total_window_ceiling)
+                || binding.limits.max_call_duration_ms.checked_add(binding.limits.dispatch_margin_ms)
+                    .is_none_or(|minimum| window_ms < minimum)
             {
-                (current.grant.max_calls, current.grant.max_duration_ms)
+                return Err(invalid());
             }
-            _ => return Err(invalid()),
+            (remaining, source.grant.max_call_duration_ms)
+        } else {
+            match (&self.grant.subject, self.grant.schema_version) {
+                (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3 | 4) => {
+                    self.context.validate(&self.grant)?;
+                    if self.schema_version != self.grant.schema_version
+                        || (self.grant.schema_version == 3 && self.grant.recovery_epoch.is_some())
+                        || (self.grant.schema_version == 4
+                            && self
+                                .grant
+                                .recovery_epoch
+                                .as_ref()
+                                .is_none_or(|binding| binding.schema_version != 2))
+                        || issued_at_ms < budget.observed_at_ms
+                        || source.continuation.as_ref().is_some_and(|state| {
+                            state.authorizations.len() >= source.continuation_window_limit()
+                        })
+                        || self.grant.provider != current.grant.provider
+                        || self.grant.model != current.grant.model
+                        || self.grant.catalog_digest != current.grant.catalog_digest
+                        || self.grant.token_policy != current.grant.token_policy
+                    {
+                        return Err(invalid());
+                    }
+                    (
+                        budget.root_allowance.grant.max_calls,
+                        budget.root_allowance.grant.max_duration_ms,
+                    )
+                }
+                (_, 1 | 2)
+                    if !matches!(
+                        &self.grant.subject,
+                        Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. })
+                    ) =>
+                {
+                    (current.grant.max_calls, current.grant.max_duration_ms)
+                }
+                _ => return Err(invalid()),
+            }
         };
         if issued_at_ms == 0
             || !(1_000..=ADAPTIVE_LEADERSHIP_MAX_GRANT_MS).contains(&window_ms)
@@ -736,6 +766,17 @@ impl AdaptiveLeadershipReviewGrantV1 {
         validate_identifier(&self.model)?;
         validate_digest(&self.catalog_digest)?;
         let leader = &self.leadership_principal;
+        if let Some(binding) = &self.resume_policy {
+            crate::adaptive::validate_resume_policy_binding(binding)?;
+            if self.recovery_epoch.is_some()
+                || !matches!((&self.subject, self.schema_version),
+                    (Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. }), 2)
+                        | (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }), 3))
+                || self.expires_at_unix_ms > binding.limits.expires_at_unix_ms
+            {
+                return Err(invalid());
+            }
+        }
         if let Some(binding) = &self.recovery_epoch {
             binding.validate_for(&leader.tenant_id, self.session_id, self.review_id)?;
             if !matches!(
@@ -851,6 +892,16 @@ impl AdaptiveLeadershipReviewContextV1 {
         }
         let project = &self.source_project;
         let session = &self.source_session;
+        if let Some(binding) = &grant.resume_policy {
+            crate::adaptive::validate_resume_policy_binding(binding)?;
+            if grant.recovery_epoch.is_some()
+                || binding.limits.max_call_duration_ms != session.grant.max_call_duration_ms
+                || !self.evidence_refs.contains(&format!(
+                    "adaptive-resume-policy:{}:{}", binding.receipt_digest, binding.ordinal))
+            {
+                return Err(invalid());
+            }
+        }
         session.grant.validate()?;
         project.governance.validate()?;
         let work = project
@@ -1074,6 +1125,7 @@ mod budget_tests {
             observed_at_ms: session.updated_at_ms,
             model_calls_exhausted: true,
             deadline_expired: false,
+            dispatch_slack_insufficient: false,
         };
         let project: ProjectV1 = serde_json::from_value(serde_json::json!({
             "schema_version": 1, "tenant_id": "tenant-01", "project_id": "project-01",
@@ -1160,6 +1212,7 @@ mod budget_tests {
                 budget: Box::new(budget),
             }),
             recovery_epoch: None,
+            resume_policy: None,
         };
         AdaptiveLeadershipReviewCallV1 {
             schema_version: 3,
@@ -1593,6 +1646,7 @@ mod budget_tests {
             deadline_ms: issued_at_ms + 120_000,
             additional_model_calls: 4,
             local_adoption: None,
+            resume_policy: None,
         };
         call.context.source_session = call
             .context

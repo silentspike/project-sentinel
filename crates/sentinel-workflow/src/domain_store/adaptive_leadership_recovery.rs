@@ -498,6 +498,11 @@ impl WorkflowStore {
         call.validate_entity()?;
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if call.grant.resume_policy.is_some() {
+            crate::domain_store::adaptive_resume_policy::require_resume_review_membership(
+                &transaction, &call.grant, &call.context_digest()?, call.operation_id,
+            )?;
+        }
         if let Some(epoch) = epoch_for_call(&transaction, call)? {
             epoch.validate_decision(decision)?;
         }
@@ -575,6 +580,11 @@ impl WorkflowStore {
             .ok_or_else(corrupt)?;
             Self::require_recovery_epoch_review(&transaction, &call)?;
             return Ok((true, prior));
+        }
+        if crate::domain_store::adaptive_resume_policy::read_resume_policy_leaf(
+            &transaction, &request.tenant_id, request.session_id,
+        )?.is_some() {
+            return Err(unauthorized());
         }
         request.validate(operator, now_ms)?;
         if grant.recovery_epoch.is_some() {
@@ -769,6 +779,11 @@ impl WorkflowStore {
             Self::require_recovery_epoch_review(&transaction, &call)?;
             scope.finish()?;
             return Ok((true, prior));
+        }
+        if crate::domain_store::adaptive_resume_policy::read_resume_policy_leaf(
+            &transaction, &request.tenant_id, request.session_id,
+        )?.is_some() {
+            return Err(unauthorized());
         }
         request.validate(operator, now_ms)?;
         let source = repair_source(&transaction, &request.tenant_id, request.session_id)?;

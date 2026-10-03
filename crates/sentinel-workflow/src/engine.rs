@@ -194,6 +194,25 @@ where
         authority: &crate::RuntimeAuthoritySnapshotV1,
         now_ms: u64,
     ) -> Result<(bool, crate::AdaptiveSessionV1), WorkflowError> {
+        self.advance_adaptive_session_with_clock(
+            session_id,
+            expected_version,
+            operation_id,
+            command,
+            authority,
+            || now_ms,
+        )
+    }
+
+    pub fn advance_adaptive_session_with_clock<Clock: FnMut() -> u64>(
+        &self,
+        session_id: uuid::Uuid,
+        expected_version: u64,
+        operation_id: uuid::Uuid,
+        command: &crate::AdaptiveTransitionV1,
+        authority: &crate::RuntimeAuthoritySnapshotV1,
+        clock: Clock,
+    ) -> Result<(bool, crate::AdaptiveSessionV1), WorkflowError> {
         require_ready(
             self.organization.readiness(),
             WorkflowErrorCode::OrganizationUnavailable,
@@ -207,13 +226,13 @@ where
                 authority.agent_id,
             )
             .map_err(map_organization_error)?;
-        self.store.advance_adaptive_session(
+        self.store.advance_adaptive_session_with_clock(
             session_id,
             expected_version,
             operation_id,
             command,
             &current,
-            now_ms,
+            clock,
         )
     }
 

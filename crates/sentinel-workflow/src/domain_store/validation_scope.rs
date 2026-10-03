@@ -36,6 +36,8 @@ struct State {
 thread_local! {
     // This slot exists only while its owner's SQLite savepoint is open.
     static ACTIVE: RefCell<Option<State>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static COMPLETED: RefCell<Option<Vec<BTreeMap<&'static str, usize>>>> = const { RefCell::new(None) };
 }
 
 fn connection_id(connection: &Connection) -> usize {
@@ -79,6 +81,14 @@ impl Scope<'_> {
             synchronize(self.connection)?;
             self.connection
                 .execute_batch("RELEASE sentinel_validation_scope")?;
+            #[cfg(test)]
+            COMPLETED.with(|completed| {
+                if let Some(scopes) = completed.borrow_mut().as_mut() {
+                    ACTIVE.with(|active| {
+                        scopes.push(active.borrow().as_ref().unwrap().validations.clone());
+                    });
+                }
+            });
             ACTIVE.with(|active| *active.borrow_mut() = None);
             self.owner = false;
         }
@@ -256,6 +266,28 @@ pub(crate) fn memoize<T: Clone + Serialize + 'static>(
 }
 
 #[cfg(test)]
+pub(crate) fn with_completed_validations<T>(
+    action: impl FnOnce() -> T,
+) -> (T, Vec<BTreeMap<&'static str, usize>>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COMPLETED.with(|completed| *completed.borrow_mut() = None);
+        }
+    }
+
+    assert!(ACTIVE.with(|active| active.borrow().is_none()));
+    COMPLETED.with(|completed| {
+        assert!(completed.borrow().is_none());
+        *completed.borrow_mut() = Some(Vec::new());
+    });
+    let _reset = Reset;
+    let result = action();
+    let scopes = COMPLETED.with(|completed| completed.borrow_mut().take().unwrap());
+    (result, scopes)
+}
+
+#[cfg(test)]
 pub(crate) fn validations(domain: &'static str) -> usize {
     ACTIVE.with(|active| {
         active
@@ -283,6 +315,31 @@ mod tests {
             Ok(connection
                 .query_row("SELECT value FROM records WHERE id=1", [], |row| row.get(0))?)
         })
+    }
+
+    #[test]
+    fn validation_scope_completed_counters_capture_owners_without_retaining_proofs() {
+        let connection = database();
+        let (_, scopes) = with_completed_validations(|| {
+            for _ in 0..2 {
+                with_scope(&connection, || {
+                    assert_eq!(value(&connection)?, 1);
+                    assert_eq!(value(&connection)?, 1);
+                    Ok(())
+                })
+                .unwrap();
+            }
+        });
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.iter().all(|scope| scope.get("record") == Some(&1)));
+        assert_eq!(validations("record"), 0);
+        let (failed, scopes) =
+            with_completed_validations(|| with_scope::<()>(&connection, || Err(corrupt())));
+        assert!(failed.is_err());
+        assert!(scopes.is_empty());
+        assert!(connection.is_autocommit());
+        assert_eq!(value(&connection).unwrap(), 1);
+        assert!(COMPLETED.with(|completed| completed.borrow().is_none()));
     }
 
     #[test]
