@@ -3,6 +3,7 @@ use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
 use sentinel_limbo::rusqlite;
 use sentinel_workflow::CustomerRequestStateV1;
 
+mod durable_health;
 mod fresh_observation;
 
 thread_local! {

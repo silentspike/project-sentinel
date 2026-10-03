@@ -1,5 +1,10 @@
 # Changelog
 
+- Inspect adaptive runtime health from validated durable heads and journals,
+  independently of current execution-profile and assignment admission.
+  Preserve historical unknown model/tool effects and fail on broken lineage;
+  do not make stale grants executable or rewrite task history (#856).
+
 - Reauthorize an adaptive provider request by its exact persisted session,
   allowance, assignee and effect, not by rescheduling the employee's other
   projects. Preserve current authority, expiry, budget, reservation and

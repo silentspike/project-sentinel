@@ -86,6 +86,14 @@ is unknown. After the authenticated inspection clears that window's fence,
 another model call does not by itself require repeating discovery. New windows
 still require fresh inspection; historical observations cannot clear the fence.
 
+Runtime health inspects validated durable session heads and journals separately
+from execution admission. A changed profile, a new assignee or a completed
+work item cannot hide an earlier unknown model or tool effect. Historical
+grants identify evidence; they do not authorize fresh work. Every current
+dispatch and leadership continuation still requires its current role, profile,
+assignment, deadline and budget. Corrupt or missing durable lineage makes
+health unavailable rather than silently omitting the affected session.
+
 ### Opt-in model work proposals
 
 The first M1 bridge is selected by `SENTINEL_MODEL_WORKBENCH_ENABLED=true`.
