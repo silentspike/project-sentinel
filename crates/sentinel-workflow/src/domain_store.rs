@@ -785,11 +785,7 @@ impl WorkflowStore {
         tenant_id.validate()?;
         project_id.validate()?;
         let connection = self.connection.lock().map_err(|_| persistence())?;
-        let value = get_entity(&connection, tenant_id, "project", &project_id.0)?;
-        if let Some(project) = &value {
-            validate_project(project)?;
-        }
-        Ok(value)
+        validated_company_project_in_snapshot(&connection, tenant_id, project_id)
     }
 
     /// Returns every durable project after validating the complete entity-row
@@ -7595,6 +7591,21 @@ impl CompanyEntity for ProjectV1 {
     fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
         subscription::validate_persisted(connection, self)
     }
+}
+
+/// Reuses the caller's pinned transaction and the canonical entity/proof validation.
+pub(crate) fn validated_company_project_in_snapshot(
+    connection: &Connection,
+    tenant_id: &TenantId,
+    project_id: &ProjectId,
+) -> Result<Option<ProjectV1>, WorkflowError> {
+    tenant_id.validate()?;
+    project_id.validate()?;
+    let value = get_entity(connection, tenant_id, "project", &project_id.0)?;
+    if let Some(project) = &value {
+        validate_project(project)?;
+    }
+    Ok(value)
 }
 
 fn get_entity<T: DeserializeOwned + Serialize + Clone + CompanyEntity + 'static>(

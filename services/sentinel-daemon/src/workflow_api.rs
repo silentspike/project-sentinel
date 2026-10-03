@@ -32,6 +32,8 @@ mod adaptive_review_epoch;
 mod budget_window_tests;
 mod delivery_intent;
 mod delivery_runtime;
+#[cfg(all(test, feature = "llm"))]
+mod exact_adaptive_dispatch_tests;
 #[cfg(feature = "llm")]
 mod historical_model_boundary;
 #[cfg(feature = "llm")]
@@ -5659,6 +5661,11 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
             return Ok(
                 adaptive_leadership_review::LeadershipAuthority::from_call(&call) == **binding,
             );
+        }
+        if let model_execution::ProviderExecutionAuthority::Adaptive(binding) = expected {
+            return self
+                .adaptive_provider_authority_for_exact_binding(binding)
+                .map(|actual| actual.as_ref() == Some(binding.as_ref()));
         }
         self.resolve_provider_usage_authority(expected.agent_id())
             .map(|current| current.as_ref() == Some(expected))

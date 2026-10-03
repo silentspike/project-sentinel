@@ -421,7 +421,13 @@ impl WorkflowApi {
             return Err("adaptive dispatch subject missing");
         };
         let binding = self
-            .adaptive_provider_authority_for_claim(AgentId(request.agent_id))?
+            .adaptive_provider_authority_for_reserved_session(
+                AgentId(request.agent_id),
+                *session_id,
+                &request.allowance_id,
+                *session_version,
+                *effect_id,
+            )?
             .ok_or("adaptive provider authority unavailable")?;
         if binding.grant.session_id != *session_id
             || binding.effect_id != *effect_id
@@ -514,7 +520,7 @@ impl WorkflowApi {
         );
         let (replayed, claimed) = self
             .core
-            .advance_adaptive_session_with_clock(
+            .advance_company_adaptive_model_with_clock(
                 *session_id,
                 *session_version,
                 operation_id,

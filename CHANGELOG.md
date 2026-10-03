@@ -1,5 +1,13 @@
 # Changelog
 
+- Reauthorize an adaptive provider request by its exact persisted session,
+  allowance, assignee and effect, not by rescheduling the employee's other
+  projects. Preserve current authority, expiry, budget, reservation and
+  one-shot claim checks before provider I/O (#856).
+- Recheck persisted company assignment and allowance in the final model-claim
+  transaction. Clarify that a known scoped file may be inspected directly,
+  without repeating workspace discovery within an inspected window (#856).
+
 - Revalidate accounting-reconsideration proofs in a fresh bounded post-write
   snapshot without committing the outer transaction early. Avoid repeated
   historical scans after cache invalidation; preserve all review limits and

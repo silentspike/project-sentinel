@@ -19,6 +19,8 @@ use crate::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+mod company_claim_tests;
 mod recovery_lineage;
 #[cfg(test)]
 mod rejected_model_tests;
@@ -671,7 +673,52 @@ impl WorkflowStore {
         operation_id: Uuid,
         command: &AdaptiveTransitionV1,
         current: &RuntimeAuthoritySnapshotV1,
+        clock: Clock,
+    ) -> Result<(bool, AdaptiveSessionV1), WorkflowError> {
+        self.advance_adaptive_session_in_transaction(
+            session_id,
+            expected_version,
+            operation_id,
+            command,
+            current,
+            clock,
+            false,
+        )
+    }
+
+    /// Checks persisted company authority only for a new final model claim.
+    pub fn advance_company_adaptive_model_with_clock<Clock: FnMut() -> u64>(
+        &self,
+        session_id: Uuid,
+        expected_version: u64,
+        operation_id: Uuid,
+        command: &AdaptiveTransitionV1,
+        current: &RuntimeAuthoritySnapshotV1,
+        clock: Clock,
+    ) -> Result<(bool, AdaptiveSessionV1), WorkflowError> {
+        if !matches!(command, AdaptiveTransitionV1::ClaimModel { .. }) {
+            return Err(authority_conflict());
+        }
+        self.advance_adaptive_session_in_transaction(
+            session_id,
+            expected_version,
+            operation_id,
+            command,
+            current,
+            clock,
+            true,
+        )
+    }
+
+    fn advance_adaptive_session_in_transaction<Clock: FnMut() -> u64>(
+        &self,
+        session_id: Uuid,
+        expected_version: u64,
+        operation_id: Uuid,
+        command: &AdaptiveTransitionV1,
+        current: &RuntimeAuthoritySnapshotV1,
         mut clock: Clock,
+        company_claim: bool,
     ) -> Result<(bool, AdaptiveSessionV1), WorkflowError> {
         current.validate()?;
         if operation_id.is_nil()
@@ -747,7 +794,22 @@ impl WorkflowStore {
         {
             return Err(authority_conflict());
         }
+        // The organization snapshot precedes this transaction. Only a NEW
+        // company claim must recheck persisted assignment/allowance authority.
+        let company_window = if company_claim {
+            Some(require_current_company_model_binding(
+                &tx, &session, current,
+            )?)
+        } else {
+            None
+        };
+        // Full project/receipt validation may be expensive. Sample the claim
+        // clock afterward so transition admission checks fresh dispatch slack.
         let now_ms = clock();
+        if company_window.is_some_and(|(earliest, expires)| now_ms < earliest || now_ms >= expires)
+        {
+            return Err(authority_conflict());
+        }
         let next = session.transition(command, now_ms)?;
         append(
             &tx,
@@ -1569,6 +1631,112 @@ pub(crate) fn require_resume_policy_anchor(
         return Err(authority_conflict());
     }
     Ok(())
+}
+
+fn require_current_company_model_binding(
+    connection: &Connection,
+    session: &AdaptiveSessionV1,
+    current: &RuntimeAuthoritySnapshotV1,
+) -> Result<(u64, u64), WorkflowError> {
+    let project = crate::domain_store::validated_company_project_in_snapshot(
+        connection,
+        &current.tenant_id,
+        &current.project_id,
+    )?
+    .ok_or_else(authority_conflict)?;
+    let effective = session.effective_grant();
+    if effective.authority != *current
+        || project.lifecycle_state != crate::ProjectLifecycleStateV1::Active
+        || project.governance.project_profile.generation != current.policy_generation
+        || !constant_time_eq(
+            &project.governance.project_profile.digest,
+            &current.policy_digest,
+        )
+    {
+        return Err(authority_conflict());
+    }
+    let work = project
+        .work_items
+        .get(&current.work_item_id)
+        .ok_or_else(authority_conflict)?;
+    let mut assignments = work
+        .assignments
+        .iter()
+        .filter(|assignment| assignment.active);
+    let assignment = assignments.next().ok_or_else(authority_conflict)?;
+    if assignments.next().is_some()
+        || !matches!(
+            work.state,
+            crate::CompanyWorkStateV1::Assigned
+                | crate::CompanyWorkStateV1::InProgress
+                | crate::CompanyWorkStateV1::InReview
+        )
+        || work.spec.work_item_id != current.work_item_id
+        || assignment.agent_id != current.agent_id
+        || assignment.role != work.spec.required_role
+        || assignment.assignment_version != current.assignment_version
+        || !constant_time_eq(&assignment.canonical_digest()?, &current.assignment_digest)
+        || assignment.organization_generation != current.organization_generation
+        || !constant_time_eq(
+            &assignment.organization_digest,
+            &current.organization_digest,
+        )
+        || assignment.profile.profile_id != current.profile_id
+        || assignment.profile.generation != current.profile_generation
+        || !constant_time_eq(&assignment.profile.digest, &current.profile_digest)
+        || !project.governance.participants.iter().any(|participant| {
+            participant.agent_id == current.agent_id
+                && participant.principal_id == current.principal.principal_id
+                && participant.role == assignment.role
+                && participant.profile == assignment.profile
+        })
+        || project
+            .reservations
+            .iter()
+            .any(|reservation| reservation.work_item_id.as_ref() == Some(&current.work_item_id))
+    {
+        return Err(authority_conflict());
+    }
+    let allowance = project
+        .subscription_call
+        .as_ref()
+        .ok_or_else(authority_conflict)?;
+    let grant = &allowance.grant;
+    // A continuation allowance authorizes one window, not the lifetime ceiling.
+    // Journal replay already verifies the continuation receipt and its root limits.
+    let window_calls = session
+        .continuation
+        .as_ref()
+        .and_then(|state| state.authorizations.last())
+        .map_or(session.grant.max_model_calls, |authorization| {
+            authorization.additional_model_calls
+        });
+    if allowance.allowance_id != effective.provider_allowance_id
+        || allowance.dispatch.is_some()
+        || grant.work_item_id != current.work_item_id
+        || grant.assignment_id != assignment.assignment_id
+        || grant.assignment_version != current.assignment_version
+        || grant.agent_id != current.agent_id
+        || grant.provider != effective.provider
+        || grant.model != effective.model
+        || !constant_time_eq(&grant.catalog_digest, &effective.catalog_digest)
+        || grant.max_calls != window_calls
+        || grant.max_concurrent != 1
+        || grant.max_duration_ms != effective.max_call_duration_ms
+        || grant.token_policy != crate::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap
+        || grant.expires_at_unix_ms != effective.deadline_ms
+        || allowance.created_at_unix_ms != effective.created_at_ms
+        || !constant_time_eq(
+            &adaptive_continuation_provider_digest(allowance, current)?,
+            &effective.provider_authority_digest,
+        )
+    {
+        return Err(authority_conflict());
+    }
+    Ok((
+        project.updated_at_unix_ms.max(allowance.created_at_unix_ms),
+        grant.expires_at_unix_ms,
+    ))
 }
 
 fn read_company_entity<T: DeserializeOwned>(
