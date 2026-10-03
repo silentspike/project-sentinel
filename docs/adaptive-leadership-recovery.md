@@ -75,6 +75,12 @@ minutes and cannot outlive the original policy.
 
 The receipt, event, membership and designated call commit together. Root
 ceilings, consumed calls, prior decisions and employee work remain unchanged.
+Historical proofs are bounded per stable read snapshot. After sealing the
+receipt and event, a new proof savepoint revalidates against the post-write
+state inside the same outer transaction. This discards stale proofs and permits
+reuse during that read phase without increasing the validation budget or
+committing any partial issuance. A failure in membership or call persistence
+still rolls back the receipt and event.
 Issuance is not Continue and creates no employee window. The real leader may
 independently Continue within the existing policy or Defer again. Automatic
 refusal reconciliation remains blocked. A failed, expired, unresolved or
