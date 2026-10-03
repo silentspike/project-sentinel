@@ -280,10 +280,12 @@ impl WorkflowApi {
         }
         validate_adaptive_decision_evidence(context.observation.as_ref(), &decision)?;
         let model_response_digest = hex_sha256(completion.content.as_bytes());
+        // Adaptive completions historically retain the full raw content without
+        // the leadership-only redundant digest. Seal the actual payload/content;
+        // a supplied optional digest must still match, never be repaired.
         if payload
             .get("model_response_digest")
-            .and_then(serde_json::Value::as_str)
-            != Some(model_response_digest.as_str())
+            .is_some_and(|value| value.as_str() != Some(model_response_digest.as_str()))
         {
             return Err("known rejection raw response changed");
         }

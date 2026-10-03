@@ -1804,6 +1804,65 @@ pub mod bridge {
         Ok(())
     }
 
+    /// Synthetic test input through the real serializer, usage append and admission;
+    /// this is not evidence of live provider execution.
+    #[cfg(test)]
+    pub(crate) fn retain_adaptive_gateway_completion_for_test(
+        store: &EventStore,
+        resolver: &crate::workflow_api::WorkflowApi,
+        completion: &ModelWorkCompletion,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<(), String> {
+        let ModelWorkContext::Adaptive(context) = &completion.context else {
+            return Err("producer fixture requires an Adaptive completion".to_owned());
+        };
+        if !completion.admissible {
+            return Err("producer fixture requires an admissible completion".to_owned());
+        }
+        let authority = completion.context.binding();
+        let response = GatewayResponse {
+            content: completion.content.clone(),
+            decision: "forward".to_owned(),
+            actions: Vec::new(),
+            tokens_used: 18,
+            request_id: request_id.to_owned(),
+            provider: authority.provider().to_owned(),
+            input_tokens: 11,
+            output_tokens: 7,
+            cache_read: 0,
+            cache_creation: 0,
+            tier: "mid".to_owned(),
+            cost_usd: 0.0,
+            hierarchy_tier: Some(HierarchyTier::TIER_2),
+            cost_source: Some(CostSource::ProviderReported),
+            effective_model: context.binding.grant.model.clone(),
+        };
+        let (action_tx, action_rx) = mpsc::channel();
+        let result = store_gateway_completion(
+            store,
+            &action_tx,
+            GatewayCompletionContext {
+                request_id,
+                request_digest,
+                agent_id: authority.agent_id(),
+                tick: 1,
+                requested_model: &context.binding.grant.model,
+                authority: Some(&authority),
+                authority_resolver: Some(resolver),
+                gateway_response: &response,
+                usage_v2_enabled: true,
+                model_work: Some(&completion.context),
+            },
+            5,
+        );
+        assert!(
+            action_rx.try_recv().is_err(),
+            "model completion emitted a legacy action"
+        );
+        result
+    }
+
     #[derive(Clone)]
     struct AgentRoutingClaim {
         role: String,
