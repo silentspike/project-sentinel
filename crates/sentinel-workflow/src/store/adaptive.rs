@@ -21,6 +21,8 @@ use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 mod company_claim_tests;
+#[cfg(test)]
+mod health_inventory_tests;
 mod recovery_lineage;
 #[cfg(test)]
 mod rejected_model_tests;
@@ -205,6 +207,17 @@ impl WorkflowStore {
         authorize(&session.grant, current)?;
         require_head(&connection, &session)?;
         Ok(Some(session))
+    }
+
+    /// Historical health inventory only, never admission or authority to retry effects.
+    pub fn adaptive_sessions_for_health(&self) -> Result<Vec<AdaptiveSessionV1>, WorkflowError> {
+        let mut connection = self.lock()?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sqlite_error)?;
+        // The validation scope pins the snapshot and reuses replay proofs only until
+        // this read ends, including journals named by both heads and namespaces.
+        crate::domain_store::validation_scope::with_scope(&tx, || adaptive_health_inventory(&tx))
     }
 
     /// Private historical pointers from one authorized, fully replayed read snapshot.
@@ -1764,6 +1777,302 @@ fn read_company_entity<T: DeserializeOwned>(
         ));
     }
     decode(&payload)
+}
+
+type HealthScope = (String, String, String, i64, String);
+
+struct HealthJournal {
+    session: AdaptiveSessionV1,
+    root: Entry,
+    scope: HealthScope,
+}
+
+fn health_scope(session: &AdaptiveSessionV1) -> Result<HealthScope, WorkflowError> {
+    let authority = &session.grant.authority;
+    Ok((
+        authority.tenant_id.to_string(),
+        authority.project_id.to_string(),
+        authority.work_item_id.to_string(),
+        i64::from(authority.agent_id.0),
+        authority.canonical_digest()?,
+    ))
+}
+
+fn adaptive_health_inventory(
+    connection: &Connection,
+) -> Result<Vec<AdaptiveSessionV1>, WorkflowError> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // Inspect namespace keys independently of heads and JSON payload locators.
+    // A deleted head, missing root, companion-only journal or alias must not vanish.
+    let mut ids = BTreeSet::new();
+    let mut statement = connection
+        .prepare("SELECT DISTINCT operation_namespace FROM workflow_operations WHERE operation_namespace GLOB 'adaptive-session-v1:*' ORDER BY operation_namespace")
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement.query([]).map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let ns: String = row.get(0).map_err(map_sqlite_error)?;
+        let key = ns
+            .strip_prefix("adaptive-session-v1:")
+            .ok_or_else(corrupt_store)?;
+        let (session_key, suffix) = key
+            .split_once(':')
+            .map_or((key, None), |(session, suffix)| (session, Some(suffix)));
+        let id = Uuid::parse_str(session_key).map_err(|_| corrupt_store())?;
+        if id.is_nil()
+            || session_key != id.to_string()
+            || !matches!(
+                suffix,
+                None | Some("operations") | Some("rejected-model-dispositions")
+            )
+        {
+            return Err(corrupt_store());
+        }
+        ids.insert(id);
+    }
+
+    let mut heads = BTreeMap::new();
+    let mut head_ids = BTreeSet::new();
+    let mut lineage_counts = BTreeMap::new();
+    let mut statement = connection
+        .prepare("SELECT tenant_id,project_id,work_item_id,agent_id,authority_digest,session_id,version,updated_at_ms FROM workflow_adaptive_heads ORDER BY tenant_id,project_id,work_item_id,agent_id,authority_digest")
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement.query([]).map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let scope: HealthScope = (
+            row.get(0).map_err(map_sqlite_error)?,
+            row.get(1).map_err(map_sqlite_error)?,
+            row.get(2).map_err(map_sqlite_error)?,
+            row.get(3).map_err(map_sqlite_error)?,
+            row.get(4).map_err(map_sqlite_error)?,
+        );
+        let lineage = (scope.0.clone(), scope.1.clone(), scope.2.clone(), scope.3);
+        let count = lineage_counts.entry(lineage).or_insert(0);
+        *count += 1;
+        if *count > MAX_SCOPED_ADAPTIVE_HEADS {
+            return Err(corrupt_store());
+        }
+        let key: String = row.get(5).map_err(map_sqlite_error)?;
+        let id = Uuid::parse_str(&key).map_err(|_| corrupt_store())?;
+        let head = AdaptiveHead {
+            session_id: id,
+            version: stored_u64(row.get(6).map_err(map_sqlite_error)?)?,
+            updated_at_ms: stored_u64(row.get(7).map_err(map_sqlite_error)?)?,
+        };
+        let (session, _) = load(connection, id)?.ok_or_else(corrupt_store)?;
+        validate_head(&head, &session)?;
+        if id.is_nil()
+            || key != id.to_string()
+            || scope != health_scope(&session)?
+            || !head_ids.insert(id)
+            || heads.insert(scope, id).is_some()
+        {
+            return Err(corrupt_store());
+        }
+        ids.insert(id);
+    }
+
+    let mut journals = BTreeMap::new();
+    let mut roots = BTreeMap::new();
+    for id in ids {
+        let (session, _, _) = load_with_feedback(connection, id)?.ok_or_else(corrupt_store)?;
+        let (_, root) = evidence_entry(connection, &namespace(id), 1)?;
+        let operation_versions = validated_journal_operations(connection, &session)?
+            .into_iter()
+            .map(|(record, _)| record.session_version)
+            .collect::<BTreeSet<_>>();
+        validate_health_dispositions(connection, &session)?;
+        // Only a proven rollover cancellation may omit its command companion.
+        let rollover = !head_ids.contains(&id)
+            && matches!(&session.cursor, crate::AdaptiveCursorV1::Cancelled);
+        if (2..=session.version).any(|version| {
+            !operation_versions.contains(&version) && !(rollover && version == session.version)
+        }) || (!head_ids.contains(&id) && !rollover)
+        {
+            return Err(corrupt_store());
+        }
+        let scope = health_scope(&session)?;
+        if roots
+            .insert((scope.clone(), root.session.updated_at_ms), id)
+            .is_some()
+        {
+            return Err(corrupt_store());
+        }
+        journals.insert(
+            id,
+            HealthJournal {
+                session,
+                root,
+                scope,
+            },
+        );
+    }
+
+    let mut successors = BTreeMap::new();
+    let mut predecessors = BTreeSet::new();
+    for (id, journal) in &journals {
+        if head_ids.contains(id) {
+            continue;
+        }
+        // The scope head has already been independently replayed and index-bound.
+        if !heads.contains_key(&journal.scope) {
+            return Err(corrupt_store());
+        }
+        let next = roots
+            .get(&(journal.scope.clone(), journal.session.updated_at_ms))
+            .filter(|next| *next != id)
+            .ok_or_else(corrupt_store)?;
+        validate_health_rollover(connection, journal, &journals[next])?;
+        if !predecessors.insert(*next) {
+            return Err(corrupt_store());
+        }
+        successors.insert(*id, *next);
+    }
+    // Feedback is introduced only by a validated rejected-first-model rollover;
+    // each later rollover preserves or increments that exact inherited record.
+    // This proves all origins once, without repeatedly replaying ancestor chains.
+    if journals
+        .iter()
+        .any(|(id, journal)| journal.root.recovery_feedback.is_some() && !predecessors.contains(id))
+    {
+        return Err(corrupt_store());
+    }
+
+    // Bound each proof chain, not the global inventory. Every unrelated head
+    // remains visible, including inventories larger than 64 sessions.
+    let mut depths = head_ids
+        .iter()
+        .map(|id| (*id, 1))
+        .collect::<BTreeMap<_, _>>();
+    for id in successors.keys() {
+        let mut cursor = *id;
+        let mut path = Vec::new();
+        let mut visited = BTreeSet::new();
+        while !depths.contains_key(&cursor) {
+            if path.len() >= MAX_SCOPED_ADAPTIVE_HEADS || !visited.insert(cursor) {
+                return Err(corrupt_store());
+            }
+            path.push(cursor);
+            cursor = *successors.get(&cursor).ok_or_else(corrupt_store)?;
+        }
+        let mut depth = depths[&cursor];
+        for prior in path.into_iter().rev() {
+            depth += 1;
+            if depth > MAX_SCOPED_ADAPTIVE_HEADS {
+                return Err(corrupt_store());
+            }
+            depths.insert(prior, depth);
+        }
+    }
+    Ok(heads
+        .values()
+        .map(|id| journals[id].session.clone())
+        .collect())
+}
+
+fn validate_health_dispositions(
+    connection: &Connection,
+    session: &AdaptiveSessionV1,
+) -> Result<(), WorkflowError> {
+    let mut statement = connection
+        .prepare("SELECT operation_id FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2")
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![
+            rejected_model_disposition_namespace(session.grant.session_id),
+            (MAX_JOURNAL_ENTRIES + 1) as i64,
+        ])
+        .map_err(map_sqlite_error)?;
+    let mut count = 0;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        count += 1;
+        let key: String = row.get(0).map_err(map_sqlite_error)?;
+        let id = Uuid::parse_str(&key).map_err(|_| corrupt_store())?;
+        if count > MAX_JOURNAL_ENTRIES || id.is_nil() || key != id.to_string() {
+            return Err(corrupt_store());
+        }
+        read_rejected_model_disposition(connection, session.grant.session_id, id)?
+            .ok_or_else(corrupt_store)?;
+    }
+    Ok(())
+}
+
+fn validate_health_rollover(
+    connection: &Connection,
+    prior: &HealthJournal,
+    next: &HealthJournal,
+) -> Result<(), WorkflowError> {
+    let session = &prior.session;
+    let ns = namespace(session.grant.session_id);
+    let (_, cancellation) = evidence_entry(connection, &ns, session.version)?;
+    let (_, source) = evidence_entry(
+        connection,
+        &ns,
+        session.version.checked_sub(1).ok_or_else(corrupt_store)?,
+    )?;
+    let source = source.session;
+    let never_claimed = source.version == 1
+        && source.model_calls == 0
+        && source.tool_calls == 0
+        && matches!(&source.cursor, crate::AdaptiveCursorV1::ReadyForModel)
+        && source.last_observation.is_none()
+        && source.last_model_result_digest.is_none()
+        && source.effect_ids.is_empty();
+    let rejected_first_model = matches!(source.version, 3 | 4)
+        && source.model_calls == 1
+        && source.tool_calls == 0
+        && matches!(
+            &source.cursor,
+            crate::AdaptiveCursorV1::ModelRejected { .. }
+        )
+        && source.last_observation.is_none()
+        && source.last_model_result_digest.is_none()
+        && source.effect_ids.len() == 1;
+    if source.continuation.is_some()
+        || !(never_claimed
+            || rejected_first_model
+            || matches!(
+                &source.cursor,
+                crate::AdaptiveCursorV1::BlockedResolved { .. }
+            ))
+        || !matches!(&cancellation.command, Some(AdaptiveTransitionV1::Cancel))
+        || session.grant.authority != next.session.grant.authority
+        || session.grant.provider_allowance_id == next.session.grant.provider_allowance_id
+        || session.updated_at_ms < session.grant.deadline_ms
+        || session.updated_at_ms != next.root.session.updated_at_ms
+        || prior.root.session.updated_at_ms >= next.root.session.updated_at_ms
+    {
+        return Err(corrupt_store());
+    }
+    let feedback = if rejected_first_model {
+        let count = prior
+            .root
+            .recovery_feedback
+            .as_ref()
+            .map_or(0, |feedback| feedback.count);
+        if count >= ADAPTIVE_SCHEMA_MAX_CORRECTIONS {
+            return Err(corrupt_store());
+        }
+        let crate::AdaptiveCursorV1::ModelRejected {
+            reason_code,
+            resolution_event_id,
+        } = &source.cursor
+        else {
+            return Err(corrupt_store());
+        };
+        Some(AdaptiveRecoveryFeedbackV1 {
+            count: count + 1,
+            reason_code: reason_code.clone(),
+            resolution_event_id: resolution_event_id.clone(),
+            previous_session_id: session.grant.session_id,
+        })
+    } else {
+        prior.root.recovery_feedback.clone()
+    };
+    if next.root.recovery_feedback != feedback {
+        return Err(corrupt_store());
+    }
+    Ok(())
 }
 
 struct AdaptiveHead {

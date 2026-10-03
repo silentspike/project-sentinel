@@ -888,24 +888,40 @@ impl WorkflowApi {
         if !self.model_work_enabled {
             return Ok(false);
         }
-        for project in self
+        let projects = self
             .store
             .company_projects()
-            .map_err(|_| "adaptive projects unavailable")?
+            .map_err(|_| "adaptive projects unavailable")?;
+        let project_ids: BTreeSet<_> = projects
+            .into_iter()
+            .map(|project| (project.tenant_id, project.project_id))
+            .collect();
+        // Health reads durable effect lineage, not permission to perform new work.
+        let mut unknown = false;
+        for session in self
+            .store
+            .adaptive_sessions_for_health()
+            .map_err(|_| "adaptive sessions unavailable")?
         {
-            for session in self.review_sessions_for_health(&project)? {
-                match &session.cursor {
-                    AdaptiveCursorV1::ModelUnknown { .. } => return Ok(true),
-                    AdaptiveCursorV1::ModelPending { effect }
-                        if self.adaptive_provider_outcome_unknown(&session, effect)? =>
-                    {
-                        return Ok(true);
-                    }
-                    _ => {}
+            if !project_ids.contains(&(
+                session.grant.authority.tenant_id.clone(),
+                session.grant.authority.project_id.clone(),
+            )) {
+                return Err("adaptive project unavailable");
+            }
+            match &session.cursor {
+                AdaptiveCursorV1::ModelUnknown { .. } | AdaptiveCursorV1::ToolUnknown { .. } => {
+                    unknown = true;
                 }
+                AdaptiveCursorV1::ModelPending { effect }
+                    if self.adaptive_provider_outcome_unknown(&session, effect)? =>
+                {
+                    unknown = true;
+                }
+                _ => {}
             }
         }
-        Ok(false)
+        Ok(unknown)
     }
 
     // Reconciliation owns the exclusive fence. Unknown is not blocked and can

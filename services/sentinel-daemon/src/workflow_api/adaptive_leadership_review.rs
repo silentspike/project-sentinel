@@ -416,21 +416,6 @@ impl WorkflowApi {
         &self,
         project: &sentinel_workflow::ProjectV1,
     ) -> Result<Vec<AdaptiveSessionV1>, &'static str> {
-        self.review_sessions_inner(project, true)
-    }
-
-    pub(super) fn review_sessions_for_health(
-        &self,
-        project: &sentinel_workflow::ProjectV1,
-    ) -> Result<Vec<AdaptiveSessionV1>, &'static str> {
-        self.review_sessions_inner(project, false)
-    }
-
-    fn review_sessions_inner(
-        &self,
-        project: &sentinel_workflow::ProjectV1,
-        skip_authority_conflicts: bool,
-    ) -> Result<Vec<AdaptiveSessionV1>, &'static str> {
         let mut sessions = Vec::new();
         for work in project.work_items.values().filter(|work| {
             work.state == sentinel_workflow::CompanyWorkStateV1::Assigned
@@ -457,7 +442,7 @@ impl WorkflowApi {
                     false,
                 ) {
                 Ok(authority) => authority,
-                Err(WorkflowPortError::AuthorityConflict) if skip_authority_conflicts => continue,
+                Err(WorkflowPortError::AuthorityConflict) => continue,
                 Err(_) => return Err("leadership assignee authority unavailable"),
             };
             match self.store.adaptive_session_for_authority(&authority) {
@@ -465,9 +450,7 @@ impl WorkflowApi {
                 Ok(None) => {}
                 // A stale assignment remains non-serving without blocking other
                 // employees. Corruption and persistence failures still propagate.
-                Err(error)
-                    if skip_authority_conflicts
-                        && error.code == WorkflowErrorCode::AuthorityConflict => {}
+                Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => {}
                 Err(_) => return Err("leadership session unavailable"),
             }
         }
@@ -4145,10 +4128,8 @@ pub(crate) mod tests {
         );
         let before = discovery_state(&path, &events);
         assert_eq!(api.review_sessions(&multiple).unwrap(), vec![ready.clone()]);
-        assert_eq!(
-            api.review_sessions_for_health(&multiple).unwrap_err(),
-            "leadership assignee authority unavailable"
-        );
+        // Health inventories durable sessions, not caller-supplied discovery hints.
+        assert!(!api.adaptive_models_have_unknown_outcome().unwrap());
         let mut foreign = project.clone();
         foreign.project_id = ProjectId::parse("000-poison-project").unwrap();
         let discovered = [&foreign, &project]
@@ -4156,7 +4137,7 @@ pub(crate) mod tests {
             .flat_map(|project| api.review_sessions(project).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(discovered, vec![ready]);
-        assert!(api.review_sessions_for_health(&foreign).is_err());
+        assert!(!api.adaptive_models_have_unknown_outcome().unwrap());
         assert_eq!(discovery_state(&path, &events), before);
     }
 
@@ -4263,7 +4244,7 @@ pub(crate) mod tests {
             let _fence = api.mutation_fence.write().unwrap();
             for poison in &projects {
                 assert!(api.review_sessions(poison).unwrap().is_empty());
-                assert!(api.review_sessions_for_health(poison).is_err());
+                assert!(!api.adaptive_models_have_unknown_outcome().unwrap());
                 assert!(api.reconcile_adaptive_leadership_reviews(poison).unwrap());
             }
             assert_eq!(discovery_state(&path, &events), before);
@@ -4336,7 +4317,7 @@ pub(crate) mod tests {
             }
             let before = discovery_state(&path, &events);
             assert!(api.review_sessions(&project).is_err());
-            assert!(api.review_sessions_for_health(&project).is_err());
+            assert!(!api.adaptive_models_have_unknown_outcome().unwrap());
             assert!(api.reconcile_adaptive_leadership_reviews(&project).is_err());
             assert_eq!(discovery_state(&path, &events), before);
         }
@@ -4388,7 +4369,7 @@ pub(crate) mod tests {
                 );
             }
             assert!(api.review_sessions(&project).is_err());
-            assert!(api.review_sessions_for_health(&project).is_err());
+            assert!(api.adaptive_models_have_unknown_outcome().is_err());
             assert!(api.reconcile_adaptive_leadership_reviews(&project).is_err());
             assert_eq!(discovery_state(&path, &events), before);
         }
