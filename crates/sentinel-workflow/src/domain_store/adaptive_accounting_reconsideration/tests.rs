@@ -208,6 +208,20 @@ fn expired_or_deferred_correction_never_releases_second_slot() {
 }
 
 #[test]
+fn accounting_write_boundary_starts_fresh_bounded_proofs_inside_the_same_transaction() {
+    let c = correction();
+    let original_journal = journal(&c.f);
+    let (result, scopes) = validation_scope::with_completed_validations(|| post(&c, c.now));
+    assert!(!result.unwrap().0);
+    assert_eq!(scopes.len(), 2);
+    for scope in scopes {
+        assert_eq!(scope.get("review-calls"), Some(&1));
+        assert_eq!(scope.get("adaptive-journal"), Some(&1));
+    }
+    assert_eq!(journal(&c.f), original_journal);
+}
+
+#[test]
 fn event_failure_rolls_back_receipt_membership_and_review_together() {
     for event in ["adaptive_accounting_reconsideration_authorized", "adaptive_resume_review_membership_issued", "adaptive_leadership_review_authorized"] {
         let c = correction();

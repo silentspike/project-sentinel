@@ -661,6 +661,10 @@ impl WorkflowStore {
             &receipt,
             now_ms,
         )?;
+        // The outer transaction remains atomic; discard pre-write proofs and
+        // validate the new receipt against the post-write snapshot with reuse.
+        scope.finish()?;
+        let scope = validation_scope::enter(&transaction)?;
         Self::authorize_new_leadership_review_in_transaction(
             &transaction,
             &grant.leadership_principal,
