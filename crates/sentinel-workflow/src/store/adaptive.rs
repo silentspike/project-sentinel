@@ -10,12 +10,15 @@ use crate::{
     AdaptiveContinuationAuthorizationV1, AdaptiveContinuationSourceV1, AdaptiveEffectV1,
     AdaptiveFirstUnknownModelJournalEvidenceV1, AdaptiveLeadershipReviewCallV1,
     AdaptiveModelDecisionV1, AdaptiveModelJournalRecordEvidenceV1, AdaptiveRecoveryFeedbackV1,
-    AdaptiveSessionGrantV1, AdaptiveSessionV1, AdaptiveTransitionV1,
-    ADAPTIVE_SCHEMA_MAX_CORRECTIONS,
+    AdaptiveRejectedModelReceiptV1, AdaptiveSessionGrantV1, AdaptiveSessionV1,
+    AdaptiveTransitionV1, ADAPTIVE_SCHEMA_MAX_CORRECTIONS,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 mod recovery_lineage;
+#[cfg(test)]
+mod rejected_model_tests;
 
 const MAX_JOURNAL_ENTRIES: usize = 512;
 const MAX_SCOPED_ADAPTIVE_HEADS: usize = 64;
@@ -29,6 +32,13 @@ struct Entry {
     // Only the initial entry carries lineage. Omitting None preserves old entry digests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_feedback: Option<AdaptiveRecoveryFeedbackV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectedModelDisposition {
+    receipt: AdaptiveRejectedModelReceiptV1,
+    response: AdaptiveSessionV1,
 }
 
 impl WorkflowStore {
@@ -204,6 +214,40 @@ impl WorkflowStore {
         authorize(&session.grant, current)?;
         require_head(&connection, &session)?;
         Ok(Some(digest))
+    }
+
+    /// One authorized read snapshot of the exact pending session and journal digest.
+    /// This evidence does not authorize disposition; the write path rechecks it.
+    pub fn adaptive_pending_model_head_evidence(
+        &self,
+        session_id: Uuid,
+        expected_version: u64,
+        effect: &AdaptiveEffectV1,
+        current: &RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<(AdaptiveSessionV1, String)>, WorkflowError> {
+        current.validate()?;
+        let mut connection = self.lock()?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sqlite_error)?;
+        let Some((session, digest)) = load(&tx, session_id)? else {
+            return Ok(None);
+        };
+        authorize(&session.grant, current)?;
+        require_head(&tx, &session)?;
+        if session.version != expected_version {
+            return Err(WorkflowError::new(
+                WorkflowErrorCode::VersionConflict,
+                false,
+                "adaptive session version changed",
+            ));
+        }
+        if !matches!(&session.cursor, crate::AdaptiveCursorV1::ModelPending { effect: pending }
+            if pending == effect)
+        {
+            return Err(authority_conflict());
+        }
+        Ok(Some((session, digest)))
     }
 
     /// Resolves exact authority without hiding same-assignment campaigns after drift.
@@ -515,7 +559,12 @@ impl WorkflowStore {
         mut clock: Clock,
     ) -> Result<(bool, AdaptiveSessionV1), WorkflowError> {
         current.validate()?;
-        if operation_id.is_nil() || matches!(command, AdaptiveTransitionV1::ContinueGoverned { .. })
+        if operation_id.is_nil()
+            || matches!(
+                command,
+                AdaptiveTransitionV1::ContinueGoverned { .. }
+                    | AdaptiveTransitionV1::ResumeRejectedModel { .. }
+            )
         {
             return Err(authority_conflict());
         }
@@ -607,6 +656,271 @@ impl WorkflowStore {
         tx.commit().map_err(map_sqlite_error)?;
         Ok((false, next))
     }
+
+    /// The verifier reads retained EventStore evidence under the locked pending
+    /// head. It must not re-enter WorkflowStore or perform provider/tool I/O.
+    /// Committed replay returns the historical response without moving the head.
+    pub fn dispose_rejected_adaptive_model<F, C>(
+        &self,
+        operation_id: Uuid,
+        receipt: &AdaptiveRejectedModelReceiptV1,
+        current: &RuntimeAuthoritySnapshotV1,
+        mut clock: C,
+        verify: F,
+    ) -> Result<(bool, AdaptiveSessionV1), WorkflowError>
+    where
+        C: FnMut() -> u64,
+        F: FnOnce(
+            &AdaptiveSessionV1,
+            &str,
+            &AdaptiveRejectedModelReceiptV1,
+        ) -> Result<AdaptiveModelDecisionV1, WorkflowError>,
+    {
+        current.validate()?;
+        receipt.validate()?;
+        if operation_id.is_nil() {
+            return Err(authority_conflict());
+        }
+        let mut connection = self.lock()?;
+        let tx = immediate(&mut connection)?;
+        let (session, prior_digest) = load(&tx, receipt.session_id)?.ok_or_else(not_found)?;
+        authorize(&session.grant, current)?;
+        require_head(&tx, &session)?;
+        if let Some(recorded) =
+            read_rejected_model_disposition(&tx, receipt.session_id, operation_id)?
+        {
+            if recorded.receipt != *receipt {
+                return Err(idempotency_conflict());
+            }
+            return Ok((true, recorded.response));
+        }
+        require_rejected_model_source(&session, &prior_digest, receipt)?;
+        if validated_journal_operations(&tx, &session)?
+            .iter()
+            .any(|(_, command)| {
+                matches!(command, AdaptiveTransitionV1::ResolveModel { effect, .. }
+                    if effect.id == receipt.effect.id)
+            })
+        {
+            return Err(authority_conflict());
+        }
+        let decision = verify(&session, &prior_digest, receipt)?;
+        let AdaptiveModelDecisionV1::Tool { tool, tool_digest } = decision else {
+            return Err(authority_conflict());
+        };
+        if !matches!(&tool, sentinel_common::WorkbenchTool::WriteFile { .. })
+            || tool_digest != receipt.tool_digest
+            || crate::adaptive_tool_digest(&tool)? != tool_digest
+        {
+            return Err(authority_conflict());
+        }
+        let now_ms = clock();
+        let (reject, resume) = rejected_model_commands(operation_id, receipt)?;
+        let rejected = session.transition(&reject, now_ms)?;
+        let resumed = rejected.transition(&resume, now_ms)?;
+        let ns = namespace(receipt.session_id);
+        let rejected_entry = Entry {
+            previous_digest: Some(prior_digest),
+            command: Some(reject.clone()),
+            session: rejected.clone(),
+            recovery_feedback: None,
+        };
+        let rejected_digest =
+            canonical_sha256("sentinel.workflow.adaptive-entry.v1", &rejected_entry)?;
+        append(&tx, &ns, &rejected_entry)?;
+        append(
+            &tx,
+            &ns,
+            &Entry {
+                previous_digest: Some(rejected_digest),
+                command: Some(resume.clone()),
+                session: resumed.clone(),
+                recovery_feedback: None,
+            },
+        )?;
+        let operations = format!("{ns}:operations");
+        for (id, source_version, command, response) in [
+            (operation_id, session.version, &reject, &rejected),
+            (
+                rejected_model_resume_operation_id(operation_id),
+                rejected.version,
+                &resume,
+                &resumed,
+            ),
+        ] {
+            let digest = canonical_sha256(
+                "sentinel.workflow.adaptive-command.v1",
+                &(receipt.session_id, source_version, command),
+            )?;
+            insert_operation(&tx, &operations, &id.to_string(), &digest, response, now_ms)?;
+        }
+        let disposition = RejectedModelDisposition {
+            receipt: receipt.clone(),
+            response: resumed.clone(),
+        };
+        insert_operation(
+            &tx,
+            &rejected_model_disposition_namespace(receipt.session_id),
+            &operation_id.to_string(),
+            &rejected_model_disposition_digest(operation_id, receipt)?,
+            &disposition,
+            now_ms,
+        )?;
+        update_head(&tx, &session, &resumed)?;
+        tx.commit().map_err(map_sqlite_error)?;
+        Ok((false, resumed))
+    }
+}
+
+fn rejected_model_disposition_namespace(session_id: Uuid) -> String {
+    format!("{}:rejected-model-dispositions", namespace(session_id))
+}
+
+fn rejected_model_disposition_digest(
+    operation_id: Uuid,
+    receipt: &AdaptiveRejectedModelReceiptV1,
+) -> Result<String, WorkflowError> {
+    canonical_sha256(
+        "sentinel.workflow.adaptive-rejected-model-disposition.v1",
+        &(operation_id, receipt),
+    )
+}
+
+fn rejected_model_resume_operation_id(operation_id: Uuid) -> Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"sentinel.workflow.resume-rejected-model-operation.v1\0");
+    hash.update(operation_id.as_bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes[6..].copy_from_slice(&digest[..10]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn rejected_model_commands(
+    operation_id: Uuid,
+    receipt: &AdaptiveRejectedModelReceiptV1,
+) -> Result<(AdaptiveTransitionV1, AdaptiveTransitionV1), WorkflowError> {
+    if operation_id.is_nil() || rejected_model_resume_operation_id(operation_id) == operation_id {
+        return Err(authority_conflict());
+    }
+    Ok((
+        AdaptiveTransitionV1::RejectModel {
+            effect: receipt.effect.clone(),
+            resolution_event_id: receipt.resolution_event_id.to_string(),
+            reason_code: receipt.reason_code.clone(),
+        },
+        AdaptiveTransitionV1::ResumeRejectedModel {
+            disposition_operation_id: operation_id,
+            expected_reason_code: receipt.reason_code.clone(),
+            resolution_event_id: receipt.resolution_event_id.to_string(),
+            receipt_digest: receipt.canonical_digest()?,
+        },
+    ))
+}
+
+fn require_rejected_model_source(
+    session: &AdaptiveSessionV1,
+    entry_digest: &str,
+    receipt: &AdaptiveRejectedModelReceiptV1,
+) -> Result<(), WorkflowError> {
+    receipt.validate()?;
+    if session.grant.session_id != receipt.session_id
+        || session.version != receipt.source_session_version
+        || entry_digest != receipt.source_entry_digest
+        || !session.requires_fresh_observation()
+        || session.is_abandoned_model_effect(&receipt.effect)
+        || !matches!(&session.cursor, crate::AdaptiveCursorV1::ModelPending { effect }
+            if effect == &receipt.effect)
+    {
+        return Err(authority_conflict());
+    }
+    Ok(())
+}
+
+fn read_rejected_model_disposition(
+    connection: &Connection,
+    session_id: Uuid,
+    operation_id: Uuid,
+) -> Result<Option<RejectedModelDisposition>, WorkflowError> {
+    let Some((digest, bytes, created)) = read_operation(
+        connection,
+        &rejected_model_disposition_namespace(session_id),
+        &operation_id.to_string(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let record: RejectedModelDisposition = decode(&bytes)?;
+    let receipt = &record.receipt;
+    receipt.validate().map_err(|_| corrupt_store())?;
+    if receipt.session_id != session_id
+        || !constant_time_eq(
+            &digest,
+            &rejected_model_disposition_digest(operation_id, receipt)?,
+        )
+        || stored_u64(created)? != record.response.updated_at_ms
+    {
+        return Err(corrupt_store());
+    }
+    let ns = namespace(session_id);
+    let (source_digest, source) = evidence_entry(connection, &ns, receipt.source_session_version)?;
+    require_rejected_model_source(&source.session, &source_digest, receipt)
+        .map_err(|_| corrupt_store())?;
+    let (reject, resume) = rejected_model_commands(operation_id, receipt)?;
+    let now_ms = record.response.updated_at_ms;
+    let rejected = source
+        .session
+        .transition(&reject, now_ms)
+        .map_err(|_| corrupt_store())?;
+    let resumed = rejected
+        .transition(&resume, now_ms)
+        .map_err(|_| corrupt_store())?;
+    let (rejected_digest, rejected_entry) = evidence_entry(connection, &ns, rejected.version)?;
+    let (_, resumed_entry) = evidence_entry(connection, &ns, resumed.version)?;
+    let expected_rejected = Entry {
+        previous_digest: Some(source_digest),
+        command: Some(reject.clone()),
+        session: rejected.clone(),
+        recovery_feedback: None,
+    };
+    let expected_resumed = Entry {
+        previous_digest: Some(rejected_digest),
+        command: Some(resume.clone()),
+        session: resumed.clone(),
+        recovery_feedback: None,
+    };
+    if rejected_entry != expected_rejected
+        || resumed_entry != expected_resumed
+        || record.response != resumed
+    {
+        return Err(corrupt_store());
+    }
+    for (id, source_version, command, response) in [
+        (operation_id, source.session.version, &reject, &rejected),
+        (
+            rejected_model_resume_operation_id(operation_id),
+            rejected.version,
+            &resume,
+            &resumed,
+        ),
+    ] {
+        let (phase_digest, phase_bytes, phase_created) =
+            read_operation(connection, &format!("{ns}:operations"), &id.to_string())?
+                .ok_or_else(corrupt_store)?;
+        let expected_digest = canonical_sha256(
+            "sentinel.workflow.adaptive-command.v1",
+            &(session_id, source_version, command),
+        )?;
+        if !constant_time_eq(&phase_digest, &expected_digest)
+            || decode::<AdaptiveSessionV1>(&phase_bytes)? != *response
+            || stored_u64(phase_created)? != now_ms
+        {
+            return Err(corrupt_store());
+        }
+    }
+    Ok(Some(record))
 }
 
 fn command_effect(command: &AdaptiveTransitionV1) -> Option<&AdaptiveEffectV1> {
@@ -1340,6 +1654,18 @@ fn load_with_feedback_uncached(
                             authorization,
                             &prior.grant.authority,
                         )?;
+                    }
+                }
+                if let Some(AdaptiveTransitionV1::ResumeRejectedModel {
+                    disposition_operation_id,
+                    ..
+                }) = &entry.command
+                {
+                    let record =
+                        read_rejected_model_disposition(connection, id, *disposition_operation_id)?
+                            .ok_or_else(corrupt_store)?;
+                    if record.response != entry.session {
+                        return Err(corrupt_store());
                     }
                 }
                 prior.transition(
