@@ -1,5 +1,11 @@
 # Changelog
 
+- Accept the actual retained Adaptive completion envelope, which omits the
+  leadership-only redundant response hash. Seal its full payload and raw
+  content digest without rewriting the response; reject every malformed or
+  conflicting optional hash and retain reservation, usage and journal fences
+  for receipt-only recovery (#856).
+
 - Bind leadership decision generation to the exact validated evidence-reference
   set. Native structured output cannot shorten or invent those references;
   carry the journal's fresh-inspection requirement into employee prompts and
