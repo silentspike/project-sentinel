@@ -1,5 +1,14 @@
 # Changelog
 
+- Surface measured collector resource totals instead of constant zero values.
+  Distinguish unavailable samples from measured zero, average agent stress,
+  preserve stalled-agent identity and age, and prevent cumulative kernel I/O
+  recounts and overlapping process/cgroup accounting. Add exporter-shaped
+  backend, collector and production Console rendering regressions. Preserve
+  counter history through transient observation failures, fence health against
+  stale activity and reused PIDs, require observed PSI provenance, bound scrape
+  bodies/deadlines and publish independent UI refresh results (#856).
+
 - Preserve mounted desktop panels and unsaved editor state when splitting,
   resizing or closing neighboring panes. Keep keyboard/pointer gutters and
   nested minimum dimensions, constrain Control form fields to their tracks,

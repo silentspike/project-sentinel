@@ -3,7 +3,9 @@
 //! Reads PSI data from cgroup v2 pressure files and converts to stress factors
 //! that feed into the Bio-Engine's stress model.
 
-use anyhow::Result;
+use std::collections::HashSet;
+
+use anyhow::{bail, Context, Result};
 use sentinel_common::psi::{parse_psi, PsiMetrics};
 
 /// Reads PSI metrics for a specific agent cgroup.
@@ -48,6 +50,77 @@ impl PsiReader {
         let content = std::fs::read_to_string(&path)?;
         parse_psi(&content)
     }
+
+    /// Reads complete, valid CPU pressure for measured telemetry, without fallback values.
+    pub fn read_measured_cpu_pressure(&self) -> Result<PsiMetrics> {
+        self.read_measured_pressure("cpu.pressure")
+    }
+
+    /// Reads complete, valid memory pressure for measured telemetry.
+    pub fn read_measured_memory_pressure(&self) -> Result<PsiMetrics> {
+        self.read_measured_pressure("memory.pressure")
+    }
+
+    /// Reads complete, valid I/O pressure for measured telemetry.
+    pub fn read_measured_io_pressure(&self) -> Result<PsiMetrics> {
+        self.read_measured_pressure("io.pressure")
+    }
+
+    fn read_measured_pressure(&self, file: &str) -> Result<PsiMetrics> {
+        let content = std::fs::read_to_string(format!("{}/{file}", self.cgroup_path))?;
+        parse_measured_psi(&content)
+    }
+}
+
+fn parse_measured_psi(content: &str) -> Result<PsiMetrics> {
+    let mut lines = content
+        .lines()
+        .filter(|line| line.split_whitespace().next() == Some("some"));
+    let line = lines.next().context("Missing measured PSI some line")?;
+    if lines.next().is_some() {
+        bail!("Duplicate measured PSI some line");
+    }
+    let mut averages = [None; 3];
+    let mut total = None;
+    let mut fields = HashSet::new();
+    for part in line.split_whitespace().skip(1) {
+        let (key, value) = part
+            .split_once('=')
+            .context("Malformed measured PSI field")?;
+        if key.is_empty() || value.is_empty() || !fields.insert(key) {
+            bail!("Invalid or duplicate measured PSI field: {key}");
+        }
+        let index = match key {
+            "avg10" => Some(0),
+            "avg60" => Some(1),
+            "avg300" => Some(2),
+            _ => None,
+        };
+        if let Some(index) = index {
+            let value = value
+                .parse::<f64>()
+                .context("Malformed measured PSI average")?;
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                bail!("Measured PSI average outside finite 0..100 range");
+            }
+            averages[index] = Some(value);
+        } else if key == "total" {
+            if value.is_empty() || !value.bytes().all(|c| c.is_ascii_digit()) {
+                bail!("Malformed measured PSI total");
+            }
+            total = Some(
+                value
+                    .parse::<u64>()
+                    .context("Malformed measured PSI total")?,
+            );
+        }
+    }
+    Ok(PsiMetrics {
+        avg10: averages[0].context("Missing measured PSI avg10")?,
+        avg60: averages[1].context("Missing measured PSI avg60")?,
+        avg300: averages[2].context("Missing measured PSI avg300")?,
+        total: total.context("Missing measured PSI total")?,
+    })
 }
 
 /// Converts PSI avg10 value (0-100%) to a Bio-Engine stress factor (0.0-1.0).
@@ -159,6 +232,43 @@ mod tests {
     fn psi_reader_path() {
         let reader = PsiReader::new("/sys/fs/cgroup/sentinel/agent-01");
         assert_eq!(reader.cgroup_path(), "/sys/fs/cgroup/sentinel/agent-01");
+    }
+
+    #[test]
+    fn measured_psi_requires_complete_unique_finite_observations() {
+        for content in [
+            "",
+            "some",
+            "some avg60=0 avg300=0 total=0",
+            "some avg10=0 avg300=0 total=0",
+            "some avg10=0 avg60=0 total=0",
+            "some avg10=0 avg60=0 avg300=0",
+            "some avg10=0 avg60=0 avg300=0 total=0 avg10=1",
+            "some avg10=0 avg60=0 avg300=0 total=0 total=1",
+            "some avg10=NaN avg60=0 avg300=0 total=0",
+            "some avg10=0 avg60=inf avg300=0 total=0",
+            "some avg10=0 avg60=0 avg300=-inf total=0",
+            "some avg10=-1 avg60=0 avg300=0 total=0",
+            "some avg10=0 avg60=101 avg300=0 total=0",
+            "some avg10=bad avg60=0 avg300=0 total=0",
+            "some avg10=0 avg60=0 avg300=0 total=-1",
+            "some avg10=0 avg60=0 avg300=0 total=1.5",
+            "some avg10=0 avg60=0 avg300=0 total=0\nsome avg10=1 avg60=1 avg300=1 total=1",
+        ] {
+            assert!(parse_measured_psi(content).is_err(), "{content}");
+        }
+        let zero = parse_measured_psi("some avg10=0 avg60=0 avg300=0 total=0").unwrap();
+        assert_eq!([zero.avg10, zero.avg60, zero.avg300], [0.0; 3]);
+        assert_eq!(zero.total, 0);
+        let metrics =
+            parse_measured_psi("some avg300=100 avg60=0.25 avg10=80 total=10\nfull avg10=0")
+                .unwrap();
+        assert_eq!(
+            [metrics.avg10, metrics.avg60, metrics.avg300],
+            [80.0, 0.25, 100.0]
+        );
+        // The shared parser remains permissive for existing non-telemetry callers.
+        assert_eq!(parse_psi("some").unwrap().avg10, 0.0);
     }
 
     #[test]
