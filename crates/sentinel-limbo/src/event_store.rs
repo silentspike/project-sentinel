@@ -1172,10 +1172,12 @@ fn validate_retained_rejection_payload(
                 == evidence.model_context_digest
             && format!("{:x}", Sha256::digest(completion.content.as_bytes()))
                 == evidence.model_response_digest
+            // Historical Adaptive producers omit this redundant envelope field.
             && payload
                 .get("model_response_digest")
-                .and_then(serde_json::Value::as_str)
-                == Some(evidence.model_response_digest.as_str()),
+                .is_none_or(|digest| {
+                    digest.as_str() == Some(evidence.model_response_digest.as_str())
+                }),
         "retained model context or response changed"
     );
     let decision: RetainedAdaptiveWriteDecision = serde_json::from_str(&completion.content)?;
@@ -7772,6 +7774,15 @@ mod tests {
             agent: AgentId,
             padding: usize,
         ) -> LlmRetainedModelRejectionEvidenceV1 {
+            fixture_with_digest(store, agent, padding, false)
+        }
+
+        fn fixture_with_digest(
+            store: &EventStore,
+            agent: AgentId,
+            padding: usize,
+            include_digest: bool,
+        ) -> LlmRetainedModelRejectionEvidenceV1 {
             let mut reservation = model_reservation_fixture();
             reservation.usage_binding.agent_id = agent;
             reservation.owner_scope = StateTransferScope::for_agent(agent.to_string());
@@ -7824,14 +7835,17 @@ mod tests {
             })
             .to_string();
             let model_response_digest = format!("{:x}", Sha256::digest(content.as_bytes()));
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "version": 2, "request_id": reservation.request_id,
                 "request_digest": reservation.request_digest,
                 "actions": [], "usage_event": usage_event,
+                "tokens_used": 15,
                 "model_work": {"context": context, "content": content, "admissible": true},
-                "model_response_digest": model_response_digest,
-            })
-            .to_string();
+            });
+            if include_digest {
+                payload["model_response_digest"] = serde_json::json!(model_response_digest);
+            }
+            let payload = payload.to_string();
             store
                 .reserve_llm_request(
                     &reservation.request_id,
@@ -7973,6 +7987,210 @@ mod tests {
             assert!(!store
                 .reserve_llm_request(&evidence.request_id, &evidence.request_digest, "AGENT-07")
                 .unwrap());
+        }
+
+        #[test]
+        fn retained_rejection_accepts_producer_shape_and_exact_optional_digest() {
+            for include_digest in [false, true] {
+                let store = EventStore::open(":memory:").unwrap();
+                let evidence = fixture_with_digest(&store, AgentId(7), 0, include_digest);
+                let entry = store
+                    .get_llm_completion(&evidence.request_id)
+                    .unwrap()
+                    .unwrap();
+                let payload: serde_json::Value = serde_json::from_str(&entry.payload).unwrap();
+                assert_eq!(
+                    payload.get("model_response_digest").is_some(),
+                    include_digest
+                );
+                assert_eq!(payload["tokens_used"], 15);
+                assert_eq!(
+                    evidence.model_response_digest,
+                    format!(
+                        "{:x}",
+                        Sha256::digest(
+                            payload["model_work"]["content"]
+                                .as_str()
+                                .unwrap()
+                                .as_bytes()
+                        )
+                    )
+                );
+                let before = snapshot(&store);
+                let event = store
+                    .record_retained_model_decision_rejection(&evidence)
+                    .unwrap();
+                let after = snapshot(&store);
+                assert_eq!(after[0], before[0]);
+                assert_eq!(after[2], before[2]);
+                assert_eq!(&after[1][..before[1].len()], before[1].as_slice());
+                assert_eq!(after[1].len(), before[1].len() + 1);
+                let receipt: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+                assert_eq!(
+                    receipt["validated_evidence"]["model_response_digest"],
+                    evidence.model_response_digest
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        store
+                            .record_retained_model_decision_rejection(&evidence)
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    serde_json::to_value(event).unwrap()
+                );
+                assert_eq!(snapshot(&store), after);
+            }
+        }
+
+        #[test]
+        fn retained_rejection_rejects_invalid_present_optional_digest_even_on_replay() {
+            for replay in [false, true] {
+                for digest in [
+                    serde_json::Value::Null,
+                    serde_json::json!(false),
+                    serde_json::json!(42),
+                    serde_json::json!([]),
+                    serde_json::json!({"digest": "invalid"}),
+                    serde_json::json!(""),
+                    serde_json::json!("not-a-sha256"),
+                    serde_json::json!("A".repeat(64)),
+                    serde_json::json!("d".repeat(64)),
+                ] {
+                    let store = EventStore::open(":memory:").unwrap();
+                    let mut evidence = fixture(&store, AgentId(7));
+                    if replay {
+                        store
+                            .record_retained_model_decision_rejection(&evidence)
+                            .unwrap();
+                    }
+                    let entry = store
+                        .get_llm_completion(&evidence.request_id)
+                        .unwrap()
+                        .unwrap();
+                    let mut payload: serde_json::Value =
+                        serde_json::from_str(&entry.payload).unwrap();
+                    payload["model_response_digest"] = digest.clone();
+                    let payload = payload.to_string();
+                    // Reseal the fixture payload so the optional-field check is exercised.
+                    evidence.completion_payload_digest =
+                        format!("{:x}", Sha256::digest(payload.as_bytes()));
+                    store
+                        .conn()
+                        .execute(
+                            "UPDATE llm_completion_outbox SET payload=?2 WHERE request_id=?1",
+                            params![evidence.request_id, payload],
+                        )
+                        .unwrap();
+                    let before = snapshot(&store);
+                    assert!(
+                        store
+                            .record_retained_model_decision_rejection(&evidence)
+                            .is_err(),
+                        "optional digest={digest}, replay={replay}"
+                    );
+                    assert_eq!(snapshot(&store), before);
+                }
+            }
+        }
+
+        #[test]
+        fn retained_rejection_optional_digest_never_relaxes_exact_payload_seal() {
+            for replay in [false, true] {
+                for change in ["content", "optional_digest", "tokens_used"] {
+                    let store = EventStore::open(":memory:").unwrap();
+                    let mut evidence = fixture(&store, AgentId(7));
+                    if replay {
+                        store
+                            .record_retained_model_decision_rejection(&evidence)
+                            .unwrap();
+                    }
+                    let entry = store
+                        .get_llm_completion(&evidence.request_id)
+                        .unwrap()
+                        .unwrap();
+                    let mut payload: serde_json::Value =
+                        serde_json::from_str(&entry.payload).unwrap();
+                    match change {
+                        "content" => {
+                            let content = payload["model_work"]["content"]
+                                .as_str()
+                                .unwrap()
+                                .replace("fixture", "changed");
+                            evidence.model_response_digest =
+                                format!("{:x}", Sha256::digest(content.as_bytes()));
+                            payload["model_work"]["content"] = serde_json::json!(content);
+                        }
+                        "optional_digest" => {
+                            payload["model_response_digest"] =
+                                serde_json::json!(evidence.model_response_digest);
+                        }
+                        "tokens_used" => payload["tokens_used"] = serde_json::json!(16),
+                        _ => unreachable!(),
+                    }
+                    store
+                        .conn()
+                        .execute(
+                            "UPDATE llm_completion_outbox SET payload=?2 WHERE request_id=?1",
+                            params![evidence.request_id, payload.to_string()],
+                        )
+                        .unwrap();
+                    let before = snapshot(&store);
+                    let error = store
+                        .record_retained_model_decision_rejection(&evidence)
+                        .unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("retained model completion changed"),
+                        "{change}"
+                    );
+                    assert_eq!(snapshot(&store), before);
+                }
+            }
+        }
+
+        #[test]
+        fn retained_rejection_optional_shape_change_conflicts_with_existing_receipt() {
+            for include_digest in [false, true] {
+                let store = EventStore::open(":memory:").unwrap();
+                let mut evidence = fixture_with_digest(&store, AgentId(7), 0, include_digest);
+                store
+                    .record_retained_model_decision_rejection(&evidence)
+                    .unwrap();
+                let entry = store
+                    .get_llm_completion(&evidence.request_id)
+                    .unwrap()
+                    .unwrap();
+                let mut payload: serde_json::Value = serde_json::from_str(&entry.payload).unwrap();
+                if include_digest {
+                    payload
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("model_response_digest");
+                } else {
+                    payload["model_response_digest"] =
+                        serde_json::json!(evidence.model_response_digest);
+                }
+                let payload = payload.to_string();
+                evidence.completion_payload_digest =
+                    format!("{:x}", Sha256::digest(payload.as_bytes()));
+                store
+                    .conn()
+                    .execute(
+                        "UPDATE llm_completion_outbox SET payload=?2 WHERE request_id=?1",
+                        params![evidence.request_id, payload],
+                    )
+                    .unwrap();
+                let before = snapshot(&store);
+                let error = store
+                    .record_retained_model_decision_rejection(&evidence)
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("retained model rejection receipt conflict"));
+                assert_eq!(snapshot(&store), before);
+            }
         }
 
         #[test]
@@ -8229,7 +8447,6 @@ mod tests {
                 "completion_field",
                 "null_actions",
                 "missing_usage",
-                "missing_raw_digest",
                 "request",
                 "request_digest",
                 "raw_bound",
@@ -8266,12 +8483,6 @@ mod tests {
                     "null_actions" => payload["actions"] = serde_json::Value::Null,
                     "missing_usage" => {
                         payload.as_object_mut().unwrap().remove("usage_event");
-                    }
-                    "missing_raw_digest" => {
-                        payload
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("model_response_digest");
                     }
                     "completion_field" => {
                         payload["model_work"]["unknown"] = serde_json::json!(true)
@@ -8312,14 +8523,11 @@ mod tests {
                 payload["model_work"]["content"] = serde_json::json!(content);
                 evidence.model_response_digest =
                     format!("{:x}", Sha256::digest(content.as_bytes()));
-                if change != "missing_raw_digest" {
-                    payload["model_response_digest"] =
-                        serde_json::json!(if change == "raw_digest" {
-                            "d".repeat(64)
-                        } else {
-                            evidence.model_response_digest.clone()
-                        });
-                }
+                payload["model_response_digest"] = serde_json::json!(if change == "raw_digest" {
+                    "d".repeat(64)
+                } else {
+                    evidence.model_response_digest.clone()
+                });
                 let payload = payload.to_string();
                 evidence.completion_payload_digest =
                     format!("{:x}", Sha256::digest(payload.as_bytes()));
