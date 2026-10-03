@@ -46,7 +46,7 @@ function blankAgent(): AgentConfig {
   };
 }
 
-export function AgentEditorView(): JSX.Element {
+export function AgentEditorView(props: { initialAgentId?: number } = {}): JSX.Element {
   const [agents, setAgents] = createSignal<AgentConfig[]>([]);
   const [selectedId, setSelectedId] = createSignal<number | null>(null);
   const [filter, setFilter] = createSignal("");
@@ -55,7 +55,7 @@ export function AgentEditorView(): JSX.Element {
   const [serverError, setServerError] = createSignal<string | null>(null);
 
   const original = createMemo(() => agents().find((a) => a.identity.id === selectedId()) ?? null);
-  const isLoaded = (): boolean => selectedId() !== null;
+  const isLoaded = (): boolean => original() !== null;
   const e = (): AgentConfig => edited;
 
   const filtered = createMemo(() => {
@@ -83,12 +83,16 @@ export function AgentEditorView(): JSX.Element {
     }
   });
 
-  // #424: when the Org Chart requested an agent (shared selectedAgentId), select it here once the
-  // agents are loaded — then CONSUME-AND-CLEAR (setSelectedAgentId(null)) so re-opening the editor
-  // without a new click stays in the default state and a stale click never overwrites a manual pick.
+  // Select only after options exist; apply a tile target once, never over a later manual choice.
+  let initialSelectionApplied = false;
   createEffect(() => {
+    if (props.initialAgentId != null && !initialSelectionApplied
+      && agents().some(agent => agent.identity.id === props.initialAgentId)) {
+      initialSelectionApplied = true;
+      setSelectedId(props.initialAgentId);
+    }
     const pre = selectedAgentId();
-    if (pre != null && agents().some((a) => a.identity.id === pre)) {
+    if (props.initialAgentId == null && pre != null && agents().some((a) => a.identity.id === pre)) {
       setSelectedId(pre);
       setSelectedAgentId(null);
     }
@@ -150,7 +154,7 @@ export function AgentEditorView(): JSX.Element {
           <Show when={serverError()}>
             {(message) => <p data-testid="ae-server-error" class="degraded-panel" role="alert">{message()}</p>}
           </Show>
-          <fieldset style={{ border: "1px solid var(--border)", "border-radius": "6px", padding: "8px" }}>
+          <fieldset class="form-grid" style={{ border: "1px solid var(--border)", "border-radius": "6px", padding: "8px" }}>
             <legend>Identity (id {e().identity.id} — read-only)</legend>
             <label>
               Name
@@ -231,7 +235,7 @@ export function AgentEditorView(): JSX.Element {
             </label>
           </fieldset>
 
-          <fieldset style={{ border: "1px solid var(--border)", "border-radius": "6px", padding: "8px" }}>
+          <fieldset class="form-grid" style={{ border: "1px solid var(--border)", "border-radius": "6px", padding: "8px" }}>
             <legend>Preferences / Background</legend>
             <label>
               favorite_room
@@ -261,7 +265,7 @@ export function AgentEditorView(): JSX.Element {
             </label>
           </fieldset>
 
-          <fieldset style={{ border: "1px solid var(--border)", "border-radius": "6px", padding: "8px" }}>
+          <fieldset class="form-grid" style={{ border: "1px solid var(--border)", "border-radius": "6px", padding: "8px" }}>
             <legend>Capabilities / Runtime</legend>
             <label>
               tools (Komma-getrennt)

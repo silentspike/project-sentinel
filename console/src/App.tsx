@@ -89,7 +89,7 @@ function Login(props: { authenticate: (key: string) => Promise<LoginResult | nul
   );
 }
 
-const PANELS: Record<PanelKind, () => JSX.Element> = {
+const PANELS: Record<PanelKind, (props?: { initialAgentId?: number }) => JSX.Element> = {
   agents: AgentsView,
   floorplan: FloorplanView,
   metrics: MetricsView,
@@ -111,7 +111,7 @@ const PANELS: Record<PanelKind, () => JSX.Element> = {
 };
 
 // Tile-Chrome: kompakte Leiste (Split horizontal/vertikal, Schliessen) ueber dem Panel.
-function renderPanel(panel: PanelKind, leafId: string): JSX.Element {
+function renderPanel(panel: PanelKind, leafId: string, initialAgentId?: number): JSX.Element {
   return (
     <div style={{ height: "100%", display: "flex", "flex-direction": "column", "min-height": 0 }}>
       <div style={{ display: "flex", gap: "4px", padding: "3px 6px", background: "var(--surface-1)", "border-bottom": "1px solid var(--border)" }}>
@@ -120,7 +120,7 @@ function renderPanel(panel: PanelKind, leafId: string): JSX.Element {
         <button data-testid={`split-col-${panel}`} title="unten splitten" style={{ padding: "1px 7px" }} onClick={() => splitLeaf(leafId, "col", "floorplan")}>⬍</button>
         <button data-testid={`close-${panel}`} title="schliessen" style={{ padding: "1px 7px" }} onClick={() => closeLeaf(leafId)}>✕</button>
       </div>
-      <div style={{ flex: 1, "min-height": 0, overflow: "auto" }}>{PANELS[panel]()}</div>
+      <div style={{ flex: 1, "min-height": 0, overflow: "auto" }}>{PANELS[panel]({ initialAgentId })}</div>
     </div>
   );
 }
