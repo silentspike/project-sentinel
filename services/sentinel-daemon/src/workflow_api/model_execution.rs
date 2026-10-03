@@ -450,12 +450,12 @@ impl AdaptiveModelContext {
         let decisions = if self.fresh_observation_required {
             "tool={kind:\"tool\",tool:<list_directory or inspect_file only, using its tool discriminator>}, \
              including workspace discovery with tool={tool:\"list_directory\",path:\".\",max_entries:64} \
-             before inspecting a named file; inspect_file never accepts a directory, or \
+             when the layout or path is unknown; directly inspect a known scoped file with inspect_file, which never accepts a directory, or \
              blocked={kind:\"blocked\",reason_code:<short identifier>}"
         } else {
             "tool={kind:\"tool\",tool:<one typed Workbench tool using its tool discriminator>}, \
              including workspace discovery with tool={tool:\"list_directory\",path:\".\",max_entries:64} \
-             before inspecting a named file; inspect_file never accepts a directory, \
+             when the layout or path is unknown; directly inspect a known scoped file with inspect_file, which never accepts a directory. Do not repeat discovery solely because another model call begins within the same inspected window. \
              propose_completion={kind:\"propose_completion\",artifact_digest:<sha256>}, \
              collaborate={kind:\"collaborate\",action:{kind:\"ask_question\",question_ref:\"...\"}} \
              or collaborate={kind:\"collaborate\",action:{kind:\"offer_handoff\",consumer_role:<role>,artifact_digests:[<sha256>],reason_ref:\"...\"}}, or \
@@ -1303,11 +1303,118 @@ impl WorkflowApi {
         self.adaptive_provider_authority_inner(agent_id, true)
     }
 
+    #[cfg(test)]
     pub(super) fn adaptive_provider_authority_for_claim(
         &self,
         agent_id: AgentId,
     ) -> Result<Option<AdaptiveProviderAuthority>, &'static str> {
         self.adaptive_provider_authority_inner(agent_id, false)
+    }
+
+    pub(super) fn adaptive_provider_authority_for_exact_binding(
+        &self,
+        expected: &AdaptiveProviderAuthority,
+    ) -> Result<Option<AdaptiveProviderAuthority>, &'static str> {
+        let scope = &expected.grant.authority;
+        let project = self
+            .store
+            .company_project(&scope.tenant_id, &scope.project_id)
+            .map_err(|_| "adaptive exact project unavailable")?
+            .ok_or("adaptive exact project missing")?;
+        let Some(binding) = select_provider_usage_binding(
+            std::slice::from_ref(&project),
+            scope.agent_id,
+            Some(&expected.grant.provider_allowance_id),
+        )?
+        else {
+            return Ok(None);
+        };
+        if binding.work_item_id != scope.work_item_id.0
+            || binding.assignment_id != expected.assignment_id
+            || binding.assignment_version != scope.assignment_version
+        {
+            return Ok(None);
+        }
+        let current = self
+            .authority
+            .as_ref()
+            .ok_or("adaptive authority unavailable")?
+            .snapshot_for_admission(
+                &scope.tenant_id,
+                &scope.project_id,
+                &scope.work_item_id,
+                scope.agent_id,
+                false,
+            )
+            .map_err(|_| "adaptive exact runtime authority unavailable")?;
+        if &current != scope {
+            return Ok(None);
+        }
+        let Some(session) = self
+            .store
+            .adaptive_session_for_authority(&current)
+            .map_err(|_| "adaptive exact session unavailable")?
+        else {
+            return Ok(None);
+        };
+        // Reauthorization must never create a session or select another job.
+        if session.effective_grant() != expected.grant {
+            return Ok(None);
+        }
+        let (actual, _) =
+            self.adaptive_provider_authority_from_binding_inner(binding, false, true)?;
+        Ok(actual.filter(|actual| actual == expected))
+    }
+
+    pub(super) fn adaptive_provider_authority_for_reserved_session(
+        &self,
+        agent_id: AgentId,
+        session_id: Uuid,
+        allowance_id: &str,
+        session_version: u64,
+        effect_id: Uuid,
+    ) -> Result<Option<AdaptiveProviderAuthority>, &'static str> {
+        let projects = self
+            .store
+            .company_projects()
+            .map_err(|_| "adaptive dispatch projects unavailable")?;
+        let Some(binding) = select_provider_usage_binding(&projects, agent_id, Some(allowance_id))?
+        else {
+            return Ok(None);
+        };
+        let current = self
+            .authority
+            .as_ref()
+            .ok_or("adaptive authority unavailable")?
+            .snapshot_for_admission(
+                &TenantId::parse(&binding.tenant_id).map_err(|_| "invalid adaptive tenant")?,
+                &ProjectId::parse(&binding.project_id).map_err(|_| "invalid adaptive project")?,
+                &WorkItemId::parse(&binding.work_item_id)
+                    .map_err(|_| "invalid adaptive work item")?,
+                agent_id,
+                false,
+            )
+            .map_err(|_| "adaptive dispatch runtime authority unavailable")?;
+        let Some(session) = self
+            .store
+            .adaptive_session_for_authority(&current)
+            .map_err(|_| "adaptive dispatch session unavailable")?
+        else {
+            return Ok(None);
+        };
+        if session.grant.session_id != session_id
+            || session.active_provider_allowance_id() != allowance_id
+        {
+            return Ok(None);
+        }
+        self.adaptive_provider_authority_for_exact_binding(&AdaptiveProviderAuthority {
+            schema_version: 3,
+            grant: session.effective_grant(),
+            session_version,
+            effect_id,
+            assignment_id: binding.assignment_id,
+            previous_observation: session.last_observation,
+        })
     }
 
     fn adaptive_provider_authority_inner(
@@ -1326,6 +1433,15 @@ impl WorkflowApi {
         &self,
         binding: ProviderUsageBinding,
         reconcile_tools: bool,
+    ) -> Result<(Option<AdaptiveProviderAuthority>, bool), &'static str> {
+        self.adaptive_provider_authority_from_binding_inner(binding, reconcile_tools, false)
+    }
+
+    fn adaptive_provider_authority_from_binding_inner(
+        &self,
+        binding: ProviderUsageBinding,
+        reconcile_tools: bool,
+        existing_only: bool,
     ) -> Result<(Option<AdaptiveProviderAuthority>, bool), &'static str> {
         let agent_id = binding.agent_id;
         let Some(subscription) = binding
@@ -1426,6 +1542,7 @@ impl WorkflowApi {
             // Exact existing effects are discovered under independently current
             // lineage authority. New/replacement grants still require serving duty.
             Some(session) if session.grant == grant => session,
+            _ if existing_only => return Ok((None, false)),
             _ => {
                 self.core
                     .begin_adaptive_session(&grant, allowance.created_at_unix_ms)
