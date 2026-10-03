@@ -89,7 +89,9 @@ impl AdaptiveBudgetWindowAuthorityV1 {
         validate_digest(&root.catalog_digest)?;
         if self.schema_version != 1
             || self.observed_at_ms == 0
-            || !(self.model_calls_exhausted || self.deadline_expired || self.dispatch_slack_insufficient)
+            || !(self.model_calls_exhausted
+                || self.deadline_expired
+                || self.dispatch_slack_insufficient)
             || root.schema_version != 1
             || root.assignment_version == 0
             || root.provider != "codex-cli"
@@ -221,8 +223,9 @@ impl AdaptiveBudgetWindowAuthorityV1 {
         if !session.model_window_exhausted_at(self.observed_at_ms)
             || self.model_calls_exhausted != (session.model_calls >= session.active_model_ceiling())
             || self.deadline_expired != (self.observed_at_ms >= session.active_deadline_ms())
-            || self.dispatch_slack_insufficient != (session.model_admission_at(self.observed_at_ms)
-                == crate::AdaptiveModelAdmissionV1::InsufficientSlack)
+            || self.dispatch_slack_insufficient
+                != (session.model_admission_at(self.observed_at_ms)
+                    == crate::AdaptiveModelAdmissionV1::InsufficientSlack)
             || self.observed_at_ms < issued_at
             || self.active_allowance_digest != adaptive_budget_allowance_digest(active)?
             || self.continuation_history_digest
@@ -375,15 +378,28 @@ impl AdaptiveLeadershipReviewCallV1 {
             crate::adaptive::validate_resume_policy_binding(binding)?;
             self.context.validate(&self.grant)?;
             if self.grant.recovery_epoch.is_some()
-                || !matches!((&self.grant.subject, self.grant.schema_version),
-                    (Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. }), 2)
-                        | (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }), 3))
+                || !matches!(
+                    (&self.grant.subject, self.grant.schema_version),
+                    (
+                        Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. }),
+                        2
+                    ) | (
+                        Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }),
+                        3
+                    )
+                )
                 || binding.limits.max_call_duration_ms != source.grant.max_call_duration_ms
                 || deadline_ms > binding.limits.expires_at_unix_ms
                 || window_ms > binding.limits.max_window_ms
-                || source.continuation.as_ref().map_or(0, |state| state.authorizations.len())
+                || source
+                    .continuation
+                    .as_ref()
+                    .map_or(0, |state| state.authorizations.len())
                     >= usize::from(binding.limits.total_window_ceiling)
-                || binding.limits.max_call_duration_ms.checked_add(binding.limits.dispatch_margin_ms)
+                || binding
+                    .limits
+                    .max_call_duration_ms
+                    .checked_add(binding.limits.dispatch_margin_ms)
                     .is_none_or(|minimum| window_ms < minimum)
             {
                 return Err(invalid());
@@ -391,7 +407,10 @@ impl AdaptiveLeadershipReviewCallV1 {
             (remaining, source.grant.max_call_duration_ms)
         } else {
             match (&self.grant.subject, self.grant.schema_version) {
-                (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3 | 4) => {
+                (
+                    Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }),
+                    3 | 4,
+                ) => {
                     self.context.validate(&self.grant)?;
                     if self.schema_version != self.grant.schema_version
                         || (self.grant.schema_version == 3 && self.grant.recovery_epoch.is_some())
@@ -769,9 +788,16 @@ impl AdaptiveLeadershipReviewGrantV1 {
         if let Some(binding) = &self.resume_policy {
             crate::adaptive::validate_resume_policy_binding(binding)?;
             if self.recovery_epoch.is_some()
-                || !matches!((&self.subject, self.schema_version),
-                    (Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. }), 2)
-                        | (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }), 3))
+                || !matches!(
+                    (&self.subject, self.schema_version),
+                    (
+                        Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. }),
+                        2
+                    ) | (
+                        Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }),
+                        3
+                    )
+                )
                 || self.expires_at_unix_ms > binding.limits.expires_at_unix_ms
             {
                 return Err(invalid());
@@ -897,7 +923,9 @@ impl AdaptiveLeadershipReviewContextV1 {
             if grant.recovery_epoch.is_some()
                 || binding.limits.max_call_duration_ms != session.grant.max_call_duration_ms
                 || !self.evidence_refs.contains(&format!(
-                    "adaptive-resume-policy:{}:{}", binding.receipt_digest, binding.ordinal))
+                    "adaptive-resume-policy:{}:{}",
+                    binding.receipt_digest, binding.ordinal
+                ))
             {
                 return Err(invalid());
             }

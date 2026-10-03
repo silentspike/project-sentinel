@@ -114,7 +114,10 @@ pub fn adaptive_resume_policy_id(
     }
     Ok(format!(
         "resume-policy-{}",
-        canonical_sha256("sentinel.workflow.adaptive-resume-policy-id.v1", &(tenant, session_id))?
+        canonical_sha256(
+            "sentinel.workflow.adaptive-resume-policy-id.v1",
+            &(tenant, session_id)
+        )?
     ))
 }
 
@@ -135,7 +138,10 @@ pub(crate) fn require_resume_policy_operator(
 ) -> Result<(), WorkflowError> {
     principal.validate()?;
     if principal.kind != CompanyPrincipalKindV1::Operator
-        || !matches!(principal.role, CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead)
+        || !matches!(
+            principal.role,
+            CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+        )
         || principal.tenant_id != *tenant
     {
         return Err(unauthorized());
@@ -172,10 +178,15 @@ impl AdaptiveResumeSourceV1 {
             validate_digest(digest)?;
         }
         match &self.subject {
-            AdaptiveResumeSubjectV1::ReadyForModel { active_allowance_digest } => {
+            AdaptiveResumeSubjectV1::ReadyForModel {
+                active_allowance_digest,
+            } => {
                 validate_digest(active_allowance_digest)?;
             }
-            AdaptiveResumeSubjectV1::ModelUnknown { effect, sealed_unknown_proof_digest } => {
+            AdaptiveResumeSubjectV1::ModelUnknown {
+                effect,
+                sealed_unknown_proof_digest,
+            } => {
                 if effect.id.is_nil() || self.base_model_calls == 0 {
                     return Err(invalid());
                 }
@@ -189,7 +200,9 @@ impl AdaptiveResumeSourceV1 {
 
 impl AdaptiveResumePolicyLimitsV1 {
     pub fn validate(&self) -> Result<(), WorkflowError> {
-        let minimum_window_ms = self.max_call_duration_ms.checked_add(self.dispatch_margin_ms);
+        let minimum_window_ms = self
+            .max_call_duration_ms
+            .checked_add(self.dispatch_margin_ms);
         if self.total_review_ceiling == 0
             || self.total_review_ceiling > ADAPTIVE_RESUME_MAX_REVIEWS
             || self.total_window_ceiling == 0
@@ -214,9 +227,16 @@ impl AdaptiveResumePolicyRequestV1 {
         self.source.validate()?;
         self.limits.validate()?;
         validate_identifier(&self.reason_ref)?;
-        let reviews = self.limits.total_review_ceiling.checked_sub(self.source.base_review_count);
-        let windows = self.limits.total_window_ceiling.checked_sub(self.source.base_window_count);
-        if self.schema_version != 1 || self.operation_id.is_nil()
+        let reviews = self
+            .limits
+            .total_review_ceiling
+            .checked_sub(self.source.base_review_count);
+        let windows = self
+            .limits
+            .total_window_ceiling
+            .checked_sub(self.source.base_window_count);
+        if self.schema_version != 1
+            || self.operation_id.is_nil()
             || !matches!((reviews, windows), (Some(reviews), Some(windows)) if windows > 0 && windows <= reviews)
         {
             return Err(invalid());
@@ -231,7 +251,8 @@ impl AdaptiveResumePolicyRequestV1 {
     ) -> Result<(), WorkflowError> {
         self.validate_shape()?;
         require_resume_policy_operator(principal, &self.source.tenant_id)?;
-        if now_ms == 0 || self.limits.expires_at_unix_ms <= now_ms
+        if now_ms == 0
+            || self.limits.expires_at_unix_ms <= now_ms
             || self.limits.expires_at_unix_ms - now_ms > ADAPTIVE_RESUME_MAX_POLICY_MS
             || !matches!(now_ms.checked_add(self.limits.max_call_duration_ms)
                 .and_then(|deadline| deadline.checked_add(self.limits.dispatch_margin_ms)),
@@ -252,7 +273,8 @@ impl AdaptiveResumePolicyBindingV1 {
         validate_identifier(&self.policy_id)?;
         validate_digest(&self.receipt_digest)?;
         self.limits.validate()?;
-        if self.schema_version != 1 || self.ordinal == 0
+        if self.schema_version != 1
+            || self.ordinal == 0
             || self.ordinal > self.limits.total_review_ceiling
         {
             return Err(invalid());
@@ -263,9 +285,14 @@ impl AdaptiveResumePolicyBindingV1 {
 
 impl AdaptiveResumePolicyReceiptV1 {
     pub fn validate(&self) -> Result<(), WorkflowError> {
-        self.request.validate_at(&self.issuer_principal, self.issued_at_unix_ms)?;
+        self.request
+            .validate_at(&self.issuer_principal, self.issued_at_unix_ms)?;
         if self.schema_version != 1
-            || self.policy_id != adaptive_resume_policy_id(&self.request.source.tenant_id, self.request.source.session_id)?
+            || self.policy_id
+                != adaptive_resume_policy_id(
+                    &self.request.source.tenant_id,
+                    self.request.source.session_id,
+                )?
         {
             return Err(invalid());
         }
@@ -289,10 +316,14 @@ impl AdaptiveResumePolicyReceiptV1 {
         Ok(binding)
     }
 
-    pub fn validate_binding(&self, binding: &AdaptiveResumePolicyBindingV1) -> Result<(), WorkflowError> {
+    pub fn validate_binding(
+        &self,
+        binding: &AdaptiveResumePolicyBindingV1,
+    ) -> Result<(), WorkflowError> {
         self.validate()?;
         binding.validate()?;
-        if binding.policy_id != self.policy_id || binding.receipt_digest != self.receipt_digest()?
+        if binding.policy_id != self.policy_id
+            || binding.receipt_digest != self.receipt_digest()?
             || binding.limits != self.request.limits
             || binding.ordinal <= self.request.source.base_review_count
         {
@@ -305,7 +336,11 @@ impl AdaptiveResumePolicyReceiptV1 {
 impl AdaptiveResumeReviewMembershipV1 {
     pub fn validate(&self) -> Result<(), WorkflowError> {
         adaptive_resume_review_membership_id(&self.policy_id, self.ordinal)?;
-        for digest in [&self.receipt_digest, &self.grant_digest, &self.context_digest] {
+        for digest in [
+            &self.receipt_digest,
+            &self.grant_digest,
+            &self.context_digest,
+        ] {
             validate_digest(digest)?;
         }
         if self.schema_version != 1 || self.review_id.is_nil() || self.operation_id.is_nil() {
@@ -315,16 +350,27 @@ impl AdaptiveResumeReviewMembershipV1 {
     }
 
     pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
-        canonical_sha256("sentinel.workflow.adaptive-resume-review-membership.v1", self)
+        canonical_sha256(
+            "sentinel.workflow.adaptive-resume-review-membership.v1",
+            self,
+        )
     }
 }
 
 fn invalid() -> WorkflowError {
-    WorkflowError::new(WorkflowErrorCode::InvalidInput, false, "invalid adaptive resume policy")
+    WorkflowError::new(
+        WorkflowErrorCode::InvalidInput,
+        false,
+        "invalid adaptive resume policy",
+    )
 }
 
 fn unauthorized() -> WorkflowError {
-    WorkflowError::new(WorkflowErrorCode::AuthorityConflict, false, "adaptive resume policy authority changed")
+    WorkflowError::new(
+        WorkflowErrorCode::AuthorityConflict,
+        false,
+        "adaptive resume policy authority changed",
+    )
 }
 
 #[cfg(test)]

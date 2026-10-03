@@ -500,7 +500,10 @@ impl WorkflowStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         if call.grant.resume_policy.is_some() {
             crate::domain_store::adaptive_resume_policy::require_resume_review_membership(
-                &transaction, &call.grant, &call.context_digest()?, call.operation_id,
+                &transaction,
+                &call.grant,
+                &call.context_digest()?,
+                call.operation_id,
             )?;
         }
         if let Some(epoch) = epoch_for_call(&transaction, call)? {
@@ -582,8 +585,12 @@ impl WorkflowStore {
             return Ok((true, prior));
         }
         if crate::domain_store::adaptive_resume_policy::read_resume_policy_leaf(
-            &transaction, &request.tenant_id, request.session_id,
-        )?.is_some() {
+            &transaction,
+            &request.tenant_id,
+            request.session_id,
+        )?
+        .is_some()
+        {
             return Err(unauthorized());
         }
         request.validate(operator, now_ms)?;
@@ -781,8 +788,12 @@ impl WorkflowStore {
             return Ok((true, prior));
         }
         if crate::domain_store::adaptive_resume_policy::read_resume_policy_leaf(
-            &transaction, &request.tenant_id, request.session_id,
-        )?.is_some() {
+            &transaction,
+            &request.tenant_id,
+            request.session_id,
+        )?
+        .is_some()
+        {
             return Err(unauthorized());
         }
         request.validate(operator, now_ms)?;

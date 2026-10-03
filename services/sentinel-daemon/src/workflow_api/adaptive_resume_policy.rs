@@ -25,13 +25,24 @@ impl WorkflowApi {
         body: &[u8],
     ) -> WorkflowHttpResponse {
         if principal.principal.kind != CompanyPrincipalKindV1::Operator
-            || !matches!(principal.principal.role,
-                CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead)
-            || !self.principals.principal(&principal.principal.principal_id)
-                .is_some_and(|registered| registered.principal == principal.principal
-                    && registered.execution_authority == principal.execution_authority)
+            || !matches!(
+                principal.principal.role,
+                CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+            )
+            || !self
+                .principals
+                .principal(&principal.principal.principal_id)
+                .is_some_and(|registered| {
+                    registered.principal == principal.principal
+                        && registered.execution_authority == principal.execution_authority
+                })
         {
-            return json_error(403, "authority_conflict", "operator resume policy authority required", false);
+            return json_error(
+                403,
+                "authority_conflict",
+                "operator resume policy authority required",
+                false,
+            );
         }
         if !self.enabled || !self.model_work_enabled {
             return workflow_error(workflow_unavailable());
@@ -43,7 +54,12 @@ impl WorkflowApi {
             return self.adaptive_resume_policy_draft_http(principal, path);
         }
         if method != "POST" {
-            return json_error(405, "invalid_input", "resume policy method unsupported", false);
+            return json_error(
+                405,
+                "invalid_input",
+                "resume policy method unsupported",
+                false,
+            );
         }
         let request: AdaptiveResumePolicyRequestV1 = match decode_body(body) {
             Ok(value) => value,
@@ -56,21 +72,38 @@ impl WorkflowApi {
             return json_error(400, "invalid_input", "invalid resume policy request", false);
         }
         // Exact sealed replay is independent of subsequent source/proof expiry.
-        match self.store.adaptive_resume_policy(&principal.principal.tenant_id, request.source.session_id) {
-            Ok(Some(_)) => return match self.store.authorize_adaptive_resume_policy(
-                &principal.principal, &request, now_unix_ms(),
-            ) {
-                Ok((replayed, receipt)) => policy_receipt(&receipt, replayed),
-                Err(error) => workflow_error(error),
-            },
-            Ok(None) => {},
+        match self
+            .store
+            .adaptive_resume_policy(&principal.principal.tenant_id, request.source.session_id)
+        {
+            Ok(Some(_)) => {
+                return match self.store.authorize_adaptive_resume_policy(
+                    &principal.principal,
+                    &request,
+                    now_unix_ms(),
+                ) {
+                    Ok((replayed, receipt)) => policy_receipt(&receipt, replayed),
+                    Err(error) => workflow_error(error),
+                }
+            }
+            Ok(None) => {}
             Err(error) => return workflow_error(error),
         }
-        if request.validate_at(&principal.principal, now_unix_ms()).is_err() {
-            return json_error(400, "invalid_input", "invalid resume policy request or expiry", false);
+        if request
+            .validate_at(&principal.principal, now_unix_ms())
+            .is_err()
+        {
+            return json_error(
+                400,
+                "invalid_input",
+                "invalid resume policy request or expiry",
+                false,
+            );
         }
         let (project, session) = match self.adaptive_resume_policy_current_source(
-            principal, &request.source.project_id, request.source.session_id,
+            principal,
+            &request.source.project_id,
+            request.source.session_id,
         ) {
             Ok(value) => value,
             Err(error) => return workflow_error(error),
@@ -84,9 +117,14 @@ impl WorkflowApi {
         {
             return workflow_error(source_conflict());
         }
-        if !matches!(request.source.subject, AdaptiveResumeSubjectV1::ModelUnknown { .. }) {
+        if !matches!(
+            request.source.subject,
+            AdaptiveResumeSubjectV1::ModelUnknown { .. }
+        ) {
             return match self.store.authorize_adaptive_resume_policy(
-                &principal.principal, &request, now_unix_ms(),
+                &principal.principal,
+                &request,
+                now_unix_ms(),
             ) {
                 Ok((replayed, receipt)) => policy_receipt(&receipt, replayed),
                 Err(error) => workflow_error(error),
@@ -100,33 +138,48 @@ impl WorkflowApi {
             _ => return workflow_error(source_conflict()),
         };
         let captured = match self.store.adaptive_resume_policy_draft_with_unknown_proof(
-            &principal.principal, &request.source.project_id, request.source.session_id,
-            request.operation_id, &request.reason_ref, request.limits.expires_at_unix_ms,
-            now_unix_ms(), &verified,
+            &principal.principal,
+            &request.source.project_id,
+            request.source.session_id,
+            request.operation_id,
+            &request.reason_ref,
+            request.limits.expires_at_unix_ms,
+            now_unix_ms(),
+            &verified,
         ) {
             Ok(fresh) if fresh.source == request.source => fresh.source,
             Ok(_) => return workflow_error(source_conflict()),
             Err(error) => return workflow_error(error),
         };
-        match self.store.authorize_adaptive_resume_policy_with_unknown_proof(
-            &principal.principal, &request, now_unix_ms(), |_, source| {
-                let (AdaptiveResumeSubjectV1::ModelUnknown { effect, .. },
-                    AdaptiveCursorV1::ModelUnknown { effect: current }) = (&source.subject, &session.cursor)
-                else { return Err(source_conflict()); };
-                if source != &captured || effect != current {
-                    return Err(source_conflict());
-                }
-                let current_proof = self.adaptive_resume_policy_source_proof(&project, &session)?
-                    .ok_or_else(source_conflict)?;
-                if current_proof != verified {
-                    return Err(source_conflict());
-                }
-                if now_unix_ms() >= request.limits.expires_at_unix_ms {
-                    return Err(source_conflict());
-                }
-                Ok(current_proof)
-            },
-        ) {
+        match self
+            .store
+            .authorize_adaptive_resume_policy_with_unknown_proof(
+                &principal.principal,
+                &request,
+                now_unix_ms(),
+                |_, source| {
+                    let (
+                        AdaptiveResumeSubjectV1::ModelUnknown { effect, .. },
+                        AdaptiveCursorV1::ModelUnknown { effect: current },
+                    ) = (&source.subject, &session.cursor)
+                    else {
+                        return Err(source_conflict());
+                    };
+                    if source != &captured || effect != current {
+                        return Err(source_conflict());
+                    }
+                    let current_proof = self
+                        .adaptive_resume_policy_source_proof(&project, &session)?
+                        .ok_or_else(source_conflict)?;
+                    if current_proof != verified {
+                        return Err(source_conflict());
+                    }
+                    if now_unix_ms() >= request.limits.expires_at_unix_ms {
+                        return Err(source_conflict());
+                    }
+                    Ok(current_proof)
+                },
+            ) {
             Ok((replayed, receipt)) => policy_receipt(&receipt, replayed),
             Err(error) => workflow_error(error),
         }
@@ -137,30 +190,41 @@ impl WorkflowApi {
         principal: &BoundPrincipal,
         path: &str,
     ) -> WorkflowHttpResponse {
-        let Some(project_id) = query_parameter(path, "project_id").and_then(|value| ProjectId::parse(value).ok()) else {
+        let Some(project_id) =
+            query_parameter(path, "project_id").and_then(|value| ProjectId::parse(value).ok())
+        else {
             return json_error(400, "invalid_input", "project_id required", false);
         };
-        let Some(session_id) = query_parameter(path, "session_id").and_then(|value| Uuid::parse_str(value).ok()).filter(|value| !value.is_nil()) else {
+        let Some(session_id) = query_parameter(path, "session_id")
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|value| !value.is_nil())
+        else {
             return json_error(400, "invalid_input", "session_id required", false);
         };
-        match self.store.adaptive_resume_policy(&principal.principal.tenant_id, session_id) {
+        match self
+            .store
+            .adaptive_resume_policy(&principal.principal.tenant_id, session_id)
+        {
             Ok(Some(receipt)) if receipt.request.source.project_id == project_id => {
                 return policy_receipt(&receipt, true);
             }
             Ok(Some(_)) => return workflow_error(source_conflict()),
-            Ok(None) => {},
+            Ok(None) => {}
             Err(error) => return workflow_error(error),
         }
-        let (project, session) = match self.adaptive_resume_policy_current_source(principal, &project_id, session_id) {
-            Ok(value) => value,
-            Err(error) => return workflow_error(error),
-        };
+        let (project, session) =
+            match self.adaptive_resume_policy_current_source(principal, &project_id, session_id) {
+                Ok(value) => value,
+                Err(error) => return workflow_error(error),
+            };
         let proof = if let AdaptiveCursorV1::ModelUnknown { effect } = &session.cursor {
             match self.read_only_unknown_model_proof_digest(&project, &session, effect) {
                 Ok(Some(proof)) if session.active_deadline_ms() <= now_unix_ms() => Some(proof),
                 _ => return workflow_error(source_conflict()),
             }
-        } else { None };
+        } else {
+            None
+        };
         let now = now_unix_ms();
         let expires = match query_parameter(path, "expires_at_unix_ms") {
             Some(value) => match value.parse::<u64>() {
@@ -176,17 +240,33 @@ impl WorkflowApi {
         let reason = query_parameter(path, "reason_ref").unwrap_or("finite-session-resume-policy");
         let request = match proof {
             Some(proof) => self.store.adaptive_resume_policy_draft_with_unknown_proof(
-                &principal.principal, &project_id, session_id, operation, reason, expires, now, &proof,
+                &principal.principal,
+                &project_id,
+                session_id,
+                operation,
+                reason,
+                expires,
+                now,
+                &proof,
             ),
             None => self.store.adaptive_resume_policy_draft(
-                &principal.principal, &project_id, session_id, operation, reason, expires, now,
+                &principal.principal,
+                &project_id,
+                session_id,
+                operation,
+                reason,
+                expires,
+                now,
             ),
         };
         match request {
-            Ok(request) => json(200, &serde_json::json!({
-                "schema_version": 1, "requires_explicit_submission": true, "request": request,
-                "model_decision_recorded": false, "developer_window_created": false,
-            })),
+            Ok(request) => json(
+                200,
+                &serde_json::json!({
+                    "schema_version": 1, "requires_explicit_submission": true, "request": request,
+                    "model_decision_recorded": false, "developer_window_created": false,
+                }),
+            ),
             Err(error) => workflow_error(error),
         }
     }
@@ -197,10 +277,15 @@ impl WorkflowApi {
         project_id: &ProjectId,
         session_id: Uuid,
     ) -> Result<(sentinel_workflow::ProjectV1, AdaptiveSessionV1), WorkflowError> {
-        let project = self.store.company_project(&principal.principal.tenant_id, project_id)?
+        let project = self
+            .store
+            .company_project(&principal.principal.tenant_id, project_id)?
             .ok_or_else(source_conflict)?;
-        let session = self.review_sessions(&project).map_err(|_| workflow_unavailable())?
-            .into_iter().find(|session| session.grant.session_id == session_id)
+        let session = self
+            .review_sessions(&project)
+            .map_err(|_| workflow_unavailable())?
+            .into_iter()
+            .find(|session| session.grant.session_id == session_id)
             .ok_or_else(source_conflict)?;
         Ok((project, session))
     }
@@ -209,14 +294,22 @@ impl WorkflowApi {
         &self,
         call: &sentinel_workflow::AdaptiveLeadershipReviewCallV1,
     ) -> Result<(), &'static str> {
-        let policy = self.store.adaptive_resume_policy(
-            &call.grant.leadership_principal.tenant_id, call.grant.session_id,
-        ).map_err(|_| "resume policy unavailable")?;
+        let policy = self
+            .store
+            .adaptive_resume_policy(
+                &call.grant.leadership_principal.tenant_id,
+                call.grant.session_id,
+            )
+            .map_err(|_| "resume policy unavailable")?;
         match (&policy, &call.grant.resume_policy) {
             (None, None) => Ok(()),
-            (Some(_), None) if call.decision.is_some() || call.retired_at_unix_ms.is_some() => Ok(()),
+            (Some(_), None) if call.decision.is_some() || call.retired_at_unix_ms.is_some() => {
+                Ok(())
+            }
             (Some(policy), Some(binding)) => {
-                policy.validate_binding(binding).map_err(|_| "resume policy binding changed")?;
+                policy
+                    .validate_binding(binding)
+                    .map_err(|_| "resume policy binding changed")?;
                 if policy.request.source.assignee_authority != call.grant.assignee_authority
                     || policy.request.source.project_id != call.grant.project_id
                     || policy.request.source.work_item_id != call.grant.work_item_id
@@ -274,13 +367,14 @@ impl WorkflowApi {
         }));
         let events = self.event_store.as_ref().ok_or_else(source_conflict)?;
         let request_id = authority.request_id();
-        let bytes = if let Some(evidence) = crate::llm_bridge::bridge::sealed_unknown_model_evidence(
-            events,
-            &authority,
-            &request_id,
-            &effect.request_digest,
-        )
-        .map_err(|_| source_conflict())?
+        let bytes = if let Some(evidence) =
+            crate::llm_bridge::bridge::sealed_unknown_model_evidence(
+                events,
+                &authority,
+                &request_id,
+                &effect.request_digest,
+            )
+            .map_err(|_| source_conflict())?
         {
             sentinel_common::canonical_json(&evidence).map_err(|_| source_conflict())?
         } else {
@@ -303,10 +397,13 @@ fn policy_receipt(receipt: &AdaptiveResumePolicyReceiptV1, replayed: bool) -> Wo
         Ok(value) => value,
         Err(error) => return workflow_error(error),
     };
-    json(200, &serde_json::json!({
-        "schema_version": 1, "replayed": replayed, "policy_id": receipt.policy_id,
-        "receipt_digest": digest, "issued_at_unix_ms": receipt.issued_at_unix_ms,
-        "request": receipt.request, "model_decision_recorded": false,
-        "developer_window_created": false,
-    }))
+    json(
+        200,
+        &serde_json::json!({
+            "schema_version": 1, "replayed": replayed, "policy_id": receipt.policy_id,
+            "receipt_digest": digest, "issued_at_unix_ms": receipt.issued_at_unix_ms,
+            "request": receipt.request, "model_decision_recorded": false,
+            "developer_window_created": false,
+        }),
+    )
 }

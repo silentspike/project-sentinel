@@ -537,8 +537,11 @@ impl WorkflowApi {
             return Err("adaptive model claim already consumed");
         }
         let effective = claimed.effective_grant();
-        Ok(effective.deadline_ms
-            .min(claimed.updated_at_ms.saturating_add(effective.max_call_duration_ms)))
+        Ok(effective.deadline_ms.min(
+            claimed
+                .updated_at_ms
+                .saturating_add(effective.max_call_duration_ms),
+        ))
     }
 
     fn claim_sales_dispatch(
@@ -996,7 +999,8 @@ mod tests {
     fn adaptive_dispatch_returns_deadline_from_the_final_committed_session_clock() {
         let temp = tempfile::tempdir().unwrap();
         let (api, binding, _) = super::super::model_work::configured_adaptive_test_api(
-            &temp.path().join("company.sqlite"), &temp.path().join("events.sqlite"),
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
         );
         let body = reserved_adaptive_request(&api, &binding);
         let request: DispatchRequest = serde_json::from_slice(&body).unwrap();
@@ -1004,15 +1008,28 @@ mod tests {
         let committed_at = validated_at + 1_000;
         assert!(committed_at + binding.grant.max_call_duration_ms < binding.grant.deadline_ms);
         let sampled = std::cell::Cell::new(0);
-        let deadline = api.claim_adaptive_dispatch_with_clock(&request, now_unix_ms(), || {
-            let index = sampled.get();
-            sampled.set(index + 1);
-            if index == 0 { validated_at } else { committed_at }
-        }).unwrap();
+        let deadline = api
+            .claim_adaptive_dispatch_with_clock(&request, now_unix_ms(), || {
+                let index = sampled.get();
+                sampled.set(index + 1);
+                if index == 0 {
+                    validated_at
+                } else {
+                    committed_at
+                }
+            })
+            .unwrap();
         assert!(sampled.get() >= 2);
-        let session = api.store.adaptive_session_for_authority(&binding.grant.authority).unwrap().unwrap();
+        let session = api
+            .store
+            .adaptive_session_for_authority(&binding.grant.authority)
+            .unwrap()
+            .unwrap();
         assert_eq!(session.updated_at_ms, committed_at);
-        assert_eq!(deadline, committed_at + session.effective_grant().max_call_duration_ms);
+        assert_eq!(
+            deadline,
+            committed_at + session.effective_grant().max_call_duration_ms
+        );
     }
 
     #[test]
@@ -1022,26 +1039,54 @@ mod tests {
                 super::super::adaptive_resume_policy::tests::continued_policy_fixture(false);
             let path = temp.path().join("company.sqlite");
             let events = temp.path().join("events.sqlite");
-            let binding = api.adaptive_provider_authority_for_claim(session.grant.authority.agent_id)
-                .unwrap().unwrap();
+            let binding = api
+                .adaptive_provider_authority_for_claim(session.grant.authority.agent_id)
+                .unwrap()
+                .unwrap();
             let body = reserved_adaptive_request(&api, &binding);
             let request: DispatchRequest = serde_json::from_slice(&body).unwrap();
-            let policy = session.continuation.as_ref().unwrap().authorizations.last().unwrap()
-                .resume_policy.as_ref().unwrap();
+            let policy = session
+                .continuation
+                .as_ref()
+                .unwrap()
+                .authorizations
+                .last()
+                .unwrap()
+                .resume_policy
+                .as_ref()
+                .unwrap();
             let boundary = session.active_deadline_ms()
-                - session.effective_call_duration_ms() - policy.limits.dispatch_margin_ms;
-            assert_eq!(session.model_admission_at(boundary), sentinel_workflow::AdaptiveModelAdmissionV1::Admissible);
-            assert_eq!(session.model_admission_at(boundary + 1), sentinel_workflow::AdaptiveModelAdmissionV1::InsufficientSlack);
+                - session.effective_call_duration_ms()
+                - policy.limits.dispatch_margin_ms;
+            assert_eq!(
+                session.model_admission_at(boundary),
+                sentinel_workflow::AdaptiveModelAdmissionV1::Admissible
+            );
+            assert_eq!(
+                session.model_admission_at(boundary + 1),
+                sentinel_workflow::AdaptiveModelAdmissionV1::InsufficientSlack
+            );
             let before = discovery_state(&path, &events);
             let sampled = std::cell::Cell::new(0);
-            assert!(api.claim_adaptive_dispatch_with_clock(&request, now_unix_ms(), || {
-                let index = sampled.get();
-                sampled.set(index + 1);
-                if changes_inside_store && index == 0 { boundary } else { boundary + 1 }
-            }).is_err());
+            assert!(api
+                .claim_adaptive_dispatch_with_clock(&request, now_unix_ms(), || {
+                    let index = sampled.get();
+                    sampled.set(index + 1);
+                    if changes_inside_store && index == 0 {
+                        boundary
+                    } else {
+                        boundary + 1
+                    }
+                })
+                .is_err());
             assert!(sampled.get() >= if changes_inside_store { 2 } else { 1 });
             assert_eq!(discovery_state(&path, &events), before);
-            assert_eq!(api.store.adaptive_session_for_authority(&session.grant.authority).unwrap(), Some(session));
+            assert_eq!(
+                api.store
+                    .adaptive_session_for_authority(&session.grant.authority)
+                    .unwrap(),
+                Some(session)
+            );
         }
     }
 

@@ -148,8 +148,12 @@ impl LeadershipContext {
                 let limits = &binding.limits;
                 call_ceiling = remaining;
                 window_ceiling = limits.max_window_ms.min(
-                    limits.expires_at_unix_ms.saturating_sub(self.binding.issued_at_ms));
-                window_floor = limits.max_call_duration_ms
+                    limits
+                        .expires_at_unix_ms
+                        .saturating_sub(self.binding.issued_at_ms),
+                );
+                window_floor = limits
+                    .max_call_duration_ms
                     .checked_add(limits.dispatch_margin_ms)
                     .ok_or("leadership admission margin invalid")?;
                 window_limit = usize::from(limits.total_window_ceiling);
@@ -163,7 +167,8 @@ impl LeadershipContext {
                     limits.max_call_duration_ms, limits.dispatch_margin_ms,
                     limits.expires_at_unix_ms,
                 );
-                if self.source.source_session.tool_calls >= self.source.source_session.grant.max_tool_calls
+                if self.source.source_session.tool_calls
+                    >= self.source.source_session.grant.max_tool_calls
                     || window_ceiling < window_floor
                 {
                     call_ceiling = 0;
@@ -174,9 +179,7 @@ impl LeadershipContext {
                 .source_session
                 .continuation
                 .as_ref()
-                .is_some_and(|state| {
-                    state.authorizations.len() >= window_limit
-                })
+                .is_some_and(|state| state.authorizations.len() >= window_limit)
             {
                 call_ceiling = 0;
             }
@@ -493,15 +496,19 @@ impl WorkflowApi {
                 }
             }
             let now = clock();
-            let resume_receipt = self.store.adaptive_resume_policy(
-                &project.tenant_id, session.grant.session_id,
-            ).map_err(|_| "resume policy unavailable")?;
+            let resume_receipt = self
+                .store
+                .adaptive_resume_policy(&project.tenant_id, session.grant.session_id)
+                .map_err(|_| "resume policy unavailable")?;
             let resume_policy = if let Some(receipt) = &resume_receipt {
                 receipt.validate().map_err(|_| "resume policy invalid")?;
                 if receipt.request.source.assignee_authority != session.grant.authority {
                     return Err("resume policy assignee changed");
                 }
-                if !matches!(session.cursor, AdaptiveCursorV1::ReadyForModel | AdaptiveCursorV1::ModelUnknown { .. }) {
+                if !matches!(
+                    session.cursor,
+                    AdaptiveCursorV1::ReadyForModel | AdaptiveCursorV1::ModelUnknown { .. }
+                ) {
                     blocked = true;
                     continue;
                 }
@@ -510,40 +517,52 @@ impl WorkflowApi {
                     || calls.len() >= usize::from(limits.total_review_ceiling)
                     || session.model_calls >= session.grant.max_model_calls
                     || session.tool_calls >= session.grant.max_tool_calls
-                    || session.continuation.as_ref().map_or(0, |state| state.authorizations.len())
+                    || session
+                        .continuation
+                        .as_ref()
+                        .map_or(0, |state| state.authorizations.len())
                         >= usize::from(limits.total_window_ceiling)
                 {
                     blocked = true;
                     continue;
                 }
-                let ordinal = u16::try_from(calls.len()).ok()
+                let ordinal = u16::try_from(calls.len())
+                    .ok()
                     .and_then(|count| count.checked_add(1))
                     .ok_or("resume policy review count invalid")?;
-                Some(Box::new(receipt.binding(ordinal)
-                    .map_err(|_| "resume policy ordinal invalid")?))
-            } else { None };
+                Some(Box::new(
+                    receipt
+                        .binding(ordinal)
+                        .map_err(|_| "resume policy ordinal invalid")?,
+                ))
+            } else {
+                None
+            };
             let normal_budget = matches!(&session.cursor, AdaptiveCursorV1::ReadyForModel)
                 && session.model_window_exhausted_at(now);
-            let (global_review_limit, head_review_limit, extension_expiry) = if let Some(binding) = &resume_policy {
-                (usize::from(binding.limits.total_review_ceiling),
-                    usize::from(binding.limits.total_review_ceiling),
-                    Some(binding.limits.expires_at_unix_ms))
-            } else if normal_budget {
-                self.store
-                    .budget_review_limits(
-                        &project.tenant_id,
-                        session.grant.session_id,
-                        session.version,
-                        now,
+            let (global_review_limit, head_review_limit, extension_expiry) =
+                if let Some(binding) = &resume_policy {
+                    (
+                        usize::from(binding.limits.total_review_ceiling),
+                        usize::from(binding.limits.total_review_ceiling),
+                        Some(binding.limits.expires_at_unix_ms),
                     )
-                    .map_err(|_| "budget review limits unavailable")?
-            } else {
-                (
-                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
-                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
-                    None,
-                )
-            };
+                } else if normal_budget {
+                    self.store
+                        .budget_review_limits(
+                            &project.tenant_id,
+                            session.grant.session_id,
+                            session.version,
+                            now,
+                        )
+                        .map_err(|_| "budget review limits unavailable")?
+                } else {
+                    (
+                        ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                        ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                        None,
+                    )
+                };
             if session.model_window_exhausted_at(now)
                 && self
                     .store
@@ -685,7 +704,10 @@ impl WorkflowApi {
                 ),
             ];
             if let Some(binding) = &resume_policy {
-                refs.push(format!("adaptive-resume-policy:{}:{}", binding.receipt_digest, binding.ordinal));
+                refs.push(format!(
+                    "adaptive-resume-policy:{}:{}",
+                    binding.receipt_digest, binding.ordinal
+                ));
             }
             match &subject {
                 Some(
@@ -747,8 +769,10 @@ impl WorkflowApi {
                         refs.push(format!(
                             "leadership-review-retirement-history:{}:{:x}",
                             retired_history.len(),
-                            Sha256::digest(serde_json::to_vec(&retired_history)
-                                .map_err(|_| "leadership retirement history invalid")?),
+                            Sha256::digest(
+                                serde_json::to_vec(&retired_history)
+                                    .map_err(|_| "leadership retirement history invalid")?
+                            ),
                         ));
                     }
                 } else {
@@ -767,17 +791,21 @@ impl WorkflowApi {
             .map_err(|_| "leadership identity invalid")?;
             let review_limit = if resume_policy.is_some() {
                 calls.len() >= global_review_limit
-            } else { (subject.is_some()
-                && calls
-                    .iter()
-                    .filter(|call| call.grant.schema_version == if normal_budget { 3 } else { 2 })
-                    .count()
-                    >= global_review_limit)
-                || calls
-                    .iter()
-                    .filter(|call| call.grant.expected_session_version == session.version)
-                    .count()
-                    >= head_review_limit };
+            } else {
+                (subject.is_some()
+                    && calls
+                        .iter()
+                        .filter(|call| {
+                            call.grant.schema_version == if normal_budget { 3 } else { 2 }
+                        })
+                        .count()
+                        >= global_review_limit)
+                    || calls
+                        .iter()
+                        .filter(|call| call.grant.expected_session_version == session.version)
+                        .count()
+                        >= head_review_limit
+            };
             let budget_limit = normal_budget
                 && (review_limit
                     || session.model_calls >= session.grant.max_model_calls
@@ -785,7 +813,8 @@ impl WorkflowApi {
                         state.authorizations.len()
                             >= resume_policy.as_ref().map_or(
                                 sentinel_workflow::ADAPTIVE_CONTINUATION_MAX_WINDOWS,
-                                |binding| usize::from(binding.limits.total_window_ceiling))
+                                |binding| usize::from(binding.limits.total_window_ceiling),
+                            )
                     }));
             // Duplicate review identity must not suppress a system-policy receipt.
             if (!budget_limit && calls.iter().any(|call| call.grant.review_id == id))
@@ -833,8 +862,13 @@ impl WorkflowApi {
                 .ok_or("leadership clock overflow")?;
             let max_duration_ms = resume_policy.as_ref().map_or(
                 planning.grant.max_duration_ms.min(120_000),
-                |binding| planning.grant.max_duration_ms.min(120_000)
-                    .min(binding.limits.max_call_duration_ms),
+                |binding| {
+                    planning
+                        .grant
+                        .max_duration_ms
+                        .min(120_000)
+                        .min(binding.limits.max_call_duration_ms)
+                },
             );
             let grant = AdaptiveLeadershipReviewGrantV1 {
                 schema_version: match &subject {
@@ -1013,9 +1047,11 @@ impl WorkflowApi {
                 continue;
             }
             for session in self.review_sessions(&project)? {
-                let policy_present = self.store.adaptive_resume_policy(
-                    &project.tenant_id, session.grant.session_id,
-                ).map_err(|_| "resume policy unavailable")?.is_some();
+                let policy_present = self
+                    .store
+                    .adaptive_resume_policy(&project.tenant_id, session.grant.session_id)
+                    .map_err(|_| "resume policy unavailable")?
+                    .is_some();
                 let mut calls = self
                     .store
                     .adaptive_leadership_review_calls(&project.tenant_id, session.grant.session_id)
