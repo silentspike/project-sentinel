@@ -14,6 +14,8 @@ const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const NOW: u64 = 300_010;
 const EXPIRY: u64 = NOW + 3_600_000;
 
+mod work_funding;
+
 struct Fixture {
     _temp: tempfile::TempDir,
     path: std::path::PathBuf,
@@ -345,6 +347,7 @@ fn review(
         }),
         recovery_epoch: None,
         resume_policy: binding.map(Box::new),
+        work_funding: None,
     };
     (grant, context)
 }
@@ -744,6 +747,7 @@ fn leaf_checks_do_not_load_project_journal_or_review_history() {
         additional_model_calls: 1,
         local_adoption: None,
         resume_policy: grant.resume_policy.clone(),
+        work_funding: None,
     };
     {
         let mut connection = f.store.connection.lock().unwrap();

@@ -273,6 +273,7 @@ fn fixture() -> Fixture {
         subject: None,
         recovery_epoch: None,
         resume_policy: None,
+        work_funding: None,
     };
     grant.validate(AUTHORIZED_AT).unwrap();
     context.validate(&grant).unwrap();

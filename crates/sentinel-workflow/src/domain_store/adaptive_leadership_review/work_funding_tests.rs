@@ -1,0 +1,574 @@
+use super::*;
+use crate::{AdaptiveWorkFundingEpochV1, AdaptiveWorkFundingLimitsV1, AdaptiveWorkFundingReceiptV1};
+
+const WINDOW_MS: u64 = 180_000;
+
+fn fund(f: &Fixture, now: u64) -> AdaptiveWorkFundingReceiptV1 {
+    fund_with_windows(f, now, 3)
+}
+
+fn fund_with_windows(f: &Fixture, now: u64, additional_windows: u16) -> AdaptiveWorkFundingReceiptV1 {
+    let mut operator = f.leader.clone();
+    operator.kind = CompanyPrincipalKindV1::Operator;
+    operator.agent_id = None;
+    let request = f.store.adaptive_work_funding_draft(
+        &operator, &f.grant.project_id, f.grant.session_id, Uuid::new_v4(),
+        "explicit-additional-work", AdaptiveWorkFundingLimitsV1 {
+            additional_model_calls: 6,
+            additional_tool_calls: 6,
+            additional_reviews: 3,
+            additional_windows,
+            max_window_ms: WINDOW_MS,
+            max_call_duration_ms: f.context.source_session.grant.max_call_duration_ms,
+            dispatch_margin_ms: crate::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+            expires_at_unix_ms: now + 3_600_000,
+        }, now,
+    ).unwrap();
+    f.store.authorize_adaptive_work_funding(&operator, &request, now).unwrap().1
+}
+
+fn bind(f: &mut Fixture, receipt: &AdaptiveWorkFundingReceiptV1, ordinal: u16) {
+    let epoch = AdaptiveWorkFundingEpochV1 {
+        receipt: receipt.clone(), binding: receipt.binding(ordinal).unwrap(),
+    };
+    f.context.evidence_refs.retain(|reference| !reference.starts_with("adaptive-work-funding:"));
+    f.context.evidence_refs.push(epoch.evidence_ref().unwrap());
+    f.grant.schema_version = 5;
+    f.grant.work_funding = Some(Box::new(epoch));
+    rebind_budget_evidence(f);
+}
+
+fn issue(f: &Fixture, now: u64) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
+    f.store.authorize_adaptive_leadership_review_call(
+        &f.leader, Uuid::new_v4(), &format!("funded-review-{}", f.grant.review_id),
+        &f.grant, &f.context, now,
+    )
+}
+
+fn dispatch(f: &Fixture, now: u64) -> AdaptiveLeadershipReviewCallV1 {
+    let call = issue(f, now).unwrap();
+    f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1).unwrap()
+}
+
+fn defer(call: &AdaptiveLeadershipReviewCallV1) -> CompleteAdaptiveLeadershipReviewCallV1 {
+    let mut result = completion(call, false);
+    result.decision = AdaptiveLeadershipReviewDecisionV1 {
+        schema_version: call.grant.schema_version,
+        decision: AdaptiveLeadershipReviewDecisionKindV1::DeferBudget {
+            rationale: "Do not continue this reviewed source".into(),
+            evidence_refs: vec![call.context.evidence_refs[0].clone()],
+        },
+    };
+    result
+}
+
+fn continued(call: &AdaptiveLeadershipReviewCallV1, now: u64, calls: u16)
+    -> CompleteAdaptiveLeadershipReviewCallV1
+{
+    let mut result = completion(call, false);
+    result.decision = AdaptiveLeadershipReviewDecisionV1 {
+        schema_version: call.grant.schema_version,
+        decision: AdaptiveLeadershipReviewDecisionKindV1::Continue {
+            additional_model_calls: calls, window_ms: WINDOW_MS,
+            rationale: "Continue only within the explicitly funded epoch".into(),
+            evidence_refs: vec![call.grant.work_funding.as_ref().map_or_else(
+                || call.context.evidence_refs[0].clone(), |epoch| epoch.evidence_ref().unwrap(),
+            )],
+        },
+    };
+    let resolution = adaptive_leadership_continuation_audit_id(
+        call.grant.review_id, &result.request_digest, &result.model_response_digest, &result.decision,
+    ).unwrap();
+    let allowance = call.continuation_allowance(now, now + WINDOW_MS, calls).unwrap();
+    let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) = &call.grant.subject
+    else { panic!("budget source"); };
+    result.resolution_event_id = Some(resolution);
+    result.continuation = Some(crate::AdaptiveContinuationAuthorizationV1 {
+        schema_version: 1, operation_id: call.operation_id, review_id: call.grant.review_id,
+        resolution_event_id: resolution, session_id: call.grant.session_id,
+        source_session_version: call.grant.expected_session_version,
+        source: crate::AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+            active_allowance_digest: budget.active_allowance_digest.clone(),
+            continuation_history_digest: budget.continuation_history_digest.clone(),
+        },
+        abandoned_model_effect: None, provider_allowance_id: allowance.allowance_id.clone(),
+        provider_authority_digest: adaptive_leadership_continuation_provider_authority_digest(
+            &allowance, &call.grant.assignee_authority,
+        ).unwrap(),
+        issued_at_ms: now, deadline_ms: now + WINDOW_MS, additional_model_calls: calls,
+        local_adoption: None, resume_policy: call.grant.resume_policy.clone(),
+        work_funding: call.grant.work_funding.clone(),
+    });
+    result
+}
+
+fn funded_fixture() -> (Fixture, AdaptiveWorkFundingReceiptV1, u64) {
+    let mut f = budget_fixture(2);
+    let now = CONTINUATION_AT + 7;
+    let receipt = fund(&f, now);
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 1);
+    (f, receipt, now)
+}
+
+#[test]
+fn funded_continue_is_atomic_preserves_source_spend_and_replays_historically() {
+    let mut f = budget_fixture(2);
+    let now = CONTINUATION_AT + 7;
+    let source = session(&f);
+    let project = f.context.source_project.clone();
+    let legacy_bytes = encode(&f.grant).unwrap();
+    assert!(!String::from_utf8(legacy_bytes.clone()).unwrap().contains("work_funding"));
+    let receipt = fund(&f, now);
+    assert_eq!(session(&f), source);
+    assert_eq!(f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap(), project);
+    assert_eq!(encode(&f.grant).unwrap(), legacy_bytes);
+    assert!(source.active_work_funding().is_none());
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 1);
+    assert_eq!(f.store.adaptive_work_funding_for_review(
+        &f.leader.tenant_id, f.grant.session_id, now,
+    ).unwrap().as_ref(), f.grant.work_funding.as_deref());
+    let call = dispatch(&f, now);
+    assert_eq!(session(&f), source);
+    let before = rows(&f.store);
+    assert!(f.store.advance_adaptive_session(
+        source.grant.session_id, source.version, Uuid::new_v4(),
+        &AdaptiveTransitionV1::ClaimModel {
+            effect: AdaptiveEffectV1 { id: Uuid::new_v4(), request_digest: DIGEST.into() },
+            previous_observation_digest: source.last_observation.as_ref().map(|observation| observation.observation_digest.clone()),
+        }, &f.grant.assignee_authority, now + 1,
+    ).is_err());
+    assert_eq!(rows(&f.store), before);
+    let result = continued(&call, now + 2, 5);
+    let completed = f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).unwrap();
+    let adopted = session(&f);
+    assert_eq!(adopted.grant, source.grant);
+    assert_eq!((adopted.model_calls, adopted.tool_calls), (source.model_calls, source.tool_calls));
+    assert_eq!(adopted.funded_model_call_ceiling(), 8);
+    assert_eq!(adopted.funded_tool_call_ceiling(), 8);
+    assert_eq!(adopted.active_work_funding(), call.grant.work_funding.as_deref());
+    assert_eq!(adopted.continuation.as_ref().unwrap().authorizations.len(), 2);
+    assert!(adopted.requires_fresh_observation());
+    let final_project = f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap();
+    assert_eq!(final_project.subscription_call.as_ref().unwrap().grant.max_calls, 5);
+    assert!(final_project.subscription_call.as_ref().unwrap().dispatch.is_none());
+    let before = rows(&f.store);
+    assert_eq!(f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &result, receipt.request.limits.expires_at_unix_ms + 1,
+    ).unwrap(), completed);
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(f.store.adaptive_leadership_review_call(
+        &f.leader.tenant_id, call.grant.review_id,
+    ).unwrap(), Some(completed.clone()));
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert_eq!(reopened.adaptive_leadership_review_call(
+        &f.leader.tenant_id, call.grant.review_id,
+    ).unwrap(), Some(completed));
+    assert_eq!(reopened.adaptive_session(f.grant.session_id, &f.grant.assignee_authority).unwrap().unwrap(), adopted);
+    assert_eq!(reopened.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap(), final_project);
+    let mut changed = result.clone();
+    changed.model_response_digest = "b".repeat(64);
+    assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &changed, now + 3).is_err());
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn completed_funded_defer_is_not_a_successor_or_replenishment_trigger() {
+    let (mut f, receipt, now) = funded_fixture();
+    let source = session(&f);
+    let call = dispatch(&f, now);
+    let result = defer(&call);
+    let refused = f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).unwrap();
+    assert_eq!(session(&f), source);
+    assert!(session(&f).active_work_funding().is_none());
+    assert_eq!(f.store.adaptive_work_funding_for_review(
+        &f.leader.tenant_id, f.grant.session_id, now + 3,
+    ).unwrap(), None);
+    let before = rows(&f.store);
+    assert_eq!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 3).unwrap(), refused);
+    f.context.evidence_refs.push("new-explanation-same-head".into());
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 2);
+    assert!(issue(&f, now + 3).is_err());
+    assert_eq!(rows(&f.store), before);
+    change_project(&f, now + 4);
+    budget_context(&mut f, now + 5, "project-only-change");
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 2);
+    let before = rows(&f.store);
+    assert!(issue(&f, now + 5).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(session(&f), source);
+}
+
+#[test]
+fn new_explicit_funding_can_review_a_retained_unfunded_defer_without_rewriting_it() {
+    let mut f = budget_fixture(4);
+    let now = CONTINUATION_AT + 7;
+    let old = dispatch_budget(&f, now);
+    let refused = f.store.complete_adaptive_leadership_review_call(&f.leader, &defer(&old), now + 2).unwrap();
+    let source = session(&f);
+    let receipt = fund(&f, now + 3);
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 1);
+    let new = dispatch(&f, now + 3);
+    assert_ne!(new.grant.review_id, refused.grant.review_id);
+    assert_eq!(session(&f), source);
+    assert_eq!(f.store.adaptive_leadership_review_call(&f.leader.tenant_id, refused.grant.review_id).unwrap(), Some(refused));
+    assert_eq!(new.grant.work_funding.as_ref().unwrap().binding.ordinal, 3);
+}
+
+#[test]
+fn historical_v1_resume_policy_reviews_and_authorizations_coexist_with_funding() {
+    let mut f = budget_fixture(4);
+    let now = CONTINUATION_AT + 7;
+    let mut operator = f.leader.clone();
+    operator.kind = CompanyPrincipalKindV1::Operator;
+    operator.agent_id = None;
+    let mut request = f.store.adaptive_resume_policy_draft(
+        &operator, &f.grant.project_id, f.grant.session_id, Uuid::new_v4(),
+        "original-v1-policy", now + 3_600_000, now,
+    ).unwrap();
+    request.limits.total_review_ceiling = request.source.base_review_count + 3;
+    request.limits.total_window_ceiling = request.source.base_window_count + 3;
+    let policy = f.store.authorize_adaptive_resume_policy_with_unknown_proof(
+        &operator, &request, now, |_, _| Ok(DIGEST.into()),
+    ).unwrap().1;
+    let binding = policy.binding(policy.request.source.base_review_count + 1).unwrap();
+    f.context.evidence_refs.push(format!("adaptive-resume-policy:{}:{}", binding.receipt_digest, binding.ordinal));
+    f.grant.resume_policy = Some(Box::new(binding));
+    rebind_budget_evidence(&mut f);
+    let old = dispatch(&f, now);
+    let old_result = continued(&old, now + 2, 1);
+    let old_review = f.store.complete_adaptive_leadership_review_call(&f.leader, &old_result, now + 2).unwrap();
+    let source = observe_budget_inspection(&f, session(&f), now + 3);
+    let old_authorizations = source.continuation.as_ref().unwrap().authorizations.clone();
+    assert!(old_authorizations.last().unwrap().resume_policy.is_some());
+    budget_context(&mut f, now + 7, "funding-after-v1-policy");
+    f.grant.resume_policy = None;
+    let receipt = fund(&f, now + 7);
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 1);
+    let new = dispatch(&f, now + 7);
+    f.store.complete_adaptive_leadership_review_call(&f.leader, &continued(&new, now + 9, 5), now + 9).unwrap();
+    let adopted = session(&f);
+    assert_eq!(adopted.grant, source.grant);
+    assert_eq!((adopted.model_calls, adopted.tool_calls), (source.model_calls, source.tool_calls));
+    assert!(adopted.continuation.as_ref().unwrap().authorizations.starts_with(&old_authorizations));
+    assert_eq!(adopted.funded_model_call_ceiling(), 10);
+    assert_eq!(f.store.adaptive_leadership_review_call(&f.leader.tenant_id, old.grant.review_id).unwrap(), Some(old_review));
+}
+
+#[test]
+fn unresolved_invalid_expired_and_stale_funded_reviews_never_reroll_the_same_head() {
+    for stale in [false, true] {
+        let (mut f, receipt, now) = funded_fixture();
+        let call = dispatch(&f, now);
+        let mut invalid = defer(&call);
+        invalid.decision.schema_version = 3;
+        let before = rows(&f.store);
+        assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &invalid, now + 2).is_err());
+        assert_eq!(rows(&f.store), before);
+        bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 2);
+        assert!(issue(&f, now + 2).is_err());
+        assert_eq!(rows(&f.store), before);
+        let at = if stale { now + 3 } else { call.grant.expires_at_unix_ms };
+        if stale {
+            change_project(&f, at);
+            f.store.retire_stale_adaptive_leadership_review_call(
+                &f.leader, call.grant.review_id, call.version, at,
+            ).unwrap();
+        } else {
+            f.store.expire_adaptive_leadership_review_call(
+                &f.leader, call.grant.review_id, call.version, at,
+            ).unwrap();
+        }
+        budget_context(&mut f, at + 1, "no-automatic-successor");
+        bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 2);
+        let before = rows(&f.store);
+        assert!(issue(&f, at + 1).is_err());
+        assert_eq!(rows(&f.store), before);
+        assert!(session(&f).active_work_funding().is_none());
+        assert_eq!(f.store.adaptive_work_funding_for_review(
+            &f.leader.tenant_id, f.grant.session_id, at + 1,
+        ).unwrap(), None);
+    }
+}
+
+#[test]
+fn productive_heads_get_bounded_successors_with_global_ordinals_and_exact_totals() {
+    let (mut f, receipt, now) = funded_fixture();
+    let first = dispatch(&f, now);
+    f.store.complete_adaptive_leadership_review_call(&f.leader, &continued(&first, now + 2, 5), now + 2).unwrap();
+    let observed = observe_budget_inspection(&f, session(&f), now + 3);
+    assert_eq!(observed.model_calls, 3);
+    assert_eq!(observed.tool_calls, 2);
+    let next = observed.active_deadline_ms();
+    budget_context(&mut f, next, "productive-successor");
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 2);
+    assert_eq!(f.store.adaptive_work_funding_for_review(
+        &f.leader.tenant_id, f.grant.session_id, next,
+    ).unwrap().as_ref(), f.grant.work_funding.as_deref());
+    let second = dispatch(&f, next);
+    assert_eq!(second.grant.work_funding.as_ref().unwrap().binding.ordinal, 3);
+    assert!(second.continuation_allowance(next + 2, next + 2 + WINDOW_MS, 5).is_ok());
+    assert!(second.continuation_allowance(next + 2, next + 2 + WINDOW_MS, 6).is_err());
+    f.store.complete_adaptive_leadership_review_call(&f.leader, &continued(&second, next + 2, 5), next + 2).unwrap();
+    let source = session(&f);
+    assert_eq!(source.grant.max_model_calls, 2);
+    assert_eq!(source.funded_model_call_ceiling(), 8);
+    assert_eq!(source.continuation.as_ref().unwrap().authorizations.len(), 3);
+    let expiry = source.active_deadline_ms();
+    budget_context(&mut f, expiry, "adoption-only-head-is-not-progress");
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 3);
+    let before = rows(&f.store);
+    assert!(issue(&f, expiry).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(f.store.adaptive_work_funding_for_review(
+        &f.leader.tenant_id, f.grant.session_id, expiry,
+    ).unwrap(), None);
+}
+
+#[test]
+fn adopted_successor_epoch_derives_prior_proof_and_cumulative_authenticated_totals() {
+    let (mut f, first_receipt, now) = funded_fixture();
+    let first = dispatch(&f, now);
+    let first_result = continued(&first, now + 2, 5);
+    let first_completed = f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &first_result, now + 2,
+    ).unwrap();
+    let progressed = observe_budget_inspection(&f, session(&f), now + 3);
+    let prior_authorizations = progressed.continuation.as_ref().unwrap().authorizations.clone();
+    assert_eq!((progressed.model_calls, progressed.tool_calls), (3, 2));
+    assert_eq!(progressed.funded_model_call_ceiling(), 8);
+    assert_eq!(progressed.funded_tool_call_ceiling(), 8);
+    let next = progressed.active_deadline_ms();
+    budget_context(&mut f, next, "explicit-successor-epoch-source");
+    let second_receipt = fund(&f, next);
+    assert_eq!(session(&f), progressed);
+    let proposal = &second_receipt.request.source;
+    let anchor = &proposal.resume_source;
+    assert_eq!(proposal.predecessor_receipt_digest, Some(first_receipt.receipt_digest().unwrap()));
+    assert_eq!(proposal.original_model_call_ceiling, progressed.grant.max_model_calls);
+    assert_eq!(proposal.original_tool_call_ceiling, progressed.grant.max_tool_calls);
+    assert_eq!(proposal.current_model_call_ceiling, progressed.funded_model_call_ceiling());
+    assert_eq!(proposal.current_tool_call_ceiling, progressed.funded_tool_call_ceiling());
+    assert_eq!((anchor.base_model_calls, anchor.base_tool_calls), (3, 2));
+    assert_eq!((anchor.base_review_count, anchor.base_window_count), (2, 2));
+    assert_eq!(anchor.expected_session_version, progressed.version);
+    assert_eq!(anchor.continuation_history_digest, crate::adaptive_budget_history_digest(&progressed.continuation).unwrap());
+    assert_eq!(second_receipt.resulting_model_call_ceiling().unwrap(), 14);
+    assert_eq!(second_receipt.resulting_tool_call_ceiling().unwrap(), 14);
+    bind(&mut f, &second_receipt, anchor.base_review_count + 1);
+    assert_eq!(f.store.adaptive_work_funding_for_review(
+        &f.leader.tenant_id, f.grant.session_id, next,
+    ).unwrap().as_ref(), f.grant.work_funding.as_deref());
+    let second = dispatch(&f, next);
+    assert_eq!(session(&f), progressed);
+    assert_eq!(second.grant.work_funding.as_ref().unwrap().binding.ordinal, 3);
+    let second_result = continued(&second, next + 2, 6);
+    f.store.complete_adaptive_leadership_review_call(&f.leader, &second_result, next + 2).unwrap();
+    let adopted = session(&f);
+    assert_eq!(adopted.grant, progressed.grant);
+    assert_eq!((adopted.model_calls, adopted.tool_calls), (progressed.model_calls, progressed.tool_calls));
+    assert_eq!(adopted.funded_model_call_ceiling(), 14);
+    assert_eq!(adopted.funded_tool_call_ceiling(), 14);
+    assert_eq!(adopted.active_work_funding(), second.grant.work_funding.as_deref());
+    let history = &adopted.continuation.as_ref().unwrap().authorizations;
+    assert!(history.starts_with(&prior_authorizations));
+    assert_eq!(history.len(), 3);
+    assert_eq!(history.last(), second_result.continuation.as_ref());
+    assert!(history.iter().any(|authorization| {
+        authorization.work_funding.as_ref().is_some_and(|epoch| epoch.receipt == first_receipt)
+    }));
+    assert_eq!(f.store.adaptive_work_funding(
+        &f.leader.tenant_id, f.grant.session_id, first_receipt.request.operation_id,
+    ).unwrap(), Some(first_receipt));
+    assert_eq!(f.store.adaptive_leadership_review_call(
+        &f.leader.tenant_id, first.grant.review_id,
+    ).unwrap(), Some(first_completed));
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert_eq!(reopened.adaptive_session(
+        f.grant.session_id, &f.grant.assignee_authority,
+    ).unwrap().unwrap(), adopted);
+}
+
+#[test]
+fn adopted_window_cap_returns_no_selector_even_with_unspent_calls_and_review_slot() {
+    let mut f = budget_fixture(2);
+    let now = CONTINUATION_AT + 7;
+    let receipt = fund_with_windows(&f, now, 2);
+    let base = receipt.request.source.resume_source.base_review_count;
+    bind(&mut f, &receipt, base + 1);
+    let first = dispatch(&f, now);
+    f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &continued(&first, now + 2, 2), now + 2,
+    ).unwrap();
+    let observed = observe_budget_inspection(&f, session(&f), now + 3);
+    let next = observed.active_deadline_ms();
+    budget_context(&mut f, next, "last-funded-window");
+    bind(&mut f, &receipt, base + 2);
+    let second = dispatch(&f, next);
+    f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &continued(&second, next + 2, 2), next + 2,
+    ).unwrap();
+    let observed = observe_budget_inspection(&f, session(&f), next + 3);
+    let epoch = observed.active_work_funding().unwrap();
+    assert_eq!(observed.continuation.as_ref().unwrap().authorizations.len(),
+        usize::from(epoch.binding.limits.total_window_ceiling));
+    let reviews = f.store.adaptive_leadership_review_calls(
+        &f.leader.tenant_id, f.grant.session_id,
+    ).unwrap();
+    assert!(reviews.len() < usize::from(epoch.binding.limits.total_review_ceiling));
+    assert!(observed.model_calls < epoch.binding.limits.total_model_call_ceiling);
+    assert!(observed.tool_calls < epoch.binding.limits.total_tool_call_ceiling);
+    let exhausted = observed.active_deadline_ms();
+    assert!(observed.model_window_exhausted_at(exhausted));
+    let before = rows(&f.store);
+    assert_eq!(f.store.adaptive_work_funding_for_review(
+        &f.leader.tenant_id, f.grant.session_id, exhausted,
+    ).unwrap(), None);
+    assert_eq!(rows(&f.store), before);
+    budget_context(&mut f, exhausted, "no-window-replenishment");
+    bind(&mut f, &receipt, base + 3);
+    assert!(issue(&f, exhausted).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(session(&f), observed);
+}
+
+#[test]
+fn manufactured_epoch_and_forged_review_membership_are_not_stored_authority() {
+    let (mut f, mut receipt, now) = funded_fixture();
+    receipt.request.operation_id = Uuid::new_v4();
+    receipt.funding_id = crate::adaptive_work_funding_id(
+        &f.leader.tenant_id, f.grant.session_id, receipt.request.operation_id,
+    ).unwrap();
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 1);
+    f.grant.work_funding.as_ref().unwrap().validate().unwrap();
+    f.context.validate(&f.grant).unwrap();
+    let before = rows(&f.store);
+    assert!(issue(&f, now).is_err());
+    assert_eq!(rows(&f.store), before);
+
+    let (f, receipt, now) = funded_fixture();
+    let call = dispatch(&f, now);
+    let mut forged = call.clone();
+    forged.grant.work_funding.as_mut().unwrap().binding = receipt.binding(
+        receipt.request.source.resume_source.base_review_count + 2,
+    ).unwrap();
+    let connection = f.store.connection.lock().unwrap();
+    assert!(require_funding_review_membership(
+        &connection, &forged.grant, &forged.context_digest().unwrap(), forged.operation_id,
+    ).is_err());
+    let result = continued(&call, now + 2, 5);
+    assert!(require_funding_authorization_membership(
+        &connection, result.continuation.as_ref().unwrap(), &call.grant.assignee_authority,
+    ).is_err());
+}
+
+#[test]
+fn missing_adoption_or_its_event_corrupts_completed_receipt_and_reopened_journal() {
+    for target in ["adoption", "adoption-event"] {
+        let (f, _, now) = funded_fixture();
+        let call = dispatch(&f, now);
+        let result = continued(&call, now + 2, 5);
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).unwrap();
+        let connection = f.store.connection.lock().unwrap();
+        let changed = match target {
+            "adoption" => connection.execute(
+                "DELETE FROM company_entities WHERE entity_kind='adaptive_work_funding_adoption'", [],
+            ).unwrap(),
+            "adoption-event" => connection.execute(
+                "DELETE FROM company_events WHERE event_type='adaptive_work_funding_adopted'", [],
+            ).unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(changed, 1);
+        drop(connection);
+        let before = rows(&f.store);
+        assert!(f.store.adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id).is_err());
+        assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 3).is_err());
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert!(reopened.adaptive_session(f.grant.session_id, &f.grant.assignee_authority).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+}
+
+#[test]
+fn funded_completion_event_failure_rolls_back_journal_adoption_allowance_and_receipt() {
+    let (f, _, now) = funded_fixture();
+    let call = dispatch(&f, now);
+    let result = continued(&call, now + 2, 5);
+    f.store.connection.lock().unwrap().execute_batch(
+        "CREATE TRIGGER reject_funded_completion BEFORE INSERT ON company_events
+         WHEN NEW.event_type='adaptive_leadership_review_completed'
+         BEGIN SELECT RAISE(ABORT, 'test funded completion failure'); END;",
+    ).unwrap();
+    let before = rows(&f.store);
+    assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(session(&f), call.context.source_session);
+    f.store.connection.lock().unwrap().execute_batch("DROP TRIGGER reject_funded_completion").unwrap();
+    assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).is_ok());
+}
+
+#[test]
+fn funded_review_event_failure_rolls_back_its_membership_without_adopting_source() {
+    let (f, _, now) = funded_fixture();
+    let source = session(&f);
+    f.store.connection.lock().unwrap().execute_batch(
+        "CREATE TRIGGER reject_funded_review BEFORE INSERT ON company_events
+         WHEN NEW.event_type='adaptive_leadership_review_authorized'
+         BEGIN SELECT RAISE(ABORT, 'test funded review failure'); END;",
+    ).unwrap();
+    let before = rows(&f.store);
+    assert!(issue(&f, now).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(session(&f), source);
+    f.store.connection.lock().unwrap().execute_batch("DROP TRIGGER reject_funded_review").unwrap();
+    let call = issue(&f, now).unwrap();
+    assert_eq!(session(&f), source);
+    require_funding_review_membership(
+        &f.store.connection.lock().unwrap(), &call.grant, &call.context_digest().unwrap(), call.operation_id,
+    ).unwrap();
+}
+
+#[test]
+fn funded_completion_rejects_missing_or_different_authorization_epoch_without_writes() {
+    let (f, receipt, now) = funded_fixture();
+    let call = dispatch(&f, now);
+    let result = continued(&call, now + 2, 5);
+    let before = rows(&f.store);
+    for ordinal in [None, Some(receipt.request.source.resume_source.base_review_count + 2)] {
+        let mut changed = result.clone();
+        changed.continuation.as_mut().unwrap().work_funding = ordinal.map(|ordinal| Box::new(AdaptiveWorkFundingEpochV1 {
+            receipt: receipt.clone(), binding: receipt.binding(ordinal).unwrap(),
+        }));
+        assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &changed, now + 2).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+}
+
+#[test]
+fn funded_persisted_and_completion_paths_reject_corrupt_receipt_event_and_membership() {
+    for target in ["receipt", "receipt-event", "membership"] {
+        let (f, _, now) = funded_fixture();
+        let call = dispatch(&f, now);
+        let result = continued(&call, now + 2, 5);
+        let connection = f.store.connection.lock().unwrap();
+        let changed = match target {
+            "receipt" => connection.execute(
+                "UPDATE company_entities SET payload=X'00' WHERE entity_kind='adaptive_work_funding'", [],
+            ).unwrap(),
+            "receipt-event" => connection.execute(
+                "UPDATE company_events SET payload=X'00' WHERE event_type='adaptive_work_funding_issued'", [],
+            ).unwrap(),
+            "membership" => connection.execute(
+                "DELETE FROM company_entities WHERE entity_kind='adaptive_work_funding_review' AND json_extract(payload,'$.grant.review_id')=?1",
+                [call.grant.review_id.to_string()],
+            ).unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(changed > 0, "missing corruption target {target}");
+        drop(connection);
+        let before = rows(&f.store);
+        assert!(f.store.adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id).is_err());
+        assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+}

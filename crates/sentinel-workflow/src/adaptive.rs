@@ -56,6 +56,8 @@ pub struct AdaptiveContinuationAuthorizationV1 {
     pub local_adoption: Option<Box<crate::AdaptiveLeadershipLocalAdoptionV1>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_policy: Option<Box<crate::AdaptiveResumePolicyBindingV1>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_funding: Option<Box<crate::AdaptiveWorkFundingEpochV1>>,
 }
 
 impl AdaptiveContinuationAuthorizationV1 {
@@ -78,6 +80,27 @@ impl AdaptiveContinuationAuthorizationV1 {
             })
         {
             return Err(invalid());
+        }
+        if let Some(epoch) = &self.work_funding {
+            epoch.validate()?;
+            let limits = &epoch.binding.limits;
+            if self.resume_policy.is_some()
+                || self.local_adoption.is_some()
+                || !matches!(
+                    self.source,
+                    AdaptiveContinuationSourceV1::BudgetWindowExhausted { .. }
+                )
+                || self.abandoned_model_effect.is_some()
+                || self.issued_at_ms < epoch.receipt.issued_at_unix_ms
+                || self.deadline_ms > limits.expires_at_unix_ms
+                || self.deadline_ms - self.issued_at_ms > limits.max_window_ms
+                || limits
+                    .max_call_duration_ms
+                    .checked_add(limits.dispatch_margin_ms)
+                    .is_none_or(|minimum| self.deadline_ms - self.issued_at_ms < minimum)
+            {
+                return Err(invalid());
+            }
         }
         if let Some(binding) = &self.resume_policy {
             validate_resume_policy_binding(binding)?;
@@ -488,11 +511,37 @@ pub struct AdaptiveWorkingMemorySourceV1 {
     pub completed_tool_count: u16,
     pub omitted_count: u16,
     pub rows: Vec<AdaptiveWorkingMemoryCompletedRowV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_funding: Option<Box<crate::AdaptiveWorkFundingEpochV1>>,
 }
 
 impl AdaptiveWorkingMemorySourceV1 {
     pub fn validate(&self) -> Result<(), WorkflowError> {
         self.authority.validate()?;
+        let (model_ceiling, tool_ceiling) = if let Some(epoch) = &self.work_funding {
+            epoch.validate()?;
+            let source = &epoch.receipt.request.source;
+            let anchor = &source.resume_source;
+            if anchor.session_id != self.session_id
+                || anchor.assignee_authority != self.authority
+                || source.original_model_call_ceiling != self.root_model_ceiling
+                || source.original_tool_call_ceiling != self.root_tool_ceiling
+                || anchor.expected_session_version >= self.head_version
+                || anchor.base_model_calls > self.model_calls
+                || anchor.base_tool_calls > self.tool_calls
+                || anchor.base_window_count >= self.continuation_windows
+                || self.continuation_windows > epoch.binding.limits.total_window_ceiling
+                || self.continuation_windows > epoch.binding.ordinal
+            {
+                return Err(invalid());
+            }
+            (
+                epoch.binding.limits.total_model_call_ceiling,
+                epoch.binding.limits.total_tool_call_ceiling,
+            )
+        } else {
+            (self.root_model_ceiling, self.root_tool_ceiling)
+        };
         if self.schema_version != 1
             || self.session_id.is_nil()
             || self.effect_id.is_nil()
@@ -502,9 +551,9 @@ impl AdaptiveWorkingMemorySourceV1 {
             || !(1..=ADAPTIVE_SESSION_MAX_CALLS).contains(&self.root_model_ceiling)
             || !(1..=ADAPTIVE_SESSION_MAX_CALLS).contains(&self.root_tool_ceiling)
             || self.active_model_ceiling == 0
-            || self.active_model_ceiling > self.root_model_ceiling
+            || self.active_model_ceiling > model_ceiling
             || self.model_calls > self.active_model_ceiling
-            || self.tool_calls > self.root_tool_ceiling
+            || self.tool_calls > tool_ceiling
             || self.completed_tool_count > self.tool_calls
             || (self.completed_tool_count > 0 && self.rows.is_empty())
             || self.rows.len() > ADAPTIVE_WORKING_MEMORY_MAX_ROWS
@@ -762,11 +811,25 @@ impl AdaptiveSessionV1 {
                     .map(|state| state.authorizations.as_slice())
                     .unwrap_or(&[]);
                 let window_limit = authorization
-                    .resume_policy
+                    .work_funding
                     .as_ref()
-                    .map_or(ADAPTIVE_CONTINUATION_MAX_WINDOWS, |binding| {
-                        usize::from(binding.limits.total_window_ceiling)
-                    });
+                    .map(|epoch| usize::from(epoch.binding.limits.total_window_ceiling))
+                    .or_else(|| {
+                        authorization
+                            .resume_policy
+                            .as_ref()
+                            .map(|binding| usize::from(binding.limits.total_window_ceiling))
+                    })
+                    .unwrap_or(ADAPTIVE_CONTINUATION_MAX_WINDOWS);
+                let model_ceiling = if let Some(epoch) = &authorization.work_funding {
+                    self.validate_work_funding_transition(epoch, authorization)?;
+                    epoch.binding.limits.total_model_call_ceiling
+                } else {
+                    if self.active_work_funding().is_some() {
+                        return Err(invalid());
+                    }
+                    self.grant.max_model_calls
+                };
                 if let Some(binding) = &authorization.resume_policy {
                     if binding.limits.max_call_duration_ms != self.grant.max_call_duration_ms
                         || history
@@ -781,7 +844,9 @@ impl AdaptiveSessionV1 {
                     {
                         return Err(invalid());
                     }
-                } else if history.iter().any(|prior| prior.resume_policy.is_some()) {
+                } else if authorization.work_funding.is_none()
+                    && history.iter().any(|prior| prior.resume_policy.is_some())
+                {
                     return Err(invalid());
                 }
                 if authorization.session_id != self.grant.session_id
@@ -804,7 +869,7 @@ impl AdaptiveSessionV1 {
                     || self
                         .model_calls
                         .checked_add(authorization.additional_model_calls)
-                        .is_none_or(|ceiling| ceiling > self.grant.max_model_calls)
+                        .is_none_or(|ceiling| ceiling > model_ceiling)
                 {
                     return Err(invalid());
                 }
@@ -949,7 +1014,7 @@ impl AdaptiveSessionV1 {
                 },
             ) if tool_digest == proposed => {
                 if now_ms >= self.active_deadline_ms()
-                    || self.tool_calls >= self.grant.max_tool_calls
+                    || self.tool_calls >= self.funded_tool_call_ceiling()
                     || (self.requires_fresh_observation()
                         && !matches!(
                             tool,
@@ -1109,14 +1174,18 @@ impl AdaptiveSessionV1 {
             grant.created_at_ms = authorization.issued_at_ms;
             grant.deadline_ms = authorization.deadline_ms;
             grant.max_model_calls = self.active_model_ceiling();
+            grant.max_tool_calls = self.funded_tool_call_ceiling();
             grant.max_call_duration_ms = self.effective_call_duration_ms();
         }
         grant
     }
 
-    /// Normal budget windows restore the root duration cap; recovery windows
-    /// retain every preceding restriction until the next normal budget window.
+    /// Funded windows use the adopted epoch's cap. Legacy budget windows restore
+    /// the root cap; legacy recovery windows retain preceding restrictions.
     pub fn effective_call_duration_ms(&self) -> u64 {
+        if let Some(epoch) = self.active_work_funding() {
+            return epoch.binding.limits.max_call_duration_ms;
+        }
         let mut duration = self.grant.max_call_duration_ms;
         if let Some(state) = &self.continuation {
             for authorization in &state.authorizations {
@@ -1186,15 +1255,20 @@ impl AdaptiveSessionV1 {
         if now_ms >= self.active_deadline_ms() {
             return AdaptiveModelAdmissionV1::DeadlineExpired;
         }
-        if let Some(binding) = self
-            .continuation
-            .as_ref()
-            .and_then(|state| state.authorizations.last())
-            .and_then(|authorization| authorization.resume_policy.as_ref())
-        {
+        let margin = self
+            .active_work_funding()
+            .map(|epoch| epoch.binding.limits.dispatch_margin_ms)
+            .or_else(|| {
+                self.continuation
+                    .as_ref()
+                    .and_then(|state| state.authorizations.last())
+                    .and_then(|authorization| authorization.resume_policy.as_ref())
+                    .map(|binding| binding.limits.dispatch_margin_ms)
+            });
+        if let Some(margin) = margin {
             if self
                 .effective_call_duration_ms()
-                .checked_add(binding.limits.dispatch_margin_ms)
+                .checked_add(margin)
                 .is_none_or(|minimum| self.active_deadline_ms() - now_ms < minimum)
             {
                 return AdaptiveModelAdmissionV1::InsufficientSlack;
@@ -1204,6 +1278,9 @@ impl AdaptiveSessionV1 {
     }
 
     pub(crate) fn continuation_window_limit(&self) -> usize {
+        if let Some(epoch) = self.active_work_funding() {
+            return usize::from(epoch.binding.limits.total_window_ceiling);
+        }
         self.continuation
             .as_ref()
             .and_then(|state| state.authorizations.last())
@@ -1211,6 +1288,104 @@ impl AdaptiveSessionV1 {
             .map_or(ADAPTIVE_CONTINUATION_MAX_WINDOWS, |binding| {
                 usize::from(binding.limits.total_window_ceiling)
             })
+    }
+
+    /// Only journal-adopted history contributes capacity, never a proposed receipt.
+    pub fn active_work_funding(&self) -> Option<&crate::AdaptiveWorkFundingEpochV1> {
+        self.continuation.as_ref().and_then(|state| {
+            state
+                .authorizations
+                .iter()
+                .rev()
+                .find_map(|authorization| authorization.work_funding.as_deref())
+        })
+    }
+
+    pub fn funded_model_call_ceiling(&self) -> u16 {
+        self.active_work_funding()
+            .map_or(self.grant.max_model_calls, |epoch| {
+                epoch.binding.limits.total_model_call_ceiling
+            })
+    }
+
+    pub fn funded_tool_call_ceiling(&self) -> u16 {
+        self.active_work_funding()
+            .map_or(self.grant.max_tool_calls, |epoch| {
+                epoch.binding.limits.total_tool_call_ceiling
+            })
+    }
+
+    fn validate_work_funding_transition(
+        &self,
+        epoch: &crate::AdaptiveWorkFundingEpochV1,
+        authorization: &AdaptiveContinuationAuthorizationV1,
+    ) -> Result<(), WorkflowError> {
+        let source = &epoch.receipt.request.source;
+        let anchor = &source.resume_source;
+        let history = self
+            .continuation
+            .as_ref()
+            .map(|state| state.authorizations.as_slice())
+            .unwrap_or(&[]);
+        let prior_ordinal = history
+            .iter()
+            .filter_map(|prior| {
+                prior
+                    .work_funding
+                    .as_ref()
+                    .map(|epoch| epoch.binding.ordinal)
+                    .or_else(|| prior.resume_policy.as_ref().map(|binding| binding.ordinal))
+            })
+            .max()
+            .unwrap_or(0);
+        if !matches!(self.cursor, AdaptiveCursorV1::ReadyForModel)
+            || anchor.session_id != self.grant.session_id
+            || anchor.assignee_authority != self.grant.authority
+            || source.original_model_call_ceiling != self.grant.max_model_calls
+            || source.original_tool_call_ceiling != self.grant.max_tool_calls
+            || history.iter().any(|prior| prior.local_adoption.is_some())
+            || epoch.binding.ordinal <= prior_ordinal
+            || usize::from(epoch.binding.ordinal) <= history.len()
+        {
+            return Err(invalid());
+        }
+        if let Some(prior) = self.active_work_funding() {
+            if prior.same_epoch(epoch) {
+                return Ok(());
+            }
+        }
+        // A successor must anchor to the current head, not an earlier issuance
+        // or an unadopted leaf. Spent counters and global ordinals never reset.
+        let predecessor = self
+            .active_work_funding()
+            .map(|prior| prior.binding.receipt_digest.as_str());
+        let AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+            active_allowance_digest,
+            continuation_history_digest,
+        } = &authorization.source
+        else {
+            return Err(invalid());
+        };
+        if source.predecessor_receipt_digest.as_deref() != predecessor
+            || epoch.receipt.issued_at_unix_ms < self.updated_at_ms
+            || source.current_model_call_ceiling != self.funded_model_call_ceiling()
+            || source.current_tool_call_ceiling != self.funded_tool_call_ceiling()
+            || anchor.expected_session_version != self.version
+            || anchor.base_model_calls != self.model_calls
+            || anchor.base_tool_calls != self.tool_calls
+            || usize::from(anchor.base_window_count) != history.len()
+            || anchor.base_review_count < prior_ordinal
+            || anchor.subject
+                != (crate::AdaptiveResumeSubjectV1::ReadyForModel {
+                    active_allowance_digest: active_allowance_digest.clone(),
+                })
+            || anchor.continuation_history_digest != *continuation_history_digest
+            || anchor.continuation_history_digest
+                != crate::adaptive_budget_history_digest(&self.continuation)?
+        {
+            return Err(invalid());
+        }
+        Ok(())
     }
 
     pub fn requires_fresh_observation(&self) -> bool {
@@ -1317,6 +1492,774 @@ fn invalid() -> WorkflowError {
 }
 
 #[cfg(test)]
+pub(crate) mod work_funding_tests {
+    use super::continuation_tests::{authorization, effect, grant, NOW};
+    use super::*;
+    use crate::{
+        AdaptiveResumeSourceV1, AdaptiveResumeSubjectV1, AdaptiveWorkFundingEpochV1,
+        AdaptiveWorkFundingLimitsV1, AdaptiveWorkFundingReceiptV1, AdaptiveWorkFundingRequestV1,
+        AdaptiveWorkFundingSourceV1, AuthenticatedCompanyPrincipalV1, CompanyPrincipalKindV1,
+    };
+
+    pub(crate) fn epoch_for(session: &AdaptiveSessionV1, id: u128) -> AdaptiveWorkFundingEpochV1 {
+        let authority = &session.grant.authority;
+        let windows = session
+            .continuation
+            .as_ref()
+            .map_or(0, |state| state.authorizations.len()) as u16;
+        let reviews = session.continuation.as_ref().map_or(windows, |state| {
+            state
+                .authorizations
+                .iter()
+                .filter_map(|auth| {
+                    auth.work_funding
+                        .as_ref()
+                        .map(|epoch| epoch.binding.ordinal)
+                        .or_else(|| auth.resume_policy.as_ref().map(|binding| binding.ordinal))
+                })
+                .max()
+                .unwrap_or(windows)
+        });
+        let request = AdaptiveWorkFundingRequestV1 {
+            schema_version: 1,
+            operation_id: Uuid::from_u128(id),
+            source: AdaptiveWorkFundingSourceV1 {
+                resume_source: AdaptiveResumeSourceV1 {
+                    tenant_id: authority.tenant_id.clone(),
+                    project_id: authority.project_id.clone(),
+                    work_item_id: authority.work_item_id.clone(),
+                    session_id: session.grant.session_id,
+                    expected_project_version: 1,
+                    expected_session_version: session.version,
+                    project_payload_digest: "a".repeat(64),
+                    root_entry_digest: "b".repeat(64),
+                    head_entry_digest: "c".repeat(64),
+                    continuation_history_digest: crate::adaptive_budget_history_digest(
+                        &session.continuation,
+                    )
+                    .unwrap(),
+                    review_history_digest: "d".repeat(64),
+                    assignee_authority: authority.clone(),
+                    base_model_calls: session.model_calls,
+                    base_tool_calls: session.tool_calls,
+                    base_review_count: reviews,
+                    base_window_count: windows,
+                    subject: AdaptiveResumeSubjectV1::ReadyForModel {
+                        active_allowance_digest: "e".repeat(64),
+                    },
+                },
+                original_model_call_ceiling: session.grant.max_model_calls,
+                original_tool_call_ceiling: session.grant.max_tool_calls,
+                current_model_call_ceiling: session.funded_model_call_ceiling(),
+                current_tool_call_ceiling: session.funded_tool_call_ceiling(),
+                predecessor_receipt_digest: session
+                    .active_work_funding()
+                    .map(|prior| prior.binding.receipt_digest.clone()),
+            },
+            limits: AdaptiveWorkFundingLimitsV1 {
+                additional_model_calls: 2,
+                additional_tool_calls: 2,
+                additional_reviews: 3,
+                additional_windows: 2,
+                max_window_ms: 10_000,
+                max_call_duration_ms: 2_000,
+                dispatch_margin_ms: crate::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+                expires_at_unix_ms: session.updated_at_ms + 60_000,
+            },
+            reason_ref: "operator:fund-work".into(),
+        };
+        let receipt = AdaptiveWorkFundingReceiptV1 {
+            schema_version: 1,
+            funding_id: crate::adaptive_work_funding_id(
+                &authority.tenant_id,
+                session.grant.session_id,
+                request.operation_id,
+            )
+            .unwrap(),
+            request,
+            issuer_principal: AuthenticatedCompanyPrincipalV1 {
+                schema_version: 1,
+                tenant_id: authority.tenant_id.clone(),
+                principal_id: "operator-funding".into(),
+                kind: CompanyPrincipalKindV1::Operator,
+                role: CompanyRoleV1::ProjectManager,
+                customer_id: None,
+                agent_id: None,
+                authority_generation: 1,
+                authority_digest: "f".repeat(64),
+            },
+            issued_at_unix_ms: session.updated_at_ms,
+        };
+        AdaptiveWorkFundingEpochV1 {
+            binding: receipt.binding(reviews + 1).unwrap(),
+            receipt,
+        }
+    }
+
+    pub(crate) fn funded_authorization(
+        session: &AdaptiveSessionV1,
+        epoch: AdaptiveWorkFundingEpochV1,
+        now: u64,
+    ) -> AdaptiveContinuationAuthorizationV1 {
+        let mut auth = authorization(session);
+        let ordinal = u128::from(epoch.binding.ordinal);
+        auth.operation_id = Uuid::from_u128(1_000 + ordinal);
+        auth.review_id = Uuid::from_u128(2_000 + ordinal);
+        auth.resolution_event_id = Uuid::from_u128(3_000 + ordinal);
+        auth.provider_allowance_id = format!("funded-allowance-{ordinal}");
+        auth.source = AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+            active_allowance_digest: "e".repeat(64),
+            continuation_history_digest: crate::adaptive_budget_history_digest(
+                &session.continuation,
+            )
+            .unwrap(),
+        };
+        auth.abandoned_model_effect = None;
+        auth.additional_model_calls = 1;
+        auth.issued_at_ms = now;
+        auth.deadline_ms = now + 4_000;
+        auth.work_funding = Some(Box::new(epoch));
+        auth
+    }
+
+    fn adopt(
+        session: &AdaptiveSessionV1,
+        auth: AdaptiveContinuationAuthorizationV1,
+    ) -> Result<AdaptiveSessionV1, WorkflowError> {
+        let now = auth.issued_at_ms;
+        session.transition(
+            &AdaptiveTransitionV1::ContinueGoverned {
+                authorization: auth,
+            },
+            now,
+        )
+    }
+
+    fn inspect(session: &AdaptiveSessionV1, id: u128, now: u64) -> AdaptiveSessionV1 {
+        let tool = WorkbenchTool::ListDirectory {
+            path: ".".into(),
+            after: None,
+            max_entries: 16,
+        };
+        let tool_digest = adaptive_tool_digest(&tool).unwrap();
+        let pending = session
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect(id),
+                    previous_observation_digest: session
+                        .last_observation
+                        .as_ref()
+                        .map(|observation| observation.observation_digest.clone()),
+                },
+                now,
+            )
+            .unwrap();
+        let ready = pending
+            .transition(
+                &AdaptiveTransitionV1::ResolveModel {
+                    effect: effect(id),
+                    result_digest: "a".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Tool {
+                        tool,
+                        tool_digest: tool_digest.clone(),
+                    },
+                },
+                now + 1,
+            )
+            .unwrap();
+        let pending = ready
+            .transition(
+                &AdaptiveTransitionV1::ClaimTool {
+                    effect: effect(id + 1),
+                    tool_digest,
+                },
+                now + 2,
+            )
+            .unwrap();
+        pending
+            .transition(
+                &AdaptiveTransitionV1::ObserveTool {
+                    observation: AdaptiveObservationRefV1 {
+                        effect: effect(id + 1),
+                        observation_digest: "b".repeat(64),
+                    },
+                },
+                now + 3,
+            )
+            .unwrap()
+    }
+
+    fn exhausted() -> AdaptiveSessionV1 {
+        let mut root = grant();
+        root.max_model_calls = 1;
+        root.max_tool_calls = 1;
+        root.max_call_duration_ms = 1_000;
+        root.deadline_ms = NOW + 10_000;
+        inspect(&AdaptiveSessionV1::initial(root).unwrap(), 400, NOW + 1)
+    }
+
+    #[test]
+    fn funded_transition_spends_new_model_and_tool_capacity_without_mutating_root() {
+        let source = exhausted();
+        let epoch = epoch_for(&source, 10);
+        let auth = funded_authorization(&source, epoch.clone(), source.updated_at_ms);
+        let next = adopt(&source, auth).unwrap();
+        assert_eq!(next.grant, source.grant);
+        assert_eq!((next.model_calls, next.tool_calls), (1, 1));
+        assert_eq!(
+            (
+                next.funded_model_call_ceiling(),
+                next.funded_tool_call_ceiling()
+            ),
+            (3, 3)
+        );
+        assert_eq!(next.active_work_funding(), Some(&epoch));
+        assert_eq!(next.effective_grant().max_tool_calls, 3);
+        assert_eq!(next.effective_call_duration_ms(), 2_000);
+        assert!(next.requires_fresh_observation());
+        let observed = inspect(&next, 410, next.updated_at_ms + 1);
+        assert_eq!((observed.model_calls, observed.tool_calls), (2, 2));
+        assert!(!observed.requires_fresh_observation());
+        assert_eq!(observed.grant, source.grant);
+        let mut repeated = epoch;
+        repeated.binding.ordinal += 1;
+        let auth = funded_authorization(&observed, repeated, observed.updated_at_ms);
+        let next = adopt(&observed, auth).unwrap();
+        let final_work = inspect(&next, 420, next.updated_at_ms + 1);
+        assert_eq!((final_work.model_calls, final_work.tool_calls), (3, 3));
+        assert_eq!(final_work.funded_model_call_ceiling(), 3);
+    }
+
+    #[test]
+    fn successor_requires_exact_current_anchor_and_adopted_predecessor() {
+        let source = exhausted();
+        let first = adopt(
+            &source,
+            funded_authorization(&source, epoch_for(&source, 10), source.updated_at_ms),
+        )
+        .unwrap();
+        let ready = inspect(&first, 410, first.updated_at_ms + 1);
+        let successor = epoch_for(&ready, 11);
+        for mutation in 0..9 {
+            let mut changed = successor.clone();
+            let source = &mut changed.receipt.request.source;
+            match mutation {
+                0 => source.predecessor_receipt_digest = Some("0".repeat(64)),
+                1 => source.current_model_call_ceiling += 1,
+                2 => source.current_tool_call_ceiling += 1,
+                3 => source.original_model_call_ceiling += 1,
+                4 => source.resume_source.expected_session_version -= 1,
+                5 => source.resume_source.base_model_calls -= 1,
+                6 => source.resume_source.base_tool_calls -= 1,
+                7 => source.resume_source.continuation_history_digest = "0".repeat(64),
+                _ => source.resume_source.base_window_count = 0,
+            }
+            changed.binding = changed.receipt.binding(successor.binding.ordinal).unwrap();
+            let auth = funded_authorization(&ready, changed, ready.updated_at_ms);
+            assert!(adopt(&ready, auth).is_err(), "mutation {mutation}");
+        }
+        let next = adopt(
+            &ready,
+            funded_authorization(&ready, successor, ready.updated_at_ms),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                next.funded_model_call_ceiling(),
+                next.funded_tool_call_ceiling()
+            ),
+            (5, 5)
+        );
+        assert_eq!((next.model_calls, next.tool_calls), (2, 2));
+        assert_eq!(next.grant, source.grant);
+    }
+
+    #[test]
+    fn funded_history_cannot_drop_funding_mix_policy_or_fund_unknown_work() {
+        let source = exhausted();
+        let epoch = epoch_for(&source, 10);
+        let auth = funded_authorization(&source, epoch.clone(), source.updated_at_ms);
+        let funded = adopt(&source, auth.clone()).unwrap();
+        let ready = inspect(&funded, 410, funded.updated_at_ms + 1);
+        let mut next_epoch = epoch.clone();
+        next_epoch.binding.ordinal += 1;
+        let mut drop = funded_authorization(&ready, next_epoch, ready.updated_at_ms);
+        drop.work_funding = None;
+        assert!(adopt(&ready, drop).is_err());
+        let mut unknown = auth.clone();
+        unknown.source = AdaptiveContinuationSourceV1::ModelUnknown;
+        unknown.abandoned_model_effect = Some(effect(401));
+        assert!(unknown.validate().is_err());
+        let mut blocked = auth.clone();
+        blocked.source = AdaptiveContinuationSourceV1::Blocked {
+            reason_code: "needs_review".into(),
+        };
+        assert!(blocked.validate().is_err());
+        let mut policy = auth;
+        policy.resume_policy = Some(Box::new(crate::AdaptiveResumePolicyBindingV1 {
+            schema_version: 1,
+            policy_id: "old-policy".into(),
+            receipt_digest: "a".repeat(64),
+            ordinal: 1,
+            limits: crate::AdaptiveResumePolicyLimitsV1 {
+                total_review_ceiling: 3,
+                total_window_ceiling: 2,
+                max_window_ms: 10_000,
+                max_call_duration_ms: 2_000,
+                dispatch_margin_ms: 1_000,
+                expires_at_unix_ms: NOW + 60_000,
+            },
+        }));
+        assert!(policy.validate().is_err());
+        let pending = funded
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect(450),
+                    previous_observation_digest: Some("b".repeat(64)),
+                },
+                funded.updated_at_ms,
+            )
+            .unwrap();
+        let unknown = pending
+            .transition(
+                &AdaptiveTransitionV1::MarkUnknown {
+                    effect: effect(450),
+                },
+                funded.updated_at_ms,
+            )
+            .unwrap();
+        let auth = funded_authorization(&unknown, epoch, unknown.updated_at_ms);
+        assert!(adopt(&unknown, auth).is_err());
+    }
+
+    #[test]
+    fn funding_lookup_retains_last_adopted_epoch_even_with_a_trailing_unfunded_authorization() {
+        let source = exhausted();
+        let epoch = epoch_for(&source, 10);
+        let funded = adopt(
+            &source,
+            funded_authorization(&source, epoch.clone(), source.updated_at_ms),
+        )
+        .unwrap();
+        let mut snapshot = funded.clone();
+        let mut unfunded = authorization(&funded);
+        unfunded.work_funding = None;
+        snapshot
+            .continuation
+            .as_mut()
+            .unwrap()
+            .authorizations
+            .push(unfunded);
+        assert_eq!(snapshot.active_work_funding(), Some(&epoch));
+        assert_eq!(
+            snapshot.funded_model_call_ceiling(),
+            funded.funded_model_call_ceiling()
+        );
+        assert_eq!(
+            snapshot.funded_tool_call_ceiling(),
+            funded.funded_tool_call_ceiling()
+        );
+        assert_eq!(
+            snapshot.effective_call_duration_ms(),
+            funded.effective_call_duration_ms()
+        );
+        assert_eq!(
+            snapshot.continuation_window_limit(),
+            funded.continuation_window_limit()
+        );
+    }
+
+    #[test]
+    fn same_epoch_is_exact_and_global_ordinal_must_increase() {
+        let source = exhausted();
+        let epoch = epoch_for(&source, 10);
+        let first = adopt(
+            &source,
+            funded_authorization(&source, epoch.clone(), source.updated_at_ms),
+        )
+        .unwrap();
+        let ready = inspect(&first, 410, first.updated_at_ms + 1);
+        assert!(adopt(
+            &ready,
+            funded_authorization(&ready, epoch.clone(), ready.updated_at_ms)
+        )
+        .is_err());
+        let mut substituted = epoch;
+        substituted.receipt.request.reason_ref = "operator:substituted".into();
+        substituted.binding = substituted.receipt.binding(2).unwrap();
+        assert!(adopt(
+            &ready,
+            funded_authorization(&ready, substituted, ready.updated_at_ms)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn retained_resume_policy_history_can_start_funding_without_rewriting_old_authorizations() {
+        let source = exhausted();
+        let mut old = funded_authorization(&source, epoch_for(&source, 10), source.updated_at_ms);
+        old.work_funding = None;
+        old.resume_policy = Some(Box::new(crate::AdaptiveResumePolicyBindingV1 {
+            schema_version: 1,
+            policy_id: "retained-policy".into(),
+            receipt_digest: "a".repeat(64),
+            ordinal: 2,
+            limits: crate::AdaptiveResumePolicyLimitsV1 {
+                total_review_ceiling: 4,
+                total_window_ceiling: 3,
+                max_window_ms: 10_000,
+                max_call_duration_ms: 1_000,
+                dispatch_margin_ms: 1_000,
+                expires_at_unix_ms: NOW + 60_000,
+            },
+        }));
+        // The legacy policy does not add calls, so use deadline exhaustion.
+        let mut root = source.grant.clone();
+        root.max_model_calls = 4;
+        let initial = AdaptiveSessionV1::initial(root).unwrap();
+        old.source_session_version = initial.version;
+        old.source = AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+            active_allowance_digest: "e".repeat(64),
+            continuation_history_digest: crate::adaptive_budget_history_digest(
+                &initial.continuation,
+            )
+            .unwrap(),
+        };
+        old.issued_at_ms = initial.grant.deadline_ms;
+        old.deadline_ms = old.issued_at_ms + 4_000;
+        let legacy = adopt(&initial, old.clone()).unwrap();
+        let bytes = serde_json::to_vec(&legacy.continuation).unwrap();
+        let epoch = epoch_for(&legacy, 11);
+        assert_eq!(epoch.binding.ordinal, 3);
+        let auth = funded_authorization(&legacy, epoch, legacy.active_deadline_ms());
+        let next = adopt(&legacy, auth).unwrap();
+        assert_eq!(next.continuation.as_ref().unwrap().authorizations[0], old);
+        assert_eq!(serde_json::to_vec(&legacy.continuation).unwrap(), bytes);
+        assert_eq!(next.funded_model_call_ceiling(), 6);
+    }
+
+    #[test]
+    fn epoch_expiry_stops_new_io_not_historical_validation_or_observation() {
+        let source = exhausted();
+        let epoch = epoch_for(&source, 10);
+        let auth = funded_authorization(&source, epoch.clone(), source.updated_at_ms);
+        let funded = adopt(&source, auth.clone()).unwrap();
+        let after = epoch.binding.limits.expires_at_unix_ms + 1;
+        epoch.validate().unwrap();
+        assert_eq!(adopt(&source, auth).unwrap(), funded);
+        assert_ne!(
+            funded.model_admission_at(after),
+            AdaptiveModelAdmissionV1::Admissible
+        );
+        let mut next_epoch = epoch;
+        next_epoch.binding.ordinal += 1;
+        assert!(adopt(&funded, funded_authorization(&funded, next_epoch, after)).is_err());
+        let pending = funded
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect(450),
+                    previous_observation_digest: Some("b".repeat(64)),
+                },
+                funded.updated_at_ms,
+            )
+            .unwrap();
+        let tool = WorkbenchTool::ListDirectory {
+            path: ".".into(),
+            after: None,
+            max_entries: 16,
+        };
+        let digest = adaptive_tool_digest(&tool).unwrap();
+        let ready = pending
+            .transition(
+                &AdaptiveTransitionV1::ResolveModel {
+                    effect: effect(450),
+                    result_digest: "c".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Tool {
+                        tool,
+                        tool_digest: digest.clone(),
+                    },
+                },
+                after,
+            )
+            .unwrap();
+        assert!(ready
+            .transition(
+                &AdaptiveTransitionV1::ClaimTool {
+                    effect: effect(451),
+                    tool_digest: digest,
+                },
+                after
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn exact_lifetime_window_and_review_bound_is_128() {
+        let root = AdaptiveSessionV1::initial(grant()).unwrap();
+        let mut epoch = epoch_for(&root, 10);
+        epoch.receipt.request.limits.additional_reviews = 128;
+        epoch.receipt.request.limits.additional_windows = 128;
+        epoch.receipt.request.limits.expires_at_unix_ms = NOW + 1_000_000;
+        epoch.binding = epoch.receipt.binding(1).unwrap();
+        let mut session = root.clone();
+        for ordinal in 1..=128 {
+            epoch.binding = epoch.receipt.binding(ordinal).unwrap();
+            let now = session.active_deadline_ms();
+            session = adopt(&session, funded_authorization(&session, epoch.clone(), now)).unwrap();
+        }
+        assert_eq!(
+            session.continuation.as_ref().unwrap().authorizations.len(),
+            128
+        );
+        assert_eq!(session.grant, root.grant);
+        assert_eq!((session.model_calls, session.tool_calls), (0, 0));
+        assert!(epoch.receipt.binding(129).is_err());
+        let mut request = epoch.receipt.request.clone();
+        request.limits.additional_reviews = 129;
+        assert!(request.validate_shape().is_err());
+        request.limits.additional_reviews = 128;
+        request.limits.additional_windows = 129;
+        assert!(request.validate_shape().is_err());
+        let mut auth = funded_authorization(&session, epoch, session.active_deadline_ms());
+        auth.operation_id = Uuid::from_u128(9_000);
+        assert!(adopt(&session, auth).is_err());
+    }
+
+    #[test]
+    fn exact_call_caps_no_refund_and_dispatch_slack() {
+        let root = AdaptiveSessionV1::initial(grant()).unwrap();
+        let mut epoch = epoch_for(&root, 10);
+        epoch.receipt.request.limits.additional_model_calls = 64 - root.grant.max_model_calls;
+        epoch.receipt.request.limits.additional_tool_calls = 64 - root.grant.max_tool_calls;
+        epoch.binding = epoch.receipt.binding(1).unwrap();
+        let funded = adopt(
+            &root,
+            funded_authorization(&root, epoch.clone(), root.grant.deadline_ms),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                funded.funded_model_call_ceiling(),
+                funded.funded_tool_call_ceiling()
+            ),
+            (64, 64)
+        );
+        assert_eq!(
+            funded.model_admission_at(funded.active_deadline_ms() - 3_000),
+            AdaptiveModelAdmissionV1::Admissible
+        );
+        assert_eq!(
+            funded.model_admission_at(funded.active_deadline_ms() - 2_999),
+            AdaptiveModelAdmissionV1::InsufficientSlack
+        );
+        for model in [true, false] {
+            let mut request = epoch.receipt.request.clone();
+            if model {
+                request.limits.additional_model_calls += 1;
+            } else {
+                request.limits.additional_tool_calls += 1;
+            }
+            assert!(request.validate_shape().is_err());
+        }
+        let mut refund = epoch;
+        refund.receipt.request.source.current_model_call_ceiling -= 1;
+        assert!(refund.receipt.validate().is_err());
+    }
+
+    #[test]
+    fn actual_lifetime_spending_stops_at_64_and_model_funding_does_not_add_tools() {
+        let mut root = grant();
+        root.max_model_calls = 63;
+        root.max_tool_calls = 63;
+        root.max_call_duration_ms = 1_000;
+        root.deadline_ms = NOW + 10_000;
+        let mut source = AdaptiveSessionV1::initial(root).unwrap();
+        for index in 0..63 {
+            source = inspect(&source, 10_000 + index * 2, NOW + index as u64 * 4 + 1);
+        }
+        let mut epoch = epoch_for(&source, 10);
+        epoch.receipt.request.limits.additional_model_calls = 1;
+        epoch.receipt.request.limits.additional_tool_calls = 1;
+        epoch.binding = epoch.receipt.binding(1).unwrap();
+        let funded = adopt(
+            &source,
+            funded_authorization(&source, epoch.clone(), source.updated_at_ms),
+        )
+        .unwrap();
+        let spent = inspect(&funded, 20_000, funded.updated_at_ms + 1);
+        assert_eq!((spent.model_calls, spent.tool_calls), (64, 64));
+        assert!(spent
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect(20_002),
+                    previous_observation_digest: Some("b".repeat(64)),
+                },
+                spent.updated_at_ms
+            )
+            .is_err());
+        epoch.binding = epoch.receipt.binding(2).unwrap();
+        assert!(adopt(
+            &spent,
+            funded_authorization(&spent, epoch, spent.updated_at_ms)
+        )
+        .is_err());
+
+        let source = exhausted();
+        let mut epoch = epoch_for(&source, 11);
+        epoch.receipt.request.limits.additional_tool_calls = 0;
+        epoch.binding = epoch.receipt.binding(1).unwrap();
+        let funded = adopt(
+            &source,
+            funded_authorization(&source, epoch, source.updated_at_ms),
+        )
+        .unwrap();
+        let pending = funded
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect(21_000),
+                    previous_observation_digest: Some("b".repeat(64)),
+                },
+                funded.updated_at_ms,
+            )
+            .unwrap();
+        let tool = WorkbenchTool::InspectFile {
+            path: "src/lib.rs".into(),
+            max_bytes: 1_024,
+        };
+        let tool_digest = adaptive_tool_digest(&tool).unwrap();
+        let ready = pending
+            .transition(
+                &AdaptiveTransitionV1::ResolveModel {
+                    effect: effect(21_000),
+                    result_digest: "c".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Tool {
+                        tool,
+                        tool_digest: tool_digest.clone(),
+                    },
+                },
+                funded.updated_at_ms,
+            )
+            .unwrap();
+        assert!(ready
+            .transition(
+                &AdaptiveTransitionV1::ClaimTool {
+                    effect: effect(21_001),
+                    tool_digest,
+                },
+                ready.updated_at_ms
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn unfunded_authorization_wire_bytes_and_digest_remain_legacy() {
+        let auth = authorization(&super::continuation_tests::unknown());
+        let bytes = serde_json::to_vec(&auth).unwrap();
+        let digest = canonical_sha256("legacy-authorization", &auth).unwrap();
+        let legacy = format!(
+            concat!(
+                "{{\"schema_version\":1,\"operation_id\":\"00000000-0000-0000-0000-0000000000c9\",",
+                "\"review_id\":\"00000000-0000-0000-0000-0000000000ca\",",
+                "\"resolution_event_id\":\"00000000-0000-0000-0000-0000000000cb\",",
+                "\"session_id\":\"00000000-0000-0000-0000-000000000065\",",
+                "\"source_session_version\":3,\"source\":{{\"kind\":\"model_unknown\"}},",
+                "\"abandoned_model_effect\":{{\"id\":\"00000000-0000-0000-0000-000000000066\",",
+                "\"request_digest\":\"{}\"}},\"provider_allowance_id\":\"continued-allowance\",",
+                "\"provider_authority_digest\":\"{}\",\"issued_at_ms\":{},",
+                "\"deadline_ms\":{},\"additional_model_calls\":3}}"
+            ),
+            "8".repeat(64),
+            "9".repeat(64),
+            NOW + 1_000,
+            NOW + 11_000,
+        );
+        assert_eq!(bytes, legacy.as_bytes());
+        assert!(!String::from_utf8(bytes.clone())
+            .unwrap()
+            .contains("work_funding"));
+        let restored: AdaptiveContinuationAuthorizationV1 = serde_json::from_slice(&bytes).unwrap();
+        assert!(restored.work_funding.is_none());
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
+        assert_eq!(
+            canonical_sha256("legacy-authorization", &restored).unwrap(),
+            digest
+        );
+        let mut encoded = serde_json::to_value(&auth).unwrap();
+        encoded["unknown_funding"] = serde_json::json!({});
+        assert!(serde_json::from_value::<AdaptiveContinuationAuthorizationV1>(encoded).is_err());
+    }
+
+    #[test]
+    fn working_memory_retains_root_caps_and_exact_adopted_epoch_proof() {
+        let source = exhausted();
+        let epoch = epoch_for(&source, 10);
+        let funded = adopt(
+            &source,
+            funded_authorization(&source, epoch.clone(), source.updated_at_ms),
+        )
+        .unwrap();
+        let observed = inspect(&funded, 410, funded.updated_at_ms + 1);
+        let observation = observed.last_observation.clone().unwrap();
+        let memory = AdaptiveWorkingMemorySourceV1 {
+            schema_version: 1,
+            session_id: observed.grant.session_id,
+            authority: observed.grant.authority.clone(),
+            provider_version: observed.version,
+            effect_id: effect(500).id,
+            head_version: observed.version,
+            head_entry_digest: "a".repeat(64),
+            last_observation: Some(observation.clone()),
+            model_calls: observed.model_calls,
+            tool_calls: observed.tool_calls,
+            root_model_ceiling: observed.grant.max_model_calls,
+            root_tool_ceiling: observed.grant.max_tool_calls,
+            active_model_ceiling: observed.active_model_ceiling(),
+            continuation_windows: 1,
+            completed_tool_count: 2,
+            omitted_count: 1,
+            rows: vec![AdaptiveWorkingMemoryCompletedRowV1 {
+                session_version: observed.version,
+                entry_digest: "b".repeat(64),
+                recorded_at_ms: observed.updated_at_ms,
+                tool_kind: AdaptiveWorkingMemoryToolKindV1::ListDirectory,
+                tool_digest: "c".repeat(64),
+                target: Some(".".into()),
+                program: None,
+                suite_id: None,
+                labels_omitted: false,
+                observation,
+            }],
+            work_funding: Some(Box::new(epoch)),
+        };
+        memory.validate().unwrap();
+        let mut dropped = memory.clone();
+        dropped.work_funding = None;
+        assert!(dropped.validate().is_err());
+        let mut changed = memory.clone();
+        changed.root_tool_ceiling += 1;
+        assert!(changed.validate().is_err());
+        let mut changed = memory.clone();
+        changed.tool_calls = 4;
+        assert!(changed.validate().is_err());
+        let mut encoded = serde_json::to_value(&memory).unwrap();
+        encoded["work_funding"]["binding"]["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<AdaptiveWorkingMemorySourceV1>(encoded).is_err());
+        let mut legacy = memory;
+        legacy.work_funding = None;
+        legacy.root_model_ceiling = 3;
+        legacy.root_tool_ceiling = 3;
+        legacy.validate().unwrap();
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(!String::from_utf8(bytes.clone())
+            .unwrap()
+            .contains("work_funding"));
+        let restored: AdaptiveWorkingMemorySourceV1 = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored, legacy);
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod continuation_tests {
     use super::*;
     use crate::{
@@ -1415,6 +2358,7 @@ pub(crate) mod continuation_tests {
             additional_model_calls: 3,
             local_adoption: None,
             resume_policy: None,
+            work_funding: None,
         }
     }
 

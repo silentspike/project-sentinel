@@ -165,6 +165,7 @@ fn result(call: &AdaptiveLeadershipReviewCallV1, now: u64, calls: u16)
         ).unwrap(),
         issued_at_ms: now, deadline_ms: now + window, additional_model_calls: calls,
         local_adoption: None, resume_policy: call.grant.resume_policy.clone(),
+        work_funding: None,
     });
     result
 }

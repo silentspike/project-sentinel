@@ -239,7 +239,9 @@ impl WorkflowApi {
                 ..
             }) => Some("budget_window_exhausted"),
         };
-        let expected_kind = if grant.schema_version == 4 {
+        let expected_kind = if grant.schema_version == 5 && grant.work_funding.is_some() {
+            Some("work_funding")
+        } else if grant.schema_version == 4 {
             Some("admission_repair")
         } else {
             expected_kind
@@ -284,6 +286,9 @@ impl WorkflowApi {
         }
         let now = now_unix_ms();
         context.validate_dispatch(now)?;
+        if grant.work_funding.is_some() {
+            self.validate_work_funding_review(&call)?;
+        }
         self.store
             .claim_adaptive_leadership_review_call(
                 &grant.leadership_principal,

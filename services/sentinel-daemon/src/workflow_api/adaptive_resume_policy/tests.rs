@@ -20,6 +20,15 @@ fn unreviewed_policy_root(
     duration_ms: u64,
     unknown: bool,
 ) -> (tempfile::TempDir, WorkflowApi, AdaptiveSessionV1) {
+    unreviewed_policy_root_with_limits(duration_ms, unknown, 64, 64)
+}
+
+pub(crate) fn unreviewed_policy_root_with_limits(
+    duration_ms: u64,
+    unknown: bool,
+    model_calls: u16,
+    tool_calls: u16,
+) -> (tempfile::TempDir, WorkflowApi, AdaptiveSessionV1) {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("company.sqlite");
     let mut api = super::super::model_work::configured_test_api(&path);
@@ -60,8 +69,8 @@ fn unreviewed_policy_root(
         catalog_digest: allowance.grant.catalog_digest.clone(),
         max_output_tokens: 4_096,
         max_call_duration_ms: duration_ms,
-        max_model_calls: 64,
-        max_tool_calls: 64,
+        max_model_calls: model_calls,
+        max_tool_calls: tool_calls,
         created_at_ms: created,
         deadline_ms: allowance.grant.expires_at_unix_ms,
     };
@@ -459,7 +468,7 @@ fn issue(api: &WorkflowApi, request: &AdaptiveResumePolicyRequestV1) -> Workflow
     )
 }
 
-fn claim_review(api: &WorkflowApi, context: &LeadershipContext) -> (String, String) {
+pub(crate) fn claim_review(api: &WorkflowApi, context: &LeadershipContext) -> (String, String) {
     let grant = &context.binding.grant;
     let id = format!("company-leadership-{}", grant.review_id);
     let digest = "c".repeat(64);
@@ -472,7 +481,9 @@ fn claim_review(api: &WorkflowApi, context: &LeadershipContext) -> (String, Stri
             &grant.leadership_principal.agent_id.unwrap().to_string(),
         )
         .unwrap();
-    let kind = if grant.schema_version == 2 {
+    let kind = if grant.schema_version == 5 && grant.work_funding.is_some() {
+        "work_funding"
+    } else if grant.schema_version == 2 {
         "unknown_model"
     } else {
         "budget_window_exhausted"

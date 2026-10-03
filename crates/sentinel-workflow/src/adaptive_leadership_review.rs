@@ -25,7 +25,8 @@ pub const ADAPTIVE_LEADERSHIP_MAX_RATIONALE_BYTES: usize = 2048;
 pub const ADAPTIVE_LEADERSHIP_MAX_DURATION_MS: u64 = 120_000;
 pub const ADAPTIVE_LEADERSHIP_MAX_GRANT_MS: u64 = 300_000;
 
-/// None is schema 1 blocked; schema 2 is recovery, schema 3 normal budget review.
+/// None is schema 1 blocked; schema 2 is recovery. Budget reviews use schema 3
+/// normally, schema 4 for recovery, and schema 5 for explicit work funding.
 /// Unknown tools are never eligible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -242,8 +243,8 @@ impl AdaptiveBudgetWindowAuthorityV1 {
             || grant.max_duration_ms != session.grant.max_call_duration_ms
             || root.created_at_unix_ms != session.grant.created_at_ms
             || grant.expires_at_unix_ms != session.grant.deadline_ms
-            || session.model_calls > session.grant.max_model_calls
-            || session.active_model_ceiling() > session.grant.max_model_calls
+            || session.model_calls > session.funded_model_call_ceiling()
+            || session.active_model_ceiling() > session.funded_model_call_ceiling()
             || session.model_calls > session.active_model_ceiling()
             || session.continuation.as_ref().is_some_and(|state| {
                 state.authorizations.is_empty()
@@ -309,6 +310,9 @@ pub struct AdaptiveLeadershipReviewGrantV1 {
     pub recovery_epoch: Option<crate::AdaptiveLeadershipRecoveryBindingV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_policy: Option<Box<crate::AdaptiveResumePolicyBindingV1>>,
+    /// Proposed or adopted epoch; this review grant itself changes no source capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_funding: Option<Box<crate::AdaptiveWorkFundingEpochV1>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,12 +373,48 @@ impl AdaptiveLeadershipReviewCallV1 {
             .subscription_call
             .as_ref()
             .ok_or_else(invalid)?;
-        let remaining = source
+        let remaining = self
             .grant
-            .max_model_calls
+            .work_funding
+            .as_ref()
+            .map_or(source.funded_model_call_ceiling(), |epoch| {
+                epoch.binding.limits.total_model_call_ceiling
+            })
             .checked_sub(source.model_calls)
             .ok_or_else(invalid)?;
-        let (call_limit, duration_limit) = if let Some(binding) = &self.grant.resume_policy {
+        self.grant.validate_work_funding()?;
+        let (call_limit, duration_limit) = if let Some(epoch) = &self.grant.work_funding {
+            self.context.validate(&self.grant)?;
+            let limits = &epoch.binding.limits;
+            let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) =
+                &self.grant.subject
+            else {
+                return Err(invalid());
+            };
+            if self.schema_version != 5
+                || issued_at_ms < budget.observed_at_ms
+                || issued_at_ms < epoch.receipt.issued_at_unix_ms
+                || issued_at_ms >= limits.expires_at_unix_ms
+                || deadline_ms > limits.expires_at_unix_ms
+                || window_ms > limits.max_window_ms
+                || source
+                    .continuation
+                    .as_ref()
+                    .map_or(0, |state| state.authorizations.len())
+                    >= usize::from(limits.total_window_ceiling)
+                || limits
+                    .max_call_duration_ms
+                    .checked_add(limits.dispatch_margin_ms)
+                    .is_none_or(|minimum| window_ms < minimum)
+                || self.grant.provider != current.grant.provider
+                || self.grant.model != current.grant.model
+                || self.grant.catalog_digest != current.grant.catalog_digest
+                || self.grant.token_policy != current.grant.token_policy
+            {
+                return Err(invalid());
+            }
+            (remaining, limits.max_call_duration_ms)
+        } else if let Some(binding) = &self.grant.resume_policy {
             crate::adaptive::validate_resume_policy_binding(binding)?;
             self.context.validate(&self.grant)?;
             if self.grant.recovery_epoch.is_some()
@@ -593,7 +633,7 @@ impl AdaptiveLeadershipReviewDecisionV1 {
         };
         let version_matches = match self.decision {
             AdaptiveLeadershipReviewDecisionKindV1::DeferBudget { .. } => {
-                matches!(self.schema_version, 3 | 4)
+                matches!(self.schema_version, 3..=5)
             }
             AdaptiveLeadershipReviewDecisionKindV1::ResolveBlocked { .. } => {
                 self.schema_version == 1
@@ -607,14 +647,14 @@ impl AdaptiveLeadershipReviewDecisionV1 {
                 window_ms,
                 ..
             } => {
-                matches!(self.schema_version, 2..=4)
+                matches!(self.schema_version, 2..=5)
                     && (1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&additional_model_calls)
                     && (1_000..=ADAPTIVE_LEADERSHIP_MAX_GRANT_MS).contains(&window_ms)
             }
         };
         if !version_matches
             || !valid_text(rationale, ADAPTIVE_LEADERSHIP_MAX_RATIONALE_BYTES)
-            || (matches!(self.schema_version, 2..=4) && refs.is_empty())
+            || (matches!(self.schema_version, 2..=5) && refs.is_empty())
         {
             return Err(invalid());
         }
@@ -632,10 +672,11 @@ impl AdaptiveLeadershipReviewDecisionV1 {
         &self,
         grant: &AdaptiveLeadershipReviewGrantV1,
     ) -> Result<(), WorkflowError> {
+        grant.validate_work_funding()?;
         if self.schema_version != grant.schema_version {
             return Err(invalid());
         }
-        if matches!(grant.schema_version, 3 | 4)
+        if matches!(grant.schema_version, 3..=5)
             != matches!(
                 &grant.subject,
                 Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. })
@@ -675,6 +716,29 @@ impl AdaptiveLeadershipReviewDecisionV1 {
         }
         if grant.schema_version == 4 && grant.recovery_epoch.is_none() {
             return Err(invalid());
+        }
+        if let (
+            Some(epoch),
+            AdaptiveLeadershipReviewDecisionKindV1::Continue {
+                additional_model_calls,
+                window_ms,
+                ..
+            },
+        ) = (&grant.work_funding, &self.decision)
+        {
+            let limits = &epoch.binding.limits;
+            if limits
+                .total_model_call_ceiling
+                .checked_sub(epoch.receipt.request.source.resume_source.base_model_calls)
+                .is_none_or(|remaining| *additional_model_calls > remaining)
+                || *window_ms > limits.max_window_ms
+                || limits
+                    .max_call_duration_ms
+                    .checked_add(limits.dispatch_margin_ms)
+                    .is_none_or(|minimum| *window_ms < minimum)
+            {
+                return Err(invalid());
+            }
         }
         let valid = matches!(
             (&grant.subject, &self.decision),
@@ -775,7 +839,43 @@ pub fn adaptive_leadership_review_id(
 }
 
 impl AdaptiveLeadershipReviewGrantV1 {
+    fn validate_work_funding(&self) -> Result<(), WorkflowError> {
+        let Some(epoch) = &self.work_funding else {
+            return if self.schema_version == 5 {
+                Err(invalid())
+            } else {
+                Ok(())
+            };
+        };
+        epoch.validate()?;
+        let anchor = &epoch.receipt.request.source.resume_source;
+        if self.schema_version != 5
+            || self.resume_policy.is_some()
+            || self.recovery_epoch.is_some()
+            || !matches!(
+                self.subject,
+                Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. })
+            )
+            || !matches!(
+                anchor.subject,
+                crate::AdaptiveResumeSubjectV1::ReadyForModel { .. }
+            )
+            || anchor.tenant_id != self.leadership_principal.tenant_id
+            || anchor.project_id != self.project_id
+            || anchor.work_item_id != self.work_item_id
+            || anchor.session_id != self.session_id
+            || anchor.assignee_authority != self.assignee_authority
+            || self.expected_session_version < anchor.expected_session_version
+            || self.max_duration_ms > epoch.binding.limits.max_call_duration_ms
+            || self.expires_at_unix_ms > epoch.binding.limits.expires_at_unix_ms
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, issued_at_ms: u64) -> Result<(), WorkflowError> {
+        self.validate_work_funding()?;
         self.project_id.validate()?;
         self.work_item_id.validate()?;
         self.leadership_principal.validate()?;
@@ -785,6 +885,12 @@ impl AdaptiveLeadershipReviewGrantV1 {
         validate_identifier(&self.model)?;
         validate_digest(&self.catalog_digest)?;
         let leader = &self.leadership_principal;
+        if self.work_funding.as_ref().is_some_and(|epoch| {
+            issued_at_ms < epoch.receipt.issued_at_unix_ms
+                || issued_at_ms >= epoch.binding.limits.expires_at_unix_ms
+        }) {
+            return Err(invalid());
+        }
         if let Some(binding) = &self.resume_policy {
             crate::adaptive::validate_resume_policy_binding(binding)?;
             if self.recovery_epoch.is_some()
@@ -822,7 +928,7 @@ impl AdaptiveLeadershipReviewGrantV1 {
             }
         }
         let valid_subject = match (&self.subject, self.schema_version) {
-            (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3 | 4) => {
+            (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3..=5) => {
                 budget.validate_shape()?;
                 self.expected_reason_code.is_empty()
                     && budget.observed_at_ms <= issued_at_ms
@@ -831,7 +937,8 @@ impl AdaptiveLeadershipReviewGrantV1 {
                             && self
                                 .recovery_epoch
                                 .as_ref()
-                                .is_some_and(|binding| binding.schema_version == 2)))
+                                .is_some_and(|binding| binding.schema_version == 2))
+                        || (self.schema_version == 5 && self.work_funding.is_some()))
             }
             (None, 1) => valid_reason(&self.expected_reason_code),
             (
@@ -893,6 +1000,7 @@ impl AdaptiveLeadershipReviewGrantV1 {
 
 impl AdaptiveLeadershipReviewContextV1 {
     pub fn validate(&self, grant: &AdaptiveLeadershipReviewGrantV1) -> Result<(), WorkflowError> {
+        grant.validate_work_funding()?;
         if !matches!(
             (&grant.subject, grant.schema_version),
             (None, 1)
@@ -905,7 +1013,7 @@ impl AdaptiveLeadershipReviewContextV1 {
                 )
                 | (
                     Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }),
-                    3 | 4
+                    3..=5
                 )
         ) || (grant.schema_version == 3 && grant.recovery_epoch.is_some())
             || (grant.schema_version == 4
@@ -918,6 +1026,54 @@ impl AdaptiveLeadershipReviewContextV1 {
         }
         let project = &self.source_project;
         let session = &self.source_session;
+        if let Some(epoch) = &grant.work_funding {
+            let funding_source = &epoch.receipt.request.source;
+            let anchor = &funding_source.resume_source;
+            let reference = epoch.evidence_ref()?;
+            let initial = session.version == anchor.expected_session_version;
+            if !matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
+                || funding_source.original_model_call_ceiling != session.grant.max_model_calls
+                || funding_source.original_tool_call_ceiling != session.grant.max_tool_calls
+                || epoch.binding.limits.max_call_duration_ms != session.grant.max_call_duration_ms
+                || session.model_calls < anchor.base_model_calls
+                || session.tool_calls < anchor.base_tool_calls
+                || !self.evidence_refs.contains(&reference)
+                || self.evidence_refs.iter().any(|value| {
+                    (value.starts_with("adaptive-work-funding:") && value != &reference)
+                        || value.starts_with("adaptive-resume-policy:")
+                })
+                || session.continuation.as_ref().is_some_and(|state| {
+                    state
+                        .authorizations
+                        .iter()
+                        .any(|authorization| authorization.local_adoption.is_some())
+                })
+                || (initial
+                    && (session.model_calls != anchor.base_model_calls
+                        || session.tool_calls != anchor.base_tool_calls
+                        || session.funded_model_call_ceiling()
+                            != funding_source.current_model_call_ceiling
+                        || session.funded_tool_call_ceiling()
+                            != funding_source.current_tool_call_ceiling
+                        || session
+                            .active_work_funding()
+                            .map(|active| &active.binding.receipt_digest)
+                            != funding_source.predecessor_receipt_digest.as_ref()))
+                || (!initial
+                    && session
+                        .active_work_funding()
+                        .is_none_or(|active| !active.same_epoch(epoch)))
+            {
+                return Err(invalid());
+            }
+        } else if session.active_work_funding().is_some()
+            || self
+                .evidence_refs
+                .iter()
+                .any(|value| value.starts_with("adaptive-work-funding:"))
+        {
+            return Err(invalid());
+        }
         if let Some(binding) = &grant.resume_policy {
             crate::adaptive::validate_resume_policy_binding(binding)?;
             if grant.recovery_epoch.is_some()
@@ -947,13 +1103,14 @@ impl AdaptiveLeadershipReviewContextV1 {
         let valid_subject = match &grant.subject {
             Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) => {
                 budget.validate(self)?;
-                matches!(grant.schema_version, 3 | 4)
+                matches!(grant.schema_version, 3..=5)
                     && ((grant.schema_version == 3 && grant.recovery_epoch.is_none())
                         || (grant.schema_version == 4
                             && grant
                                 .recovery_epoch
                                 .as_ref()
-                                .is_some_and(|binding| binding.schema_version == 2)))
+                                .is_some_and(|binding| binding.schema_version == 2))
+                        || (grant.schema_version == 5 && grant.work_funding.is_some()))
                     && grant.expected_reason_code.is_empty()
                     && grant.assignment_id == budget.root_allowance.grant.assignment_id
                     && grant.provider == session.grant.provider
@@ -1088,6 +1245,9 @@ fn invalid() -> WorkflowError {
 mod budget_tests {
     use super::*;
     use crate::adaptive::continuation_tests::{authorization, grant, NOW};
+    mod work_funding_tests {
+        include!("adaptive_leadership_review/work_funding_tests.rs");
+    }
 
     fn fixture() -> AdaptiveLeadershipReviewCallV1 {
         let mut session = AdaptiveSessionV1::initial(grant()).unwrap();
@@ -1241,6 +1401,7 @@ mod budget_tests {
             }),
             recovery_epoch: None,
             resume_policy: None,
+            work_funding: None,
         };
         AdaptiveLeadershipReviewCallV1 {
             schema_version: 3,
@@ -1675,6 +1836,7 @@ mod budget_tests {
             additional_model_calls: 4,
             local_adoption: None,
             resume_policy: None,
+            work_funding: None,
         };
         call.context.source_session = call
             .context
