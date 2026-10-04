@@ -1,5 +1,12 @@
 # Changelog
 
+- Admit late-arriving validated read views with bounded least-recently-used
+  eviction instead of permanently retaining the first eight views. Share exact
+  input proofs with historical leadership-review reads; preserve tenant/session
+  binding, full corruption checks, fresh authority decisions and invalidation
+  after any input change. Keep aggregate serialized-result admission bounded
+  independently of the 32-view ceiling (#856).
+
 - Reuse completed project, discovery and adaptive-health replay proofs only
   after re-reading the complete typed SQLite table/schema input set in one
   pinned snapshot and checking index consistency. Bound the shared input/result
