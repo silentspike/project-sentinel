@@ -204,7 +204,9 @@ impl WorkflowStore {
         session_id: Uuid,
         current: &RuntimeAuthoritySnapshotV1,
     ) -> Result<Option<AdaptiveSessionV1>, WorkflowError> {
-        Ok(self.authorized_adaptive_head(session_id, current)?.map(|(session, _)| session))
+        Ok(self
+            .authorized_adaptive_head(session_id, current)?
+            .map(|(session, _)| session))
     }
 
     fn authorized_adaptive_head(
@@ -215,14 +217,19 @@ impl WorkflowStore {
         current.validate()?;
         let query_key = encode(&(session_id, current))?;
         let mut connection = self.lock()?;
-        self.validated_read_snapshot(&mut connection, "authorized-adaptive-head", &query_key, |tx| {
-            let Some((session, digest)) = load(tx, session_id)? else {
-                return Ok(None);
-            };
-            authorize(&session.grant, current)?;
-            require_head(tx, &session)?;
-            Ok(Some((session, digest)))
-        })
+        self.validated_read_snapshot(
+            &mut connection,
+            "authorized-adaptive-head",
+            &query_key,
+            |tx| {
+                let Some((session, digest)) = load(tx, session_id)? else {
+                    return Ok(None);
+                };
+                authorize(&session.grant, current)?;
+                require_head(tx, &session)?;
+                Ok(Some((session, digest)))
+            },
+        )
     }
 
     /// Historical health inventory only, never admission or authority to retry effects.
@@ -356,7 +363,9 @@ impl WorkflowStore {
         session_id: Uuid,
         current: &RuntimeAuthoritySnapshotV1,
     ) -> Result<Option<String>, WorkflowError> {
-        Ok(self.authorized_adaptive_head(session_id, current)?.map(|(_, digest)| digest))
+        Ok(self
+            .authorized_adaptive_head(session_id, current)?
+            .map(|(_, digest)| digest))
     }
 
     /// One authorized read snapshot of the exact pending session and journal digest.
@@ -394,9 +403,12 @@ impl WorkflowStore {
         current.validate()?;
         let query_key = encode(current)?;
         let mut connection = self.lock()?;
-        self.validated_read_snapshot(&mut connection, "adaptive-authority-head", &query_key, |tx| {
-            adaptive_session_for_authority_on_connection(tx, current)
-        })
+        self.validated_read_snapshot(
+            &mut connection,
+            "adaptive-authority-head",
+            &query_key,
+            |tx| adaptive_session_for_authority_on_connection(tx, current),
+        )
     }
 
     /// Read-only journal provenance for the original first model's sealed unknown.
@@ -2759,13 +2771,15 @@ fn adaptive_session_for_authority_on_connection(
     let mut statement = connection.prepare(
         "SELECT authority_digest,session_id,version,updated_at_ms FROM workflow_adaptive_heads WHERE tenant_id=?1 AND project_id=?2 AND work_item_id=?3 AND agent_id=?4 ORDER BY authority_digest LIMIT ?5"
     ).map_err(map_sqlite_error)?;
-    let mut rows = statement.query(params![
-        current.tenant_id.0,
-        current.project_id.0,
-        current.work_item_id.0,
-        i64::from(current.agent_id.0),
-        (MAX_SCOPED_ADAPTIVE_HEADS + 1) as i64
-    ]).map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![
+            current.tenant_id.0,
+            current.project_id.0,
+            current.work_item_id.0,
+            i64::from(current.agent_id.0),
+            (MAX_SCOPED_ADAPTIVE_HEADS + 1) as i64
+        ])
+        .map_err(map_sqlite_error)?;
     let mut exact = None;
     let mut drifted_assignment = false;
     let mut count = 0;
