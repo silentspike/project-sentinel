@@ -902,6 +902,28 @@ fn require_unfunded_source(
     Ok((source, session.grant.max_call_duration_ms))
 }
 
+pub(super) fn require_unfunded_review_lane(
+    connection: &Connection,
+    session: &crate::AdaptiveSessionV1,
+    now_ms: u64,
+) -> Result<(), WorkflowError> {
+    let tenant = &session.grant.authority.tenant_id;
+    let session_id = session.grant.session_id;
+    let receipts = funding_receipts(connection, tenant, session_id)?;
+    let adopted = adopted_epochs(session);
+    let superseded = superseded_unused_receipts(connection, tenant, session_id)?;
+    // Selection and authorization are separate reads. A concurrently issued
+    // live proposal must be reselected, not stranded by an older unfunded call.
+    if receipts.iter().any(|receipt| {
+        now_ms < receipt.request.limits.expires_at_unix_ms
+            && !adopted.iter().any(|epoch| epoch.receipt == *receipt)
+            && !superseded.contains(&receipt.funding_id)
+    }) {
+        return Err(transition());
+    }
+    Ok(())
+}
+
 pub(super) fn require_fresh_funding_review_source(
     connection: &Connection,
     call: &AdaptiveLeadershipReviewCallV1,

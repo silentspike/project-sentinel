@@ -1771,6 +1771,13 @@ impl WorkflowStore {
         {
             return Err(transition());
         }
+        if grant.schema_version == 3 && grant.work_funding.is_none() {
+            super::adaptive_work_funding::require_unfunded_review_lane(
+                transaction,
+                &context.source_session,
+                now_ms,
+            )?;
+        }
         let correction = if grant.work_funding.is_some() {
             None
         } else {
