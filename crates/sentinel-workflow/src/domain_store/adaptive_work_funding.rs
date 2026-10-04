@@ -94,8 +94,8 @@ fn require_epoch_receipt(
         if stored != epoch.receipt {
             return Err(corrupt());
         }
-        let receipts = funding_receipts(connection, &source.tenant_id, source.session_id)?;
-        let superseded = superseded_unused_receipts(connection, &receipts)?;
+        let superseded =
+            superseded_unused_receipts(connection, &source.tenant_id, source.session_id)?;
         if superseded.contains(&stored.funding_id) {
             return Err(unauthorized());
         }
@@ -533,6 +533,36 @@ fn funding_receipts(
     tenant: &TenantId,
     session_id: Uuid,
 ) -> Result<Vec<AdaptiveWorkFundingReceiptV1>, WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        let ids = funding_inventory(connection, tenant)?;
+        let mut receipts = Vec::new();
+        for id in ids {
+            let receipt: AdaptiveWorkFundingReceiptV1 =
+                get_entity(connection, tenant, FUNDING_KIND, &id)?.ok_or_else(corrupt)?;
+            if receipt.request.source.resume_source.session_id == session_id {
+                receipts.push(receipt);
+            }
+        }
+        if receipts.len() > 128 {
+            return Err(corrupt());
+        }
+        Ok(receipts)
+    })
+}
+
+fn funding_inventory(
+    connection: &Connection,
+    tenant: &TenantId,
+) -> Result<Vec<String>, WorkflowError> {
+    validation_scope::memoize(connection, "funding-inventory", tenant, || {
+        funding_inventory_uncached(connection, tenant)
+    })
+}
+
+fn funding_inventory_uncached(
+    connection: &Connection,
+    tenant: &TenantId,
+) -> Result<Vec<String>, WorkflowError> {
     let mut statement = connection.prepare(
         "SELECT entity_id FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2
          ORDER BY entity_id LIMIT 4097",
@@ -545,30 +575,23 @@ fn funding_receipts(
     if ids.len() > 4096 {
         return Err(corrupt());
     }
-    let mut receipts = Vec::with_capacity(ids.len());
-    for id in ids {
-        let receipt: AdaptiveWorkFundingReceiptV1 =
-            get_entity(connection, tenant, FUNDING_KIND, &id)?.ok_or_else(corrupt)?;
-        // Validate key, payload, issuer and event before selecting by payload.
-        // A corrupted session field must not hide a pending epoch.
-        if receipt.request.source.resume_source.session_id == session_id {
-            receipts.push(receipt);
-        }
-    }
-    if receipts.len() > 128 {
-        return Err(corrupt());
+    // Retain only validated keys; typed payload proofs already belong to this scope.
+    // Validate every row and issuance event before any session selection.
+    for id in &ids {
+        let _: AdaptiveWorkFundingReceiptV1 =
+            get_entity(connection, tenant, FUNDING_KIND, id)?.ok_or_else(corrupt)?;
     }
     let mut events = connection.prepare(
         "SELECT sequence FROM company_events WHERE tenant_id=?1 AND event_type=?2 ORDER BY sequence LIMIT 4097")?;
-    let ids = events
+    let sequences = events
         .query_map(params![tenant.0, FUNDING_EVENT], |row| row.get::<_, i64>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    if ids.len() > 4096 {
+    if sequences.len() > 4096 {
         return Err(corrupt());
     }
     // The event selector cannot trust an unvalidated payload either. Match
     // every bounded issuance event to its typed, event-verified entity first.
-    for sequence in ids {
+    for sequence in sequences {
         let row = read_company_event_row(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
         validation_scope::charge_bytes(connection, row.payload.len())?;
         let event_receipt: AdaptiveWorkFundingReceiptV1 = decode(&row.payload)?;
@@ -579,7 +602,7 @@ fn funding_receipts(
             return Err(corrupt());
         }
     }
-    Ok(receipts)
+    Ok(ids)
 }
 
 fn adopted_epochs(session: &crate::AdaptiveSessionV1) -> Vec<&AdaptiveWorkFundingEpochV1> {
@@ -768,6 +791,22 @@ fn reviewed_funding_ids(
 
 fn superseded_unused_receipts(
     connection: &Connection,
+    tenant: &TenantId,
+    session_id: Uuid,
+) -> Result<BTreeSet<String>, WorkflowError> {
+    validation_scope::memoize(
+        connection,
+        "funding-supersession",
+        &(tenant, session_id),
+        || {
+            let receipts = funding_receipts(connection, tenant, session_id)?;
+            superseded_unused_receipts_uncached(connection, &receipts)
+        },
+    )
+}
+
+fn superseded_unused_receipts_uncached(
+    connection: &Connection,
     receipts: &[AdaptiveWorkFundingReceiptV1],
 ) -> Result<BTreeSet<String>, WorkflowError> {
     let mut superseded = BTreeSet::new();
@@ -826,7 +865,7 @@ fn require_unfunded_source(
         connection, tenant, project_id, session_id, now_ms, None,
     )?;
     let adopted = adopted_epochs(&session);
-    let superseded = superseded_unused_receipts(connection, &receipts)?;
+    let superseded = superseded_unused_receipts(connection, tenant, session_id)?;
     let pending = receipts
         .iter()
         .filter(|receipt| {
@@ -967,7 +1006,7 @@ impl WorkflowStore {
         }
         let receipts = funding_receipts(&transaction, tenant, session_id)?;
         let adopted = adopted_epochs(&session);
-        let superseded = superseded_unused_receipts(&transaction, &receipts)?;
+        let superseded = superseded_unused_receipts(&transaction, tenant, session_id)?;
         let pending: Vec<_> = receipts
             .iter()
             .filter(|receipt| {
@@ -1209,7 +1248,8 @@ impl WorkflowStore {
             let mut receipts =
                 funding_receipts(&transaction, &source.tenant_id, source.session_id)?;
             receipts.push(receipt.clone());
-            superseded_unused_receipts(&transaction, &receipts)?;
+            // The prospective successor is not part of the stored snapshot proof.
+            superseded_unused_receipts_uncached(&transaction, &receipts)?;
         }
         scope.finish()?;
         put_entity(
@@ -1264,4 +1304,36 @@ pub(super) fn read_during_issuance(
     issue: impl FnOnce() -> Result<(), WorkflowError>,
 ) -> Result<Option<AdaptiveWorkFundingReceiptV1>, WorkflowError> {
     read_funding_leaf_with_observer(connection, tenant, session_id, operation_id, issue)
+}
+
+#[cfg(test)]
+#[test]
+fn funding_inventory_and_supersession_scope_keys_keep_tenants_and_sessions_distinct() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = WorkflowStore::open(directory.path().join("funding-proof.sqlite")).unwrap();
+    let connection = store.connection.lock().unwrap();
+    let first = TenantId::parse("first-tenant").unwrap();
+    let second = TenantId::parse("second-tenant").unwrap();
+    let one = Uuid::from_u128(9101);
+    let two = Uuid::from_u128(9102);
+    for _ in 0..2 {
+        validation_scope::with_scope(&connection, || {
+            assert!(funding_receipts(&connection, &first, one)?.is_empty());
+            assert!(funding_receipts(&connection, &first, two)?.is_empty());
+            assert_eq!(validation_scope::validations("funding-inventory"), 1);
+            for _ in 0..3 {
+                assert!(superseded_unused_receipts(&connection, &first, one)?.is_empty());
+                assert!(superseded_unused_receipts(&connection, &first, two)?.is_empty());
+            }
+            assert_eq!(validation_scope::validations("funding-supersession"), 2);
+            assert!(superseded_unused_receipts(&connection, &second, one)?.is_empty());
+            assert_eq!(validation_scope::validations("funding-inventory"), 2);
+            assert_eq!(validation_scope::validations("funding-supersession"), 3);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(validation_scope::validations("funding-inventory"), 0);
+        assert_eq!(validation_scope::validations("funding-supersession"), 0);
+    }
+    assert!(connection.is_autocommit());
 }
