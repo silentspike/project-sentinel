@@ -127,6 +127,318 @@ fn assert_rejected(response: &WorkflowHttpResponse) {
     assert_eq!(error["retryable"], false);
 }
 
+#[test]
+fn funding_get_and_post_coexist_with_reconciliation_reader_without_adoption() {
+    let (temp, api, source) = fixture();
+    let request = request(&api, &source);
+    let before = discovery_state(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    let operator = api.principals.principal("operator").unwrap();
+    let path = query(&request);
+    let reconciliation = api.mutation_fence.read().unwrap();
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let (api, operator, path) = (&api, &operator, &path);
+        let child = scope.spawn(move || {
+            let draft = api.adaptive_work_funding_http(operator, "GET", path, &[]);
+            send.send(draft).unwrap();
+        });
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(5));
+        // Release even on regression so the scoped child cannot deadlock the test.
+        drop(reconciliation);
+        child.join().unwrap();
+        let draft = assert_ok(&observed.expect("GET waited for the reconciliation reader"));
+        assert_eq!(draft["requires_explicit_submission"], true);
+        assert_eq!(
+            discovery_state(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite"),
+            ),
+            before
+        );
+    });
+    let reconciliation = api.mutation_fence.read().unwrap();
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let (api, request) = (&api, &request);
+        let child = scope.spawn(move || send.send(post(api, request)).unwrap());
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(5));
+        drop(reconciliation);
+        child.join().unwrap();
+        let receipt = assert_ok(&observed.expect("POST waited for the reconciliation reader"));
+        assert_eq!(receipt["model_decision_recorded"], false);
+        assert_eq!(receipt["developer_window_created"], false);
+    });
+    assert_eq!(
+        api.store
+            .adaptive_session_for_authority(&source.grant.authority)
+            .unwrap(),
+        Some(source.clone())
+    );
+    assert!(api
+        .store
+        .adaptive_leadership_review_calls(
+            &source.grant.authority.tenant_id,
+            source.grant.session_id,
+        )
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn concurrent_funding_posts_replay_one_operation_and_reject_competing_source() {
+    for same_operation in [false, true] {
+        let (_temp, api, source) = fixture();
+        let first = request(&api, &source);
+        let second = if same_operation {
+            first.clone()
+        } else {
+            request(&api, &source)
+        };
+        let barrier = std::sync::Barrier::new(3);
+        let responses = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                barrier.wait();
+                post(&api, &first)
+            });
+            let right = scope.spawn(|| {
+                barrier.wait();
+                post(&api, &second)
+            });
+            barrier.wait();
+            [left.join().unwrap(), right.join().unwrap()]
+        });
+        let succeeded = responses
+            .iter()
+            .filter(|response| response.status == 200)
+            .count();
+        assert_eq!(succeeded, if same_operation { 2 } else { 1 });
+        let receipts: Vec<_> = responses
+            .iter()
+            .filter(|response| response.status == 200)
+            .map(assert_ok)
+            .collect();
+        if same_operation {
+            assert_eq!(receipts[0]["receipt_digest"], receipts[1]["receipt_digest"]);
+            assert_eq!(
+                receipts
+                    .iter()
+                    .filter(|receipt| receipt["replayed"] == false)
+                    .count(),
+                1
+            );
+        } else {
+            assert_rejected(
+                responses
+                    .iter()
+                    .find(|response| response.status != 200)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            api.store
+                .adaptive_session_for_authority(&source.grant.authority)
+                .unwrap(),
+            Some(source)
+        );
+    }
+}
+
+#[test]
+fn funding_recovery_fence_poison_rejects_get_and_post_without_writes() {
+    let (temp, api, source) = fixture();
+    let request = request(&api, &source);
+    let operator = api.principals.principal("operator").unwrap();
+    let before = discovery_state(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _recovery = api.mutation_fence.write().unwrap();
+        panic!("synthetic recovery poison");
+    }))
+    .is_err());
+    assert_eq!(
+        api.adaptive_work_funding_http(&operator, "GET", &query(&request), &[])
+            .status,
+        503
+    );
+    assert_eq!(post(&api, &request).status, 503);
+    assert_eq!(
+        discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        ),
+        before
+    );
+}
+
+fn prepared_unfunded_review(
+    temp: &tempfile::TempDir,
+    api: &mut WorkflowApi,
+    source: &AdaptiveSessionV1,
+) -> sentinel_workflow::AdaptiveLeadershipReviewCallV1 {
+    // Prepare through the productive selector in an identical snapshot, leaving
+    // the actual store at the pre-authorization boundary of the interleaving.
+    let snapshot = temp.path().join("prepared-review.sqlite");
+    sentinel_limbo::rusqlite::Connection::open(temp.path().join("company.sqlite"))
+        .unwrap()
+        .execute("VACUUM INTO ?1", [snapshot.to_str().unwrap()])
+        .unwrap();
+    let original = Arc::clone(&api.store);
+    api.store = Arc::new(sentinel_workflow::WorkflowStore::open(snapshot).unwrap());
+    let project = project(api, source);
+    assert!(reconcile_review_at(api, &project, now_unix_ms()));
+    let calls = api
+        .store
+        .adaptive_leadership_review_calls(
+            &source.grant.authority.tenant_id,
+            source.grant.session_id,
+        )
+        .unwrap();
+    assert_eq!(calls.len(), 1);
+    let call = calls.into_iter().next().unwrap();
+    assert_eq!(call.grant.schema_version, 3);
+    assert!(call.grant.work_funding.is_none());
+    api.store = original;
+    call
+}
+
+#[test]
+fn funding_commit_rejects_prepared_unfunded_review_and_preserves_selection() {
+    let (temp, mut api, source) = fixture();
+    let stale = prepared_unfunded_review(&temp, &mut api, &source);
+    let request = request(&api, &source);
+    let receipt = assert_ok(&post(&api, &request));
+    let before = discovery_state(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    assert!(api
+        .store
+        .authorize_adaptive_leadership_review_call(
+            &stale.grant.leadership_principal,
+            stale.operation_id,
+            &stale.allowance_id,
+            &stale.grant,
+            &stale.context,
+            now_unix_ms(),
+        )
+        .is_err());
+    assert_eq!(
+        discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        ),
+        before
+    );
+    let selected = api
+        .store
+        .adaptive_work_funding_for_review(
+            &source.grant.authority.tenant_id,
+            source.grant.session_id,
+            now_unix_ms(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        selected.receipt.receipt_digest().unwrap(),
+        receipt["receipt_digest"]
+    );
+    assert!(reconcile_review_at(
+        &api,
+        &project(&api, &source),
+        now_unix_ms()
+    ));
+    let calls = api
+        .store
+        .adaptive_leadership_review_calls(
+            &source.grant.authority.tenant_id,
+            source.grant.session_id,
+        )
+        .unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].grant.work_funding.as_ref().unwrap().receipt,
+        selected.receipt
+    );
+    assert_eq!(calls[0].dispatch, None);
+}
+
+#[test]
+fn intervening_review_rejects_typed_and_compact_funding_without_writes() {
+    for typed in [false, true] {
+        let (temp, mut api, source) = fixture();
+        let stale = prepared_unfunded_review(&temp, &mut api, &source);
+        let request = request(&api, &source);
+        api.store
+            .authorize_adaptive_leadership_review_call(
+                &stale.grant.leadership_principal,
+                stale.operation_id,
+                &stale.allowance_id,
+                &stale.grant,
+                &stale.context,
+                now_unix_ms(),
+            )
+            .unwrap();
+        let before = discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        );
+        assert_rejected(&if typed {
+            post(&api, &request)
+        } else {
+            post(&api, &submission(&request).unwrap())
+        });
+        assert_eq!(
+            discovery_state(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite"),
+            ),
+            before
+        );
+    }
+}
+
+#[test]
+fn healthy_exclusive_recovery_blocks_funding_get_and_post_until_release() {
+    for get in [false, true] {
+        let (_temp, api, source) = fixture();
+        let request = request(&api, &source);
+        let operator = api.principals.principal("operator").unwrap();
+        let path = query(&request);
+        let recovery = api.mutation_fence.write().unwrap();
+        std::thread::scope(|scope| {
+            let (entered, started) = std::sync::mpsc::channel();
+            let (send, receive) = std::sync::mpsc::channel();
+            let (api, request, operator, path) = (&api, &request, &operator, &path);
+            let child = scope.spawn(move || {
+                entered.send(()).unwrap();
+                let response = if get {
+                    api.adaptive_work_funding_http(operator, "GET", path, &[])
+                } else {
+                    post(api, request)
+                };
+                send.send(response).unwrap();
+            });
+            started
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let blocked = receive.recv_timeout(std::time::Duration::from_millis(100));
+            drop(recovery);
+            let response = receive.recv_timeout(std::time::Duration::from_secs(5));
+            child.join().unwrap();
+            assert!(matches!(
+                blocked,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_ok(&response.unwrap());
+        });
+    }
+}
+
 fn project(api: &WorkflowApi, source: &AdaptiveSessionV1) -> sentinel_workflow::ProjectV1 {
     api.store
         .company_project(
