@@ -11,6 +11,10 @@ The three modes have separate authority boundaries:
 - `daemon` reads the operator credential from a systemd credential file and
   validates only daemon-local runtime, security, process, cgroup, repair and
   worker invariants. It deliberately does not wait for the projection service.
+  Its authenticated `/operator/runtime-readiness` response uses the same
+  runtime snapshot without invoking workflow-store health. Full company
+  readiness remains a separate `/operator/runtime-health` acceptance check;
+  passing the boot probe does not prove that employee work is ready.
 - `nightrun` posts the fixed operator action using that credential file; the
   credential value never enters argv or the result record.
 

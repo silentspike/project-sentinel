@@ -72,6 +72,7 @@ const OPERATOR_PLATFORM_TRIGGER_TEST_PATH: &str = "/operator/platform-trigger-te
 const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-test";
 const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
 const OPERATOR_RUNTIME_HEALTH_PATH: &str = "/operator/runtime-health";
+const OPERATOR_RUNTIME_READINESS_PATH: &str = "/operator/runtime-readiness";
 const OPERATOR_EPISODE_PROJECTION_PATH: &str = "/operator/episode-projection";
 const OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH: &str = "/operator/episode-projection/resolve";
 const OPERATOR_EPISODE_PROJECTION_GENERATION_PATH: &str = "/operator/episode-projection/generation";
@@ -919,7 +920,10 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
 
     // GET-Endpoints ohne Auth (read-only)
     if request.method == "GET" {
-        let authorized = if path_only == OPERATOR_EPISODE_PROJECTION_PATH {
+        let authorized = if matches!(
+            path_only,
+            OPERATOR_EPISODE_PROJECTION_PATH | OPERATOR_RUNTIME_READINESS_PATH
+        ) {
             episode_projection_is_authorized(&request.headers, state.shared_secret.as_deref())
         } else {
             is_authorized(&request.headers, state.shared_secret.as_deref())
@@ -957,7 +961,7 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     ApiError::ServiceUnavailable("Platform-State nicht verfuegbar").to_response()
                 }
             },
-            OPERATOR_RUNTIME_HEALTH_PATH => {
+            OPERATOR_RUNTIME_HEALTH_PATH | OPERATOR_RUNTIME_READINESS_PATH => {
                 let snapshot = {
                     match state.runtime_health.read() {
                         Ok(snapshot) => snapshot.clone(),
@@ -969,7 +973,14 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 };
                 match serde_json::to_value(snapshot) {
                     Ok(mut payload) => {
-                        if let Some(object) = payload.as_object_mut() {
+                        // Boot readiness depends on the daemon snapshot, not a database scan.
+                        if path_only == OPERATOR_RUNTIME_HEALTH_PATH {
+                            let Some(object) = payload.as_object_mut() else {
+                                return ApiError::ServiceUnavailable(
+                                    "Runtime-Health nicht serialisierbar",
+                                )
+                                .to_response();
+                            };
                             #[cfg(test)]
                             if let Some(hook) = state.before_workflow_health.as_ref() {
                                 hook();
@@ -2424,6 +2435,7 @@ fn is_security_path(path: &str) -> bool {
 fn is_protected_read_path(path: &str) -> bool {
     path == OPERATOR_APICP_SNAPSHOT_PATH
         || path == OPERATOR_RUNTIME_HEALTH_PATH
+        || path == OPERATOR_RUNTIME_READINESS_PATH
         || path == OPERATOR_EPISODE_PROJECTION_PATH
         || path == OPERATOR_STATE_HASH_PATH
         || is_security_path(path)
@@ -4664,6 +4676,90 @@ mod tests {
         assert_eq!(payload["current_shift"], 1);
         assert_eq!(health.read().unwrap().current_shift, 3);
         assert!(payload.get("company_workflow").is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_readiness_responds_while_workflow_health_is_blocked() {
+        let (mut state, _commands, _platform, _runtime) = test_state(Some("secret"));
+        let (mut release, entered, pause) = paused_response(json_response(200, true));
+        let pause = std::sync::Mutex::new(Some(pause));
+        state.before_workflow_health = Some(Arc::new(move || {
+            if let Some(pause) = pause.lock().unwrap().take() {
+                let _ = pause();
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(server_loop(
+            listener,
+            state,
+            Arc::new(Semaphore::new(2)),
+            REQUEST_READ_TIMEOUT,
+            RESPONSE_WRITE_TIMEOUT,
+        ));
+        let mut full_request = test_get_request(OPERATOR_RUNTIME_HEALTH_PATH);
+        full_request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.into(), "secret".into());
+        let full_response = tokio::spawn(exchange_operator_request(address, full_request));
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut boot_request = test_get_request(OPERATOR_RUNTIME_READINESS_PATH);
+        boot_request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.into(), "secret".into());
+        let boot_response = tokio::time::timeout(
+            Duration::from_secs(5),
+            exchange_operator_request(address, boot_request),
+        )
+        .await;
+        release.release();
+        let full_response = full_response.await.unwrap();
+        server.abort();
+        let _ = server.await;
+        let boot_response = boot_response.expect("readiness must not wait for workflow health");
+        assert_eq!(boot_response.status, 200);
+        let boot: serde_json::Value = serde_json::from_slice(&boot_response.body).unwrap();
+        let full: serde_json::Value = serde_json::from_slice(&full_response.body).unwrap();
+        assert!(boot.get("company_workflow").is_none());
+        assert!(full.get("company_workflow").is_some());
+        let mut full_runtime = full.as_object().unwrap().clone();
+        full_runtime.remove("company_workflow");
+        assert_eq!(boot, serde_json::Value::Object(full_runtime));
+    }
+
+    #[test]
+    fn runtime_readiness_requires_configured_exact_operator_authority() {
+        for secret in [None, Some("secret")] {
+            let (mut state, _commands, _platform, _runtime) = test_state(secret);
+            state.before_workflow_health = Some(Arc::new(|| panic!("no workflow I/O")));
+            for credential in [None, Some("wrong"), Some("secret")] {
+                let mut request = test_get_request(OPERATOR_RUNTIME_READINESS_PATH);
+                if let Some(credential) = credential {
+                    request
+                        .headers
+                        .insert(OPERATOR_KEY_HEADER.into(), credential.into());
+                }
+                let response = handle_http_request(request, &state);
+                assert_eq!(
+                    response.status,
+                    if secret.is_some() && credential == secret {
+                        200
+                    } else {
+                        401
+                    }
+                );
+                if response.status == 200 {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&response.body).unwrap();
+                    assert_eq!(payload["stale_runtime_entries"], 2);
+                    assert_eq!(payload["expected_active_agents"], 26);
+                    assert!(payload.get("company_workflow").is_none());
+                }
+            }
+        }
     }
 
     fn attach_test_fs_layer(state: &mut AppState) -> Arc<LayerManager> {
