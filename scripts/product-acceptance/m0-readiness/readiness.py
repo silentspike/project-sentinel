@@ -23,7 +23,7 @@ NATS_PORT = 8222
 NATS_PATH = "/healthz?js-enabled-only=true"
 DAEMON_HOST = "127.0.0.1"
 DAEMON_PORT = 8084
-DAEMON_READINESS_PATH = "/operator/runtime-health"
+DAEMON_READINESS_PATH = "/operator/runtime-readiness"
 NIGHTRUN_PATH = "/operator/nightrun"
 MAX_HTTP_BYTES = 256 * 1024
 MAX_CREDENTIAL_BYTES = 512

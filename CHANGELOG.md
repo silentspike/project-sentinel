@@ -1,5 +1,11 @@
 # Changelog
 
+- Separate authenticated daemon boot readiness from workflow-store health.
+  Preserve the complete runtime/security/worker snapshot and fail-closed
+  credential checks; leave full company readiness as an independent product
+  acceptance requirement. Prove boot responses remain available while a
+  concurrent full workflow health read is blocked (#856).
+
 - Reuse fully validated funding and leadership-review inventories, session
   supersession proofs and exact governed-journal predicates only within one
   unchanged SQLite validation snapshot. Share working-memory journal proofs
