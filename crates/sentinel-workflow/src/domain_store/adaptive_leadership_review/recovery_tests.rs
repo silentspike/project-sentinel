@@ -1888,6 +1888,74 @@ fn company_project_cached_reads_keep_exact_tenant_project_and_absent_bindings() 
 }
 
 #[test]
+fn leadership_history_cached_reads_keep_tenant_session_and_reject_resealed_corruption() {
+    let (f, _, archived) = company_discovery_fixture();
+    let tenant = &f.leader.tenant_id;
+    let session_id = archived.grant.session_id;
+    let missing_session_id = Uuid::new_v4();
+    let expected = f.store.adaptive_leadership_review_calls(tenant, session_id).unwrap();
+    assert!(!expected.is_empty());
+    for _ in 0..2 {
+        assert_eq!(f.store.adaptive_leadership_review_calls(tenant, session_id).unwrap(), expected);
+        assert!(f.store.adaptive_leadership_review_calls(&TenantId("foreign-tenant".into()), session_id).unwrap().is_empty());
+        assert!(f.store.adaptive_leadership_review_calls(tenant, missing_session_id).unwrap().is_empty());
+    }
+    let mut unbound = archived.clone();
+    assert!(unbound.grant.recovery_epoch.take().is_some());
+    assert!(unbound.validate_entity().is_err());
+    {
+        let mut connection = f.store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        put_entity(&transaction, tenant, KIND, &unbound.review_key, unbound.version, &unbound).unwrap();
+        transaction.commit().unwrap();
+    }
+    let before = rows(&f.store);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    for store in [&f.store, &reopened] {
+        assert!(store.adaptive_leadership_review_calls(tenant, session_id).is_err());
+        assert!(store.adaptive_leadership_review_calls(tenant, missing_session_id).is_err());
+        assert!(store.connection.lock().unwrap().is_autocommit());
+        assert_eq!(rows(store), before);
+    }
+}
+
+#[test]
+fn leadership_history_cached_reads_preserve_outer_transaction_changes_and_rollback() {
+    let (f, _, archived) = company_discovery_fixture();
+    let tenant = &f.leader.tenant_id;
+    let session_id = archived.grant.session_id;
+    let expected = f.store.adaptive_leadership_review_calls(tenant, session_id).unwrap();
+    let before = rows(&f.store);
+    let mut unbound = archived.clone();
+    assert!(unbound.grant.recovery_epoch.take().is_some());
+    let payload = encode(&unbound).unwrap();
+    let payload_digest = bytes_digest("sentinel.workflow.company-entity-row.v1", &payload).unwrap();
+    for (begin, rollback) in [
+        ("BEGIN", "ROLLBACK"),
+        ("SAVEPOINT caller", "ROLLBACK TO caller; RELEASE caller"),
+    ] {
+        {
+            let connection = f.store.connection.lock().unwrap();
+            connection.execute_batch(begin).unwrap();
+            assert_eq!(connection.execute(
+                "UPDATE company_entities SET payload=?1,payload_digest=?2 WHERE tenant_id=?3 AND entity_kind=?4 AND entity_id=?5",
+                params![payload, payload_digest, tenant.0, KIND, unbound.review_key],
+            ).unwrap(), 1);
+        }
+        assert!(f.store.adaptive_leadership_review_calls(tenant, session_id).is_err());
+        {
+            let connection = f.store.connection.lock().unwrap();
+            assert!(!connection.is_autocommit());
+            connection.execute_batch(rollback).unwrap();
+        }
+        assert_eq!(rows(&f.store), before);
+        for _ in 0..2 {
+            assert_eq!(f.store.adaptive_leadership_review_calls(tenant, session_id).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
 fn company_projects_rejects_resealed_archived_receipt_after_warm_read_and_reopen() {
     let (f, project, archived) = company_discovery_fixture();
     assert_company_discovery_proofs(&f.store, &project);

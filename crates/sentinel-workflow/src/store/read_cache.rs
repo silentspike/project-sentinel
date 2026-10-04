@@ -12,7 +12,7 @@ use crate::WorkflowError;
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_INPUT_ROWS: usize = 16_384;
 const MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_RESULTS: usize = 8;
+const MAX_RESULTS: usize = 32;
 const MAX_KEY_BYTES: usize = 4096;
 const TABLES: &[&str] = &[
     "company_schema_meta",
@@ -200,6 +200,8 @@ impl Inputs {
 
 struct ResultProof {
     value: Box<dyn Any + Send>,
+    accounted_bytes: usize,
+    last_used: u64,
 }
 
 #[derive(Default)]
@@ -207,6 +209,7 @@ pub(super) struct ReadCache {
     inputs: Option<Inputs>,
     results: BTreeMap<(&'static str, TypeId, Vec<u8>), ResultProof>,
     result_bytes: usize,
+    use_counter: u64,
 }
 
 impl std::fmt::Debug for ReadCache {
@@ -224,6 +227,35 @@ impl ReadCache {
         self.inputs = None;
         self.results.clear();
         self.result_bytes = 0;
+        self.use_counter = 0;
+    }
+
+    fn next_use(&mut self) -> u64 {
+        if self.use_counter == u64::MAX {
+            // Only retention order changes on rollover, never proof validity.
+            for proof in self.results.values_mut() {
+                proof.last_used = 0;
+            }
+            self.use_counter = 0;
+        }
+        self.use_counter += 1;
+        self.use_counter
+    }
+
+    fn evict_for(&mut self, bytes: usize) {
+        while self.results.len() >= MAX_RESULTS
+            || self.result_bytes.saturating_add(bytes) > MAX_RESULT_BYTES
+        {
+            let oldest = self
+                .results
+                .iter()
+                .min_by_key(|(_, proof)| proof.last_used)
+                .map(|(key, _)| key.clone());
+            let Some(key) = oldest else { break };
+            if let Some(proof) = self.results.remove(&key) {
+                self.result_bytes -= proof.accounted_bytes;
+            }
+        }
     }
 
     /// Caller owns one fresh read snapshot and the store connection mutex.
@@ -281,8 +313,10 @@ impl ReadCache {
             if !self.integrity_ok(connection)? {
                 return Err(super::corrupt_store());
             }
-            if let Some(proof) = self.results.get(&key) {
+            let used = self.next_use();
+            if let Some(proof) = self.results.get_mut(&key) {
                 if let Some(value) = proof.value.downcast_ref::<T>() {
+                    proof.last_used = used;
                     return Ok(value.clone());
                 }
             }
@@ -314,14 +348,16 @@ impl ReadCache {
             let size = serialized_json_size(&value).ok().and_then(|bytes| {
                 bytes.checked_add(size_of::<T>() + size_of::<ResultProof>() + key.2.len())
             });
-            if let Some(bytes) =
-                size.filter(|bytes| self.result_bytes.saturating_add(*bytes) <= MAX_RESULT_BYTES)
-            {
-                if self.results.len() < MAX_RESULTS && !self.results.contains_key(&key) {
+            if let Some(bytes) = size.filter(|bytes| *bytes <= MAX_RESULT_BYTES) {
+                if !self.results.contains_key(&key) {
+                    self.evict_for(bytes);
+                    let last_used = self.next_use();
                     self.results.insert(
                         key,
                         ResultProof {
                             value: Box::new(value.clone()),
+                            accounted_bytes: bytes,
+                            last_used,
                         },
                     );
                     self.result_bytes += bytes;
@@ -710,6 +746,144 @@ mod tests {
             assert!(cache.results.len() <= MAX_RESULTS);
             assert!(cache.result_bytes <= MAX_RESULT_BYTES);
         }
+    }
+
+    #[test]
+    fn exact_read_cache_late_views_evict_least_recently_used_proofs() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut cache = ReadCache::default();
+        for index in 0..MAX_RESULTS {
+            cache
+                .read_keyed(&snapshot, true, "project", &index.to_le_bytes(), || {
+                    Ok(index)
+                })
+                .unwrap();
+        }
+        cache
+            .read_keyed::<usize>(&snapshot, true, "project", &0_usize.to_le_bytes(), || {
+                panic!("hot proof retained")
+            })
+            .unwrap();
+        cache
+            .read(&snapshot, true, "late-health", || Ok(42_usize))
+            .unwrap();
+        assert_eq!(cache.results.len(), MAX_RESULTS);
+        assert!(cache.results.contains_key(&(
+            "project",
+            TypeId::of::<usize>(),
+            0_usize.to_le_bytes().to_vec()
+        )));
+        assert!(!cache.results.contains_key(&(
+            "project",
+            TypeId::of::<usize>(),
+            1_usize.to_le_bytes().to_vec()
+        )));
+        assert_eq!(
+            cache
+                .read::<usize>(&snapshot, true, "late-health", || panic!(
+                    "late health is reusable"
+                ))
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            cache.result_bytes,
+            cache
+                .results
+                .values()
+                .map(|proof| proof.accounted_bytes)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn exact_read_cache_byte_pressure_evicts_but_oversize_preserves_proofs() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut cache = ReadCache::default();
+        cache
+            .read(&snapshot, true, "large-old", || {
+                Ok("a".repeat(MAX_RESULT_BYTES / 2))
+            })
+            .unwrap();
+        cache
+            .read(&snapshot, true, "hot-small", || Ok(7_u64))
+            .unwrap();
+        cache
+            .read(&snapshot, true, "large-new", || {
+                Ok("b".repeat(MAX_RESULT_BYTES / 2))
+            })
+            .unwrap();
+        assert_eq!(cache.results.len(), 2);
+        assert!(!cache
+            .results
+            .contains_key(&("large-old", TypeId::of::<String>(), Vec::new())));
+        assert_eq!(
+            cache
+                .read::<u64>(&snapshot, true, "hot-small", || panic!(
+                    "small proof survives byte eviction"
+                ))
+                .unwrap(),
+            7
+        );
+        let before = cache.result_bytes;
+        cache
+            .read(&snapshot, true, "oversize", || {
+                Ok("c".repeat(MAX_RESULT_BYTES))
+            })
+            .unwrap();
+        assert_eq!(cache.result_bytes, before);
+        assert_eq!(cache.results.len(), 2);
+        assert_eq!(
+            cache
+                .read::<String>(&snapshot, true, "large-new", || panic!(
+                    "oversize cannot flush useful proofs"
+                ))
+                .unwrap()
+                .len(),
+            MAX_RESULT_BYTES / 2
+        );
+        assert!(cache.result_bytes <= MAX_RESULT_BYTES);
+    }
+
+    #[test]
+    fn exact_read_cache_rollover_and_mutation_preserve_bounded_freshness() {
+        let mut connection = database(":memory:");
+        let mut cache = ReadCache::default();
+        {
+            let snapshot = connection.savepoint().unwrap();
+            cache.read(&snapshot, true, "a", || Ok(1_u64)).unwrap();
+            cache.read(&snapshot, true, "b", || Ok(2_u64)).unwrap();
+            cache.use_counter = u64::MAX;
+            assert_eq!(
+                cache
+                    .read::<u64>(&snapshot, true, "a", || panic!(
+                        "rollover retains exact proof"
+                    ))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(cache.use_counter, 1);
+            snapshot.commit().unwrap();
+        }
+        connection
+            .execute("UPDATE workflow_work_items SET value=X'6e6577'", [])
+            .unwrap();
+        let snapshot = connection.savepoint().unwrap();
+        assert_eq!(cache.read(&snapshot, true, "a", || Ok(3_u64)).unwrap(), 3);
+        assert_eq!(cache.results.len(), 1);
+        assert!(!cache
+            .results
+            .contains_key(&("b", TypeId::of::<u64>(), Vec::new())));
+        assert_eq!(
+            cache.result_bytes,
+            cache
+                .results
+                .values()
+                .map(|proof| proof.accounted_bytes)
+                .sum::<usize>()
+        );
     }
 
     #[test]

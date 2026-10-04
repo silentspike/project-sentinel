@@ -2004,8 +2004,18 @@ impl WorkflowStore {
         tenant: &TenantId,
         session_id: Uuid,
     ) -> Result<Vec<AdaptiveLeadershipReviewCallV1>, WorkflowError> {
-        let connection = self.connection.lock().map_err(|_| persistence())?;
-        calls_for_session(&connection, tenant, session_id)
+        tenant.validate()?;
+        if session_id.is_nil() {
+            return Err(invalid("invalid adaptive session identity"));
+        }
+        let query_key = serde_json::to_vec(&(tenant, session_id)).map_err(|_| persistence())?;
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        self.validated_read_snapshot(
+            &mut connection,
+            "leadership-review-history",
+            &query_key,
+            |snapshot| calls_for_session(snapshot, tenant, session_id),
+        )
     }
 
     /// Retire stale input or an expired undispatched schema2 subject without releasing authority.
