@@ -1,5 +1,12 @@
 # Changelog
 
+- Allow read-only funding drafts and atomic immutable receipt issuance to
+  coexist with ordinary reconciliation under the shared recovery fence.
+  Preserve exclusive recovery, transaction-local source checks, idempotency
+  and independent model adoption. Record content-free preparation phase timings
+  and reject stale unfunded review authorization after concurrent issuance.
+  Cover competing/concurrent requests and exclusive/poisoned recovery (#856).
+
 - Share one freshly validated project snapshot across adjacent no-effect
   entries in a bounded company reconciliation page. Re-read every real state
   transition through the existing current authority path, discard the shared
