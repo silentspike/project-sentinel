@@ -1,5 +1,11 @@
 # Changelog
 
+- Share bounded exact-content byte-digest proofs across workflow readers instead
+  of repeatedly hashing unchanged journal payloads. Match the full domain and
+  every byte before reuse; keep persisted digests, replay, time and authorization
+  checks unchanged. Bound retained payloads by size, count and shard, hash outside
+  locks, and recompute safely when a cache shard is unavailable (#856).
+
 - Stream canonical workflow digests through a fixed-size hash buffer instead of
   allocating complete serialized payload copies. Preserve existing JSON numeric
   array byte digests exactly with a decimal lookup; keep every hash domain,
