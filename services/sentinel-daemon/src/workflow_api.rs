@@ -2967,7 +2967,7 @@ fn validate_provider_usage_event(
 }
 
 fn reconciliation_warning_due(last: &AtomicU64, now_ms: u64) -> bool {
-    last.fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+    last.try_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
         if now_ms > previous && (previous == 0 || now_ms - previous >= 60_000) {
             Some(now_ms)
         } else {

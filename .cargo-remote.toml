@@ -1,0 +1,8 @@
+[cargo_remote]
+schema = 1
+project_id = "61ad3ece-e0a7-4bf3-a565-9a862f785059"
+profile = "linux-gnu-sentinel"
+toolchain = "1.99.0"
+targets = []
+resources = "large"
+image = "9ddf43347f111624a2c249068ec2464df4b2d603cea1c2f6fa612d2732e279c9"

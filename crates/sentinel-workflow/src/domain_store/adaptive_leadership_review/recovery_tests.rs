@@ -583,6 +583,150 @@ fn local_adoption_result(
 }
 
 #[test]
+fn funded_review_preserves_completed_recovery_and_local_adoption_history() {
+    for (unknown, local) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (mut f, epoch, dispatched, known, request, issued) = local_adoption_source(unknown);
+        let completed = if local {
+            let (_, adoption) = f.store.authorize_adaptive_leadership_local_adoption(
+                &recovery_operator(&request.tenant_id), &request, issued,
+            ).unwrap();
+            let result = local_adoption_result(&dispatched, &known, &adoption);
+            f.store.complete_adaptive_leadership_review_call(
+                &f.leader, &result, issued + 1,
+            ).unwrap()
+        } else {
+            f.store.complete_adaptive_leadership_review_call(
+                &f.leader, &known, known.continuation.as_ref().unwrap().issued_at_ms,
+            ).unwrap()
+        };
+        let continued = session(&f);
+        let observed_at = continued.continuation.as_ref().unwrap()
+            .authorizations.last().unwrap().issued_at_ms + 1;
+        observe_budget_inspection(&f, continued, observed_at);
+        let now = session(&f).active_deadline_ms() + 1;
+        budget_context(&mut f, now, "fund-after-completed-recovery");
+        let source = session(&f);
+        let history = f.store.adaptive_leadership_review_calls(
+            &f.leader.tenant_id, f.grant.session_id,
+        ).unwrap();
+        let funding = super::work_funding_tests::fund(&f, now);
+        super::work_funding_tests::bind(
+            &mut f, &funding, funding.request.source.resume_source.base_review_count + 1,
+        );
+        let call = super::work_funding_tests::dispatch(&f, now);
+        let result = super::work_funding_tests::continued(&call, now + 2, 1);
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).unwrap();
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert_eq!(reopened.adaptive_leadership_recovery_epoch(
+            &request.tenant_id, request.session_id,
+        ).unwrap(), Some(epoch));
+        assert_eq!(reopened.adaptive_leadership_review_call(
+            &f.leader.tenant_id, completed.grant.review_id,
+        ).unwrap(), Some(completed));
+        let calls = reopened.adaptive_leadership_review_calls(
+            &f.leader.tenant_id, f.grant.session_id,
+        ).unwrap();
+        assert_eq!(calls.len(), history.len() + 1);
+        assert!(history.iter().all(|prior| calls.contains(prior)));
+        let adopted = session(&f);
+        assert_eq!(adopted.grant, source.grant);
+        assert_eq!((adopted.model_calls, adopted.tool_calls),
+            (source.model_calls, source.tool_calls));
+        assert_eq!(adopted.active_work_funding(), call.grant.work_funding.as_deref());
+        assert_eq!(adopted.continuation.as_ref().unwrap().authorizations.len(), 2);
+    }
+}
+
+#[test]
+fn funding_rejects_missing_or_corrupt_completed_local_adoption_proof_without_writes() {
+    for corruption in ["missing_entity", "missing_event", "corrupt_event"] {
+        let (mut f, _, dispatched, known, request, issued) = local_adoption_source(false);
+        let (_, adoption) = f.store.authorize_adaptive_leadership_local_adoption(
+            &recovery_operator(&request.tenant_id), &request, issued,
+        ).unwrap();
+        let result = local_adoption_result(&dispatched, &known, &adoption);
+        f.store.complete_adaptive_leadership_review_call(
+            &f.leader, &result, issued + 1,
+        ).unwrap();
+        let continued = session(&f);
+        let observed_at = continued.continuation.as_ref().unwrap()
+            .authorizations.last().unwrap().issued_at_ms + 1;
+        observe_budget_inspection(&f, continued, observed_at);
+        let now = session(&f).active_deadline_ms() + 1;
+        budget_context(&mut f, now, "fund-after-damaged-local-adoption");
+        let operator = recovery_operator(&request.tenant_id);
+        let draft = f.store.adaptive_work_funding_draft(
+            &operator, &f.grant.project_id, f.grant.session_id, Uuid::new_v4(),
+            "require-completed-local-adoption-proof", crate::AdaptiveWorkFundingLimitsV1 {
+                additional_model_calls: 6,
+                additional_tool_calls: 6,
+                additional_reviews: 3,
+                additional_windows: 3,
+                max_window_ms: 180_000,
+                max_call_duration_ms: f.context.source_session.grant.max_call_duration_ms,
+                dispatch_margin_ms: crate::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+                expires_at_unix_ms: now + 3_600_000,
+            }, now,
+        ).unwrap();
+        {
+            let connection = f.store.connection.lock().unwrap();
+            let changed = match corruption {
+                "missing_entity" => connection.execute(
+                    "DELETE FROM company_entities WHERE tenant_id=?1
+                     AND entity_kind='adaptive_leadership_local_adoption' AND entity_id=?2",
+                    params![request.tenant_id.0, adoption.adoption_key],
+                ),
+                "missing_event" => connection.execute(
+                    "DELETE FROM company_events WHERE tenant_id=?1
+                     AND event_type='adaptive_leadership_local_adoption_authorized' AND operation_id=?2",
+                    params![request.tenant_id.0, request.operation_id.to_string()],
+                ),
+                "corrupt_event" => connection.execute(
+                    "UPDATE company_events SET payload=X'00' WHERE tenant_id=?1
+                     AND event_type='adaptive_leadership_local_adoption_authorized' AND operation_id=?2",
+                    params![request.tenant_id.0, request.operation_id.to_string()],
+                ),
+                _ => unreachable!(),
+            }.unwrap();
+            assert_eq!(changed, 1);
+        }
+        let before = rows(&f.store);
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert!(reopened.adaptive_leadership_review_call(
+            &request.tenant_id, request.review_id,
+        ).is_err());
+        assert!(reopened.authorize_adaptive_work_funding(&operator, &draft, now).is_err());
+        assert_eq!(rows(&reopened), before);
+    }
+}
+
+#[test]
+fn funding_rejects_unresolved_recovery_even_after_review_expiry_without_writes() {
+    for unknown in [false, true] {
+        let (f, _, pending, _, request, issued) = local_adoption_source(unknown);
+        assert!(issued > pending.grant.expires_at_unix_ms);
+        assert!(pending.decision.is_none() && pending.retired_at_unix_ms.is_none());
+        let before = rows(&f.store);
+        let limits = crate::AdaptiveWorkFundingLimitsV1 {
+            additional_model_calls: 6,
+            additional_tool_calls: 6,
+            additional_reviews: 3,
+            additional_windows: 3,
+            max_window_ms: 180_000,
+            max_call_duration_ms: f.context.source_session.grant.max_call_duration_ms,
+            dispatch_margin_ms: crate::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+            expires_at_unix_ms: issued + 3_600_000,
+        };
+        assert!(f.store.adaptive_work_funding_draft(
+            &recovery_operator(&request.tenant_id), &f.grant.project_id,
+            f.grant.session_id, Uuid::new_v4(), "no-unresolved-recovery-bypass",
+            limits, issued,
+        ).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+}
+
+#[test]
 fn local_adoption_persisted_continue_completes_both_subjects_and_replays_after_reopen() {
     for unknown in [true, false] {
         let (f, epoch, call, known, request, issued) = local_adoption_source(unknown);
