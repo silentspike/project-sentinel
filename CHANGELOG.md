@@ -1,5 +1,14 @@
 # Changelog
 
+- Reuse completed project, discovery and adaptive-health replay proofs only
+  after re-reading the complete typed SQLite table/schema input set in one
+  pinned snapshot and checking index consistency. Bound the shared input/result
+  retention; bypass unsupported schemas, outer transactions and overflow, and
+  invalidate all views after any changed input or validation failure. Current
+  authority, clock, dispatch and external provider outcomes remain fresh checks.
+  Publish reconciliation success and error together; poisoned fences/status
+  degrade explicitly instead of retaining stale readiness (#856).
+
 - Share bounded exact-content byte-digest proofs across workflow readers instead
   of repeatedly hashing unchanged journal payloads. Match the full domain and
   every byte before reuse; keep persisted digests, replay, time and authorization
