@@ -49,6 +49,7 @@ fn funded() -> AdaptiveLeadershipReviewCallV1 {
                 current_model_call_ceiling: session.grant.max_model_calls,
                 current_tool_call_ceiling: session.grant.max_tool_calls,
                 predecessor_receipt_digest: None,
+                supersedes_unused_receipt_digest: None,
             },
             limits: crate::AdaptiveWorkFundingLimitsV1 {
                 additional_model_calls: 8, additional_tool_calls: 8,

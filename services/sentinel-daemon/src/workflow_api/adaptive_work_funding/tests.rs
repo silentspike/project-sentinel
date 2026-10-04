@@ -43,11 +43,63 @@ fn request(api: &WorkflowApi, source: &AdaptiveSessionV1) -> AdaptiveWorkFunding
 fn query(request: &AdaptiveWorkFundingRequestV1) -> String {
     let source = &request.source.resume_source;
     let limits = &request.limits;
-    format!("{ADAPTIVE_WORK_FUNDING_PATH}?project_id={}&session_id={}&operation_id={}&reason_ref={}&additional_model_calls={}&additional_tool_calls={}&additional_reviews={}&additional_windows={}&max_window_ms={}&max_call_duration_ms={}&dispatch_margin_ms={}&expires_at_unix_ms={}",
+    let mut path = format!("{ADAPTIVE_WORK_FUNDING_PATH}?project_id={}&session_id={}&operation_id={}&reason_ref={}&additional_model_calls={}&additional_tool_calls={}&additional_reviews={}&additional_windows={}&max_window_ms={}&max_call_duration_ms={}&dispatch_margin_ms={}&expires_at_unix_ms={}",
         source.project_id, source.session_id, request.operation_id, request.reason_ref,
         limits.additional_model_calls, limits.additional_tool_calls, limits.additional_reviews,
         limits.additional_windows, limits.max_window_ms, limits.max_call_duration_ms,
-        limits.dispatch_margin_ms, limits.expires_at_unix_ms)
+        limits.dispatch_margin_ms, limits.expires_at_unix_ms);
+    if let Some(digest) = &request.source.supersedes_unused_receipt_digest {
+        path.push_str(&format!("&supersedes_unused_receipt_digest={digest}"));
+    }
+    path
+}
+
+fn expired_unused_receipt(
+    api: &WorkflowApi,
+    source: &AdaptiveSessionV1,
+) -> AdaptiveWorkFundingReceiptV1 {
+    let operator = api.principals.principal("operator").unwrap();
+    let issued_at = now_unix_ms() - 240_000;
+    let mut old_limits = limits();
+    old_limits.expires_at_unix_ms = issued_at + 180_000;
+    let request = api
+        .store
+        .adaptive_work_funding_draft(
+            &operator.principal,
+            &source.grant.authority.project_id,
+            source.grant.session_id,
+            Uuid::new_v4(),
+            "explicit-expired-unused-work",
+            old_limits,
+            issued_at,
+        )
+        .unwrap();
+    let (replayed, receipt) = api
+        .store
+        .authorize_adaptive_work_funding(&operator.principal, &request, issued_at)
+        .unwrap();
+    assert!(!replayed);
+    assert!(receipt.request.limits.expires_at_unix_ms < now_unix_ms());
+    receipt
+}
+
+fn superseding_request(
+    api: &WorkflowApi,
+    source: &AdaptiveSessionV1,
+    receipt: &AdaptiveWorkFundingReceiptV1,
+) -> AdaptiveWorkFundingRequestV1 {
+    api.store
+        .adaptive_work_funding_draft_with_supersession(
+            &api.principals.principal("operator").unwrap().principal,
+            &source.grant.authority.project_id,
+            source.grant.session_id,
+            Uuid::new_v4(),
+            "explicit-unused-work-replacement",
+            limits(),
+            now_unix_ms(),
+            Some(&receipt.receipt_digest().unwrap()),
+        )
+        .unwrap()
 }
 
 fn post<T: Serialize>(api: &WorkflowApi, value: &T) -> WorkflowHttpResponse {
@@ -67,6 +119,12 @@ fn assert_ok(response: &WorkflowHttpResponse) -> serde_json::Value {
         String::from_utf8_lossy(&response.body)
     );
     serde_json::from_slice(&response.body).unwrap()
+}
+
+fn assert_rejected(response: &WorkflowHttpResponse) {
+    assert_ne!(response.status, 200);
+    let error: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(error["retryable"], false);
 }
 
 fn project(api: &WorkflowApi, source: &AdaptiveSessionV1) -> sentinel_workflow::ProjectV1 {
@@ -123,6 +181,9 @@ fn draft_authorize_read_are_redacted_explicit_and_do_not_dispatch_or_adopt() {
     let operator = api.principals.principal("operator").unwrap();
     let draft = assert_ok(&api.adaptive_work_funding_http(&operator, "GET", &query(&request), &[]));
     assert!(draft["request"].get("source").is_none());
+    assert!(draft["request"]
+        .get("supersedes_unused_receipt_digest")
+        .is_none());
     assert_eq!(draft["requires_explicit_submission"], true);
     assert_eq!(
         discovery_state(
@@ -132,6 +193,7 @@ fn draft_authorize_read_are_redacted_explicit_and_do_not_dispatch_or_adopt() {
         before
     );
     let issued = assert_ok(&post(&api, &draft["request"]));
+    assert!(issued.get("supersedes_unused_receipt_digest").is_none());
     assert_eq!(issued["replayed"], false);
     assert_eq!(issued["model_decision_recorded"], false);
     assert_eq!(issued["developer_window_created"], false);
@@ -173,6 +235,330 @@ fn draft_authorize_read_are_redacted_explicit_and_do_not_dispatch_or_adopt() {
             &temp.path().join("events.sqlite")
         ),
         sealed
+    );
+}
+
+#[test]
+fn submission_serde_roundtrips_optional_supersession_and_preserves_old_wire() {
+    let (_temp, api, source) = fixture();
+    let mut request = request(&api, &source);
+    let old_typed = serde_json::to_value(&request).unwrap();
+    let old_public = serde_json::to_value(submission(&request).unwrap()).unwrap();
+    assert!(old_typed["source"]
+        .get("supersedes_unused_receipt_digest")
+        .is_none());
+    assert!(old_public.get("supersedes_unused_receipt_digest").is_none());
+    for explicit_null in [false, true] {
+        let mut wire = old_public.clone();
+        if explicit_null {
+            wire["supersedes_unused_receipt_digest"] = serde_json::Value::Null;
+        }
+        let parsed: FundingSubmission = serde_json::from_value(wire.clone()).unwrap();
+        assert!(parsed.supersedes_unused_receipt_digest.is_none());
+        assert_eq!(serde_json::to_value(parsed).unwrap(), old_public);
+        assert!(matches!(
+            serde_json::from_value::<FundingInput>(wire).unwrap(),
+            FundingInput::Draft(_)
+        ));
+        let mut wire = old_typed.clone();
+        if explicit_null {
+            wire["source"]["supersedes_unused_receipt_digest"] = serde_json::Value::Null;
+        }
+        let parsed: AdaptiveWorkFundingRequestV1 = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(parsed, request);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), old_typed);
+        assert!(matches!(
+            serde_json::from_value::<FundingInput>(wire).unwrap(),
+            FundingInput::Request(_)
+        ));
+    }
+    request.source.supersedes_unused_receipt_digest = Some("a".repeat(64));
+    let public = serde_json::to_value(submission(&request).unwrap()).unwrap();
+    let parsed: FundingSubmission = serde_json::from_value(public.clone()).unwrap();
+    assert_eq!(
+        parsed.supersedes_unused_receipt_digest,
+        Some("a".repeat(64))
+    );
+    assert_eq!(serde_json::to_value(parsed).unwrap(), public);
+    assert!(public.get("source").is_none());
+    assert!(public.get("predecessor_receipt_digest").is_none());
+    let FundingInput::Request(parsed) =
+        serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap()
+    else {
+        panic!("typed request decoded as public draft");
+    };
+    assert_eq!(*parsed, request);
+    assert!(request.source.predecessor_receipt_digest.is_none());
+    assert_ne!(public["source_digest"], old_public["source_digest"]);
+}
+
+#[test]
+fn explicit_unused_supersession_roundtrips_get_and_both_post_paths_without_adoption() {
+    for typed in [false, true] {
+        let (temp, api, source) = fixture();
+        let old = expired_unused_receipt(&api, &source);
+        let request = superseding_request(&api, &source, &old);
+        let digest = old.receipt_digest().unwrap();
+        let operator = api.principals.principal("operator").unwrap();
+        let before = discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        );
+        let draft =
+            assert_ok(&api.adaptive_work_funding_http(&operator, "GET", &query(&request), &[]));
+        assert_eq!(draft["requires_explicit_submission"], true);
+        assert_eq!(draft["request"]["supersedes_unused_receipt_digest"], digest);
+        assert_eq!(
+            draft["request"]["source_digest"],
+            request.canonical_digest().unwrap()
+        );
+        assert!(draft["request"].get("source").is_none());
+        assert_eq!(
+            discovery_state(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite")
+            ),
+            before
+        );
+        let issued = assert_ok(&if typed {
+            post(&api, &request)
+        } else {
+            post(&api, &draft["request"])
+        });
+        assert_eq!(issued["replayed"], false);
+        assert_eq!(issued["supersedes_unused_receipt_digest"], digest);
+        assert_eq!(issued["model_decision_recorded"], false);
+        assert_eq!(issued["developer_window_created"], false);
+        for key in [
+            "source",
+            "request",
+            "issuer_principal",
+            "predecessor_receipt_digest",
+        ] {
+            assert!(issued.get(key).is_none(), "{key}");
+        }
+        let stored = api
+            .store
+            .adaptive_work_funding(
+                &source.grant.authority.tenant_id,
+                source.grant.session_id,
+                request.operation_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.request, request);
+        assert!(stored.request.source.predecessor_receipt_digest.is_none());
+        assert_eq!(stored.request.source.current_model_call_ceiling, 4);
+        assert_eq!(stored.request.source.current_tool_call_ceiling, 4);
+        assert_eq!(stored.request.resulting_model_call_ceiling().unwrap(), 8);
+        assert_eq!(stored.request.resulting_tool_call_ceiling().unwrap(), 8);
+        assert_eq!(
+            api.store
+                .adaptive_session_for_authority(&source.grant.authority)
+                .unwrap(),
+            Some(source.clone())
+        );
+        assert!(api
+            .store
+            .adaptive_leadership_review_calls(
+                &source.grant.authority.tenant_id,
+                source.grant.session_id
+            )
+            .unwrap()
+            .is_empty());
+        let sealed = discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        );
+        let replay = assert_ok(&post(&api, &request));
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(assert_ok(&post(&api, &draft["request"])), replay);
+        assert_eq!(
+            assert_ok(&api.adaptive_work_funding_http(&operator, "GET", &query(&request), &[])),
+            replay
+        );
+        let old_replay = assert_ok(&post(&api, &old.request));
+        assert_eq!(old_replay["receipt_digest"], digest);
+        assert_eq!(old_replay["issued_at_unix_ms"], old.issued_at_unix_ms);
+        assert_eq!(
+            old_replay["limits"],
+            serde_json::to_value(&old.request.limits).unwrap()
+        );
+        assert!(old_replay.get("supersedes_unused_receipt_digest").is_none());
+        assert_eq!(
+            assert_ok(&post(&api, &submission(&old.request).unwrap())),
+            old_replay
+        );
+        assert_eq!(
+            assert_ok(&api.adaptive_work_funding_http(&operator, "GET", &query(&old.request), &[])),
+            old_replay
+        );
+        assert_eq!(
+            api.store
+                .adaptive_work_funding(
+                    &source.grant.authority.tenant_id,
+                    source.grant.session_id,
+                    old.request.operation_id,
+                )
+                .unwrap(),
+            Some(old)
+        );
+        assert_eq!(
+            discovery_state(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite")
+            ),
+            sealed
+        );
+    }
+}
+
+#[test]
+fn malformed_or_tampered_supersession_digests_are_nonretryable_and_read_only() {
+    let (temp, api, source) = fixture();
+    let old = expired_unused_receipt(&api, &source);
+    let request = superseding_request(&api, &source, &old);
+    let operator = api.principals.principal("operator").unwrap();
+    let before = discovery_state(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    for digest in [
+        String::new(),
+        "invalid".into(),
+        "f".repeat(63),
+        "g".repeat(64),
+        "f".repeat(64),
+    ] {
+        let mut changed = request.clone();
+        changed.source.supersedes_unused_receipt_digest = Some(digest.clone());
+        assert_rejected(&post(&api, &changed));
+        assert_rejected(&api.adaptive_work_funding_http(&operator, "GET", &query(&changed), &[]));
+        let mut public = serde_json::to_value(submission(&request).unwrap()).unwrap();
+        public["supersedes_unused_receipt_digest"] = serde_json::json!(digest);
+        assert_rejected(&post(&api, &public));
+    }
+    for invalid in [
+        serde_json::json!(17),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ] {
+        let mut public = serde_json::to_value(submission(&request).unwrap()).unwrap();
+        public["supersedes_unused_receipt_digest"] = invalid.clone();
+        assert_rejected(&post(&api, &public));
+        let mut typed = serde_json::to_value(&request).unwrap();
+        typed["source"]["supersedes_unused_receipt_digest"] = invalid;
+        assert_rejected(&post(&api, &typed));
+    }
+    for suffix in [
+        "&supersedes_unused_receipt_digest",
+        "&supersedes_unused_receipt_digest=",
+        "&supersedes_unused_receipt_digest=invalid",
+    ] {
+        assert_rejected(&api.adaptive_work_funding_http(
+            &operator,
+            "GET",
+            &format!("{}{suffix}", query(&request)),
+            &[],
+        ));
+    }
+    let mut tampered = request.clone();
+    tampered.source.resume_source.head_entry_digest = "f".repeat(64);
+    assert_rejected(&post(&api, &tampered));
+    let mut public = serde_json::to_value(submission(&request).unwrap()).unwrap();
+    public["source_digest"] = serde_json::json!("f".repeat(64));
+    assert_rejected(&post(&api, &public));
+    assert_eq!(
+        discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite")
+        ),
+        before
+    );
+}
+
+#[test]
+fn changed_supersession_under_same_operation_cannot_replay_or_renew() {
+    let (temp, api, source) = fixture();
+    let old = expired_unused_receipt(&api, &source);
+    let request = superseding_request(&api, &source, &old);
+    assert_ok(&post(&api, &request));
+    let operator = api.principals.principal("operator").unwrap();
+    let before = discovery_state(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    for original in [&old.request, &request] {
+        let mut changed = original.clone();
+        changed.source.supersedes_unused_receipt_digest = Some("f".repeat(64));
+        assert_rejected(&post(&api, &changed));
+        assert_rejected(&api.adaptive_work_funding_http(&operator, "GET", &query(&changed), &[]));
+        let mut public = serde_json::to_value(submission(original).unwrap()).unwrap();
+        public["supersedes_unused_receipt_digest"] = serde_json::json!("f".repeat(64));
+        assert_rejected(&post(&api, &public));
+        assert_rejected(&post(&api, &submission(&changed).unwrap()));
+    }
+    let mut omitted = request.clone();
+    omitted.source.supersedes_unused_receipt_digest = None;
+    assert_rejected(&post(&api, &omitted));
+    assert_rejected(&api.adaptive_work_funding_http(&operator, "GET", &query(&omitted), &[]));
+    let mut public = serde_json::to_value(submission(&request).unwrap()).unwrap();
+    public
+        .as_object_mut()
+        .unwrap()
+        .remove("supersedes_unused_receipt_digest");
+    assert_rejected(&post(&api, &public));
+    public["supersedes_unused_receipt_digest"] = serde_json::Value::Null;
+    assert_rejected(&post(&api, &public));
+    assert_eq!(
+        discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite")
+        ),
+        before
+    );
+}
+
+#[test]
+fn expired_unused_receipt_requires_explicit_new_operation_without_silent_retry() {
+    let (temp, api, source) = fixture();
+    let old = expired_unused_receipt(&api, &source);
+    let operator = api.principals.principal("operator").unwrap();
+    let before = discovery_state(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    for _ in 0..3 {
+        let replay = assert_ok(&post(&api, &old.request));
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["issued_at_unix_ms"], old.issued_at_unix_ms);
+        assert_eq!(
+            replay["limits"],
+            serde_json::to_value(&old.request.limits).unwrap()
+        );
+        assert_eq!(
+            assert_ok(&api.adaptive_work_funding_http(&operator, "GET", &query(&old.request), &[])),
+            replay
+        );
+        let mut implicit = old.request.clone();
+        implicit.operation_id = Uuid::new_v4();
+        implicit.limits = limits();
+        assert_rejected(&post(&api, &implicit));
+        assert_rejected(&post(&api, &submission(&implicit).unwrap()));
+        assert_rejected(&api.adaptive_work_funding_http(&operator, "GET", &query(&implicit), &[]));
+        let mut reused = old.request.clone();
+        reused.limits = limits();
+        reused.source.supersedes_unused_receipt_digest = Some(old.receipt_digest().unwrap());
+        assert_rejected(&post(&api, &reused));
+        assert_rejected(&post(&api, &submission(&reused).unwrap()));
+        assert_rejected(&api.adaptive_work_funding_http(&operator, "GET", &query(&reused), &[]));
+    }
+    assert_eq!(
+        discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite")
+        ),
+        before
     );
 }
 

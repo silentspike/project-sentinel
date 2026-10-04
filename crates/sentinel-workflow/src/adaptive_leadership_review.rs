@@ -1042,12 +1042,6 @@ impl AdaptiveLeadershipReviewContextV1 {
                     (value.starts_with("adaptive-work-funding:") && value != &reference)
                         || value.starts_with("adaptive-resume-policy:")
                 })
-                || session.continuation.as_ref().is_some_and(|state| {
-                    state
-                        .authorizations
-                        .iter()
-                        .any(|authorization| authorization.local_adoption.is_some())
-                })
                 || (initial
                     && (session.model_calls != anchor.base_model_calls
                         || session.tool_calls != anchor.base_tool_calls

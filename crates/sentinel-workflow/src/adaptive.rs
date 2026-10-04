@@ -1343,7 +1343,6 @@ impl AdaptiveSessionV1 {
             || anchor.assignee_authority != self.grant.authority
             || source.original_model_call_ceiling != self.grant.max_model_calls
             || source.original_tool_call_ceiling != self.grant.max_tool_calls
-            || history.iter().any(|prior| prior.local_adoption.is_some())
             || epoch.binding.ordinal <= prior_ordinal
             || usize::from(epoch.binding.ordinal) <= history.len()
         {
@@ -1555,6 +1554,7 @@ pub(crate) mod work_funding_tests {
                 predecessor_receipt_digest: session
                     .active_work_funding()
                     .map(|prior| prior.binding.receipt_digest.clone()),
+                supersedes_unused_receipt_digest: None,
             },
             limits: AdaptiveWorkFundingLimitsV1 {
                 additional_model_calls: 2_u16

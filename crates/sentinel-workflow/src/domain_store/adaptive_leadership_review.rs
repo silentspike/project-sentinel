@@ -1403,6 +1403,15 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
     }
 
     fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
+        if let Some(adoption) = self
+            .continuation
+            .as_ref()
+            .and_then(|authorization| authorization.local_adoption.as_deref())
+        {
+            super::adaptive_leadership_local_adoption::require_local_adoption(
+                connection, self, adoption,
+            )?;
+        }
         if self.grant.work_funding.is_some() {
             require_funding_review_membership(
                 connection,
@@ -1758,21 +1767,10 @@ impl WorkflowStore {
             epoch.validate()?;
             let binding = &epoch.binding;
             let source = &context.source_session;
-            let extension_exists: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM company_entities WHERE tenant_id=?1 AND entity_kind='adaptive_budget_review_extension' AND json_extract(payload,'$.request.session_id')=?2)",
-                params![leader.tenant_id.0, grant.session_id.to_string()], |row| row.get(0),
-            )?;
-            if extension_exists
-                || existing.iter().any(|call| {
-                    call.grant.recovery_epoch.is_some()
-                        || call
-                            .continuation
-                            .as_ref()
-                            .is_some_and(|authorization| authorization.local_adoption.is_some())
-                })
-            {
-                return Err(unauthorized());
-            }
+            // Completed recovery and extension history remains part of the
+            // exact funding source; it is not authority for this new review.
+            // Pending reviews are excluded above, and require_budget_source
+            // validates the receipt, journal head and continuation lineage.
             if now_ms >= binding.limits.expires_at_unix_ms
                 || existing.len() != usize::from(binding.ordinal) - 1
                 || existing.len() >= usize::from(binding.limits.total_review_ceiling)
@@ -2756,6 +2754,60 @@ mod tests {
                 reason_ref: "operator-reviewed-evidence".into(),
                 expires_at_unix_ms: now + 3_600_000,
             }
+        }
+
+        #[test]
+        fn funded_review_preserves_expired_budget_extension_history() {
+            let (mut f, now) = limit_fixture();
+            let request = draft(&f, now, 1, 120_000);
+            let (_, extension) = f
+                .store
+                .authorize_budget_review_extension(&operator(&f), &request, now)
+                .unwrap();
+            let now = request.expires_at_unix_ms + 1;
+            budget_context(&mut f, now, "fund-after-expired-extension");
+            let history = f
+                .store
+                .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+                .unwrap();
+            let source = session(&f);
+            let funding = super::work_funding_tests::fund(&f, now);
+            super::work_funding_tests::bind(
+                &mut f,
+                &funding,
+                funding.request.source.resume_source.base_review_count + 1,
+            );
+            let call = super::work_funding_tests::dispatch(&f, now);
+            let result = super::work_funding_tests::continued(&call, now + 2, 1);
+            f.store
+                .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+                .unwrap();
+            let reopened = WorkflowStore::open(&f.path).unwrap();
+            assert!(
+                reopened
+                    .budget_review_extension(
+                        &f.leader.tenant_id,
+                        f.grant.session_id,
+                        source.version,
+                    )
+                    .unwrap()
+                    == Some(extension)
+            );
+            let calls = reopened
+                .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+                .unwrap();
+            assert_eq!(calls.len(), history.len() + 1);
+            assert!(history.iter().all(|prior| calls.contains(prior)));
+            let adopted = session(&f);
+            assert_eq!(adopted.grant, source.grant);
+            assert_eq!(
+                (adopted.model_calls, adopted.tool_calls),
+                (source.model_calls, source.tool_calls)
+            );
+            assert_eq!(
+                adopted.active_work_funding(),
+                call.grant.work_funding.as_deref()
+            );
         }
 
         #[test]

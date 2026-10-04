@@ -64,6 +64,7 @@ fn request() -> AdaptiveWorkFundingRequestV1 {
             current_model_call_ceiling: 10,
             current_tool_call_ceiling: 8,
             predecessor_receipt_digest: None,
+            supersedes_unused_receipt_digest: None,
         },
         limits: AdaptiveWorkFundingLimitsV1 {
             additional_model_calls: 2,

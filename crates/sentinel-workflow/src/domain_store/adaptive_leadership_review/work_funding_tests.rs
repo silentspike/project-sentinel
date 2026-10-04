@@ -3,7 +3,7 @@ use crate::{AdaptiveWorkFundingEpochV1, AdaptiveWorkFundingLimitsV1, AdaptiveWor
 
 const WINDOW_MS: u64 = 180_000;
 
-fn fund(f: &Fixture, now: u64) -> AdaptiveWorkFundingReceiptV1 {
+pub(super) fn fund(f: &Fixture, now: u64) -> AdaptiveWorkFundingReceiptV1 {
     fund_with_windows(f, now, 3)
 }
 
@@ -27,7 +27,7 @@ fn fund_with_windows(f: &Fixture, now: u64, additional_windows: u16) -> Adaptive
     f.store.authorize_adaptive_work_funding(&operator, &request, now).unwrap().1
 }
 
-fn bind(f: &mut Fixture, receipt: &AdaptiveWorkFundingReceiptV1, ordinal: u16) {
+pub(super) fn bind(f: &mut Fixture, receipt: &AdaptiveWorkFundingReceiptV1, ordinal: u16) {
     let epoch = AdaptiveWorkFundingEpochV1 {
         receipt: receipt.clone(), binding: receipt.binding(ordinal).unwrap(),
     };
@@ -45,7 +45,7 @@ fn issue(f: &Fixture, now: u64) -> Result<AdaptiveLeadershipReviewCallV1, Workfl
     )
 }
 
-fn dispatch(f: &Fixture, now: u64) -> AdaptiveLeadershipReviewCallV1 {
+pub(super) fn dispatch(f: &Fixture, now: u64) -> AdaptiveLeadershipReviewCallV1 {
     let call = issue(f, now).unwrap();
     f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1).unwrap()
 }
@@ -62,7 +62,7 @@ fn defer(call: &AdaptiveLeadershipReviewCallV1) -> CompleteAdaptiveLeadershipRev
     result
 }
 
-fn continued(call: &AdaptiveLeadershipReviewCallV1, now: u64, calls: u16)
+pub(super) fn continued(call: &AdaptiveLeadershipReviewCallV1, now: u64, calls: u16)
     -> CompleteAdaptiveLeadershipReviewCallV1
 {
     let mut result = completion(call, false);
@@ -108,6 +108,238 @@ fn funded_fixture() -> (Fixture, AdaptiveWorkFundingReceiptV1, u64) {
     let receipt = fund(&f, now);
     bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 1);
     (f, receipt, now)
+}
+
+fn funding_operator(f: &Fixture) -> AuthenticatedCompanyPrincipalV1 {
+    let mut operator = f.leader.clone();
+    operator.kind = CompanyPrincipalKindV1::Operator;
+    operator.agent_id = None;
+    operator
+}
+
+fn supersession_draft(
+    f: &Fixture,
+    receipt: &AdaptiveWorkFundingReceiptV1,
+    operation: Uuid,
+    now: u64,
+) -> Result<crate::AdaptiveWorkFundingRequestV1, WorkflowError> {
+    let mut limits = receipt.request.limits.clone();
+    limits.expires_at_unix_ms = now + 3_600_000;
+    f.store.adaptive_work_funding_draft_with_supersession(
+        &funding_operator(f), &f.grant.project_id, f.grant.session_id, operation,
+        "replace-expired-unused-proposal", limits, now, Some(&receipt.receipt_digest()?),
+    )
+}
+
+#[test]
+fn expired_unused_funding_replacement_is_explicit_atomic_and_preserves_replay_and_spend() {
+    let (mut f, old, _) = funded_fixture();
+    let now = old.request.limits.expires_at_unix_ms;
+    let original = session(&f);
+    let operator = funding_operator(&f);
+    assert_eq!(f.store.adaptive_work_funding_for_review(
+        &operator.tenant_id, f.grant.session_id, now,
+    ).unwrap(), None);
+    let mut limits = old.request.limits.clone();
+    limits.expires_at_unix_ms = now + 3_600_000;
+    assert!(f.store.adaptive_work_funding_draft(
+        &operator, &f.grant.project_id, f.grant.session_id, Uuid::new_v4(),
+        "no-implicit-replacement", limits, now,
+    ).is_err());
+    let replacement = supersession_draft(&f, &old, Uuid::new_v4(), now).unwrap();
+    assert_eq!(replacement.source.current_model_call_ceiling, original.grant.max_model_calls);
+    assert!(replacement.source.predecessor_receipt_digest.is_none());
+    assert_eq!(replacement.source.supersedes_unused_receipt_digest.as_deref(),
+        Some(old.receipt_digest().unwrap().as_str()));
+    let before = rows(&f.store);
+    let (_, fresh) = f.store.authorize_adaptive_work_funding(&operator, &replacement, now).unwrap();
+    assert_eq!(session(&f), original);
+    assert_eq!(fresh.resulting_model_call_ceiling().unwrap(), old.resulting_model_call_ceiling().unwrap());
+    assert_eq!(fresh.resulting_tool_call_ceiling().unwrap(), old.resulting_tool_call_ceiling().unwrap());
+    let after = rows(&f.store);
+    assert_ne!(after, before);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert!(reopened.authorize_adaptive_work_funding(&operator, &old.request, now + 1).unwrap().1 == old);
+    assert!(reopened.authorize_adaptive_work_funding(&operator, &replacement, now + 1).unwrap().1 == fresh);
+    assert_eq!(rows(&reopened), after);
+    assert_eq!(reopened.adaptive_work_funding_for_review(
+        &operator.tenant_id, f.grant.session_id, now,
+    ).unwrap().unwrap().receipt, fresh);
+    assert!(supersession_draft(&f, &old, Uuid::new_v4(), now + 1).is_err());
+    // A caller cannot backdate a manual old-epoch review after replacement.
+    let old_time = old.issued_at_unix_ms + 1;
+    assert!(issue(&f, old_time).is_err());
+    assert_eq!(rows(&f.store), after);
+    budget_context(&mut f, now, "new-explicit-proposal");
+    bind(&mut f, &fresh, fresh.request.source.resume_source.base_review_count + 1);
+    let call = dispatch(&f, now);
+    f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &continued(&call, now + 2, 1), now + 2,
+    ).unwrap();
+    assert_eq!(session(&f).grant, original.grant);
+    assert_eq!((session(&f).model_calls, session(&f).tool_calls),
+        (original.model_calls, original.tool_calls));
+    assert!(f.store.adaptive_work_funding(&operator.tenant_id,
+        f.grant.session_id, old.request.operation_id).unwrap().unwrap() == old);
+}
+
+#[test]
+fn unused_funding_supersession_rejects_unexpired_wrong_digest_and_changed_source_without_writes() {
+    let (f, old, issued) = funded_fixture();
+    let before = rows(&f.store);
+    assert!(supersession_draft(&f, &old, Uuid::new_v4(), issued + 1).is_err());
+    let now = old.request.limits.expires_at_unix_ms;
+    let operator = funding_operator(&f);
+    let mut draft = supersession_draft(&f, &old, Uuid::new_v4(), now).unwrap();
+    draft.source.supersedes_unused_receipt_digest = Some("f".repeat(64));
+    assert!(f.store.authorize_adaptive_work_funding(&operator, &draft, now).is_err());
+    assert_eq!(rows(&f.store), before);
+    let draft = supersession_draft(&f, &old, Uuid::new_v4(), now).unwrap();
+    change_project(&f, now);
+    let changed = rows(&f.store);
+    assert!(f.store.authorize_adaptive_work_funding(&operator, &draft, now).is_err());
+    assert_eq!(rows(&f.store), changed);
+}
+
+#[test]
+fn issued_funding_reviews_permanently_veto_unused_supersession_in_all_states() {
+    for state in ["authorized", "dispatched", "retired", "defer", "continue", "orphan_event"] {
+        let (f, receipt, now) = funded_fixture();
+        let call = issue(&f, now).unwrap();
+        let dispatched = if state != "authorized" && state != "orphan_event" {
+            Some(f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1).unwrap())
+        } else { None };
+        match state {
+            "retired" => { f.store.expire_adaptive_leadership_review_call(
+                &f.leader, call.grant.review_id, dispatched.as_ref().unwrap().version,
+                call.grant.expires_at_unix_ms,
+            ).unwrap(); },
+            "defer" => { f.store.complete_adaptive_leadership_review_call(
+                &f.leader, &defer(dispatched.as_ref().unwrap()), now + 2,
+            ).unwrap(); },
+            "continue" => { f.store.complete_adaptive_leadership_review_call(
+                &f.leader, &continued(dispatched.as_ref().unwrap(), now + 2, 1), now + 2,
+            ).unwrap(); },
+            "orphan_event" => {
+                let connection = f.store.connection.lock().unwrap();
+                connection.execute("DELETE FROM company_entities WHERE entity_kind IN
+                    ('adaptive_work_funding_review','adaptive_leadership_review_call')", []).unwrap();
+            },
+            _ => {},
+        }
+        let before = rows(&f.store);
+        assert!(supersession_draft(&f, &receipt, Uuid::new_v4(),
+            receipt.request.limits.expires_at_unix_ms).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+}
+
+#[test]
+fn missing_or_corrupt_unused_funding_proof_rejects_supersession_without_writes() {
+    for damage in ["entity", "event", "corrupt_event"] {
+        let (f, old, _) = funded_fixture();
+        let now = old.request.limits.expires_at_unix_ms;
+        let request = supersession_draft(&f, &old, Uuid::new_v4(), now).unwrap();
+        {
+            let connection = f.store.connection.lock().unwrap();
+            let sql = match damage {
+                "entity" => "DELETE FROM company_entities WHERE entity_kind='adaptive_work_funding'",
+                "event" => "DELETE FROM company_events WHERE event_type='adaptive_work_funding_issued'",
+                _ => "UPDATE company_events SET payload=X'00' WHERE event_type='adaptive_work_funding_issued'",
+            };
+            assert_eq!(connection.execute(sql, []).unwrap(), 1);
+        }
+        let before = rows(&f.store);
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert!(reopened.authorize_adaptive_work_funding(&funding_operator(&f), &request, now).is_err());
+        assert_eq!(rows(&reopened), before);
+    }
+}
+
+#[test]
+fn valid_json_cannot_hide_issued_review_traces_from_unused_supersession() {
+    for damage in ["event_payload", "orphan_membership_payload"] {
+        let (f, old, issued) = funded_fixture();
+        let now = old.request.limits.expires_at_unix_ms;
+        let request = supersession_draft(&f, &old, Uuid::new_v4(), now).unwrap();
+        issue(&f, issued).unwrap();
+        {
+            let connection = f.store.connection.lock().unwrap();
+            assert_eq!(connection.execute("DELETE FROM company_entities
+                WHERE entity_kind='adaptive_leadership_review_call'
+                AND json_extract(payload,'$.grant.work_funding.receipt.funding_id')=?1",
+                [&old.funding_id]).unwrap(), 1);
+            if damage == "event_payload" {
+                assert_eq!(connection.execute("DELETE FROM company_entities
+                    WHERE entity_kind='adaptive_work_funding_review'
+                    AND json_extract(payload,'$.grant.work_funding.receipt.funding_id')=?1",
+                    [&old.funding_id]).unwrap(), 1);
+                assert_eq!(connection.execute("UPDATE company_events SET payload='{}'
+                    WHERE event_type IN ('adaptive_work_funding_review_issued','adaptive_leadership_review_authorized')
+                    AND json_extract(payload,'$.grant.work_funding.receipt.funding_id')=?1",
+                    [&old.funding_id]).unwrap(), 2);
+            } else {
+                assert_eq!(connection.execute("DELETE FROM company_events
+                    WHERE event_type IN ('adaptive_work_funding_review_issued','adaptive_leadership_review_authorized')
+                    AND json_extract(payload,'$.grant.work_funding.receipt.funding_id')=?1",
+                    [&old.funding_id]).unwrap(), 2);
+                assert_eq!(connection.execute("UPDATE company_entities SET payload='{}'
+                    WHERE entity_kind='adaptive_work_funding_review'
+                    AND json_extract(payload,'$.grant.work_funding.receipt.funding_id')=?1",
+                    [&old.funding_id]).unwrap(), 1);
+            }
+            let visible: i64 = connection.query_row("SELECT count(*) FROM company_events
+                WHERE event_type IN ('adaptive_work_funding_review_issued','adaptive_leadership_review_authorized')
+                AND json_extract(payload,'$.grant.work_funding.receipt.funding_id')=?1",
+                [&old.funding_id], |row| row.get(0)).unwrap();
+            assert_eq!(visible, 0);
+        }
+        let before = rows(&f.store);
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert!(supersession_draft(&f, &old, Uuid::new_v4(), now).is_err());
+        assert!(reopened.authorize_adaptive_work_funding(&funding_operator(&f), &request, now).is_err());
+        assert_eq!(rows(&reopened), before);
+    }
+}
+
+#[test]
+fn unused_expiry_history_counts_toward_the_permanent_issuance_cap() {
+    let (f, mut receipt, _) = funded_fixture();
+    let operator = funding_operator(&f);
+    for _ in 1..128 {
+        let now = receipt.request.limits.expires_at_unix_ms;
+        let request = supersession_draft(&f, &receipt, Uuid::new_v4(), now).unwrap();
+        receipt = f.store.authorize_adaptive_work_funding(&operator, &request, now).unwrap().1;
+    }
+    let before = rows(&f.store);
+    assert!(supersession_draft(&f, &receipt, Uuid::new_v4(),
+        receipt.request.limits.expires_at_unix_ms).is_err());
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn concurrent_unused_funding_replacements_have_exactly_one_successor() {
+    let (f, old, _) = funded_fixture();
+    let now = old.request.limits.expires_at_unix_ms;
+    let requests = [supersession_draft(&f, &old, Uuid::new_v4(), now).unwrap(),
+        supersession_draft(&f, &old, Uuid::new_v4(), now).unwrap()];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut jobs = Vec::new();
+    for request in requests {
+        let store = WorkflowStore::open(&f.path).unwrap();
+        let operator = funding_operator(&f);
+        let barrier = barrier.clone();
+        jobs.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.authorize_adaptive_work_funding(&operator, &request, now)
+        }));
+    }
+    let results = jobs.into_iter().map(|job| job.join().unwrap()).collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let connection = f.store.connection.lock().unwrap();
+    let count: i64 = connection.query_row("SELECT count(*) FROM company_entities
+        WHERE entity_kind='adaptive_work_funding'", [], |row| row.get(0)).unwrap();
+    assert_eq!(count, 2);
 }
 
 #[test]
