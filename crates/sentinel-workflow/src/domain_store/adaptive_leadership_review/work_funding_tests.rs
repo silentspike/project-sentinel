@@ -1063,6 +1063,7 @@ fn governed_journal_predicate_reuses_only_exact_inputs_and_invalidates_on_write(
             assert!(predicate(allowance)?);
             assert_eq!(validation_scope::validations("governed-journal-predicate"), 1);
             assert_eq!(validation_scope::validations("adaptive-journal"), 1);
+            assert_eq!(validation_scope::validations("governed-journal-locators"), 1);
         }
         let mut changed = allowance.clone();
         changed.grant.max_calls += 1;
@@ -1072,6 +1073,7 @@ fn governed_journal_predicate_reuses_only_exact_inputs_and_invalidates_on_write(
         assert!(!predicate(&changed)?);
         assert_eq!(validation_scope::validations("governed-journal-predicate"), 3);
         assert_eq!(validation_scope::validations("adaptive-journal"), 1);
+        assert_eq!(validation_scope::validations("governed-journal-locators"), 1);
         assert!(!crate::store::adaptive::allowance_is_governed_in_journal(
             &transaction, &TenantId::parse("other-tenant")?, &f.grant.project_id, allowance,
         )?);
@@ -1094,6 +1096,41 @@ fn governed_journal_predicate_reuses_only_exact_inputs_and_invalidates_on_write(
         Ok(())
     }).unwrap();
     transaction.rollback().unwrap();
+}
+
+#[test]
+fn project_subscription_reuses_exact_proofs_only_in_the_current_snapshot() {
+    let f = budget_fixture(2);
+    let project = f.store.company_project(&f.leader.tenant_id, &f.grant.project_id)
+        .unwrap().unwrap();
+    let connection = f.store.connection.lock().unwrap();
+    validation_scope::with_scope(&connection, || {
+        for _ in 0..3 {
+            subscription::validate_persisted(&connection, &project)?;
+            assert_eq!(validation_scope::validations("project-subscription"), 1);
+        }
+        let mut later = project.clone();
+        later.updated_at_unix_ms += 1;
+        subscription::validate_persisted(&connection, &later)?;
+        assert_eq!(validation_scope::validations("project-subscription"), 2);
+        Ok(())
+    }).unwrap();
+    let (review_id, digest): (String, String) = connection.query_row(
+        "SELECT entity_id,payload_digest FROM company_entities WHERE entity_kind=?1 AND json_extract(payload,'$.continuation.provider_allowance_id')=?2",
+        params![KIND, project.subscription_call.as_ref().unwrap().allowance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    connection.execute(
+        "UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind=?1 AND entity_id=?2",
+        params![KIND, review_id],
+    ).unwrap();
+    assert!(subscription::validate_persisted(&connection, &project).is_err());
+    connection.execute(
+        "UPDATE company_entities SET payload_digest=?1 WHERE entity_kind=?2 AND entity_id=?3",
+        params![digest, KIND, review_id],
+    ).unwrap();
+    subscription::validate_persisted(&connection, &project).unwrap();
+    assert!(connection.is_autocommit());
 }
 
 #[test]

@@ -11,6 +11,8 @@ use crate::WorkflowError;
 const MAX_NODES: usize = 16_384;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
+const MAX_INVENTORY_BYTES: usize = 512 * 1024;
+const MAX_INVENTORY_NODES: usize = 64;
 const SAVEPOINT: &str = "sentinel_validation_scope";
 
 type Key = (&'static str, TypeId, Vec<u8>);
@@ -24,6 +26,9 @@ struct State {
     connection: usize,
     changes: i64,
     entries: BTreeMap<Key, Entry>,
+    inventories: BTreeMap<Key, Entry>,
+    inventory_bytes: usize,
+    inventory_depth: usize,
     nodes: usize,
     bytes: usize,
     depth: usize,
@@ -58,10 +63,12 @@ fn synchronize(connection: &Connection) -> Result<(), WorkflowError> {
         }
         if state.changes != current {
             state.entries.clear();
+            state.inventories.clear();
+            state.inventory_bytes = 0;
             state.changes = current;
             state.reuse = false;
             // Validators are read-only. A write during one cannot produce a reusable proof.
-            if state.depth != 0 {
+            if state.depth != 0 || state.inventory_depth != 0 {
                 state.poisoned = true;
                 return Err(corrupt());
             }
@@ -134,6 +141,9 @@ pub(crate) fn enter(connection: &Connection) -> Result<Scope<'_>, WorkflowError>
             connection: connection_id(connection),
             changes: 0,
             entries: BTreeMap::new(),
+            inventories: BTreeMap::new(),
+            inventory_bytes: 0,
+            inventory_depth: 0,
             nodes: 0,
             bytes: 0,
             depth: 0,
@@ -174,6 +184,97 @@ pub(crate) fn charge_bytes(connection: &Connection, bytes: usize) -> Result<(), 
     })
 }
 
+// Advisory discovery is not a proof. Its bounded storage must never consume
+// the mandatory replay budget or turn optional overflow into corruption.
+pub(crate) fn inventory<T: Clone + Serialize + 'static>(
+    connection: &Connection,
+    domain: &'static str,
+    input: &impl Serialize,
+    discover: impl FnOnce() -> Result<Option<T>, WorkflowError>,
+) -> Result<Option<T>, WorkflowError> {
+    with_scope(connection, || {
+        synchronize(connection)?;
+        let key = (
+            domain,
+            TypeId::of::<T>(),
+            serde_json::to_vec(input).map_err(|_| persistence())?,
+        );
+        let key_cost = key.2.len().saturating_add(256);
+        let admission = ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let state = active.as_mut().ok_or_else(corrupt)?;
+            match state.inventories.get(&key) {
+                Some(Entry::Visiting) => {
+                    state.poisoned = true;
+                    return Err(corrupt());
+                }
+                Some(Entry::Complete(value)) => {
+                    return value
+                        .downcast_ref::<Option<T>>()
+                        .cloned()
+                        .map(|value| (Some(value), None))
+                        .ok_or_else(corrupt);
+                }
+                None => {}
+            }
+            let capacity = MAX_INVENTORY_BYTES.saturating_sub(state.inventory_bytes);
+            if !state.reuse
+                || state.inventories.len() >= MAX_INVENTORY_NODES
+                || state.inventory_depth >= MAX_DEPTH
+                || key_cost.saturating_add(4) > capacity
+            {
+                return Ok((Some(None), None));
+            }
+            state.inventory_bytes += key_cost;
+            state.inventory_depth += 1;
+            state.inventories.insert(key.clone(), Entry::Visiting);
+            #[cfg(test)]
+            {
+                *state.validations.entry(domain).or_default() += 1;
+            }
+            Ok((None, Some(capacity - key_cost)))
+        })?;
+        if let (Some(value), _) = admission {
+            return Ok(value);
+        }
+        let capacity = admission.1.ok_or_else(corrupt)?;
+        let result = (|| {
+            let value = discover()?;
+            synchronize(connection)?;
+            let encoded = serde_json::to_vec(&value).map_err(|_| persistence())?;
+            if encoded.len() > capacity {
+                Ok((None, 4))
+            } else {
+                Ok((value, encoded.len()))
+            }
+        })();
+        let retained = ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let state = active.as_mut().ok_or_else(corrupt)?;
+            state.inventory_depth = state.inventory_depth.saturating_sub(1);
+            match &result {
+                Ok((value, bytes))
+                    if !state.poisoned
+                        && state.reuse
+                        && state.inventory_bytes.saturating_add(*bytes) <= MAX_INVENTORY_BYTES =>
+                {
+                    state.inventory_bytes += bytes;
+                    state
+                        .inventories
+                        .insert(key.clone(), Entry::Complete(Box::new(value.clone())));
+                    Ok::<_, WorkflowError>(true)
+                }
+                _ => {
+                    state.inventories.remove(&key);
+                    state.inventory_bytes = state.inventory_bytes.saturating_sub(key_cost);
+                    Ok(false)
+                }
+            }
+        })?;
+        result.map(|(value, _)| if retained { value } else { None })
+    })
+}
+
 pub(crate) fn before_write(connection: &Connection) -> Result<(), WorkflowError> {
     ACTIVE.with(|active| {
         let mut active = active.borrow_mut();
@@ -184,8 +285,10 @@ pub(crate) fn before_write(connection: &Connection) -> Result<(), WorkflowError>
             return Err(corrupt());
         }
         state.entries.clear();
+        state.inventories.clear();
+        state.inventory_bytes = 0;
         state.reuse = false;
-        if state.depth != 0 {
+        if state.depth != 0 || state.inventory_depth != 0 {
             state.poisoned = true;
             return Err(corrupt());
         }
@@ -315,6 +418,102 @@ mod tests {
             Ok(connection
                 .query_row("SELECT value FROM records WHERE id=1", [], |row| row.get(0))?)
         })
+    }
+
+    #[test]
+    fn optional_inventory_does_not_consume_near_limit_mandatory_proof_capacity() {
+        for accelerated in [false, true] {
+            let connection = database();
+            with_scope(&connection, || {
+                charge_bytes(&connection, MAX_BYTES - 4096)?;
+                ACTIVE.with(|active| active.borrow_mut().as_mut().unwrap().nodes = MAX_NODES - 3);
+                if accelerated {
+                    let first =
+                        inventory(&connection, "optional", &1, || Ok(Some("x".repeat(3072))))?;
+                    assert_eq!(first.as_ref().unwrap().len(), 3072);
+                    assert_eq!(
+                        inventory(&connection, "optional", &1, || panic!("must reuse"))?,
+                        first
+                    );
+                    ACTIVE.with(|active| {
+                        let state = active.borrow();
+                        let state = state.as_ref().unwrap();
+                        assert_eq!(state.nodes, MAX_NODES - 3);
+                        assert_eq!(state.bytes, MAX_BYTES - 4096);
+                    });
+                }
+                charge_bytes(&connection, 3000)?;
+                for key in 0..3 {
+                    assert_eq!(memoize(&connection, "mandatory", &key, || Ok(1))?, 1);
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn optional_inventory_overflow_cycles_and_writes_preserve_scope_contracts() {
+        let connection = database();
+        with_scope(&connection, || {
+            let oversized = inventory(&connection, "oversized", &1, || {
+                Ok(Some("x".repeat(MAX_INVENTORY_BYTES)))
+            })?;
+            assert!(oversized.is_none());
+            assert_eq!(value(&connection)?, 1);
+            before_write(&connection)?;
+            connection.execute("UPDATE records SET value=2 WHERE id=1", [])?;
+            assert!(inventory::<i64>(&connection, "after-write", &1, || panic!(
+                "no discovery after write"
+            ))?
+            .is_none());
+            assert_eq!(value(&connection)?, 2);
+            Ok(())
+        })
+        .unwrap();
+        assert!(inventory::<i64>(&connection, "cycle", &1, || inventory(
+            &connection,
+            "cycle",
+            &1,
+            || Ok(Some(1))
+        ))
+        .is_err());
+        assert!(inventory::<i64>(&connection, "write", &1, || {
+            connection.execute("UPDATE records SET value=3 WHERE id=1", [])?;
+            Ok(Some(3))
+        })
+        .is_err());
+        assert_eq!(value(&connection).unwrap(), 2);
+        assert!(connection.is_autocommit());
+    }
+
+    #[test]
+    fn optional_inventory_nested_overflow_returns_fallback_and_retains_child() {
+        let connection = database();
+        with_scope(&connection, || {
+            let outer = inventory(&connection, "outer", &1, || {
+                assert!(inventory(&connection, "child", &1, || Ok(Some(
+                    "x".repeat(400 * 1024)
+                )))?
+                .is_some());
+                Ok(Some("y".repeat(200 * 1024)))
+            })?;
+            assert!(outer.is_none());
+            let child: Option<String> =
+                inventory(&connection, "child", &1, || panic!("retain child"))?;
+            assert_eq!(child.unwrap().len(), 400 * 1024);
+            ACTIVE.with(|active| {
+                let state = active.borrow();
+                let state = state.as_ref().unwrap();
+                assert!(state.inventory_bytes <= MAX_INVENTORY_BYTES);
+                assert_eq!(state.inventories.len(), 1);
+                assert_eq!(state.inventory_depth, 0);
+                assert_eq!(state.bytes, 0);
+            });
+            assert_eq!(value(&connection)?, 1);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
