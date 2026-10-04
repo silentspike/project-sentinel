@@ -1218,10 +1218,19 @@ impl WorkflowApi {
         Ok(session.is_some_and(|session| session.continuation.is_some()))
     }
 
+    #[cfg(test)]
     pub(super) fn adaptive_subscription_queue_priority(
         &self,
         binding: &ProviderUsageBinding,
     ) -> Result<Option<u8>, &'static str> {
+        self.adaptive_subscription_queue_order(binding)
+            .map(|order| order.map(|(priority, _)| priority))
+    }
+
+    pub(super) fn adaptive_subscription_queue_order(
+        &self,
+        binding: &ProviderUsageBinding,
+    ) -> Result<Option<(u8, u64)>, &'static str> {
         let authority = self
             .authority
             .as_ref()
@@ -1241,7 +1250,7 @@ impl WorkflowApi {
             .adaptive_session_for_authority(&current)
             .map_err(|_| "adaptive queue session unavailable")?
         else {
-            return Ok(Some(2));
+            return Ok(Some((2, 0)));
         };
         if session.continuation.is_some()
             && session.active_provider_allowance_id() != binding.reservation_id
@@ -1255,7 +1264,7 @@ impl WorkflowApi {
             && !(session.continuation.is_some()
                 && session.active_provider_allowance_id() == binding.reservation_id)
         {
-            return Ok(Some(2));
+            return Ok(Some((2, 0)));
         }
         if session.active_provider_allowance_id() != binding.reservation_id {
             let rejected = matches!(session.version, 3 | 4)
@@ -1275,11 +1284,11 @@ impl WorkflowApi {
                 || rejected && corrections_available
                 || matches!(session.cursor, AdaptiveCursorV1::BlockedResolved { .. }))
                 && session.active_deadline_ms() <= now_unix_ms())
-            .then_some(2));
+            .then_some((2, 0)));
         }
         // Selection observes persisted state only: no new session, tool I/O or
         // mutation is allowed while considering the employee's other projects.
-        match &session.cursor {
+        let priority: Result<Option<u8>, &'static str> = match &session.cursor {
             AdaptiveCursorV1::ReadyForModel
                 if session.model_calls >= session.active_model_ceiling() =>
             {
@@ -1346,7 +1355,8 @@ impl WorkflowApi {
             }
             AdaptiveCursorV1::ReadyForTool { .. } => Ok(Some(1)),
             AdaptiveCursorV1::ReadyForModel => Ok(Some(if session.version > 1 { 1 } else { 2 })),
-        }
+        };
+        Ok(priority?.map(|rank| (rank, session.updated_at_ms)))
     }
 
     pub(super) fn adaptive_provider_authority(
@@ -1905,20 +1915,40 @@ impl WorkflowApi {
                 return Err("adaptive adopted funding receipt changed");
             }
         }
-        context.working_memory =
-            Some({
-                let _phase = AdaptiveContextReadPhase::start("historical_observations");
-                working_memory::compose(source, context.observation.as_ref(), |effect| match self
+        context.working_memory = Some({
+            let _phase = AdaptiveContextReadPhase::start("historical_observations");
+            source
+                .validate()
+                .map_err(|_| "adaptive working memory source invalid")?;
+            let ids = source
+                .rows
+                .iter()
+                .filter(|row| {
+                    context.observation.is_none()
+                        || source.last_observation.as_ref() != Some(&row.observation)
+                })
+                .map(|row| row.observation.effect.id)
+                .collect::<Vec<_>>();
+            let mut observations = if ids.is_empty() {
+                Default::default()
+            } else {
+                match self
                     .workbench
                     .as_ref()
                     .ok_or("adaptive Workbench unavailable")?
-                    .private_observation(effect, &binding.grant.authority.profile_id)
+                    .private_observations(&ids, &binding.grant.authority.profile_id)
                 {
-                    Ok(observation) => Ok(Some(observation)),
-                    Err(WorkflowPortError::Unavailable) => Ok(None),
-                    Err(_) => Err("historical private observation access or validation rejected"),
-                })?
-            });
+                    Ok(observations) => observations,
+                    Err(WorkflowPortError::Unavailable) => Default::default(),
+                    Err(_) => {
+                        return Err("historical private observation access or validation rejected")
+                    }
+                }
+            };
+            working_memory::compose(source, context.observation.as_ref(), |effect| {
+                Ok(observations.remove(&effect))
+            })?
+        });
         if reservation
             .as_ref()
             .is_some_and(|value| digest(&context).ok().as_ref() != Some(&value.context_digest))
