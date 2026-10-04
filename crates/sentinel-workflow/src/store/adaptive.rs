@@ -2338,39 +2338,28 @@ fn allowance_is_governed_in_journal_uncached(
     project: &crate::ProjectId,
     allowance: &crate::SubscriptionCallAllowanceV1,
 ) -> Result<bool, WorkflowError> {
-    // Bound only journals naming this allowance; unrelated expired rollovers are not evidence.
-    let mut statement = connection.prepare(
-        "SELECT root.operation_namespace FROM workflow_operations AS root
-         WHERE root.operation_namespace GLOB 'adaptive-session-v1:*'
-           AND root.operation_id='00000000000000000001'
-           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.tenant_id') END=?1
-           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.project_id') END=?2
-           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.work_item_id') END=?3
-           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.agent_id') END=?4
-           AND EXISTS (
-               SELECT 1 FROM workflow_operations AS journal,
-                    json_each(CASE WHEN json_valid(journal.response) THEN journal.response ELSE '{}' END,
-                              '$.session.continuation.authorizations') AS authorization
-               WHERE journal.operation_namespace=root.operation_namespace
-                 AND json_extract(authorization.value,'$.provider_allowance_id')=?5
-           )
-         ORDER BY root.operation_namespace LIMIT ?6",
-    ).map_err(map_sqlite_error)?;
-    let namespaces = statement
-        .query_map(
-            params![
-                tenant.0,
-                project.0,
-                allowance.grant.work_item_id.0,
-                i64::from(allowance.grant.agent_id.0),
-                allowance.allowance_id,
-                (MAX_SCOPED_ADAPTIVE_HEADS + 1) as i64
-            ],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(map_sqlite_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(map_sqlite_error)?;
+    let locators = governed_journal_locators(
+        connection,
+        tenant,
+        project,
+        &allowance.grant.work_item_id,
+        allowance.grant.agent_id,
+    )?;
+    let namespaces = match locators {
+        Some(index) => index
+            .0
+            .get(&allowance.allowance_id)
+            .cloned()
+            .unwrap_or_default(),
+        None => governed_journal_namespaces_legacy(
+            connection,
+            tenant,
+            project,
+            &allowance.grant.work_item_id,
+            allowance.grant.agent_id,
+            &allowance.allowance_id,
+        )?,
+    };
     if namespaces.len() > MAX_SCOPED_ADAPTIVE_HEADS {
         return Err(corrupt_store());
     }
@@ -2396,6 +2385,429 @@ fn allowance_is_governed_in_journal_uncached(
         });
     }
     Ok(governed)
+}
+
+type GovernedJournalMap = std::collections::BTreeMap<String, Vec<String>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GovernedJournalLocators(std::sync::Arc<GovernedJournalMap>);
+
+impl Serialize for GovernedJournalLocators {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+const MAX_LOCATOR_SCAN_ROWS: usize = 8_192;
+const MAX_LOCATOR_INDEX_BYTES: usize = 256 * 1024;
+
+fn governed_journal_locators(
+    connection: &Connection,
+    tenant: &crate::TenantId,
+    project: &crate::ProjectId,
+    work_item: &crate::WorkItemId,
+    agent: crate::AgentId,
+) -> Result<Option<GovernedJournalLocators>, WorkflowError> {
+    crate::domain_store::validation_scope::inventory(
+        connection,
+        "governed-journal-locators",
+        &(tenant, project, work_item, agent),
+        || governed_journal_locators_uncached(connection, tenant, project, work_item, agent),
+    )
+}
+
+fn governed_journal_locators_uncached(
+    connection: &Connection,
+    tenant: &crate::TenantId,
+    project: &crate::ProjectId,
+    work_item: &crate::WorkItemId,
+    agent: crate::AgentId,
+) -> Result<Option<GovernedJournalLocators>, WorkflowError> {
+    // Preserve the historical JSON locator selection, but parse it once per
+    // lineage/snapshot, not once per current, abandoned and historical allowance.
+    // These are locators only: every selected journal still needs full replay.
+    let mut statement = connection.prepare(
+        "SELECT root.operation_namespace,
+                 json_extract(authorization.value,'$.provider_allowance_id')
+         FROM workflow_operations AS root
+         JOIN workflow_operations AS journal ON journal.operation_namespace=root.operation_namespace,
+              json_each(CASE WHEN json_valid(journal.response) THEN journal.response ELSE '{}' END,
+                        '$.session.continuation.authorizations') AS authorization
+         WHERE root.operation_namespace GLOB 'adaptive-session-v1:*'
+           AND root.operation_id='00000000000000000001'
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.tenant_id') END=?1
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.project_id') END=?2
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.work_item_id') END=?3
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.agent_id') END=?4
+           AND json_type(authorization.value,'$.provider_allowance_id')='text'
+         LIMIT ?5",
+    ).map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![
+            tenant.0,
+            project.0,
+            work_item.0,
+            i64::from(agent.0),
+            (MAX_LOCATOR_SCAN_ROWS + 1) as i64,
+        ])
+        .map_err(map_sqlite_error)?;
+    let mut locators =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    let mut visited = 0;
+    let mut bytes = 0usize;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        visited += 1;
+        if visited > MAX_LOCATOR_SCAN_ROWS {
+            return Ok(None);
+        }
+        let lengths = [0, 1].map(
+            |column| match row.get_ref(column).map_err(map_sqlite_error)? {
+                rusqlite::types::ValueRef::Text(value) => Ok(value.len()),
+                _ => Err(corrupt_store()),
+            },
+        );
+        let [ns_bytes, id_bytes] = lengths;
+        let cost = ns_bytes?.saturating_add(id_bytes?).saturating_add(128);
+        if cost > MAX_LOCATOR_INDEX_BYTES || bytes.saturating_add(cost) > MAX_LOCATOR_INDEX_BYTES {
+            return Ok(None);
+        }
+        let text = [0, 1].map(
+            |column| match row.get_ref(column).map_err(map_sqlite_error)? {
+                rusqlite::types::ValueRef::Text(value) => Ok(std::str::from_utf8(value).ok()),
+                _ => Err(corrupt_store()),
+            },
+        );
+        let [ns, id] = text;
+        let (Some(ns), Some(id)) = (ns?, id?) else {
+            return Ok(None);
+        };
+        let ns = ns.to_owned();
+        let id = id.to_owned();
+        let namespaces = locators.entry(id).or_default();
+        // Keep an overflow sentinel, never replay an unbounded per-allowance set.
+        if namespaces.len() <= MAX_SCOPED_ADAPTIVE_HEADS && namespaces.insert(ns) {
+            bytes += cost;
+        }
+    }
+    let index = GovernedJournalLocators(std::sync::Arc::new(
+        locators
+            .into_iter()
+            .map(|(id, namespaces)| (id, namespaces.into_iter().collect()))
+            .collect(),
+    ));
+    Ok(Some(index))
+}
+
+fn governed_journal_namespaces_legacy(
+    connection: &Connection,
+    tenant: &crate::TenantId,
+    project: &crate::ProjectId,
+    work_item: &crate::WorkItemId,
+    agent: crate::AgentId,
+    allowance_id: &str,
+) -> Result<Vec<String>, WorkflowError> {
+    let mut statement = connection.prepare(
+        "SELECT root.operation_namespace FROM workflow_operations AS root
+         WHERE root.operation_namespace GLOB 'adaptive-session-v1:*'
+           AND root.operation_id='00000000000000000001'
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.tenant_id') END=?1
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.project_id') END=?2
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.work_item_id') END=?3
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.agent_id') END=?4
+           AND EXISTS (SELECT 1 FROM workflow_operations AS journal,
+               json_each(CASE WHEN json_valid(journal.response) THEN journal.response ELSE '{}' END,
+                         '$.session.continuation.authorizations') AS authorization
+               WHERE journal.operation_namespace=root.operation_namespace
+                 AND json_extract(authorization.value,'$.provider_allowance_id')=?5)
+         ORDER BY root.operation_namespace LIMIT ?6",
+    ).map_err(map_sqlite_error)?;
+    let result = statement
+        .query_map(
+            params![
+                tenant.0,
+                project.0,
+                work_item.0,
+                i64::from(agent.0),
+                allowance_id,
+                (MAX_SCOPED_ADAPTIVE_HEADS + 1) as i64
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod governed_locator_tests {
+    use super::*;
+    use crate::domain_store::validation_scope;
+    use crate::{AgentId, ProjectId, TenantId, WorkItemId};
+
+    fn fixture() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE workflow_operations (
+            operation_namespace TEXT NOT NULL,operation_id TEXT NOT NULL,response BLOB NOT NULL,
+            PRIMARY KEY(operation_namespace,operation_id))",
+            )
+            .unwrap();
+        let root = serde_json::json!({"session":{"grant":{"authority":{
+            "tenant_id":"tenant","project_id":"project","work_item_id":"work","agent_id":6
+        }}}});
+        for (index, values) in [
+            vec![
+                serde_json::json!("old"),
+                serde_json::json!("active"),
+                serde_json::json!("old"),
+            ],
+            vec![serde_json::json!("old")],
+            vec![serde_json::Value::Null, serde_json::json!(7)],
+            vec![],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ns = namespace(Uuid::from_u128(100 + index as u128));
+            connection
+                .execute(
+                    "INSERT INTO workflow_operations VALUES (?1,?2,?3)",
+                    params![
+                        ns,
+                        "00000000000000000001",
+                        serde_json::to_vec(&root).unwrap()
+                    ],
+                )
+                .unwrap();
+            let authorizations = values
+                .into_iter()
+                .map(|value| serde_json::json!({"provider_allowance_id":value}))
+                .collect::<Vec<_>>();
+            let row =
+                serde_json::json!({"session":{"continuation":{"authorizations":authorizations}}});
+            for version in 2..=4 {
+                connection
+                    .execute(
+                        "INSERT INTO workflow_operations VALUES (?1,?2,?3)",
+                        params![
+                            ns,
+                            format!("{version:020}"),
+                            serde_json::to_vec(&row).unwrap()
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+        connection
+    }
+
+    #[test]
+    fn governed_locator_inventory_matches_legacy_history_selection() {
+        let connection = fixture();
+        let tenant = TenantId::parse("tenant").unwrap();
+        let project = ProjectId::parse("project").unwrap();
+        let work = WorkItemId::parse("work").unwrap();
+        validation_scope::with_scope(&connection, || {
+            let actual = governed_journal_locators(&connection, &tenant, &project, &work, AgentId(6))?.unwrap();
+            for allowance in ["old", "active", "missing", "7"] {
+                let mut statement = connection.prepare(
+                    "SELECT root.operation_namespace FROM workflow_operations AS root
+                     WHERE root.operation_namespace GLOB 'adaptive-session-v1:*'
+                     AND root.operation_id='00000000000000000001'
+                     AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.tenant_id') END=?1
+                     AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.project_id') END=?2
+                     AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.work_item_id') END=?3
+                     AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.agent_id') END=?4
+                     AND EXISTS (SELECT 1 FROM workflow_operations AS journal,
+                         json_each(CASE WHEN json_valid(journal.response) THEN journal.response ELSE '{}' END,
+                         '$.session.continuation.authorizations') AS authorization
+                         WHERE journal.operation_namespace=root.operation_namespace
+                         AND json_extract(authorization.value,'$.provider_allowance_id')=?5)
+                     ORDER BY root.operation_namespace LIMIT 65")?;
+                let expected = statement.query_map(
+                    params![tenant.0, project.0, work.0, 6, allowance],
+                    |row| row.get::<_, String>(0),
+                )?.collect::<Result<Vec<_>, _>>()?;
+                assert_eq!(actual.0.get(allowance).cloned().unwrap_or_default(), expected);
+            }
+            assert_eq!(actual.0["old"].len(), 2);
+            assert_eq!(actual.0["active"].len(), 1);
+            let repeated = governed_journal_locators(&connection, &tenant, &project, &work, AgentId(6))?.unwrap();
+            assert!(std::sync::Arc::ptr_eq(&actual.0, &repeated.0));
+            assert_eq!(validation_scope::validations("governed-journal-locators"), 1);
+            assert!(governed_journal_locators(&connection, &tenant, &project, &work, AgentId(7))?.unwrap().0.is_empty());
+            assert_eq!(validation_scope::validations("governed-journal-locators"), 2);
+            Ok(())
+        }).unwrap();
+        assert!(connection.is_autocommit());
+    }
+
+    #[test]
+    fn governed_locator_inventory_rebuilds_after_write_and_error() {
+        let connection = fixture();
+        let tenant = TenantId::parse("tenant").unwrap();
+        let project = ProjectId::parse("project").unwrap();
+        let work = WorkItemId::parse("work").unwrap();
+        let query = || governed_journal_locators(&connection, &tenant, &project, &work, AgentId(6));
+        let expected = query().unwrap();
+        validation_scope::with_scope(&connection, || {
+            assert_eq!(query()?, expected);
+            connection.execute(
+                "DELETE FROM workflow_operations WHERE operation_id!='00000000000000000001'",
+                [],
+            )?;
+            assert!(query()?.is_none());
+            assert!(query()?.is_none());
+            assert_eq!(
+                validation_scope::validations("governed-journal-locators"),
+                1
+            );
+            Err::<(), _>(corrupt_store())
+        })
+        .unwrap_err();
+        assert_eq!(query().unwrap(), expected);
+        validation_scope::with_scope(&connection, || {
+            validation_scope::charge_bytes(&connection, 64 * 1024 * 1024)?;
+            assert_eq!(query()?, expected);
+            Err::<(), _>(corrupt_store())
+        })
+        .unwrap_err();
+        assert_eq!(query().unwrap(), expected);
+        assert!(connection.is_autocommit());
+    }
+
+    #[test]
+    fn governed_locator_overflow_falls_back_without_poisoning_or_partial_absence() {
+        for damage in ["large-id", "row-limit", "invalid-utf8"] {
+            let connection = fixture();
+            let tenant = TenantId::parse("tenant").unwrap();
+            let project = ProjectId::parse("project").unwrap();
+            let work = WorkItemId::parse("work").unwrap();
+            let ns = namespace(Uuid::from_u128(100));
+            if damage == "large-id" {
+                let payload = serde_json::json!({"session":{"continuation":{"authorizations":[
+                    {"provider_allowance_id":"x".repeat(MAX_LOCATOR_INDEX_BYTES)}
+                ]}}});
+                connection
+                    .execute(
+                        "INSERT INTO workflow_operations VALUES (?1,?2,?3)",
+                        params![
+                            ns,
+                            "00000000000000000009",
+                            serde_json::to_vec(&payload).unwrap()
+                        ],
+                    )
+                    .unwrap();
+            } else if damage == "invalid-utf8" {
+                connection.execute("INSERT INTO workflow_operations VALUES (?1,?2,?3)", params![
+                    ns, "00000000000000000009",
+                    br#"{"session":{"continuation":{"authorizations":[{"provider_allowance_id":"other\ud800"}]}}}"#.as_slice()
+                ]).unwrap();
+            } else {
+                connection.execute("WITH RECURSIVE n(i) AS (VALUES(10) UNION ALL SELECT i+1 FROM n WHERE i<8300)
+                    INSERT INTO workflow_operations SELECT ?1,printf('%020d',i),
+                    (SELECT response FROM workflow_operations WHERE operation_namespace=?1 AND operation_id='00000000000000000002') FROM n",
+                    [&ns]).unwrap();
+            }
+            validation_scope::with_scope(&connection, || {
+                for _ in 0..2 {
+                    assert!(governed_journal_locators(
+                        &connection,
+                        &tenant,
+                        &project,
+                        &work,
+                        AgentId(6)
+                    )?
+                    .is_none());
+                    let selected = governed_journal_namespaces_legacy(
+                        &connection,
+                        &tenant,
+                        &project,
+                        &work,
+                        AgentId(6),
+                        "old",
+                    )?;
+                    assert_eq!(selected.len(), 2, "{damage}");
+                    assert!(governed_journal_namespaces_legacy(
+                        &connection,
+                        &tenant,
+                        &project,
+                        &work,
+                        AgentId(6),
+                        "missing"
+                    )?
+                    .is_empty());
+                }
+                assert_eq!(
+                    validation_scope::validations("governed-journal-locators"),
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn governed_locator_counts_preserve_the_exact_per_allowance_overflow_sentinel() {
+        for count in [64, 65, 66] {
+            let connection = fixture();
+            let root: Vec<u8> = connection
+                .query_row(
+                    "SELECT response FROM workflow_operations
+                WHERE operation_id='00000000000000000001' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let journal: Vec<u8> = connection
+                .query_row(
+                    "SELECT response FROM workflow_operations
+                WHERE operation_id='00000000000000000002' ORDER BY operation_namespace LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM workflow_operations", [])
+                .unwrap();
+            for index in 0..count {
+                let ns = namespace(Uuid::from_u128(200 + index as u128));
+                connection
+                    .execute(
+                        "INSERT INTO workflow_operations VALUES (?1,?2,?3)",
+                        params![ns, "00000000000000000001", root],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO workflow_operations VALUES (?1,?2,?3)",
+                        params![ns, "00000000000000000002", journal],
+                    )
+                    .unwrap();
+            }
+            let tenant = TenantId::parse("tenant").unwrap();
+            let project = ProjectId::parse("project").unwrap();
+            let work = WorkItemId::parse("work").unwrap();
+            let actual =
+                governed_journal_locators(&connection, &tenant, &project, &work, AgentId(6))
+                    .unwrap()
+                    .unwrap();
+            let expected = governed_journal_namespaces_legacy(
+                &connection,
+                &tenant,
+                &project,
+                &work,
+                AgentId(6),
+                "old",
+            )
+            .unwrap();
+            assert_eq!(actual.0["old"], expected);
+            assert_eq!(actual.0["old"].len(), count.min(65));
+        }
+    }
 }
 
 type LoadedSession = (

@@ -437,7 +437,7 @@ pub(super) fn validate_persisted(
     connection: &Connection,
     project: &ProjectV1,
 ) -> Result<(), WorkflowError> {
-    validation_scope::with_scope(connection, || {
+    validation_scope::memoize(connection, "project-subscription", project, || {
         validate_persisted_uncached(connection, project)
     })
 }
