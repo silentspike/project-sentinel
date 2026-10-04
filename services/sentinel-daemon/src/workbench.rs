@@ -2925,6 +2925,31 @@ pub(crate) fn read_workbench_invocation_status(
         .invocation_status(invocation_id, authority)
 }
 
+/// Immutable private evidence does not require an ECS tick or a runtime exchange.
+pub(crate) fn read_workbench_private_observation(
+    invocation_id: &str,
+    authority: &dyn WorkbenchAuthoritySource,
+    profile: &WorkbenchProfile,
+    profile_digest: &str,
+) -> anyhow::Result<Option<sentinel_common::WorkbenchPrivateObservation>> {
+    #[cfg(test)]
+    if let Some((store, scoped_profile, digest)) =
+        PRIVATE_OBSERVATION_TEST_STORE.with(|slot| slot.borrow().clone())
+    {
+        anyhow::ensure!(
+            profile == &scoped_profile && profile_digest == digest.as_str(),
+            "private observation profile does not match scoped test store"
+        );
+        return WorkbenchCoordinator::new(&store, &scoped_profile, &digest)
+            .private_observation(invocation_id, authority);
+    }
+    let store = WORKBENCH_STATUS_STORE
+        .get()
+        .ok_or(WorkbenchDispatchUnavailable)?;
+    WorkbenchCoordinator::new(store, profile, profile_digest)
+        .private_observation(invocation_id, authority)
+}
+
 pub(crate) fn take_workbench_service() -> anyhow::Result<Option<WorkbenchService>> {
     WORKBENCH_SERVICE
         .get_or_init(|| Mutex::new(None))
@@ -4315,7 +4340,7 @@ mod tests {
             assert!(!public.contains("PRIVATE-CONTINUATION"));
         }
         drop(store);
-        let reopened = WorkbenchInvocationStore::open(&path).unwrap();
+        let reopened = Arc::new(WorkbenchInvocationStore::open(&path).unwrap());
         let coordinator =
             WorkbenchCoordinator::new(&reopened, &profile, &request.tool_profile_digest);
         let observation = coordinator
@@ -4338,6 +4363,60 @@ mod tests {
         assert!(coordinator
             .private_observation(&request.invocation_id, &foreign)
             .is_err());
+        with_private_observation_store_for_test(
+            Arc::clone(&reopened),
+            profile.clone(),
+            request.tool_profile_digest.clone(),
+            || {
+                for _ in 0..16 {
+                    assert_eq!(
+                        read_workbench_private_observation(
+                            &request.invocation_id,
+                            &current,
+                            &profile,
+                            &request.tool_profile_digest,
+                        )
+                        .unwrap(),
+                        Some(observation.clone()),
+                    );
+                }
+                assert!(read_workbench_private_observation(
+                    &request.invocation_id,
+                    &revoked,
+                    &profile,
+                    &request.tool_profile_digest,
+                )
+                .is_err());
+                assert!(read_workbench_private_observation(
+                    &request.invocation_id,
+                    &foreign,
+                    &profile,
+                    &request.tool_profile_digest,
+                )
+                .is_err());
+                assert!(read_workbench_private_observation(
+                    &request.invocation_id,
+                    &current,
+                    &profile,
+                    &"0".repeat(64),
+                )
+                .is_err());
+                let changing = SequencedAuthority {
+                    snapshots: Mutex::new(VecDeque::from([current.clone(), revoked.clone()])),
+                };
+                assert!(read_workbench_private_observation(
+                    &request.invocation_id,
+                    &changing,
+                    &profile,
+                    &request.tool_profile_digest,
+                )
+                .is_err());
+            },
+        );
+        assert_eq!(
+            reopened.load(&request.invocation_id).unwrap(),
+            Some(record.clone())
+        );
         let changing = SequencedAuthority {
             snapshots: Mutex::new(VecDeque::from([current, revoked])),
         };
@@ -4356,6 +4435,34 @@ mod tests {
         write.commit().unwrap();
         assert!(reopened.private_observation(&record).is_err());
         assert!(reopened.accept_result(&message, 1_900_000_000_004).is_err());
+    }
+
+    #[test]
+    fn model_context_private_observations_do_not_enter_tick_queue() {
+        let source = include_str!("workflow_api.rs");
+        let reader = source
+            .split("    fn private_observation(\n")
+            .nth(1)
+            .unwrap()
+            .split("    fn build_adaptive_request(\n")
+            .next()
+            .unwrap();
+        assert!(reader.contains("read_workbench_private_observation("));
+        for forbidden in ["dispatch_workbench", "sync_channel", "recv_timeout"] {
+            assert!(
+                !reader.contains(forbidden),
+                "private context read must not queue: {forbidden}"
+            );
+        }
+        let reader = include_str!("workbench.rs")
+            .split("pub(crate) fn read_workbench_private_observation(\n")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn take_workbench_service(")
+            .next()
+            .unwrap();
+        assert!(reader.contains(".private_observation(invocation_id, authority)"));
+        assert!(!reader.contains("dispatch_workbench"));
     }
 
     #[test]

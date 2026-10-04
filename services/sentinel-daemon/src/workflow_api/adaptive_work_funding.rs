@@ -363,7 +363,7 @@ impl WorkflowApi {
                 .workbench
                 .as_ref()
                 .ok_or_else(source_conflict)?
-                .private_observation(reference.effect.id)
+                .private_observation(reference.effect.id, &session.grant.authority.profile_id)
                 .map_err(|_| source_conflict())?;
             observation
                 .validate(

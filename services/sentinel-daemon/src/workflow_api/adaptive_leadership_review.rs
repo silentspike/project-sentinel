@@ -1720,7 +1720,7 @@ impl WorkflowApi {
                     self.workbench
                         .as_ref()
                         .ok_or("leadership Workbench unavailable")?
-                        .private_observation(reference.effect.id)
+                        .private_observation(reference.effect.id, &current.profile_id)
                         .map_err(|_| "leadership private observation unavailable")
                 })
                 .transpose()?

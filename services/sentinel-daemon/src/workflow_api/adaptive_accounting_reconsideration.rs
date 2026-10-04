@@ -160,7 +160,7 @@ impl WorkflowApi {
                         .workbench
                         .as_ref()
                         .ok_or("accounting reconsideration Workbench unavailable")?
-                        .private_observation(reference.effect.id)
+                        .private_observation(reference.effect.id, &current.profile_id)
                         .map_err(|_| "accounting reconsideration observation unavailable")?;
                     observation
                         .validate(
@@ -318,7 +318,10 @@ impl WorkflowApi {
                     self.workbench
                         .as_ref()
                         .ok_or("accounting refusal Workbench missing")?
-                        .private_observation(reference.effect.id)
+                        .private_observation(
+                            reference.effect.id,
+                            &call.context.source_session.grant.authority.profile_id,
+                        )
                         .map_err(|_| "accounting refusal observation unavailable")
                 })
                 .transpose()?;
