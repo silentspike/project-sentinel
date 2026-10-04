@@ -5359,9 +5359,11 @@ impl WorkflowApi {
                 .map(|(tenant, project, work)| (tenant, project, work)),
             MAX_RECONCILE_BATCH,
         )?;
-        for execution in &page {
-            self.sync_company_state(execution)?;
-        }
+        reconcile_company_page(
+            &page,
+            |tenant, project| self.store.company_project(tenant, project),
+            |execution| self.sync_company_state(execution),
+        )?;
         let next = page.last().map(|execution| {
             (
                 execution.tenant_id.clone(),
@@ -5387,42 +5389,9 @@ impl WorkflowApi {
                 .ok_or_else(|| {
                     WorkflowError::new(WorkflowErrorCode::NotFound, false, "project not found")
                 })?;
-            if project.archived_source_reviews.iter().any(|archive| {
-                archive.review_work.spec.work_item_id == execution.work_item_id
-                    && archive
-                        .review_allowance
-                        .dispatch
-                        .as_ref()
-                        .is_some_and(|dispatch| {
-                            execution.plan.plan_id
-                                == stable_operation_id(
-                                    "sentinel.model-work.v1",
-                                    &format!("{}:{}", dispatch.request_id, dispatch.request_digest),
-                                    1,
-                                )
-                        })
-                    && execution.state == sentinel_workflow::WorkItemState::Done
-                    && execution.terminal_execution_evidence.is_some()
-                    && execution.gate_evidence.as_ref().is_some_and(|gate| {
-                        archive
-                            .review_work
-                            .gate_receipt
-                            .as_ref()
-                            .is_some_and(|receipt| {
-                                receipt.passed && receipt.subject_digest == gate.subject_digest
-                            })
-                    })
-            }) {
+            let Some(target) = company_sync_target(execution, &project)? else {
                 return Ok(());
-            }
-            // A correction is pending until its new plan exists. Old completion
-            // replay must not close it again during periodic reconciliation.
-            if project.work_corrections.iter().any(|correction| {
-                correction.previous.spec.work_item_id == execution.work_item_id
-                    && correction.execution_revision.previous_plan_id == execution.plan.plan_id
-            }) {
-                return Ok(());
-            }
+            };
             let work = project
                 .work_items
                 .get(&execution.work_item_id)
@@ -5440,9 +5409,6 @@ impl WorkflowApi {
                         "assignment unavailable",
                     )
                 })?;
-            let Some(target) = company_transition_target(execution.state, work.state)? else {
-                return Ok(());
-            };
             let current_authority = self
                 .authority
                 .as_ref()
@@ -6046,6 +6012,94 @@ fn delivery_error_class(error: &crate::delivery::DeliveryError) -> &'static str 
         DeliveryError::Storage(_) => "storage",
         DeliveryError::Validation(_) => "validation",
     }
+}
+
+fn reconcile_company_page(
+    page: &[sentinel_workflow::WorkItemExecutionV1],
+    mut load: impl FnMut(
+        &TenantId,
+        &ProjectId,
+    ) -> Result<Option<sentinel_workflow::ProjectV1>, WorkflowError>,
+    mut sync: impl FnMut(&sentinel_workflow::WorkItemExecutionV1) -> Result<(), WorkflowError>,
+) -> Result<(), WorkflowError> {
+    let mut snapshot: Option<sentinel_workflow::ProjectV1> = None;
+    for execution in page {
+        if !snapshot.as_ref().is_some_and(|project| {
+            project.tenant_id == execution.tenant_id && project.project_id == execution.project_id
+        }) {
+            snapshot = Some(
+                load(&execution.tenant_id, &execution.project_id)?.ok_or_else(|| {
+                    WorkflowError::new(WorkflowErrorCode::NotFound, false, "project not found")
+                })?,
+            );
+        }
+        let project = snapshot.as_ref().ok_or_else(workflow_persistence_failure)?;
+        if project.tenant_id != execution.tenant_id || project.project_id != execution.project_id {
+            return Err(workflow_persistence_failure());
+        }
+        if company_sync_target(execution, project)?.is_some() {
+            // Only no-effect classification shares this page-local snapshot.
+            // Effects re-read current authority and invalidate the entire view.
+            snapshot = None;
+            sync(execution)?;
+        }
+    }
+    Ok(())
+}
+
+fn company_sync_target(
+    execution: &sentinel_workflow::WorkItemExecutionV1,
+    project: &sentinel_workflow::ProjectV1,
+) -> Result<Option<sentinel_workflow::CompanyWorkStateV1>, WorkflowError> {
+    if project.archived_source_reviews.iter().any(|archive| {
+        archive.review_work.spec.work_item_id == execution.work_item_id
+            && archive
+                .review_allowance
+                .dispatch
+                .as_ref()
+                .is_some_and(|dispatch| {
+                    execution.plan.plan_id
+                        == stable_operation_id(
+                            "sentinel.model-work.v1",
+                            &format!("{}:{}", dispatch.request_id, dispatch.request_digest),
+                            1,
+                        )
+                })
+            && execution.state == sentinel_workflow::WorkItemState::Done
+            && execution.terminal_execution_evidence.is_some()
+            && execution.gate_evidence.as_ref().is_some_and(|gate| {
+                archive
+                    .review_work
+                    .gate_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| {
+                        receipt.passed && receipt.subject_digest == gate.subject_digest
+                    })
+            })
+    }) {
+        return Ok(None);
+    }
+    // Old completion replay must not close a correction awaiting its new plan.
+    if project.work_corrections.iter().any(|correction| {
+        correction.previous.spec.work_item_id == execution.work_item_id
+            && correction.execution_revision.previous_plan_id == execution.plan.plan_id
+    }) {
+        return Ok(None);
+    }
+    let work = project
+        .work_items
+        .get(&execution.work_item_id)
+        .ok_or_else(|| {
+            WorkflowError::new(WorkflowErrorCode::NotFound, false, "work item not found")
+        })?;
+    if !work.assignments.iter().any(|assignment| assignment.active) {
+        return Err(WorkflowError::new(
+            WorkflowErrorCode::AuthorityConflict,
+            false,
+            "assignment unavailable",
+        ));
+    }
+    company_transition_target(execution.state, work.state)
 }
 
 fn company_sync_authority_error(error: WorkflowPortError) -> WorkflowError {
