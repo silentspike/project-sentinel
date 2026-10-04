@@ -1,5 +1,12 @@
 # Changelog
 
+- Read immutable private Workbench observations through the protected store
+  path instead of serial ECS tick dispatch for working memory, funding,
+  leadership and accounting. Keep exact profile/terminal/capability checks,
+  authority before and after each read, private digest binding and public-output
+  isolation; runtime effects still use the owning tick queue. Add content-free
+  read timings (#856).
+
 - Share exact-input-validated adaptive head proofs across authorized session,
   journal-digest and pending-model evidence readers, and reuse authority-head
   selection without replaying unchanged journal history. Preserve full input

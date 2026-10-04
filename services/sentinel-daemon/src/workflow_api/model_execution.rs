@@ -21,6 +21,40 @@ const QA_SCHEMA_RECOVERY_REASON: &str = "strict-json-correction";
 const QA_SCHEMA_MAX_CORRECTIONS: usize = 2;
 const ADAPTIVE_TOOL_SCHEMA_ERROR: &str = "adaptive tool is invalid";
 const ADAPTIVE_TOOL_SCHEMA_RESOLUTION: &str = "adaptive-first-model-tool-schema";
+const ADAPTIVE_CONTEXT_SLOW_READ_MS: u64 = 100;
+
+struct AdaptiveContextReadPhase {
+    phase: &'static str,
+    started: std::time::Instant,
+}
+
+impl AdaptiveContextReadPhase {
+    fn start(phase: &'static str) -> Self {
+        Self {
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for AdaptiveContextReadPhase {
+    fn drop(&mut self) {
+        let elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if elapsed_ms >= ADAPTIVE_CONTEXT_SLOW_READ_MS {
+            tracing::warn!(
+                phase = self.phase,
+                elapsed_ms,
+                "Adaptive context evidence read"
+            );
+        } else {
+            tracing::debug!(
+                phase = self.phase,
+                elapsed_ms,
+                "Adaptive context evidence read"
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1747,15 +1781,21 @@ impl WorkflowApi {
         }) {
             return Err("adaptive assignment changed");
         }
-        let observation = match &binding.previous_observation {
-            Some(previous) => Some(
-                self.workbench
-                    .as_ref()
-                    .ok_or("adaptive Workbench unavailable")?
-                    .private_observation(previous.effect.id)
-                    .map_err(|_| "adaptive observation unavailable")?,
-            ),
-            None => None,
+        let observation = {
+            let _phase = AdaptiveContextReadPhase::start("latest_observation");
+            match &binding.previous_observation {
+                Some(previous) => Some(
+                    self.workbench
+                        .as_ref()
+                        .ok_or("adaptive Workbench unavailable")?
+                        .private_observation(
+                            previous.effect.id,
+                            &binding.grant.authority.profile_id,
+                        )
+                        .map_err(|_| "adaptive observation unavailable")?,
+                ),
+                None => None,
+            }
         };
         let (profile, digest) = self
             .authority
@@ -1833,16 +1873,18 @@ impl WorkflowApi {
             context.prompt()?;
             return Ok(context);
         }
-        let source = self
-            .core
-            .adaptive_working_memory_source(
-                binding.grant.session_id,
-                binding.session_version,
-                binding.effect_id,
-                &binding.grant.authority,
-            )
-            .map_err(|_| "adaptive working memory journal unavailable")?
-            .ok_or("adaptive working memory journal missing")?;
+        let source = {
+            let _phase = AdaptiveContextReadPhase::start("working_memory_source");
+            self.core
+                .adaptive_working_memory_source(
+                    binding.grant.session_id,
+                    binding.session_version,
+                    binding.effect_id,
+                    &binding.grant.authority,
+                )
+                .map_err(|_| "adaptive working memory journal unavailable")?
+                .ok_or("adaptive working memory journal missing")?
+        };
         if source.root_model_ceiling != session.grant.max_model_calls
             || source.root_tool_ceiling != session.grant.max_tool_calls
             || source.work_funding.as_deref() != session.active_work_funding()
@@ -1863,20 +1905,20 @@ impl WorkflowApi {
                 return Err("adaptive adopted funding receipt changed");
             }
         }
-        context.working_memory = Some(working_memory::compose(
-            source,
-            context.observation.as_ref(),
-            |effect| match self
-                .workbench
-                .as_ref()
-                .ok_or("adaptive Workbench unavailable")?
-                .private_observation(effect)
-            {
-                Ok(observation) => Ok(Some(observation)),
-                Err(WorkflowPortError::Unavailable) => Ok(None),
-                Err(_) => Err("historical private observation access or validation rejected"),
-            },
-        )?);
+        context.working_memory =
+            Some({
+                let _phase = AdaptiveContextReadPhase::start("historical_observations");
+                working_memory::compose(source, context.observation.as_ref(), |effect| match self
+                    .workbench
+                    .as_ref()
+                    .ok_or("adaptive Workbench unavailable")?
+                    .private_observation(effect, &binding.grant.authority.profile_id)
+                {
+                    Ok(observation) => Ok(Some(observation)),
+                    Err(WorkflowPortError::Unavailable) => Ok(None),
+                    Err(_) => Err("historical private observation access or validation rejected"),
+                })?
+            });
         if reservation
             .as_ref()
             .is_some_and(|value| digest(&context).ok().as_ref() != Some(&value.context_digest))
