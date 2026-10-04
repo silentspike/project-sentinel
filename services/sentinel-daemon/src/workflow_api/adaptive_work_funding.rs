@@ -536,7 +536,11 @@ impl WorkflowApi {
         {
             Ok(Some(receipt))
                 if receipt.request.source.resume_source.project_id == project
-                    && receipt.request.source.supersedes_unused_receipt_digest.as_deref()
+                    && receipt
+                        .request
+                        .source
+                        .supersedes_unused_receipt_digest
+                        .as_deref()
                         == supersedes_unused_receipt_digest =>
             {
                 return receipt_http(&receipt, true);
