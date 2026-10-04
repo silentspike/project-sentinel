@@ -275,7 +275,10 @@ fn submission_serde_roundtrips_optional_supersession_and_preserves_old_wire() {
     request.source.supersedes_unused_receipt_digest = Some("a".repeat(64));
     let public = serde_json::to_value(submission(&request).unwrap()).unwrap();
     let parsed: FundingSubmission = serde_json::from_value(public.clone()).unwrap();
-    assert_eq!(parsed.supersedes_unused_receipt_digest, Some("a".repeat(64)));
+    assert_eq!(
+        parsed.supersedes_unused_receipt_digest,
+        Some("a".repeat(64))
+    );
     assert_eq!(serde_json::to_value(parsed).unwrap(), public);
     assert!(public.get("source").is_none());
     assert!(public.get("predecessor_receipt_digest").is_none());
@@ -381,9 +384,7 @@ fn explicit_unused_supersession_roundtrips_get_and_both_post_paths_without_adopt
             old_replay["limits"],
             serde_json::to_value(&old.request.limits).unwrap()
         );
-        assert!(old_replay
-            .get("supersedes_unused_receipt_digest")
-            .is_none());
+        assert!(old_replay.get("supersedes_unused_receipt_digest").is_none());
         assert_eq!(
             assert_ok(&post(&api, &submission(&old.request).unwrap())),
             old_replay

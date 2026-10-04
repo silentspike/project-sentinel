@@ -604,7 +604,9 @@ fn require_never_reviewed_funding(
     receipt: &AdaptiveWorkFundingReceiptV1,
 ) -> Result<(), WorkflowError> {
     let used = reviewed_funding_ids(connection, &receipt.request.source.resume_source.tenant_id)?;
-    if used.contains(&receipt.funding_id) { return Err(transition()); }
+    if used.contains(&receipt.funding_id) {
+        return Err(transition());
+    }
     Ok(())
 }
 
@@ -623,34 +625,55 @@ fn reviewed_funding_ids(
                  ('adaptive_work_funding_review','adaptive_leadership_review_call')
                  ORDER BY entity_kind,entity_id LIMIT 4097",
             )?;
-            let rows = statement.query_map([&tenant.0], |row| Ok((
-                row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
-                row.get::<_, Vec<u8>>(3)?, row.get::<_, String>(4)?,
-            )))?;
+            let rows = statement.query_map([&tenant.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        if rows.len() > 4096 { return Err(corrupt()); }
+        if rows.len() > 4096 {
+            return Err(corrupt());
+        }
         for (kind, id, version, payload, digest) in rows {
             validation_scope::charge_bytes(connection, payload.len())?;
-            if !constant_time_eq(&digest, &bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?) {
+            if !constant_time_eq(
+                &digest,
+                &bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?,
+            ) {
                 return Err(corrupt());
             }
             let funding_id = if kind == REVIEW_KIND {
                 let leaf: FundingReviewLeaf = decode(&payload)?;
                 leaf.validate_entity()?;
-                if leaf.row_binding() != (tenant, kind.as_str(), id.as_str(), stored_u64(version)?) {
+                if leaf.row_binding() != (tenant, kind.as_str(), id.as_str(), stored_u64(version)?)
+                {
                     return Err(corrupt());
                 }
-                Some(require_review_binding(&leaf.grant)?.binding.funding_id.clone())
+                Some(
+                    require_review_binding(&leaf.grant)?
+                        .binding
+                        .funding_id
+                        .clone(),
+                )
             } else {
                 let call: AdaptiveLeadershipReviewCallV1 = decode(&payload)?;
                 call.validate_entity()?;
-                if call.row_binding() != (tenant, kind.as_str(), id.as_str(), stored_u64(version)?) {
+                if call.row_binding() != (tenant, kind.as_str(), id.as_str(), stored_u64(version)?)
+                {
                     return Err(corrupt());
                 }
-                call.grant.work_funding.map(|epoch| epoch.binding.funding_id)
+                call.grant
+                    .work_funding
+                    .map(|epoch| epoch.binding.funding_id)
             };
-            if let Some(id) = funding_id { used.insert(id); }
+            if let Some(id) = funding_id {
+                used.insert(id);
+            }
         }
         let sequences = {
             let mut statement = connection.prepare(
@@ -658,39 +681,86 @@ fn reviewed_funding_ids(
                  AND (event_type=?2 OR event_type GLOB 'adaptive_leadership_review_*')
                  ORDER BY sequence LIMIT 4097",
             )?;
-            let rows = statement.query_map(params![tenant.0, REVIEW_EVENT], |row| row.get::<_, i64>(0))?;
+            let rows =
+                statement.query_map(params![tenant.0, REVIEW_EVENT], |row| row.get::<_, i64>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        if sequences.len() > 4096 { return Err(corrupt()); }
+        if sequences.len() > 4096 {
+            return Err(corrupt());
+        }
         for sequence in sequences {
-            let row = read_company_event_row(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
+            let row =
+                read_company_event_row(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
             validation_scope::charge_bytes(connection, row.payload.len())?;
-            let (principal, project, operation, digest, time, funding_id) = if row.event_type == REVIEW_EVENT {
+            let (principal, project, operation, digest, time, funding_id) = if row.event_type
+                == REVIEW_EVENT
+            {
                 let leaf: FundingReviewLeaf = decode(&row.payload)?;
                 leaf.validate_entity()?;
-                let digest = canonical_sha256("sentinel.workflow.adaptive-work-funding-review.v1", &leaf)?;
-                let funding_id = require_review_binding(&leaf.grant)?.binding.funding_id.clone();
-                (leaf.grant.leadership_principal, leaf.grant.project_id,
-                    leaf.operation_id, digest, leaf.issued_at_unix_ms, Some(funding_id))
+                let digest =
+                    canonical_sha256("sentinel.workflow.adaptive-work-funding-review.v1", &leaf)?;
+                let funding_id = require_review_binding(&leaf.grant)?
+                    .binding
+                    .funding_id
+                    .clone();
+                (
+                    leaf.grant.leadership_principal,
+                    leaf.grant.project_id,
+                    leaf.operation_id,
+                    digest,
+                    leaf.issued_at_unix_ms,
+                    Some(funding_id),
+                )
             } else {
                 let call: AdaptiveLeadershipReviewCallV1 = decode(&row.payload)?;
                 call.validate_entity()?;
-                let digest = canonical_sha256("sentinel.workflow.adaptive-leadership-call.v1", &call)?;
-                let funding_id = call.grant.work_funding.as_ref().map(|epoch| epoch.binding.funding_id.clone());
-                (call.grant.leadership_principal, call.grant.project_id,
-                    call.operation_id, digest, call.updated_at_unix_ms, funding_id)
+                let digest =
+                    canonical_sha256("sentinel.workflow.adaptive-leadership-call.v1", &call)?;
+                let funding_id = call
+                    .grant
+                    .work_funding
+                    .as_ref()
+                    .map(|epoch| epoch.binding.funding_id.clone());
+                (
+                    call.grant.leadership_principal,
+                    call.grant.project_id,
+                    call.operation_id,
+                    digest,
+                    call.updated_at_unix_ms,
+                    funding_id,
+                )
             };
-            let payload_digest = bytes_digest("sentinel.workflow.company-event-payload.v1", &row.payload)?;
+            let payload_digest =
+                bytes_digest("sentinel.workflow.company-event-payload.v1", &row.payload)?;
             let authority_digest = principal.binding_digest()?;
-            let event_id = canonical_sha256("sentinel.workflow.company-event-id.v1",
-                &(tenant, Some(&project), &row.event_type, operation, &digest, &authority_digest, &payload_digest, time))?;
+            let event_id = canonical_sha256(
+                "sentinel.workflow.company-event-id.v1",
+                &(
+                    tenant,
+                    Some(&project),
+                    &row.event_type,
+                    operation,
+                    &digest,
+                    &authority_digest,
+                    &payload_digest,
+                    time,
+                ),
+            )?;
             if company_event_principal(&row)? != principal
-                || row.tenant_id != tenant.0 || row.project_id.as_deref() != Some(project.0.as_str())
-                || row.operation_id != operation.to_string() || row.operation_digest != digest
-                || row.authority_binding_digest != authority_digest || row.payload_digest != payload_digest
-                || row.event_id != event_id || stored_u64(row.created_at_ms)? != time
-            { return Err(corrupt()); }
-            if let Some(id) = funding_id { used.insert(id); }
+                || row.tenant_id != tenant.0
+                || row.project_id.as_deref() != Some(project.0.as_str())
+                || row.operation_id != operation.to_string()
+                || row.operation_digest != digest
+                || row.authority_binding_digest != authority_digest
+                || row.payload_digest != payload_digest
+                || row.event_id != event_id
+                || stored_u64(row.created_at_ms)? != time
+            {
+                return Err(corrupt());
+            }
+            if let Some(id) = funding_id {
+                used.insert(id);
+            }
         }
         Ok(used)
     })
@@ -703,7 +773,10 @@ fn superseded_unused_receipts(
     let mut superseded = BTreeSet::new();
     let mut by_digest = BTreeMap::new();
     for receipt in receipts {
-        if by_digest.insert(receipt.receipt_digest()?, receipt).is_some() {
+        if by_digest
+            .insert(receipt.receipt_digest()?, receipt)
+            .is_some()
+        {
             return Err(corrupt());
         }
     }
@@ -746,7 +819,9 @@ fn require_unfunded_source(
     supersedes_unused_receipt_digest: Option<&str>,
 ) -> Result<(AdaptiveWorkFundingSourceV1, u64), WorkflowError> {
     let receipts = funding_receipts(connection, tenant, session_id)?;
-    if receipts.len() >= 128 { return Err(transition()); }
+    if receipts.len() >= 128 {
+        return Err(transition());
+    }
     let (resume_source, session) = adaptive_resume_policy::fresh_resume_source(
         connection, tenant, project_id, session_id, now_ms, None,
     )?;
@@ -754,15 +829,19 @@ fn require_unfunded_source(
     let superseded = superseded_unused_receipts(connection, &receipts)?;
     let pending = receipts
         .iter()
-        .filter(|receipt| !adopted.iter().any(|epoch| epoch.receipt == **receipt)
-            && !superseded.contains(&receipt.funding_id))
+        .filter(|receipt| {
+            !adopted.iter().any(|epoch| epoch.receipt == **receipt)
+                && !superseded.contains(&receipt.funding_id)
+        })
         .collect::<Vec<_>>();
     match (pending.as_slice(), supersedes_unused_receipt_digest) {
-        ([], None) => {},
-        ([old], Some(digest)) if old.receipt_digest()? == digest
-            && old.request.limits.expires_at_unix_ms <= now_ms => {
-                require_never_reviewed_funding(connection, old)?;
-            },
+        ([], None) => {}
+        ([old], Some(digest))
+            if old.receipt_digest()? == digest
+                && old.request.limits.expires_at_unix_ms <= now_ms =>
+        {
+            require_never_reviewed_funding(connection, old)?;
+        }
         _ => return Err(transition()),
     }
     if adopted.len() + superseded.len() + pending.len() != receipts.len() {
@@ -891,8 +970,10 @@ impl WorkflowStore {
         let superseded = superseded_unused_receipts(&transaction, &receipts)?;
         let pending: Vec<_> = receipts
             .iter()
-            .filter(|receipt| !adopted.iter().any(|epoch| epoch.receipt == **receipt)
-                && !superseded.contains(&receipt.funding_id))
+            .filter(|receipt| {
+                !adopted.iter().any(|epoch| epoch.receipt == **receipt)
+                    && !superseded.contains(&receipt.funding_id)
+            })
             .collect();
         let receipt = match pending.as_slice() {
             [] => session.active_work_funding().map(|epoch| &epoch.receipt),
@@ -995,7 +1076,14 @@ impl WorkflowStore {
         now_ms: u64,
     ) -> Result<AdaptiveWorkFundingRequestV1, WorkflowError> {
         self.adaptive_work_funding_draft_with_supersession(
-            principal, project_id, session_id, operation_id, reason_ref, limits, now_ms, None,
+            principal,
+            project_id,
+            session_id,
+            operation_id,
+            reason_ref,
+            limits,
+            now_ms,
+            None,
         )
     }
 
@@ -1025,7 +1113,11 @@ impl WorkflowStore {
                 || prior.request.source.resume_source.project_id != *project_id
                 || prior.request.reason_ref != reason_ref
                 || prior.request.limits != limits
-                || prior.request.source.supersedes_unused_receipt_digest.as_deref()
+                || prior
+                    .request
+                    .source
+                    .supersedes_unused_receipt_digest
+                    .as_deref()
                     != supersedes_unused_receipt_digest
             {
                 return Err(funding_conflict());
@@ -1108,8 +1200,14 @@ impl WorkflowStore {
             issued_at_unix_ms: now_ms,
         };
         receipt.validate()?;
-        if receipt.request.source.supersedes_unused_receipt_digest.is_some() {
-            let mut receipts = funding_receipts(&transaction, &source.tenant_id, source.session_id)?;
+        if receipt
+            .request
+            .source
+            .supersedes_unused_receipt_digest
+            .is_some()
+        {
+            let mut receipts =
+                funding_receipts(&transaction, &source.tenant_id, source.session_id)?;
             receipts.push(receipt.clone());
             superseded_unused_receipts(&transaction, &receipts)?;
         }
