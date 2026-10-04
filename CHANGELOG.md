@@ -1,5 +1,11 @@
 # Changelog
 
+- Share exact-input-validated adaptive head proofs across authorized session,
+  journal-digest and pending-model evidence readers, and reuse authority-head
+  selection without replaying unchanged journal history. Preserve full input
+  equality/index checks, complete competing-head scans, fresh pending-effect
+  checks, caller transactions and invalidation after any store change (#856).
+
 - Allow read-only funding drafts and atomic immutable receipt issuance to
   coexist with ordinary reconciliation under the shared recovery fence.
   Preserve exclusive recovery, transaction-local source checks, idempotency
