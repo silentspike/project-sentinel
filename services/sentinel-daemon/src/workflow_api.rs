@@ -2096,21 +2096,17 @@ impl WorkbenchExecutionAdapter {
     fn private_observation(
         &self,
         invocation_id: Uuid,
+        profile_id: &str,
     ) -> Result<sentinel_common::WorkbenchPrivateObservation, WorkflowPortError> {
-        let authority: Arc<dyn WorkbenchAuthoritySource> = self.authority.clone();
-        let (response, receiver) = mpsc::sync_channel(1);
-        dispatch_workbench(WorkbenchDispatchCommand::PrivateObservation {
-            invocation_id: invocation_id.to_string(),
-            authority,
-            response,
-        })
-        .map_err(|_| WorkflowPortError::Unavailable)?;
-        match receiver.recv_timeout(DISPATCH_RESPONSE_TIMEOUT) {
-            Ok(Ok(Some(observation))) => Ok(observation),
-            Ok(Ok(None)) => Err(WorkflowPortError::Rejected),
-            Ok(Err(error)) => Err(map_workbench_dispatch_error(error)),
-            Err(_) => Err(WorkflowPortError::Unavailable),
-        }
+        let (profile, digest) = self.authority.profile_for_binding(profile_id)?;
+        crate::workbench::read_workbench_private_observation(
+            &invocation_id.to_string(),
+            self.authority.as_ref(),
+            profile,
+            digest,
+        )
+        .map_err(map_workbench_dispatch_error)?
+        .ok_or(WorkflowPortError::Rejected)
     }
 
     fn build_adaptive_request(
@@ -2279,7 +2275,8 @@ impl AdaptiveToolPort for WorkbenchExecutionAdapter {
         if !record.state.is_terminal() {
             return Ok(AdaptiveToolObservationV1::Pending);
         }
-        let observation = self.private_observation(effect.id)?;
+        let observation =
+            self.private_observation(effect.id, &session.grant.authority.profile_id)?;
         observation
             .validate(&effect.id.to_string(), &effect.request_digest)
             .map_err(|_| WorkflowPortError::Rejected)?;
