@@ -237,20 +237,47 @@ fn adaptive_cached_reads_reuse_exact_authorized_head_and_digest_proof() {
     let authority = &session.grant.authority;
     let before = durable_rows(&fixture.store);
     let (_, first) = crate::domain_store::validation_scope::with_completed_validations(|| {
-        assert_eq!(fixture.store.adaptive_session(id, authority).unwrap(), Some(session.clone()));
+        assert_eq!(
+            fixture.store.adaptive_session(id, authority).unwrap(),
+            Some(session.clone())
+        );
     });
-    assert!(first.iter().any(|scope| scope.get("adaptive-journal").is_some_and(|count| *count > 0)));
+    assert!(first.iter().any(|scope| scope
+        .get("adaptive-journal")
+        .is_some_and(|count| *count > 0)));
     let (_, repeated) = crate::domain_store::validation_scope::with_completed_validations(|| {
-        assert_eq!(fixture.store.adaptive_session(id, authority).unwrap(), Some(session.clone()));
-        assert!(fixture.store.adaptive_session_head_digest(id, authority).unwrap().is_some());
+        assert_eq!(
+            fixture.store.adaptive_session(id, authority).unwrap(),
+            Some(session.clone())
+        );
+        assert!(fixture
+            .store
+            .adaptive_session_head_digest(id, authority)
+            .unwrap()
+            .is_some());
     });
-    assert!(repeated.is_empty(), "exact unchanged input should reuse the typed proof");
+    assert!(
+        repeated.is_empty(),
+        "exact unchanged input should reuse the typed proof"
+    );
     let (_, selected) = crate::domain_store::validation_scope::with_completed_validations(|| {
-        assert_eq!(fixture.store.adaptive_session_for_authority(authority).unwrap(), Some(session.clone()));
+        assert_eq!(
+            fixture
+                .store
+                .adaptive_session_for_authority(authority)
+                .unwrap(),
+            Some(session.clone())
+        );
     });
     assert!(!selected.is_empty());
     let (_, repeated) = crate::domain_store::validation_scope::with_completed_validations(|| {
-        assert_eq!(fixture.store.adaptive_session_for_authority(authority).unwrap(), Some(session.clone()));
+        assert_eq!(
+            fixture
+                .store
+                .adaptive_session_for_authority(authority)
+                .unwrap(),
+            Some(session.clone())
+        );
     });
     assert!(repeated.is_empty());
     assert_eq!(durable_rows(&fixture.store), before);
@@ -263,13 +290,31 @@ fn adaptive_cached_reads_recheck_authority_and_absent_session_keys() {
     let session = fixture.begin(&grant());
     let id = session.grant.session_id;
     let authority = &session.grant.authority;
-    assert!(fixture.store.adaptive_session(Uuid::from_u128(888), authority).unwrap().is_none());
+    assert!(fixture
+        .store
+        .adaptive_session(Uuid::from_u128(888), authority)
+        .unwrap()
+        .is_none());
     for _ in 0..2 {
-        assert_eq!(fixture.store.adaptive_session(id, authority).unwrap(), Some(session.clone()));
+        assert_eq!(
+            fixture.store.adaptive_session(id, authority).unwrap(),
+            Some(session.clone())
+        );
         let mut drifted = authority.clone();
         drifted.profile_digest = "a".repeat(64);
-        assert_eq!(fixture.store.adaptive_session(id, &drifted).unwrap_err().code, WorkflowErrorCode::AuthorityConflict);
-        assert!(fixture.store.adaptive_session(Uuid::from_u128(888), authority).unwrap().is_none());
+        assert_eq!(
+            fixture
+                .store
+                .adaptive_session(id, &drifted)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+        assert!(fixture
+            .store
+            .adaptive_session(Uuid::from_u128(888), authority)
+            .unwrap()
+            .is_none());
     }
 }
 
@@ -279,17 +324,49 @@ fn adaptive_cached_reads_invalidate_after_append_and_pending_checks_remain_fresh
     let source = fixture.begin(&grant());
     let id = source.grant.session_id;
     let authority = &source.grant.authority;
-    assert_eq!(fixture.store.adaptive_session(id, authority).unwrap(), Some(source.clone()));
-    let old_digest = fixture.store.adaptive_session_head_digest(id, authority).unwrap().unwrap();
-    let pending = fixture.advance(&source, AdaptiveTransitionV1::ClaimModel {
-        effect: effect(102), previous_observation_digest: None,
-    });
-    assert_eq!(fixture.store.adaptive_session(id, authority).unwrap(), Some(pending.clone()));
-    let (fresh, digest) = fixture.store.adaptive_pending_model_head_evidence(id, pending.version, &effect(102), authority).unwrap().unwrap();
+    assert_eq!(
+        fixture.store.adaptive_session(id, authority).unwrap(),
+        Some(source.clone())
+    );
+    let old_digest = fixture
+        .store
+        .adaptive_session_head_digest(id, authority)
+        .unwrap()
+        .unwrap();
+    let pending = fixture.advance(
+        &source,
+        AdaptiveTransitionV1::ClaimModel {
+            effect: effect(102),
+            previous_observation_digest: None,
+        },
+    );
+    assert_eq!(
+        fixture.store.adaptive_session(id, authority).unwrap(),
+        Some(pending.clone())
+    );
+    let (fresh, digest) = fixture
+        .store
+        .adaptive_pending_model_head_evidence(id, pending.version, &effect(102), authority)
+        .unwrap()
+        .unwrap();
     assert_eq!(fresh, pending);
     assert_ne!(digest, old_digest);
-    assert_eq!(fixture.store.adaptive_pending_model_head_evidence(id, source.version, &effect(102), authority).unwrap_err().code, WorkflowErrorCode::VersionConflict);
-    assert_eq!(fixture.store.adaptive_pending_model_head_evidence(id, pending.version, &effect(103), authority).unwrap_err().code, WorkflowErrorCode::AuthorityConflict);
+    assert_eq!(
+        fixture
+            .store
+            .adaptive_pending_model_head_evidence(id, source.version, &effect(102), authority)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::VersionConflict
+    );
+    assert_eq!(
+        fixture
+            .store
+            .adaptive_pending_model_head_evidence(id, pending.version, &effect(103), authority)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::AuthorityConflict
+    );
 }
 
 #[test]
@@ -297,16 +374,46 @@ fn adaptive_cached_reads_reject_resealed_journal_corruption_after_warm_read() {
     let fixture = Fixture::new();
     let session = fixture.unknown(&grant());
     let authority = &session.grant.authority;
-    assert_eq!(fixture.store.adaptive_session(session.grant.session_id, authority).unwrap(), Some(session.clone()));
-    assert_eq!(fixture.store.adaptive_session_for_authority(authority).unwrap(), Some(session.clone()));
+    assert_eq!(
+        fixture
+            .store
+            .adaptive_session(session.grant.session_id, authority)
+            .unwrap(),
+        Some(session.clone())
+    );
+    assert_eq!(
+        fixture
+            .store
+            .adaptive_session_for_authority(authority)
+            .unwrap(),
+        Some(session.clone())
+    );
     fixture.rewrite_entry(session.grant.session_id, session.version, |entry| {
         entry.previous_digest = Some("f".repeat(64));
     });
     let before = durable_rows(&fixture.store);
     for store in [&fixture.store, &fixture.reopen()] {
-        assert_eq!(store.adaptive_session(session.grant.session_id, authority).unwrap_err().code, WorkflowErrorCode::CorruptStore);
-        assert_eq!(store.adaptive_session_head_digest(session.grant.session_id, authority).unwrap_err().code, WorkflowErrorCode::CorruptStore);
-        assert_eq!(store.adaptive_session_for_authority(authority).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert_eq!(
+            store
+                .adaptive_session(session.grant.session_id, authority)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
+        assert_eq!(
+            store
+                .adaptive_session_head_digest(session.grant.session_id, authority)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
+        assert_eq!(
+            store
+                .adaptive_session_for_authority(authority)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
         assert_eq!(durable_rows(store), before);
     }
 }
@@ -317,14 +424,52 @@ fn adaptive_cached_reads_recheck_external_writes_without_local_change_counter() 
     let session = fixture.begin(&grant());
     let id = session.grant.session_id;
     let authority = &session.grant.authority;
-    assert_eq!(fixture.store.adaptive_session(id, authority).unwrap(), Some(session.clone()));
-    assert_eq!(fixture.store.adaptive_session_for_authority(authority).unwrap(), Some(session.clone()));
-    let local_changes: i64 = fixture.store.lock().unwrap().query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        fixture.store.adaptive_session(id, authority).unwrap(),
+        Some(session.clone())
+    );
+    assert_eq!(
+        fixture
+            .store
+            .adaptive_session_for_authority(authority)
+            .unwrap(),
+        Some(session.clone())
+    );
+    let local_changes: i64 = fixture
+        .store
+        .lock()
+        .unwrap()
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap();
     let external = rusqlite::Connection::open(fixture.root.path().join("health.sqlite")).unwrap();
-    external.execute("UPDATE workflow_adaptive_heads SET version=version+1", []).unwrap();
-    assert_eq!(fixture.store.lock().unwrap().query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0)).unwrap(), local_changes);
-    assert_eq!(fixture.store.adaptive_session(id, authority).unwrap_err().code, WorkflowErrorCode::CorruptStore);
-    assert_eq!(fixture.store.adaptive_session_for_authority(authority).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    external
+        .execute("UPDATE workflow_adaptive_heads SET version=version+1", [])
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .lock()
+            .unwrap()
+            .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        local_changes
+    );
+    assert_eq!(
+        fixture
+            .store
+            .adaptive_session(id, authority)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::CorruptStore
+    );
+    assert_eq!(
+        fixture
+            .store
+            .adaptive_session_for_authority(authority)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::CorruptStore
+    );
 }
 
 #[test]
@@ -332,14 +477,27 @@ fn adaptive_cached_reads_do_not_hide_new_same_assignment_drifted_heads() {
     let fixture = Fixture::new();
     let session = fixture.begin(&grant());
     let authority = &session.grant.authority;
-    assert_eq!(fixture.store.adaptive_session_for_authority(authority).unwrap(), Some(session.clone()));
+    assert_eq!(
+        fixture
+            .store
+            .adaptive_session_for_authority(authority)
+            .unwrap(),
+        Some(session.clone())
+    );
     let mut drifted = grant();
     drifted.session_id = Uuid::from_u128(303);
     drifted.provider_allowance_id = "new-profile-allowance".into();
     drifted.authority.profile_digest = "a".repeat(64);
     drifted.authority.profile_generation += 1;
     fixture.begin(&drifted);
-    assert_eq!(fixture.store.adaptive_session_for_authority(authority).unwrap_err().code, WorkflowErrorCode::AuthorityConflict);
+    assert_eq!(
+        fixture
+            .store
+            .adaptive_session_for_authority(authority)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::AuthorityConflict
+    );
 }
 
 #[test]
@@ -348,22 +506,53 @@ fn adaptive_cached_reads_preserve_outer_transaction_and_rollback() {
     let session = fixture.begin(&grant());
     let id = session.grant.session_id;
     let authority = &session.grant.authority;
-    assert_eq!(fixture.store.adaptive_session(id, authority).unwrap(), Some(session.clone()));
-    for (begin, rollback) in [("BEGIN", "ROLLBACK"), ("SAVEPOINT caller", "ROLLBACK TO caller; RELEASE caller")] {
+    assert_eq!(
+        fixture.store.adaptive_session(id, authority).unwrap(),
+        Some(session.clone())
+    );
+    for (begin, rollback) in [
+        ("BEGIN", "ROLLBACK"),
+        ("SAVEPOINT caller", "ROLLBACK TO caller; RELEASE caller"),
+    ] {
         {
             let connection = fixture.store.lock().unwrap();
             connection.execute_batch(begin).unwrap();
-            connection.execute("UPDATE workflow_adaptive_heads SET version=version+1", []).unwrap();
+            connection
+                .execute("UPDATE workflow_adaptive_heads SET version=version+1", [])
+                .unwrap();
         }
-        assert_eq!(fixture.store.adaptive_session(id, authority).unwrap_err().code, WorkflowErrorCode::CorruptStore);
-        assert_eq!(fixture.store.adaptive_session_for_authority(authority).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert_eq!(
+            fixture
+                .store
+                .adaptive_session(id, authority)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
+        assert_eq!(
+            fixture
+                .store
+                .adaptive_session_for_authority(authority)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
         {
             let connection = fixture.store.lock().unwrap();
             assert!(!connection.is_autocommit());
             connection.execute_batch(rollback).unwrap();
         }
-        assert_eq!(fixture.store.adaptive_session(id, authority).unwrap(), Some(session.clone()));
-        assert_eq!(fixture.store.adaptive_session_for_authority(authority).unwrap(), Some(session.clone()));
+        assert_eq!(
+            fixture.store.adaptive_session(id, authority).unwrap(),
+            Some(session.clone())
+        );
+        assert_eq!(
+            fixture
+                .store
+                .adaptive_session_for_authority(authority)
+                .unwrap(),
+            Some(session.clone())
+        );
     }
 }
 
