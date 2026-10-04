@@ -2570,6 +2570,7 @@ mod tests {
                     .unwrap(),
                 old_execution
             );
+            assert_company_page_read_contract(&reopened, &old_execution);
             return;
         }
         let body = serde_json::to_vec(
@@ -2692,6 +2693,7 @@ mod tests {
                 .unwrap(),
             *corrected
         );
+        assert_company_page_read_contract(&api, &old_execution);
         api.subscription_allowance_id = Some(next.allowance_id.clone());
         let next_binding = ProviderUsageAuthority {
             reservation_id: next.allowance_id.clone(),
@@ -2767,6 +2769,344 @@ mod tests {
             .accept_model_work(&first, &old_request, &digest)
             .is_err());
         assert_eq!(api.store.pending_executions(10).unwrap().len(), 1);
+    }
+
+    fn assert_company_page_read_contract(
+        api: &WorkflowApi,
+        execution: &sentinel_workflow::WorkItemExecutionV1,
+    ) {
+        use std::cell::{Cell, RefCell};
+
+        let page = vec![execution.clone(), execution.clone()];
+        let reads = Cell::new(0);
+        reconcile_company_page(
+            &page,
+            |tenant, project| {
+                reads.set(reads.get() + 1);
+                let mut view = api.store.company_project(tenant, project)?;
+                if execution.state == sentinel_workflow::WorkItemState::Done {
+                    view.as_mut()
+                        .unwrap()
+                        .work_items
+                        .get_mut(&execution.work_item_id)
+                        .unwrap()
+                        .state = sentinel_workflow::CompanyWorkStateV1::Done;
+                }
+                Ok(view)
+            },
+            |_| panic!("old completion must not close a pending correction"),
+        )
+        .unwrap();
+        assert_eq!(reads.get(), 1);
+        // A new page never inherits a preceding page's no-effect decision.
+        reconcile_company_page(
+            &page,
+            |tenant, project| {
+                reads.set(reads.get() + 1);
+                let mut view = api.store.company_project(tenant, project)?;
+                if execution.state == sentinel_workflow::WorkItemState::Done {
+                    view.as_mut()
+                        .unwrap()
+                        .work_items
+                        .get_mut(&execution.work_item_id)
+                        .unwrap()
+                        .state = sentinel_workflow::CompanyWorkStateV1::Done;
+                }
+                Ok(view)
+            },
+            |_| panic!("old completion must not close a pending correction"),
+        )
+        .unwrap();
+        assert_eq!(reads.get(), 2);
+
+        let mut current = api
+            .store
+            .company_project(&execution.tenant_id, &execution.project_id)
+            .unwrap()
+            .unwrap();
+        current.archived_source_reviews.clear();
+        current.work_corrections.clear();
+        let settled_state = match execution.state {
+            sentinel_workflow::WorkItemState::Done => sentinel_workflow::CompanyWorkStateV1::Done,
+            sentinel_workflow::WorkItemState::Blocked => {
+                sentinel_workflow::CompanyWorkStateV1::Blocked
+            }
+            _ => panic!("terminal fixture"),
+        };
+        if execution.state == sentinel_workflow::WorkItemState::Done {
+            let mut archived = current.clone();
+            let mut review_work = archived.work_items[&execution.work_item_id].clone();
+            review_work.gate_receipt = company_gate_receipt(
+                sentinel_workflow::CompanyWorkStateV1::Done,
+                execution.gate_evidence.as_ref(),
+            )
+            .unwrap();
+            let allowance = archived.subscription_call.as_ref().unwrap().clone();
+            let dispatch = allowance.dispatch.as_ref().unwrap();
+            let mut archived_execution = execution.clone();
+            archived_execution.plan.plan_id = stable_operation_id(
+                "sentinel.model-work.v1",
+                &format!("{}:{}", dispatch.request_id, dispatch.request_digest),
+                1,
+            );
+            archived
+                .archived_source_reviews
+                .push(sentinel_workflow::ArchivedSourceReviewV1 {
+                    source_work: review_work.clone(),
+                    review_work,
+                    review_corrections: Vec::new(),
+                    review_abandoned_calls: Vec::new(),
+                    source_allowance: allowance.clone(),
+                    review_allowance: allowance,
+                    report_digest: "a".repeat(64),
+                    blocker_id: "archived-review".into(),
+                    archived_at_unix_ms: 1,
+                });
+            archived.work_items.clear();
+            assert_eq!(
+                company_sync_target(&archived_execution, &archived).unwrap(),
+                None
+            );
+            let mut changed_plan = archived_execution.clone();
+            changed_plan.plan.plan_id = Uuid::new_v4();
+            assert_eq!(
+                company_sync_target(&changed_plan, &archived)
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::NotFound
+            );
+            archived.archived_source_reviews[0]
+                .review_work
+                .gate_receipt
+                .as_mut()
+                .unwrap()
+                .passed = false;
+            assert_eq!(
+                company_sync_target(&archived_execution, &archived)
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::NotFound
+            );
+        }
+        current
+            .work_items
+            .get_mut(&execution.work_item_id)
+            .unwrap()
+            .state = sentinel_workflow::CompanyWorkStateV1::Assigned;
+        let current = RefCell::new(current);
+        let reads = Cell::new(0);
+        let effects = Cell::new(0);
+        reconcile_company_page(
+            &page,
+            |_, _| {
+                reads.set(reads.get() + 1);
+                Ok(Some(current.borrow().clone()))
+            },
+            |_| {
+                effects.set(effects.get() + 1);
+                current
+                    .borrow_mut()
+                    .work_items
+                    .get_mut(&execution.work_item_id)
+                    .unwrap()
+                    .state = settled_state;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!((reads.get(), effects.get()), (2, 1));
+
+        let mut second = execution.clone();
+        second.work_item_id = WorkItemId::parse("second-adjacent-work").unwrap();
+        let mut second_work = current.borrow().work_items[&execution.work_item_id].clone();
+        second_work.spec.work_item_id = second.work_item_id.clone();
+        current
+            .borrow_mut()
+            .work_items
+            .insert(second.work_item_id.clone(), second_work);
+        current
+            .borrow_mut()
+            .work_items
+            .get_mut(&execution.work_item_id)
+            .unwrap()
+            .state = sentinel_workflow::CompanyWorkStateV1::Assigned;
+        let reads = Cell::new(0);
+        assert_eq!(
+            reconcile_company_page(
+                &[execution.clone(), second.clone()],
+                |_, _| {
+                    reads.set(reads.get() + 1);
+                    Ok(Some(current.borrow().clone()))
+                },
+                |_| {
+                    current
+                        .borrow_mut()
+                        .work_items
+                        .get_mut(&second.work_item_id)
+                        .unwrap()
+                        .assignments
+                        .clear();
+                    Ok(())
+                },
+            )
+            .unwrap_err()
+            .code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+        assert_eq!(
+            reads.get(),
+            2,
+            "effect must invalidate a distinct following work item"
+        );
+        current.borrow_mut().work_items.remove(&second.work_item_id);
+        current
+            .borrow_mut()
+            .work_items
+            .get_mut(&execution.work_item_id)
+            .unwrap()
+            .state = settled_state;
+
+        let mut foreign = execution.clone();
+        foreign.tenant_id = TenantId::parse("tenant-other").unwrap();
+        foreign.project_id = ProjectId::parse("project-other").unwrap();
+        let reads = Cell::new(0);
+        reconcile_company_page(
+            &[execution.clone(), foreign, execution.clone()],
+            |tenant, project| {
+                reads.set(reads.get() + 1);
+                let mut view = current.borrow().clone();
+                view.tenant_id = tenant.clone();
+                view.project_id = project.clone();
+                Ok(Some(view))
+            },
+            |_| panic!("settled work has no effects"),
+        )
+        .unwrap();
+        assert_eq!(reads.get(), 3);
+
+        for tenant_change in [true, false] {
+            let mut changed = execution.clone();
+            if tenant_change {
+                changed.tenant_id = TenantId::parse("tenant-other").unwrap();
+            } else {
+                changed.project_id = ProjectId::parse("project-other").unwrap();
+            }
+            let reads = Cell::new(0);
+            reconcile_company_page(
+                &[execution.clone(), changed],
+                |tenant, project| {
+                    reads.set(reads.get() + 1);
+                    let mut view = current.borrow().clone();
+                    view.tenant_id = tenant.clone();
+                    view.project_id = project.clone();
+                    Ok(Some(view))
+                },
+                |_| panic!("settled boundary"),
+            )
+            .unwrap();
+            assert_eq!(reads.get(), 2);
+        }
+
+        let mut incompatible = current.borrow().clone();
+        incompatible
+            .work_items
+            .get_mut(&execution.work_item_id)
+            .unwrap()
+            .state = sentinel_workflow::CompanyWorkStateV1::Ready;
+        assert_eq!(
+            reconcile_company_page(
+                &page,
+                |_, _| Ok(Some(incompatible.clone())),
+                |_| panic!("invalid state")
+            )
+            .unwrap_err()
+            .code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+
+        let prior_cursor = api.company_sync_cursor.lock().unwrap().clone();
+        *api.company_sync_cursor.lock().unwrap() = Some((
+            TenantId::parse("zzzz-tenant").unwrap(),
+            ProjectId::parse("zzzz-project").unwrap(),
+            WorkItemId::parse("zzzz-work").unwrap(),
+        ));
+        api.reconcile_company_state_page().unwrap();
+        assert!(api.company_sync_cursor.lock().unwrap().is_none());
+        *api.company_sync_cursor.lock().unwrap() = prior_cursor;
+
+        assert_eq!(
+            reconcile_company_page(&page, |_, _| Ok(None), |_| panic!("missing project"))
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::NotFound
+        );
+        assert_eq!(
+            reconcile_company_page(
+                &page,
+                |_, _| Err(workflow_persistence_failure()),
+                |_| panic!("corrupt project")
+            )
+            .unwrap_err()
+            .code,
+            WorkflowErrorCode::PersistenceFailure
+        );
+        let mut foreign_view = current.borrow().clone();
+        foreign_view.tenant_id = TenantId::parse("tenant-other").unwrap();
+        assert_eq!(
+            reconcile_company_page(
+                &page,
+                |_, _| Ok(Some(foreign_view.clone())),
+                |_| panic!("foreign project")
+            )
+            .unwrap_err()
+            .code,
+            WorkflowErrorCode::PersistenceFailure
+        );
+        let mut missing_assignment = current.borrow().clone();
+        missing_assignment
+            .work_items
+            .get_mut(&execution.work_item_id)
+            .unwrap()
+            .assignments
+            .clear();
+        assert_eq!(
+            reconcile_company_page(
+                &page,
+                |_, _| Ok(Some(missing_assignment.clone())),
+                |_| panic!("missing assignment")
+            )
+            .unwrap_err()
+            .code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+        let mut missing_work = current.borrow().clone();
+        missing_work.work_items.clear();
+        assert_eq!(
+            reconcile_company_page(
+                &page,
+                |_, _| Ok(Some(missing_work.clone())),
+                |_| panic!("missing work")
+            )
+            .unwrap_err()
+            .code,
+            WorkflowErrorCode::NotFound
+        );
+        current
+            .borrow_mut()
+            .work_items
+            .get_mut(&execution.work_item_id)
+            .unwrap()
+            .state = sentinel_workflow::CompanyWorkStateV1::Assigned;
+        assert_eq!(
+            reconcile_company_page(
+                &page,
+                |_, _| Ok(Some(current.borrow().clone())),
+                |_| Err(workflow_unavailable())
+            )
+            .unwrap_err()
+            .code,
+            WorkflowErrorCode::PersistenceFailure
+        );
     }
 
     #[test]
