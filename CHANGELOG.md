@@ -1,5 +1,11 @@
 # Changelog
 
+- Share one freshly validated project snapshot across adjacent no-effect
+  entries in a bounded company reconciliation page. Re-read every real state
+  transition through the existing current authority path, discard the shared
+  view after effects, and never retain it across pages or tenant/project changes.
+  Preserve correction/archive replay and assignment/state rejection (#856).
+
 - Admit late-arriving validated read views with bounded least-recently-used
   eviction instead of permanently retaining the first eight views. Share exact
   input proofs with historical leadership-review reads; preserve tenant/session
