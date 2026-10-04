@@ -1,5 +1,14 @@
 # Changelog
 
+- Parse governed journal allowance locators once per exact work lineage and
+  unchanged SQLite snapshot, instead of rescanning every historical allowance.
+  Reuse exact project subscription proofs in the same snapshot; preserve full
+  selected-journal replay, per-allowance bounds, corruption rejection and
+  invalidation after writes or a new read. Share immutable locator maps through
+  references, bound discovery independently from mandatory proof budgets, and
+  fall back to exact legacy selection on oversized or undecodable advisory
+  inventories (#856).
+
 - Separate authenticated daemon boot readiness from workflow-store health.
   Preserve the complete runtime/security/worker snapshot and fail-closed
   credential checks; leave full company readiness as an independent product
