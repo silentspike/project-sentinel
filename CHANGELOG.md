@@ -1,5 +1,12 @@
 # Changelog
 
+- Stream canonical workflow digests through a fixed-size hash buffer instead of
+  allocating complete serialized payload copies. Preserve existing JSON numeric
+  array byte digests exactly with a decimal lookup; keep every hash domain,
+  persisted journal format and authority validation unchanged. Count serialized
+  proof sizes without a second payload allocation while retaining exact mandatory
+  and advisory validation budgets (#856).
+
 - Parse governed journal allowance locators once per exact work lineage and
   unchanged SQLite snapshot, instead of rescanning every historical allowance.
   Reuse exact project subscription proofs in the same snapshot; preserve full
