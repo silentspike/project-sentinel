@@ -217,12 +217,11 @@ impl WorkflowStore {
     /// Historical health inventory only, never admission or authority to retry effects.
     pub fn adaptive_sessions_for_health(&self) -> Result<Vec<AdaptiveSessionV1>, WorkflowError> {
         let mut connection = self.lock()?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(map_sqlite_error)?;
         // The validation scope pins the snapshot and reuses replay proofs only until
         // this read ends, including journals named by both heads and namespaces.
-        crate::domain_store::validation_scope::with_scope(&tx, || adaptive_health_inventory(&tx))
+        self.validated_read_snapshot(&mut connection, "adaptive-health-inventory", &[], |tx| {
+            crate::domain_store::validation_scope::with_scope(tx, || adaptive_health_inventory(tx))
+        })
     }
 
     /// Private historical pointers from one authorized, fully replayed read snapshot.

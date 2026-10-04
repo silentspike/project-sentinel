@@ -18,6 +18,7 @@ use crate::{
 
 pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 3;
 pub(crate) mod adaptive;
+mod read_cache;
 mod revisions;
 pub(crate) use revisions::require_completed_source;
 pub use revisions::ExecutionRevisionV1;
@@ -149,6 +150,7 @@ UPDATE workflow_schema_meta SET schema_version = 3 WHERE singleton = 1;
 #[derive(Debug)]
 pub struct WorkflowStore {
     pub(crate) connection: Mutex<Connection>,
+    validated_reads: Mutex<read_cache::ReadCache>,
 }
 
 struct ExecutionRow {
@@ -191,6 +193,36 @@ struct GateRow {
 }
 
 impl WorkflowStore {
+    pub(crate) fn validated_read_snapshot<T: Clone + Serialize + Send + 'static>(
+        &self,
+        connection: &mut Connection,
+        domain: &'static str,
+        query_key: &[u8],
+        validate: impl FnOnce(&Connection) -> Result<T, WorkflowError>,
+    ) -> Result<T, WorkflowError> {
+        let eligible = connection.is_autocommit();
+        let mut cache = self.validated_reads.lock().ok();
+        // Keep the proof private under both locks until snapshot cleanup succeeds.
+        // Savepoints also preserve caller-owned transactions without nested BEGIN.
+        let result = (|| {
+            let snapshot = connection.savepoint()?;
+            let value = match cache.as_mut() {
+                Some(cache) => cache.read_keyed(&snapshot, eligible, domain, query_key, || {
+                    validate(&snapshot)
+                }),
+                None => validate(&snapshot),
+            }?;
+            snapshot.commit()?;
+            Ok(value)
+        })();
+        if result.is_err() {
+            if let Some(cache) = cache.as_mut() {
+                cache.clear();
+            }
+        }
+        result
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WorkflowError> {
         Self::open_with_failure_injection(path, false, false)
     }
@@ -270,6 +302,7 @@ impl WorkflowStore {
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(Self {
             connection: Mutex::new(connection),
+            validated_reads: Mutex::new(read_cache::ReadCache::default()),
         })
     }
 
@@ -2447,6 +2480,45 @@ mod tests {
     use crate::WorkflowErrorCode;
 
     struct SerializationFailure;
+
+    #[test]
+    fn validated_read_snapshot_clears_proofs_after_cleanup_failure() {
+        let store = WorkflowStore::open(":memory:").unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let result = store.validated_read_snapshot(&mut connection, "fixture", &[], |snapshot| {
+            snapshot.execute_batch("ROLLBACK")?;
+            Ok(7_u64)
+        });
+        assert!(result.is_err());
+        assert!(connection.is_autocommit());
+        assert!(format!("{:?}", store.validated_reads.lock().unwrap()).contains("views: 0"));
+    }
+
+    #[test]
+    fn public_validated_reads_preserve_caller_owned_transactions() {
+        let store = WorkflowStore::open(":memory:").unwrap();
+        assert!(store.company_projects().unwrap().is_empty());
+        assert!(store.adaptive_sessions_for_health().unwrap().is_empty());
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("BEGIN")
+            .unwrap();
+        assert!(store.company_projects().unwrap().is_empty());
+        assert!(store.adaptive_sessions_for_health().unwrap().is_empty());
+        assert!(store
+            .company_project(
+                &crate::TenantId("tenant-a".into()),
+                &crate::ProjectId("project-a".into())
+            )
+            .unwrap()
+            .is_none());
+        let connection = store.connection.lock().unwrap();
+        assert!(!connection.is_autocommit());
+        connection.execute_batch("ROLLBACK").unwrap();
+        assert!(format!("{:?}", store.validated_reads.lock().unwrap()).contains("views: 0"));
+    }
 
     impl Serialize for SerializationFailure {
         fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
