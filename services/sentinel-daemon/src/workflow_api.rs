@@ -1217,6 +1217,8 @@ impl WorkbenchAuthoritySource for CompanyAuthority {
         &self,
         record: &WorkbenchInvocationRecord,
     ) -> anyhow::Result<WorkbenchAuthoritySnapshot> {
+        #[cfg(test)]
+        tests::record_workbench_authority_read();
         let principal = self
             .principals
             .principal(&record.caller_id)
@@ -1228,6 +1230,36 @@ impl WorkbenchAuthoritySource for CompanyAuthority {
             record.agent_id,
             false,
         )
+    }
+
+    fn current_for_records(
+        &self,
+        records: &[WorkbenchInvocationRecord],
+    ) -> anyhow::Result<Vec<WorkbenchAuthoritySnapshot>> {
+        anyhow::ensure!(
+            records.len() <= sentinel_workflow::ADAPTIVE_WORKING_MEMORY_MAX_ROWS,
+            "workbench authority batch exceeds bound"
+        );
+        // These are exactly the record inputs to current_for_record. Share only
+        // within this call; the coordinator repeats the fresh proof after reads.
+        let mut snapshots = HashMap::new();
+        records
+            .iter()
+            .map(|record| {
+                let key = (
+                    record.caller_id.as_str(),
+                    record.project_id.as_str(),
+                    record.work_item_id.as_str(),
+                    record.agent_id,
+                );
+                if let Some(snapshot) = snapshots.get(&key) {
+                    return Ok(WorkbenchAuthoritySnapshot::clone(snapshot));
+                }
+                let snapshot = self.current_for_record(record)?;
+                snapshots.insert(key, snapshot.clone());
+                Ok(snapshot)
+            })
+            .collect()
     }
 }
 
@@ -2109,6 +2141,39 @@ impl WorkbenchExecutionAdapter {
         .ok_or(WorkflowPortError::Rejected)
     }
 
+    fn private_observations(
+        &self,
+        invocation_ids: &[Uuid],
+        profile_id: &str,
+    ) -> Result<HashMap<Uuid, sentinel_common::WorkbenchPrivateObservation>, WorkflowPortError>
+    {
+        let (profile, digest) = self.authority.profile_for_binding(profile_id)?;
+        let ids = invocation_ids
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>();
+        let observations = crate::workbench::read_workbench_private_observations(
+            &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            self.authority.as_ref(),
+            profile,
+            digest,
+        )
+        .map_err(map_workbench_dispatch_error)?;
+        if observations.len() != invocation_ids.len() {
+            return Err(WorkflowPortError::Rejected);
+        }
+        invocation_ids
+            .iter()
+            .copied()
+            .zip(observations)
+            .map(|(id, observation)| {
+                observation
+                    .map(|value| (id, value))
+                    .ok_or(WorkflowPortError::Rejected)
+            })
+            .collect()
+    }
+
     fn build_adaptive_request(
         &self,
         session: &AdaptiveSessionV1,
@@ -2839,7 +2904,7 @@ where
     F: FnMut(&str) -> Result<bool, &'static str>,
 {
     select_subscription_queue_allowance_id(projects, agent_id, now_ms, locally_recoverable, |_| {
-        Ok(Some(2))
+        Ok(Some((2, 0)))
     })
 }
 
@@ -2852,7 +2917,7 @@ fn select_subscription_queue_allowance_id<F, G>(
 ) -> Result<Option<&str>, &'static str>
 where
     F: FnMut(&str) -> Result<bool, &'static str>,
-    G: FnMut(&ProviderUsageBinding) -> Result<Option<u8>, &'static str>,
+    G: FnMut(&ProviderUsageBinding) -> Result<Option<(u8, u64)>, &'static str>,
 {
     let mut selected = None;
     for project in projects {
@@ -2868,7 +2933,7 @@ where
         else {
             continue;
         };
-        let Some(adaptive_rank) = adaptive_priority(&binding)? else {
+        let Some((adaptive_rank, last_transition_ms)) = adaptive_priority(&binding)? else {
             continue;
         };
         let has_local_completion = match &allowance.dispatch {
@@ -2890,6 +2955,11 @@ where
         // duplicate/assignment validation above still fails closed for every row.
         let candidate = (
             priority,
+            if last_transition_ms == 0 {
+                allowance.created_at_unix_ms
+            } else {
+                last_transition_ms
+            },
             allowance.created_at_unix_ms,
             project.tenant_id.0.as_str(),
             project.project_id.0.as_str(),
@@ -2899,7 +2969,7 @@ where
             selected = Some(candidate);
         }
     }
-    Ok(selected.map(|(_, _, _, _, allowance_id)| allowance_id))
+    Ok(selected.map(|(_, _, _, _, _, allowance_id)| allowance_id))
 }
 
 fn validate_provider_usage_event(
@@ -4228,7 +4298,7 @@ impl WorkflowApi {
             |binding| {
                 #[cfg(feature = "llm")]
                 {
-                    let priority = self.adaptive_subscription_queue_priority(binding)?;
+                    let priority = self.adaptive_subscription_queue_order(binding)?;
                     // Exact grant validation precedes this callback. An idle
                     // authorized campaign is not a foreign-agent authorization.
                     inactive_adaptive_work |= priority.is_none();
@@ -4243,7 +4313,7 @@ impl WorkflowApi {
                     {
                         Err("adaptive model work unavailable")
                     } else {
-                        Ok(Some(2))
+                        Ok(Some((2, 0)))
                     }
                 }
             },
@@ -6551,6 +6621,16 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     use super::*;
+
+    thread_local! {
+        pub(super) static WORKBENCH_AUTHORITY_READS: std::cell::Cell<usize> = const {
+            std::cell::Cell::new(0)
+        };
+    }
+
+    pub(super) fn record_workbench_authority_read() {
+        WORKBENCH_AUTHORITY_READS.with(|count| count.set(count.get() + 1));
+    }
 
     #[test]
     fn delivery_reconciliation_error_classes_never_embed_private_details() {
