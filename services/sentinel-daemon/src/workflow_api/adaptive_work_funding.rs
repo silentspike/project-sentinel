@@ -30,6 +30,30 @@ enum FundingInput {
     Draft(FundingSubmission),
 }
 
+struct FundingPhase {
+    phase: &'static str,
+    started: std::time::Instant,
+}
+
+impl FundingPhase {
+    fn start(phase: &'static str) -> Self {
+        Self {
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for FundingPhase {
+    fn drop(&mut self) {
+        tracing::info!(
+            phase = self.phase,
+            elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Work funding preparation phase"
+        );
+    }
+}
+
 fn source_conflict() -> WorkflowError {
     WorkflowError::new(
         WorkflowErrorCode::AuthorityConflict,
@@ -273,6 +297,7 @@ impl WorkflowApi {
         session_id: Uuid,
         now: u64,
     ) -> Result<(), WorkflowError> {
+        let _phase = FundingPhase::start("current_source");
         let (project, session) =
             self.adaptive_resume_policy_current_source(operator, project_id, session_id)?;
         if !matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
@@ -371,9 +396,15 @@ impl WorkflowApi {
         if !self.enabled || !self.model_work_enabled {
             return workflow_error(workflow_unavailable());
         }
-        let Ok(_fence) = self.mutation_fence.write() else {
+        let _total = FundingPhase::start("request_total");
+        let wait = FundingPhase::start("recovery_fence_wait");
+        // Issuance appends only an immutable receipt. The immediate store
+        // transaction rechecks every source field; only recovery needs exclusion
+        // from reconciliation/dispatch, as with ordinary workflow commands.
+        let Ok(_fence) = self.mutation_fence.read() else {
             return workflow_error(workflow_unavailable());
         };
+        drop(wait);
         let now = now_unix_ms();
         if method == "GET" {
             return self.work_funding_draft_http(operator, path, now);
@@ -493,6 +524,7 @@ impl WorkflowApi {
                 request = fresh;
             }
         }
+        let _phase = FundingPhase::start("receipt_transaction");
         match self.store.authorize_adaptive_work_funding(
             &operator.principal,
             &request,
@@ -509,6 +541,7 @@ impl WorkflowApi {
         path: &str,
         now: u64,
     ) -> WorkflowHttpResponse {
+        let _phase = FundingPhase::start("draft_total");
         let parsed = (|| {
             let project = ProjectId::parse(query_parameter(path, "project_id")?).ok()?;
             let session = Uuid::parse_str(query_parameter(path, "session_id")?).ok()?;
