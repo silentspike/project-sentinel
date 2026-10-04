@@ -6,6 +6,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use super::{corrupt, persistence};
+use crate::digest::serialized_json_size;
 use crate::WorkflowError;
 
 const MAX_NODES: usize = 16_384;
@@ -241,11 +242,11 @@ pub(crate) fn inventory<T: Clone + Serialize + 'static>(
         let result = (|| {
             let value = discover()?;
             synchronize(connection)?;
-            let encoded = serde_json::to_vec(&value).map_err(|_| persistence())?;
-            if encoded.len() > capacity {
+            let encoded_size = serialized_json_size(&value).map_err(|_| persistence())?;
+            if encoded_size > capacity {
                 Ok((None, 4))
             } else {
-                Ok((value, encoded.len()))
+                Ok((value, encoded_size))
             }
         })();
         let retained = ACTIVE.with(|active| {
@@ -344,8 +345,8 @@ pub(crate) fn memoize<T: Clone + Serialize + 'static>(
             charge_bytes(connection, key.2.len().saturating_add(256))?;
             let value = validate()?;
             synchronize(connection)?;
-            let bytes = serde_json::to_vec(&value).map_err(|_| persistence())?;
-            charge_bytes(connection, bytes.len())?;
+            let bytes = serialized_json_size(&value).map_err(|_| persistence())?;
+            charge_bytes(connection, bytes)?;
             Ok(value)
         })();
         ACTIVE.with(|active| {

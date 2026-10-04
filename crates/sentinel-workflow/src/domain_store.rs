@@ -28,7 +28,7 @@ mod work_corrections;
 
 use crate::admission::*;
 use crate::collaboration::*;
-use crate::digest::{canonical_sha256, constant_time_eq};
+use crate::digest::{canonical_bytes_sha256, canonical_sha256, constant_time_eq};
 use crate::domain::*;
 use crate::model::{execution_subject_digest, validate_digest, validate_identifier};
 use crate::store::{read_work_item, read_work_item_by_invocation};
@@ -7647,7 +7647,7 @@ fn get_entity_uncached<T: DeserializeOwned + CompanyEntity>(
 }
 
 fn bytes_digest(domain: &'static str, value: &[u8]) -> Result<String, WorkflowError> {
-    canonical_sha256(domain, &value)
+    Ok(canonical_bytes_sha256(domain, value))
 }
 
 fn enum_name<T: std::fmt::Debug>(value: T) -> String {
