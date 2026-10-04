@@ -204,14 +204,25 @@ impl WorkflowStore {
         session_id: Uuid,
         current: &RuntimeAuthoritySnapshotV1,
     ) -> Result<Option<AdaptiveSessionV1>, WorkflowError> {
+        Ok(self.authorized_adaptive_head(session_id, current)?.map(|(session, _)| session))
+    }
+
+    fn authorized_adaptive_head(
+        &self,
+        session_id: Uuid,
+        current: &RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<(AdaptiveSessionV1, String)>, WorkflowError> {
         current.validate()?;
-        let connection = self.lock()?;
-        let Some((session, _)) = load(&connection, session_id)? else {
-            return Ok(None);
-        };
-        authorize(&session.grant, current)?;
-        require_head(&connection, &session)?;
-        Ok(Some(session))
+        let query_key = encode(&(session_id, current))?;
+        let mut connection = self.lock()?;
+        self.validated_read_snapshot(&mut connection, "authorized-adaptive-head", &query_key, |tx| {
+            let Some((session, digest)) = load(tx, session_id)? else {
+                return Ok(None);
+            };
+            authorize(&session.grant, current)?;
+            require_head(tx, &session)?;
+            Ok(Some((session, digest)))
+        })
     }
 
     /// Historical health inventory only, never admission or authority to retry effects.
@@ -345,14 +356,7 @@ impl WorkflowStore {
         session_id: Uuid,
         current: &RuntimeAuthoritySnapshotV1,
     ) -> Result<Option<String>, WorkflowError> {
-        current.validate()?;
-        let connection = self.lock()?;
-        let Some((session, digest)) = load(&connection, session_id)? else {
-            return Ok(None);
-        };
-        authorize(&session.grant, current)?;
-        require_head(&connection, &session)?;
-        Ok(Some(digest))
+        Ok(self.authorized_adaptive_head(session_id, current)?.map(|(_, digest)| digest))
     }
 
     /// One authorized read snapshot of the exact pending session and journal digest.
@@ -364,16 +368,9 @@ impl WorkflowStore {
         effect: &AdaptiveEffectV1,
         current: &RuntimeAuthoritySnapshotV1,
     ) -> Result<Option<(AdaptiveSessionV1, String)>, WorkflowError> {
-        current.validate()?;
-        let mut connection = self.lock()?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(map_sqlite_error)?;
-        let Some((session, digest)) = load(&tx, session_id)? else {
+        let Some((session, digest)) = self.authorized_adaptive_head(session_id, current)? else {
             return Ok(None);
         };
-        authorize(&session.grant, current)?;
-        require_head(&tx, &session)?;
         if session.version != expected_version {
             return Err(WorkflowError::new(
                 WorkflowErrorCode::VersionConflict,
@@ -395,65 +392,11 @@ impl WorkflowStore {
         current: &RuntimeAuthoritySnapshotV1,
     ) -> Result<Option<AdaptiveSessionV1>, WorkflowError> {
         current.validate()?;
+        let query_key = encode(current)?;
         let mut connection = self.lock()?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(map_sqlite_error)?;
-        let mut statement = tx.prepare(
-            "SELECT authority_digest,session_id,version,updated_at_ms FROM workflow_adaptive_heads WHERE tenant_id=?1 AND project_id=?2 AND work_item_id=?3 AND agent_id=?4 ORDER BY authority_digest LIMIT ?5"
-        ).map_err(map_sqlite_error)?;
-        let mut rows = statement
-            .query(params![
-                current.tenant_id.0,
-                current.project_id.0,
-                current.work_item_id.0,
-                i64::from(current.agent_id.0),
-                (MAX_SCOPED_ADAPTIVE_HEADS + 1) as i64
-            ])
-            .map_err(map_sqlite_error)?;
-        let mut exact = None;
-        let mut drifted_assignment = false;
-        let mut count = 0;
-        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-            count += 1;
-            if count > MAX_SCOPED_ADAPTIVE_HEADS {
-                return Err(authority_conflict());
-            }
-            let stored_digest: String = row.get(0).map_err(map_sqlite_error)?;
-            let session_id: String = row.get(1).map_err(map_sqlite_error)?;
-            let head = AdaptiveHead {
-                session_id: Uuid::parse_str(&session_id).map_err(|_| corrupt_store())?,
-                version: stored_u64(row.get(2).map_err(map_sqlite_error)?)?,
-                updated_at_ms: stored_u64(row.get(3).map_err(map_sqlite_error)?)?,
-            };
-            let (session, _) = load(&tx, head.session_id)?.ok_or_else(corrupt_store)?;
-            validate_head(&head, &session)?;
-            let source = &session.grant.authority;
-            if source.tenant_id != current.tenant_id
-                || source.project_id != current.project_id
-                || source.work_item_id != current.work_item_id
-                || source.agent_id != current.agent_id
-                || !constant_time_eq(&stored_digest, &source.canonical_digest()?)
-            {
-                return Err(corrupt_store());
-            }
-            // Prior assignments remain history, never current provider authority.
-            // Do not stop at an exact match: another head may hide spent authority.
-            if source.assignment_version == current.assignment_version {
-                if source != current {
-                    drifted_assignment = true;
-                } else {
-                    authorize(&session.grant, current)?;
-                    if exact.replace(session).is_some() {
-                        return Err(corrupt_store());
-                    }
-                }
-            }
-        }
-        if drifted_assignment {
-            return Err(authority_conflict());
-        }
-        Ok(exact)
+        self.validated_read_snapshot(&mut connection, "adaptive-authority-head", &query_key, |tx| {
+            adaptive_session_for_authority_on_connection(tx, current)
+        })
     }
 
     /// Read-only journal provenance for the original first model's sealed unknown.
@@ -2807,6 +2750,64 @@ mod governed_locator_tests {
             assert_eq!(actual.0["old"].len(), count.min(65));
         }
     }
+}
+
+fn adaptive_session_for_authority_on_connection(
+    connection: &Connection,
+    current: &RuntimeAuthoritySnapshotV1,
+) -> Result<Option<AdaptiveSessionV1>, WorkflowError> {
+    let mut statement = connection.prepare(
+        "SELECT authority_digest,session_id,version,updated_at_ms FROM workflow_adaptive_heads WHERE tenant_id=?1 AND project_id=?2 AND work_item_id=?3 AND agent_id=?4 ORDER BY authority_digest LIMIT ?5"
+    ).map_err(map_sqlite_error)?;
+    let mut rows = statement.query(params![
+        current.tenant_id.0,
+        current.project_id.0,
+        current.work_item_id.0,
+        i64::from(current.agent_id.0),
+        (MAX_SCOPED_ADAPTIVE_HEADS + 1) as i64
+    ]).map_err(map_sqlite_error)?;
+    let mut exact = None;
+    let mut drifted_assignment = false;
+    let mut count = 0;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        count += 1;
+        if count > MAX_SCOPED_ADAPTIVE_HEADS {
+            return Err(authority_conflict());
+        }
+        let stored_digest: String = row.get(0).map_err(map_sqlite_error)?;
+        let session_id: String = row.get(1).map_err(map_sqlite_error)?;
+        let head = AdaptiveHead {
+            session_id: Uuid::parse_str(&session_id).map_err(|_| corrupt_store())?,
+            version: stored_u64(row.get(2).map_err(map_sqlite_error)?)?,
+            updated_at_ms: stored_u64(row.get(3).map_err(map_sqlite_error)?)?,
+        };
+        let (session, _) = load(connection, head.session_id)?.ok_or_else(corrupt_store)?;
+        validate_head(&head, &session)?;
+        let source = &session.grant.authority;
+        if source.tenant_id != current.tenant_id
+            || source.project_id != current.project_id
+            || source.work_item_id != current.work_item_id
+            || source.agent_id != current.agent_id
+            || !constant_time_eq(&stored_digest, &source.canonical_digest()?)
+        {
+            return Err(corrupt_store());
+        }
+        // An exact head must not hide another campaign with spent assignment authority.
+        if source.assignment_version == current.assignment_version {
+            if source != current {
+                drifted_assignment = true;
+            } else {
+                authorize(&session.grant, current)?;
+                if exact.replace(session).is_some() {
+                    return Err(corrupt_store());
+                }
+            }
+        }
+    }
+    if drifted_assignment {
+        return Err(authority_conflict());
+    }
+    Ok(exact)
 }
 
 type LoadedSession = (
