@@ -280,7 +280,7 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(observed["credential"], SECRET)
         self.assertEqual(
             observed["args"],
-            ("GET", "127.0.0.1", 8084, "/operator/runtime-health", 5.0),
+            ("GET", "127.0.0.1", 8084, "/operator/runtime-readiness", 5.0),
         )
 
     def test_daemon_retries_zero_or_mismatched_local_counts(self) -> None:
