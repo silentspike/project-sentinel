@@ -54,6 +54,121 @@ fn session(api: &WorkflowApi, binding: &AdaptiveProviderAuthority) -> AdaptiveSe
         .unwrap()
 }
 
+#[test]
+fn adaptive_queue_rotates_equal_priority_projects_after_durable_progress() {
+    use sentinel_workflow::{
+        adaptive_tool_digest, AdaptiveModelDecisionV1, AdaptiveObservationRefV1,
+        AdaptiveTransitionV1,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (api, a, b) = two_project_fixture(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    let base = now_unix_ms().max(b.grant.created_at_ms) + 1;
+    let finish_inspect = |binding: &AdaptiveProviderAuthority, at: u64| {
+        let tool = WorkbenchTool::InspectFile {
+            path: "src/main.rs".into(),
+            max_bytes: 16,
+        };
+        let tool_digest = adaptive_tool_digest(&tool).unwrap();
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "a".repeat(64),
+        };
+        let tool_effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "b".repeat(64),
+        };
+        for (offset, command) in [
+            AdaptiveTransitionV1::ClaimModel {
+                effect: effect.clone(),
+                previous_observation_digest: None,
+            },
+            AdaptiveTransitionV1::ResolveModel {
+                effect,
+                result_digest: "c".repeat(64),
+                decision: AdaptiveModelDecisionV1::Tool {
+                    tool,
+                    tool_digest: tool_digest.clone(),
+                },
+            },
+            AdaptiveTransitionV1::ClaimTool {
+                effect: tool_effect.clone(),
+                tool_digest,
+            },
+            AdaptiveTransitionV1::ObserveTool {
+                observation: AdaptiveObservationRefV1 {
+                    effect: tool_effect,
+                    observation_digest: "d".repeat(64),
+                },
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let current = session(&api, binding);
+            api.store
+                .advance_adaptive_session(
+                    binding.grant.session_id,
+                    current.version,
+                    Uuid::new_v4(),
+                    &command,
+                    &binding.grant.authority,
+                    at + offset as u64,
+                )
+                .unwrap();
+        }
+    };
+    finish_inspect(&a, base);
+    finish_inspect(&b, base + 10);
+    let selected = api
+        .provider_usage_binding_for_agent(a.grant.authority.agent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.reservation_id, a.grant.provider_allowance_id);
+    let old = session(&api, &a);
+    let effect = AdaptiveEffectV1 {
+        id: Uuid::new_v4(),
+        request_digest: "e".repeat(64),
+    };
+    api.store
+        .advance_adaptive_session(
+            a.grant.session_id,
+            old.version,
+            Uuid::new_v4(),
+            &AdaptiveTransitionV1::ClaimModel {
+                effect,
+                previous_observation_digest: old
+                    .last_observation
+                    .as_ref()
+                    .map(|value| value.observation_digest.clone()),
+            },
+            &a.grant.authority,
+            base + 20,
+        )
+        .unwrap();
+    let selected = api
+        .provider_usage_binding_for_agent(a.grant.authority.agent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.reservation_id, b.grant.provider_allowance_id);
+    assert_eq!(
+        api.adaptive_subscription_queue_order(&selected).unwrap(),
+        Some((1, session(&api, &b).updated_at_ms))
+    );
+    // Restart reconstructs the same order from existing journal data, not RAM.
+    let reopened = super::model_work::configured_test_api(&temp.path().join("company.sqlite"));
+    assert_eq!(
+        reopened
+            .provider_usage_binding_for_agent(a.grant.authority.agent_id)
+            .unwrap()
+            .unwrap()
+            .reservation_id,
+        b.grant.provider_allowance_id
+    );
+}
+
 fn reserved_adaptive_request(
     api: &WorkflowApi,
     binding: &AdaptiveProviderAuthority,

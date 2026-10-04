@@ -2481,6 +2481,16 @@ pub trait WorkbenchAuthoritySource: Send + Sync {
         &self,
         record: &WorkbenchInvocationRecord,
     ) -> anyhow::Result<WorkbenchAuthoritySnapshot>;
+
+    fn current_for_records(
+        &self,
+        records: &[WorkbenchInvocationRecord],
+    ) -> anyhow::Result<Vec<WorkbenchAuthoritySnapshot>> {
+        records
+            .iter()
+            .map(|record| self.current_for_record(record))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -2950,6 +2960,30 @@ pub(crate) fn read_workbench_private_observation(
         .private_observation(invocation_id, authority)
 }
 
+pub(crate) fn read_workbench_private_observations(
+    invocation_ids: &[&str],
+    authority: &dyn WorkbenchAuthoritySource,
+    profile: &WorkbenchProfile,
+    profile_digest: &str,
+) -> anyhow::Result<Vec<Option<sentinel_common::WorkbenchPrivateObservation>>> {
+    #[cfg(test)]
+    if let Some((store, scoped_profile, digest)) =
+        PRIVATE_OBSERVATION_TEST_STORE.with(|slot| slot.borrow().clone())
+    {
+        anyhow::ensure!(
+            profile == &scoped_profile && profile_digest == digest.as_str(),
+            "private observation profile does not match scoped test store"
+        );
+        return WorkbenchCoordinator::new(&store, &scoped_profile, &digest)
+            .private_observations(invocation_ids, authority);
+    }
+    let store = WORKBENCH_STATUS_STORE
+        .get()
+        .ok_or(WorkbenchDispatchUnavailable)?;
+    WorkbenchCoordinator::new(store, profile, profile_digest)
+        .private_observations(invocation_ids, authority)
+}
+
 pub(crate) fn take_workbench_service() -> anyhow::Result<Option<WorkbenchService>> {
     WORKBENCH_SERVICE
         .get_or_init(|| Mutex::new(None))
@@ -3105,12 +3139,63 @@ impl<'a> WorkbenchCoordinator<'a> {
         invocation_id: &str,
         authority: &dyn WorkbenchAuthoritySource,
     ) -> anyhow::Result<Option<sentinel_common::WorkbenchPrivateObservation>> {
-        let record = self
-            .store
-            .load(invocation_id)?
-            .ok_or(WorkbenchStoreError::NotReserved)?;
-        let current = authority.current_for_record(&record)?;
-        authorize_workbench_record(&record, &current)?;
+        self.private_observations(&[invocation_id], authority)?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("private observation batch was empty"))
+    }
+
+    /// One bounded read fence; no private bytes escape if any record loses authority.
+    pub fn private_observations(
+        &self,
+        invocation_ids: &[&str],
+        authority: &dyn WorkbenchAuthoritySource,
+    ) -> anyhow::Result<Vec<Option<sentinel_common::WorkbenchPrivateObservation>>> {
+        anyhow::ensure!(
+            invocation_ids.len() <= sentinel_workflow::ADAPTIVE_WORKING_MEMORY_MAX_ROWS,
+            "private observation batch exceeds bound"
+        );
+        let records = invocation_ids
+            .iter()
+            .map(|id| {
+                self.store
+                    .load(id)?
+                    .ok_or(WorkbenchStoreError::NotReserved.into())
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let before = authority.current_for_records(&records)?;
+        anyhow::ensure!(
+            before.len() == records.len(),
+            "private observation authority count changed"
+        );
+        for (record, current) in records.iter().zip(&before) {
+            authorize_workbench_record(record, current)?;
+            self.authorize_private_observation(record)?;
+        }
+        let observations = records
+            .iter()
+            .map(|record| self.store.private_observation(record))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let after = authority.current_for_records(&records)?;
+        anyhow::ensure!(
+            after.len() == records.len(),
+            "private observation authority count changed"
+        );
+        for (record, current) in records.iter().zip(&after) {
+            authorize_workbench_record(record, current)?;
+        }
+        if before != after {
+            bail!("private observation authority changed");
+        }
+        Ok(observations)
+    }
+
+    fn authorize_private_observation(
+        &self,
+        record: &WorkbenchInvocationRecord,
+    ) -> anyhow::Result<()> {
         if !record
             .capabilities
             .contains(sentinel_common::WORKBENCH_RETAIN_OBSERVATION)
@@ -3125,13 +3210,7 @@ impl<'a> WorkbenchCoordinator<'a> {
         {
             bail!("private observation read is not authorized");
         }
-        let observation = self.store.private_observation(&record)?;
-        let after = authority.current_for_record(&record)?;
-        authorize_workbench_record(&record, &after)?;
-        if current != after {
-            bail!("private observation authority changed");
-        }
-        Ok(observation)
+        Ok(())
     }
 
     pub fn new(
@@ -4463,6 +4542,197 @@ mod tests {
             .unwrap();
         assert!(reader.contains(".private_observation(invocation_id, authority)"));
         assert!(!reader.contains("dispatch_workbench"));
+    }
+
+    #[test]
+    fn private_observation_batch_rejects_later_revocation_missing_data_and_overflow() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            WorkbenchInvocationStore::open(directory.path().join("workbench.redb")).unwrap();
+        let fixture = secure_test_workbench_profile_authority();
+        let (mut profile, _) = WorkbenchProfile::load(fixture.path()).unwrap();
+        profile
+            .capabilities
+            .insert(sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into());
+        let ids = [
+            "018f3f32-4f01-7f2c-a6c1-f6f4a81b2881",
+            "018f3f32-4f01-7f2c-a6c1-f6f4a81b2882",
+        ];
+        let mut current = None;
+        let mut records = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            let mut request = request(id);
+            request
+                .capabilities
+                .insert(sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into());
+            request.input_digest = request.canonical_digest().unwrap();
+            current = Some(authority(&request, &profile));
+            store.reserve(&request, 1_900_000_000_000).unwrap();
+            store
+                .mark_executing(id, &request.input_digest, 1_900_000_000_001)
+                .unwrap();
+            records.push(
+                store
+                    .accept_result(
+                        &WorkbenchMessage::Result {
+                            schema_version: WORKBENCH_SCHEMA_VERSION,
+                            invocation_id: id.to_string(),
+                            input_digest: request.input_digest,
+                            outcome: WorkbenchOutcome::Succeeded,
+                            resources: WorkbenchResourceUsage::default(),
+                            artifacts: Vec::new(),
+                            output: BTreeMap::from([(
+                                "content".into(),
+                                format!("PRIVATE-{index}"),
+                            )]),
+                            error: None,
+                        },
+                        1_900_000_000_002,
+                    )
+                    .unwrap(),
+            );
+        }
+        let current = current.unwrap();
+        let coordinator = WorkbenchCoordinator::new(&store, &profile, &current.tool_profile_digest);
+        let observations = coordinator.private_observations(&ids, &current).unwrap();
+        assert_eq!(observations.len(), 2);
+        for (index, observation) in observations.iter().enumerate() {
+            assert_eq!(
+                observation.as_ref().unwrap().output()["content"],
+                format!("PRIVATE-{index}")
+            );
+        }
+        let mut revoked = current.clone();
+        revoked
+            .assignment_capabilities
+            .remove(sentinel_common::WORKBENCH_RETAIN_OBSERVATION);
+        let changing = SequencedAuthority {
+            snapshots: Mutex::new(VecDeque::from([
+                current.clone(),
+                current.clone(),
+                current.clone(),
+                revoked.clone(),
+            ])),
+        };
+        assert!(coordinator.private_observations(&ids, &changing).is_err());
+        assert!(changing.snapshots.lock().unwrap().is_empty());
+        assert!(coordinator.private_observations(&ids, &revoked).is_err());
+        assert!(coordinator
+            .private_observations(
+                &vec![ids[0]; sentinel_workflow::ADAPTIVE_WORKING_MEMORY_MAX_ROWS + 1],
+                &current
+            )
+            .is_err());
+        assert!(coordinator
+            .private_observations(&[ids[0], "missing"], &current)
+            .is_err());
+        assert!(coordinator
+            .private_observations(&[], &current)
+            .unwrap()
+            .is_empty());
+        for record in &records {
+            assert_eq!(
+                store.load(&record.invocation_id).unwrap().as_ref(),
+                Some(record)
+            );
+        }
+        let write = store.db.begin_write().unwrap();
+        write
+            .open_table(PRIVATE_OBSERVATIONS)
+            .unwrap()
+            .remove(ids[1])
+            .unwrap();
+        write.commit().unwrap();
+        assert!(coordinator.private_observations(&ids, &current).is_err());
+        assert!(coordinator
+            .private_observation(ids[0], &current)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn private_observation_batch_rejects_misaligned_authority_vectors() {
+        struct TruncatedAuthority {
+            snapshot: WorkbenchAuthoritySnapshot,
+            calls: std::sync::atomic::AtomicUsize,
+            truncate_at: usize,
+        }
+        impl WorkbenchAuthoritySource for TruncatedAuthority {
+            fn current_for_request(
+                &self,
+                _: &WorkbenchRequest,
+            ) -> anyhow::Result<WorkbenchAuthoritySnapshot> {
+                Ok(self.snapshot.clone())
+            }
+            fn current_for_record(
+                &self,
+                _: &WorkbenchInvocationRecord,
+            ) -> anyhow::Result<WorkbenchAuthoritySnapshot> {
+                Ok(self.snapshot.clone())
+            }
+            fn current_for_records(
+                &self,
+                records: &[WorkbenchInvocationRecord],
+            ) -> anyhow::Result<Vec<WorkbenchAuthoritySnapshot>> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                Ok(if call == self.truncate_at {
+                    Vec::new()
+                } else {
+                    vec![self.snapshot.clone(); records.len()]
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            WorkbenchInvocationStore::open(directory.path().join("workbench.redb")).unwrap();
+        let fixture = secure_test_workbench_profile_authority();
+        let (mut profile, _) = WorkbenchProfile::load(fixture.path()).unwrap();
+        profile
+            .capabilities
+            .insert(sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into());
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2883");
+        request
+            .capabilities
+            .insert(sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into());
+        request.input_digest = request.canonical_digest().unwrap();
+        let current = authority(&request, &profile);
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        store
+            .accept_result(
+                &WorkbenchMessage::Result {
+                    schema_version: WORKBENCH_SCHEMA_VERSION,
+                    invocation_id: request.invocation_id.clone(),
+                    input_digest: request.input_digest.clone(),
+                    outcome: WorkbenchOutcome::Succeeded,
+                    resources: WorkbenchResourceUsage::default(),
+                    artifacts: Vec::new(),
+                    output: BTreeMap::new(),
+                    error: None,
+                },
+                1_900_000_000_002,
+            )
+            .unwrap();
+        let coordinator = WorkbenchCoordinator::new(&store, &profile, &request.tool_profile_digest);
+        for truncate_at in [1, 2] {
+            let error = coordinator
+                .private_observations(
+                    &[request.invocation_id.as_str()],
+                    &TruncatedAuthority {
+                        snapshot: current.clone(),
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                        truncate_at,
+                    },
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("authority count changed"));
+        }
     }
 
     #[test]
