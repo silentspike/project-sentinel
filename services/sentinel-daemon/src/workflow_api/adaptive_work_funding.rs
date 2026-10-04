@@ -19,6 +19,8 @@ struct FundingSubmission {
     reason_ref: String,
     limits: AdaptiveWorkFundingLimitsV1,
     source_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supersedes_unused_receipt_digest: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -46,6 +48,7 @@ fn submission(request: &AdaptiveWorkFundingRequestV1) -> Result<FundingSubmissio
         reason_ref: request.reason_ref.clone(),
         limits: request.limits.clone(),
         source_digest: request.canonical_digest()?,
+        supersedes_unused_receipt_digest: request.source.supersedes_unused_receipt_digest.clone(),
     })
 }
 
@@ -55,16 +58,35 @@ fn receipt_http(receipt: &AdaptiveWorkFundingReceiptV1, replayed: bool) -> Workf
         Err(error) => return workflow_error(error),
     };
     let source = &receipt.request.source.resume_source;
-    json(
-        200,
-        &serde_json::json!({
-            "schema_version": 1, "replayed": replayed, "funding_id": receipt.funding_id,
-            "receipt_digest": digest, "operation_id": receipt.request.operation_id,
-            "project_id": source.project_id, "session_id": source.session_id,
-            "issued_at_unix_ms": receipt.issued_at_unix_ms, "limits": receipt.request.limits,
-            "model_decision_recorded": false, "developer_window_created": false,
-        }),
-    )
+    let mut public = serde_json::json!({
+        "schema_version": 1, "replayed": replayed, "funding_id": receipt.funding_id,
+        "receipt_digest": digest, "operation_id": receipt.request.operation_id,
+        "project_id": source.project_id, "session_id": source.session_id,
+        "issued_at_unix_ms": receipt.issued_at_unix_ms, "limits": receipt.request.limits,
+        "model_decision_recorded": false, "developer_window_created": false,
+    });
+    if let Some(digest) = &receipt.request.source.supersedes_unused_receipt_digest {
+        public["supersedes_unused_receipt_digest"] = serde_json::json!(digest);
+    }
+    json(200, &public)
+}
+
+fn supersession_query(path: &str) -> Result<Option<&str>, WorkflowError> {
+    let Some((_, query)) = path.split_once('?') else {
+        return Ok(None);
+    };
+    let mut digest = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "supersedes_unused_receipt_digest" {
+            // Do not silently turn an explicit blank or ambiguous value into None.
+            if value.is_empty() || digest.is_some() {
+                return Err(source_conflict());
+            }
+            digest = Some(value);
+        }
+    }
+    Ok(digest)
 }
 
 impl WorkflowApi {
@@ -401,7 +423,7 @@ impl WorkflowApi {
                     ) {
                         return workflow_error(error);
                     }
-                    match self.store.adaptive_work_funding_draft(
+                    match self.store.adaptive_work_funding_draft_with_supersession(
                         &operator.principal,
                         &value.project_id,
                         value.session_id,
@@ -409,6 +431,7 @@ impl WorkflowApi {
                         &value.reason_ref,
                         value.limits.clone(),
                         now,
+                        value.supersedes_unused_receipt_digest.as_deref(),
                     ) {
                         Ok(request) => request,
                         Err(error) => return workflow_error(error),
@@ -426,6 +449,8 @@ impl WorkflowApi {
                     || fresh.reason_ref != value.reason_ref
                     || fresh.limits != value.limits
                     || fresh.source_digest != value.source_digest
+                    || fresh.supersedes_unused_receipt_digest
+                        != value.supersedes_unused_receipt_digest
             }) {
                 return workflow_error(source_conflict());
             }
@@ -449,7 +474,7 @@ impl WorkflowApi {
                 }
                 // Exact comparison of every source field precedes store issuance;
                 // the store repeats this check in its own transaction.
-                let fresh = match self.store.adaptive_work_funding_draft(
+                let fresh = match self.store.adaptive_work_funding_draft_with_supersession(
                     &operator.principal,
                     &source.project_id,
                     source.session_id,
@@ -457,6 +482,7 @@ impl WorkflowApi {
                     &request.reason_ref,
                     request.limits.clone(),
                     now,
+                    request.source.supersedes_unused_receipt_digest.as_deref(),
                 ) {
                     Ok(value) => value,
                     Err(error) => return workflow_error(error),
@@ -500,11 +526,19 @@ impl WorkflowApi {
                 false,
             );
         };
+        let supersedes_unused_receipt_digest = match supersession_query(path) {
+            Ok(value) => value,
+            Err(error) => return workflow_error(error),
+        };
         match self
             .store
             .adaptive_work_funding(&operator.principal.tenant_id, session, operation)
         {
-            Ok(Some(receipt)) if receipt.request.source.resume_source.project_id == project => {
+            Ok(Some(receipt))
+                if receipt.request.source.resume_source.project_id == project
+                    && receipt.request.source.supersedes_unused_receipt_digest.as_deref()
+                        == supersedes_unused_receipt_digest =>
+            {
                 return receipt_http(&receipt, true);
             }
             Ok(Some(_)) => return workflow_error(source_conflict()),
@@ -545,7 +579,7 @@ impl WorkflowApi {
         }
         match self
             .store
-            .adaptive_work_funding_draft(
+            .adaptive_work_funding_draft_with_supersession(
                 &operator.principal,
                 &project,
                 session,
@@ -553,6 +587,7 @@ impl WorkflowApi {
                 reason,
                 limits,
                 now,
+                supersedes_unused_receipt_digest,
             )
             .and_then(|request| submission(&request))
         {

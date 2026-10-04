@@ -173,7 +173,9 @@ fn unhex(value: &str) -> io::Result<Vec<u8>> {
     };
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Ok(digit(pair[0])? * 16 + digit(pair[1])?))
         .collect()
 }
@@ -1301,6 +1303,17 @@ fn terminal_wait_status(code: Option<i32>, signal: Option<i32>) -> io::Result<i3
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hex_decoding_preserves_bounds_and_strict_lowercase_pairs() {
+        assert_eq!(unhex("").unwrap(), Vec::<u8>::new());
+        assert_eq!(unhex("000fff").unwrap(), vec![0, 15, 255]);
+        for invalid in ["0", "001", "FF", "0g", "\u{00e9}"] {
+            assert!(unhex(invalid).is_err(), "{invalid:?}");
+        }
+        assert_eq!(unhex(&"ff".repeat(CHUNK_BYTES)).unwrap().len(), CHUNK_BYTES);
+        assert!(unhex(&"ff".repeat(CHUNK_BYTES + 1)).is_err());
+    }
 
     fn limits() -> WorkbenchResourceLimits {
         WorkbenchResourceLimits {

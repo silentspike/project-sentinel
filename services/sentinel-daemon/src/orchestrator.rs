@@ -6806,9 +6806,7 @@ fn execute_world_restore_transfer(
     );
 
     // #491: finaler Zustand = Ziel-Tick (nach Replay) bzw. Anchor-Tick (ohne Replay).
-    let final_tick;
-    let final_sim_hour;
-    match commit_result {
+    let (final_tick, final_sim_hour) = match commit_result {
         Err(commit_error) => {
             error!(
                 error = %commit_error,
@@ -6865,10 +6863,9 @@ fn execute_world_restore_transfer(
                 replayed_inputs = report.replayed_inputs,
                 "Projection Snapshot-Seeding abgeschlossen"
             );
-            final_tick = report.final_tick;
-            final_sim_hour = report.final_sim_hour;
+            (report.final_tick, report.final_sim_hour)
         }
-    }
+    };
 
     let mut respawned = 0u32;
     let mut respawn_errors = Vec::new();

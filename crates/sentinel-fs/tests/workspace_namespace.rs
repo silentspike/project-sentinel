@@ -360,7 +360,9 @@ fn concurrent_append_is_serialized_across_distinct_handles() {
     let bytes = layer.read_file("alice", inode).unwrap();
     assert_eq!(bytes.len(), 256);
     let mut markers: Vec<_> = bytes
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|chunk| {
             assert!(chunk.iter().all(|byte| *byte == chunk[0]));
             chunk[0]

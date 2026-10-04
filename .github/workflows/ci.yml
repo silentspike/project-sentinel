@@ -172,11 +172,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.0"
           components: rustfmt, clippy
       - name: Assert determinism toolchain (DEV-010)
         run: |
-          EXPECT="1.97.1"; ACTUAL="$(rustc --version | awk '{print $2}')"
+          EXPECT="1.99.0"; ACTUAL="$(rustc --version | awk '{print $2}')"
           echo "rustc: $ACTUAL (DEV-010 expects $EXPECT)"
           test "$ACTUAL" = "$EXPECT" || { echo "::error::DEV-010 determinism profile violated: rustc $ACTUAL != $EXPECT"; exit 1; }
       - name: Configure local cache (self-hosted)
@@ -216,10 +216,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.0"
       - name: Assert determinism toolchain (DEV-010)
         run: |
-          EXPECT="1.97.1"; ACTUAL="$(rustc --version | awk '{print $2}')"
+          EXPECT="1.99.0"; ACTUAL="$(rustc --version | awk '{print $2}')"
           echo "rustc: $ACTUAL (DEV-010 expects $EXPECT)"
           test "$ACTUAL" = "$EXPECT" || { echo "::error::DEV-010 determinism profile violated: rustc $ACTUAL != $EXPECT"; exit 1; }
       - name: Configure local cache (self-hosted)
@@ -252,10 +252,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.0"
       - name: Assert determinism toolchain (DEV-010)
         run: |
-          EXPECT="1.97.1"; ACTUAL="$(rustc --version | awk '{print $2}')"
+          EXPECT="1.99.0"; ACTUAL="$(rustc --version | awk '{print $2}')"
           echo "rustc: $ACTUAL (DEV-010 expects $EXPECT)"
           test "$ACTUAL" = "$EXPECT" || { echo "::error::DEV-010 determinism profile violated: rustc $ACTUAL != $EXPECT"; exit 1; }
       - name: Configure local cache (self-hosted)
@@ -321,11 +321,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.0"
           components: clippy
       - name: Assert determinism toolchain (DEV-010)
         run: |
-          EXPECT="1.97.1"; ACTUAL="$(rustc --version | awk '{print $2}')"
+          EXPECT="1.99.0"; ACTUAL="$(rustc --version | awk '{print $2}')"
           echo "rustc: $ACTUAL (DEV-010 expects $EXPECT)"
           test "$ACTUAL" = "$EXPECT" || { echo "::error::DEV-010 determinism profile violated: rustc $ACTUAL != $EXPECT"; exit 1; }
       - name: Configure local cache (self-hosted)

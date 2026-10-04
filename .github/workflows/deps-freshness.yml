@@ -29,11 +29,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.0"
 
       - name: Assert pinned Rust toolchain
         run: |
-          EXPECT="1.97.1"; ACTUAL="$(rustc --version | awk '{print $2}')"
+          EXPECT="1.99.0"; ACTUAL="$(rustc --version | awk '{print $2}')"
           echo "rustc: $ACTUAL (expected $EXPECT)"
           test "$ACTUAL" = "$EXPECT" || { echo "::error::rustc $ACTUAL != $EXPECT"; exit 1; }
 
@@ -66,11 +66,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.0"
 
       - name: Assert pinned Rust toolchain
         run: |
-          EXPECT="1.97.1"; ACTUAL="$(rustc --version | awk '{print $2}')"
+          EXPECT="1.99.0"; ACTUAL="$(rustc --version | awk '{print $2}')"
           echo "rustc: $ACTUAL (expected $EXPECT)"
           test "$ACTUAL" = "$EXPECT" || { echo "::error::rustc $ACTUAL != $EXPECT"; exit 1; }
 
