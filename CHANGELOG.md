@@ -1,5 +1,15 @@
 # Changelog
 
+- Batch immutable historical Workbench observation reads within one bounded
+  context. Share fresh authority proofs only for identical caller/project/work/
+  agent bindings within each read fence; revalidate after all reads and retain
+  every record's terminal, profile, capability and private digest checks. Reject
+  the complete batch on authority changes, preserving context bytes and public
+  output isolation without a persistent permission cache. Schedule equally
+  ranked employee projects by their last durable transition instead of always
+  picking the oldest grant; retain recovery precedence and exact dispatch
+  binding, reconstructing fairness after restart without a new cursor (#856).
+
 - Read immutable private Workbench observations through the protected store
   path instead of serial ECS tick dispatch for working memory, funding,
   leadership and accounting. Keep exact profile/terminal/capability checks,

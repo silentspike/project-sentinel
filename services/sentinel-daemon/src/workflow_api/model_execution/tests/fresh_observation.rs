@@ -73,6 +73,109 @@ fn working_memory_is_private_numeric_history_and_preserves_fresh_inspection() {
 }
 
 #[test]
+fn working_memory_batched_reads_preserve_exact_serial_context_bytes() {
+    use super::super::super::tests::WORKBENCH_AUTHORITY_READS;
+    let mut fixture = Fixture::continued_unknown_with_observation();
+    fixture.inspect_and_observe(now_unix_ms(), "second private observation");
+    fixture.inspect_and_observe(now_unix_ms(), "third private observation");
+    WORKBENCH_AUTHORITY_READS.with(|count| count.set(0));
+    let context = fixture.context();
+    assert_eq!(WORKBENCH_AUTHORITY_READS.with(|count| count.get()), 4);
+    let memory = context.working_memory.as_ref().unwrap();
+    assert_eq!(memory.source.rows.len(), 3);
+    let serial = fixture.with_observations(|| {
+        super::super::working_memory::compose(
+            memory.source.clone(),
+            context.observation.as_ref(),
+            |effect| {
+                fixture
+                    .api
+                    .workbench
+                    .as_ref()
+                    .unwrap()
+                    .private_observation(effect, &context.binding.grant.authority.profile_id)
+                    .map(Some)
+                    .map_err(|_| "serial private read failed")
+            },
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        serde_json::to_vec(memory).unwrap(),
+        serde_json::to_vec(&serial).unwrap()
+    );
+    let mut old = context.clone();
+    old.working_memory = Some(serial);
+    assert_eq!(
+        serde_json::to_vec(&context).unwrap(),
+        serde_json::to_vec(&old).unwrap()
+    );
+    assert_eq!(context.prompt().unwrap(), old.prompt().unwrap());
+    assert_eq!(fixture.read(), fixture.session);
+}
+
+#[test]
+fn private_observation_batch_shares_only_exact_authority_keys_and_not_across_calls() {
+    use super::super::super::tests::WORKBENCH_AUTHORITY_READS;
+    let fixture = Fixture::continued_unknown_with_observation();
+    let authority = fixture.api.authority.as_ref().unwrap();
+    let id = fixture
+        .session
+        .last_observation
+        .as_ref()
+        .unwrap()
+        .effect
+        .id
+        .to_string();
+    let record = fixture.tools.load(&id).unwrap().unwrap();
+    let expected = authority.current_for_record(&record).unwrap();
+    let records = vec![record.clone(); sentinel_workflow::ADAPTIVE_WORKING_MEMORY_MAX_ROWS];
+    WORKBENCH_AUTHORITY_READS.with(|count| count.set(0));
+    for call in 1..=2 {
+        assert_eq!(
+            authority.current_for_records(&records).unwrap(),
+            vec![expected.clone(); records.len()]
+        );
+        assert_eq!(WORKBENCH_AUTHORITY_READS.with(|count| count.get()), call);
+    }
+    let (profile, digest) = authority.profile_for_binding(&record.tool_profile).unwrap();
+    let coordinator = WorkbenchCoordinator::new(&fixture.tools, profile, digest);
+    WORKBENCH_AUTHORITY_READS.with(|count| count.set(0));
+    let observations = coordinator
+        .private_observations(&vec![id.as_str(); records.len()], authority.as_ref())
+        .unwrap();
+    assert_eq!(observations.len(), records.len());
+    assert!(observations.iter().all(|value| value.is_some()));
+    assert_eq!(WORKBENCH_AUTHORITY_READS.with(|count| count.get()), 2);
+    for change in 0..4 {
+        let mut foreign = record.clone();
+        match change {
+            0 => foreign.caller_id = "unregistered-principal".into(),
+            1 => foreign.project_id = "different-project".into(),
+            2 => foreign.work_item_id = "different-work".into(),
+            _ => foreign.agent_id = AgentId(63),
+        }
+        WORKBENCH_AUTHORITY_READS.with(|count| count.set(0));
+        assert!(authority
+            .current_for_records(&[record.clone(), foreign])
+            .is_err());
+        assert_eq!(WORKBENCH_AUTHORITY_READS.with(|count| count.get()), 2);
+    }
+    let connection =
+        rusqlite::Connection::open(fixture._temp.path().join("company.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind='project'",
+            [],
+        )
+        .unwrap();
+    assert!(authority.current_for_records(&records).is_err());
+    assert!(coordinator
+        .private_observations(&[id.as_str()], authority.as_ref())
+        .is_err());
+}
+
+#[test]
 fn working_memory_reconstructs_exact_legacy_before_send_context_without_enrichment() {
     let fixture = Fixture::continued_unknown_with_observation();
     let mut historical = fixture.context();

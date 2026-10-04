@@ -1517,7 +1517,7 @@ mod tests {
                     AgentId(6),
                     expired_at,
                     |_| Ok(false),
-                    |candidate| api.adaptive_subscription_queue_priority(candidate),
+                    |candidate| api.adaptive_subscription_queue_order(candidate),
                 )
                 .unwrap(),
                 Some(selected.reservation_id.as_str()),
@@ -1540,7 +1540,7 @@ mod tests {
                     AgentId(6),
                     expired_at,
                     |_| Ok(false),
-                    |candidate| api.adaptive_subscription_queue_priority(candidate),
+                    |candidate| api.adaptive_subscription_queue_order(candidate),
                 )
                 .unwrap(),
                 Some(selected.reservation_id.as_str()),
