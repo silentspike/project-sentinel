@@ -346,6 +346,32 @@ impl fmt::Display for MonotonicityError {
 
 impl std::error::Error for MonotonicityError {}
 
+/// Offset writer contention proved before any mirror mutation or transaction.
+/// The underlying SQLite error remains available through anyhow downcasting.
+#[derive(Debug, Clone)]
+pub struct ProjectionOffsetAcquisitionBusy {
+    projection: String,
+}
+
+impl ProjectionOffsetAcquisitionBusy {
+    /// The projection whose writer could not be acquired before any offset write.
+    pub fn projection(&self) -> &str {
+        &self.projection
+    }
+}
+
+impl fmt::Display for ProjectionOffsetAcquisitionBusy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "projection offset writer acquisition busy: {}",
+            self.projection
+        )
+    }
+}
+
+impl std::error::Error for ProjectionOffsetAcquisitionBusy {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OffsetUpdateDecision {
     InsertOrAdvance,
@@ -5256,8 +5282,31 @@ impl EventStore {
     /// - `offset == current` → No-op (idempotent, kein Fehler)
     /// - `offset < current` → `MonotonicityError` (Rueckwaerts-Drift)
     pub fn update_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
-        let conn =
-            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
+        let guard = self.owner_registry.issue(StateTransferScope::World)?;
+        let conn = match self.begin_fenced_write(&guard) {
+            Ok(conn) => conn,
+            Err(error) => {
+                if !matches!(
+                    error.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(code, _))
+                        if code.code == rusqlite::ErrorCode::DatabaseBusy
+                ) {
+                    return Err(error);
+                }
+                // Only a clean, still-owned pre-write failure may be deferred.
+                self.owner_registry.validate(&guard)?;
+                let conn = self
+                    .conn
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+                if !conn.is_autocommit() {
+                    anyhow::bail!("unresolved projection offset transaction: {error:#}");
+                }
+                return Err(error.context(ProjectionOffsetAcquisitionBusy {
+                    projection: name.to_owned(),
+                }));
+            }
+        };
 
         // Aktuellen Offset pruefen
         let current: Option<i64> = conn
@@ -9314,6 +9363,129 @@ mod tests {
         // Offset erhoehen (monoton)
         store.update_offset("dashboard", 10).unwrap();
         assert_eq!(store.get_offset("dashboard").unwrap(), Some(10));
+    }
+
+    #[test]
+    fn projection_offset_acquisition_busy_is_typed_clean_and_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contended-offset.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        store.update_offset("dashboard", 5).unwrap();
+        store
+            .conn()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        let before: (i64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT last_event_id, updated_at FROM projection_offsets
+                 WHERE projection_name='dashboard'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let competitor = Connection::open(&path).unwrap();
+        competitor.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for _ in 0..3 {
+            let error = store.update_offset("dashboard", 10).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ProjectionOffsetAcquisitionBusy>()
+                    .unwrap()
+                    .projection(),
+                "dashboard"
+            );
+            assert!(matches!(
+                error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(code, _))
+                    if code.code == rusqlite::ErrorCode::DatabaseBusy
+            ));
+            let conn = store.conn();
+            assert!(conn.is_autocommit());
+            let retained: (i64, i64) = conn
+                .query_row(
+                    "SELECT last_event_id, updated_at FROM projection_offsets
+                     WHERE projection_name='dashboard'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(retained, before);
+        }
+        competitor.execute_batch("ROLLBACK").unwrap();
+        store.update_offset("dashboard", 10).unwrap();
+        store.update_offset("dashboard", 10).unwrap();
+        let error = store.update_offset("dashboard", 5).unwrap_err();
+        assert!(error.downcast_ref::<MonotonicityError>().is_some());
+        assert!(error
+            .downcast_ref::<ProjectionOffsetAcquisitionBusy>()
+            .is_none());
+        assert!(store.conn().is_autocommit());
+        drop(store);
+        let reopened = EventStore::open_compatible(path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.get_offset("dashboard").unwrap(), Some(10));
+    }
+
+    #[test]
+    fn projection_offset_unresolved_transaction_is_not_acquisition_busy() {
+        let store = EventStore::open(":memory:").unwrap();
+        store.update_offset("dashboard", 5).unwrap();
+        store.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = store.update_offset("dashboard", 10).unwrap_err();
+        assert!(error
+            .downcast_ref::<ProjectionOffsetAcquisitionBusy>()
+            .is_none());
+        assert!(!store.conn().is_autocommit());
+        assert_eq!(store.get_offset("dashboard").unwrap(), Some(5));
+        store.conn().execute_batch("ROLLBACK").unwrap();
+        store.update_offset("dashboard", 10).unwrap();
+    }
+
+    #[test]
+    fn projection_offset_commit_failure_is_not_acquisition_busy() {
+        let store = EventStore::open(":memory:").unwrap();
+        store.update_offset("dashboard", 5).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TABLE offset_parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE offset_child(parent_id INTEGER REFERENCES offset_parent(id)
+                   DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TEMP TRIGGER fail_offset_commit AFTER UPDATE ON projection_offsets
+                 BEGIN INSERT INTO offset_child VALUES(99); END;",
+            )
+            .unwrap();
+        let error = store.update_offset("dashboard", 10).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::ConstraintViolation
+        ));
+        assert!(error
+            .downcast_ref::<ProjectionOffsetAcquisitionBusy>()
+            .is_none());
+        assert!(store.conn().is_autocommit());
+        assert_eq!(store.get_offset("dashboard").unwrap(), Some(5));
+        let children: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM offset_child", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(children, 0);
+    }
+
+    #[test]
+    fn projection_offset_foreign_owner_is_not_acquisition_busy() {
+        let store =
+            EventStore::open_with_owner_registry(":memory:", cluster_owner_registry()).unwrap();
+        let error = store.update_offset("dashboard", 10).unwrap_err();
+        assert!(error
+            .downcast_ref::<sentinel_common::OwnerIssueError>()
+            .is_some());
+        assert!(error
+            .downcast_ref::<ProjectionOffsetAcquisitionBusy>()
+            .is_none());
+        assert!(store.conn().is_autocommit());
+        assert_eq!(store.get_offset("dashboard").unwrap(), None);
     }
 
     #[test]
