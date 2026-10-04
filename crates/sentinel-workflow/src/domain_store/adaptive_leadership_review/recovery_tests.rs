@@ -1864,12 +1864,27 @@ fn assert_company_discovery_proofs(store: &WorkflowStore, expected: &ProjectV1) 
 }
 
 #[test]
-fn company_projects_reuses_multi_allowance_proofs_only_within_each_discovery() {
+fn company_projects_reuses_multi_allowance_proofs_only_after_exact_input_recheck() {
     let (f, project, _) = company_discovery_fixture();
     assert_company_discovery_proofs(&f.store, &project);
-    assert_company_discovery_proofs(&f.store, &project);
+    let (projects, scopes) =
+        validation_scope::with_completed_validations(|| f.store.company_projects());
+    assert_eq!(projects.unwrap(), vec![project.clone()]);
+    assert!(scopes.is_empty());
+    assert!(f.store.connection.lock().unwrap().is_autocommit());
     let reopened = WorkflowStore::open(&f.path).unwrap();
     assert_company_discovery_proofs(&reopened, &project);
+}
+
+#[test]
+fn company_project_cached_reads_keep_exact_tenant_project_and_absent_bindings() {
+    let (f, project, _) = company_discovery_fixture();
+    for _ in 0..2 {
+        assert_eq!(f.store.company_project(&project.tenant_id, &project.project_id).unwrap(), Some(project.clone()));
+        assert!(f.store.company_project(&TenantId("foreign-tenant".into()), &project.project_id).unwrap().is_none());
+        assert!(f.store.company_project(&project.tenant_id, &ProjectId("missing-project".into())).unwrap().is_none());
+    }
+    assert!(f.store.connection.lock().unwrap().is_autocommit());
 }
 
 #[test]
