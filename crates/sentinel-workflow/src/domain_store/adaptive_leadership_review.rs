@@ -433,6 +433,34 @@ fn calls_for_session_uncached(
     if session_id.is_nil() {
         return Err(invalid("invalid adaptive session identity"));
     }
+    let ids = review_inventory(connection, tenant)?;
+    let mut matching = Vec::new();
+    for id in ids {
+        let call: AdaptiveLeadershipReviewCallV1 =
+            get_entity(connection, tenant, KIND, &id)?.ok_or_else(corrupt)?;
+        if call.grant.session_id == session_id {
+            matching.push(call);
+        }
+    }
+    if matching.len() > MAX_AGGREGATE_ITEMS {
+        return Err(corrupt());
+    }
+    Ok(matching)
+}
+
+fn review_inventory(
+    connection: &Connection,
+    tenant: &TenantId,
+) -> Result<Vec<String>, WorkflowError> {
+    validation_scope::memoize(connection, "review-inventory", tenant, || {
+        review_inventory_uncached(connection, tenant)
+    })
+}
+
+fn review_inventory_uncached(
+    connection: &Connection,
+    tenant: &TenantId,
+) -> Result<Vec<String>, WorkflowError> {
     let mut statement = connection.prepare(
         "SELECT entity_id FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2
          ORDER BY entity_id LIMIT ?3",
@@ -446,19 +474,12 @@ fn calls_for_session_uncached(
     if ids.len() > MAX_TENANT_REVIEW_SCAN {
         return Err(corrupt());
     }
-    let mut matching = Vec::new();
-    // Verify every candidate before using payload fields to select the session.
-    for id in ids {
-        let call: AdaptiveLeadershipReviewCallV1 =
-            get_entity(connection, tenant, KIND, &id)?.ok_or_else(corrupt)?;
-        if call.grant.session_id == session_id {
-            matching.push(call);
-        }
+    // Typed proofs stay in this scope; no payload field may hide an invalid row.
+    for id in &ids {
+        let _: AdaptiveLeadershipReviewCallV1 =
+            get_entity(connection, tenant, KIND, id)?.ok_or_else(corrupt)?;
     }
-    if matching.len() > MAX_AGGREGATE_ITEMS {
-        return Err(corrupt());
-    }
-    Ok(matching)
+    Ok(ids)
 }
 
 pub(super) fn require_current_source(

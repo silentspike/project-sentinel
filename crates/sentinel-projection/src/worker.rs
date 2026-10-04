@@ -22,7 +22,7 @@ use crate::handlers::room_live_view::RoomLiveViewHandler;
 use crate::handlers::task_kanban_view::TaskKanbanHandler;
 use crate::handlers::workbench::WorkbenchHandler;
 use crate::handlers::ProjectionHandler;
-use crate::retry::{commit_then_mirror, sqlite_busy};
+use crate::retry::{commit_then_mirror, live_batch, sqlite_busy, MIRROR_DEFER_BACKOFF};
 use crate::store::{LlmHierarchyCostUpdate, ReadModelStore};
 
 /// Alle 26 Raum-IDs aus config/rooms.toml (statisches Gebaeudelayout).
@@ -100,7 +100,8 @@ impl ProjectionWorker {
 
     /// Projects one ordinary live batch, committing views before mirroring the offset.
     pub fn process_pending_batch(&self) -> anyhow::Result<usize> {
-        let offset = self.event_store.get_offset(PROJECTION_NAME)?.unwrap_or(0);
+        let mirrored = self.event_store.get_offset(PROJECTION_NAME)?;
+        let offset = mirrored.unwrap_or(0);
         let batch = self
             .event_store
             .get_events_since_with_id(offset, self.config.batch_size)?;
@@ -108,6 +109,8 @@ impl ProjectionWorker {
             return Ok(0);
         };
         let count = commit_then_mirror(
+            PROJECTION_NAME,
+            mirrored.is_some(),
             || {
                 let count = self.process_batch(&batch)?;
                 if let Some(max_tick) = batch.iter().map(|(_, event)| event.tick).max() {
@@ -148,9 +151,11 @@ impl ProjectionWorker {
                 next_rebuild_poll = Instant::now() + self.config.rebuild_request_poll_interval;
             }
 
-            let hierarchy_processed = self.process_hierarchy_pending_batch()?;
-            let processed = self.process_pending_batch()?;
-            if processed == 0 && hierarchy_processed == 0 {
+            let hierarchy_processed = live_batch(self.process_hierarchy_pending_batch())?;
+            let processed = live_batch(self.process_pending_batch())?;
+            if hierarchy_processed.is_none() || processed.is_none() {
+                thread::sleep(self.config.poll_interval.max(MIRROR_DEFER_BACKOFF));
+            } else if processed == Some(0) && hierarchy_processed == Some(0) {
                 thread::sleep(self.config.poll_interval);
             }
         }
@@ -233,10 +238,8 @@ impl ProjectionWorker {
 
     /// Advances one hierarchy-projection batch using its own EventStore offset.
     fn process_hierarchy_pending_batch(&self) -> anyhow::Result<usize> {
-        let offset = self
-            .event_store
-            .get_offset(HIERARCHY_PROJECTION_NAME)?
-            .unwrap_or(0);
+        let mirrored = self.event_store.get_offset(HIERARCHY_PROJECTION_NAME)?;
+        let offset = mirrored.unwrap_or(0);
         let batch = self
             .event_store
             .get_events_since_with_id(offset, self.config.batch_size)?;
@@ -246,6 +249,8 @@ impl ProjectionWorker {
 
         let last_row_id = batch.last().expect("non-empty hierarchy batch").0;
         commit_then_mirror(
+            HIERARCHY_PROJECTION_NAME,
+            mirrored.is_some(),
             || self.process_hierarchy_batch(&batch),
             || {
                 self.event_store
@@ -649,6 +654,31 @@ mod tests {
             .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
             .append_event(event)
             .unwrap();
+    }
+
+    fn mirror_test_worker(
+        dir: &tempfile::TempDir,
+        event_store: &Arc<EventStore>,
+    ) -> ProjectionWorker {
+        ProjectionWorker::new(
+            Arc::clone(event_store),
+            ProjectionConfig {
+                batch_size: 1,
+                poll_interval: std::time::Duration::from_millis(1),
+                db_path: dir
+                    .path()
+                    .join("projection.db")
+                    .to_string_lossy()
+                    .into_owned(),
+                rebuild_request_path: dir
+                    .path()
+                    .join(".projection-rebuild-request")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..ProjectionConfig::default()
+            },
+        )
+        .unwrap()
     }
 
     fn planning_usage_event(project_id: &str) -> DomainEvent {
@@ -1147,6 +1177,276 @@ mod tests {
             event_store.get_offset(PROJECTION_NAME).unwrap(),
             Some(mixed.last().unwrap().0)
         );
+    }
+
+    #[test]
+    fn ordinary_mirror_contention_preserves_exactly_once_effects_frontier_and_reopen() {
+        let dir = tempdir().unwrap();
+        let event_path = dir.path().join("events.db");
+        let event_store = Arc::new(EventStore::open(event_path.to_str().unwrap()).unwrap());
+        for id in [1, 2] {
+            append_event(
+                &event_store,
+                u64::from(id),
+                &DomainEventPayload::AgentSpawned {
+                    agent_id: AgentId(id),
+                    name: format!("Fixture Agent {id}"),
+                    role: "QA".into(),
+                    shift_set: 1,
+                    room_id: "empfang".into(),
+                },
+            );
+        }
+        event_store.update_offset(PROJECTION_NAME, 0).unwrap();
+        event_store
+            .update_offset(HIERARCHY_PROJECTION_NAME, 0)
+            .unwrap();
+        let worker = mirror_test_worker(&dir, &event_store);
+        let competitor = rusqlite::Connection::open(&event_path).unwrap();
+        competitor.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = worker.process_pending_batch().unwrap_err();
+        assert!(error
+            .downcast_ref::<sentinel_limbo::event_store::ProjectionOffsetAcquisitionBusy>()
+            .is_some());
+        assert_eq!(live_batch(Err(error)).unwrap(), None);
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), Some(0));
+        assert_eq!(worker.read_store().active_agent_count().unwrap(), 1);
+        assert!(worker.read_store().get_agent(2).unwrap().is_none());
+        let committed = worker
+            .read_store()
+            .transaction(|txn| txn.projection_watermark(PROJECTION_NAME))
+            .unwrap();
+        assert_eq!(committed, 1);
+        drop(worker);
+
+        let reopened = mirror_test_worker(&dir, &event_store);
+        let retained = event_store.get_events_since_with_id(0, 1).unwrap();
+        for _ in 0..3 {
+            assert_eq!(reopened.process_batch(&retained).unwrap(), 0);
+        }
+        let connection = rusqlite::Connection::open(dir.path().join("projection.db")).unwrap();
+        let active_kpi: i64 = connection
+            .query_row("SELECT SUM(active_agents) FROM kpi_1m", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(active_kpi, 1);
+        assert_eq!(
+            reopened
+                .read_store()
+                .get_room("empfang")
+                .unwrap()
+                .unwrap()
+                .occupant_count,
+            1
+        );
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), Some(0));
+        competitor.execute_batch("ROLLBACK").unwrap();
+
+        assert_eq!(
+            live_batch(reopened.process_pending_batch()).unwrap(),
+            Some(0)
+        );
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), Some(1));
+        assert_eq!(reopened.process_pending_batch().unwrap(), 1);
+        assert_eq!(reopened.process_pending_batch().unwrap(), 0);
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), Some(2));
+        assert_eq!(
+            event_store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(),
+            Some(0)
+        );
+        assert_eq!(reopened.read_store().active_agent_count().unwrap(), 2);
+        assert_eq!(
+            reopened
+                .read_store()
+                .get_room("empfang")
+                .unwrap()
+                .unwrap()
+                .occupant_count,
+            2
+        );
+        let active_kpi: i64 = connection
+            .query_row("SELECT SUM(active_agents) FROM kpi_1m", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(active_kpi, 2);
+        assert_eq!(
+            reopened
+                .read_store()
+                .transaction(|txn| txn.projection_watermark(PROJECTION_NAME))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn hierarchy_mirror_contention_preserves_exactly_once_costs_frontier_and_strict_catchup() {
+        let dir = tempdir().unwrap();
+        let event_path = dir.path().join("events.db");
+        let event_store = Arc::new(EventStore::open(event_path.to_str().unwrap()).unwrap());
+        for project in ["project-a", "project-b"] {
+            append_raw_event(&event_store, &planning_usage_event(project));
+        }
+        event_store.update_offset(PROJECTION_NAME, 0).unwrap();
+        event_store
+            .update_offset(HIERARCHY_PROJECTION_NAME, 0)
+            .unwrap();
+        let worker = mirror_test_worker(&dir, &event_store);
+        let competitor = rusqlite::Connection::open(&event_path).unwrap();
+        competitor.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // Explicit catch-up must return the error; only its live-loop adapter defers it.
+        let error = worker.catch_up_hierarchy().unwrap_err();
+        assert_eq!(live_batch(Err(error)).unwrap(), None);
+        assert_eq!(
+            event_store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(),
+            Some(0)
+        );
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), Some(0));
+        assert_eq!(
+            worker
+                .read_store()
+                .transaction(|txn| txn.projection_watermark(HIERARCHY_PROJECTION_NAME))
+                .unwrap(),
+            1
+        );
+        let meta = worker.read_store().hierarchy_projection_meta().unwrap();
+        assert_eq!(meta.first_v2_event_id, Some(1));
+        assert_eq!(meta.last_hierarchy_event_id, 1);
+        let costs = worker.read_store().cost_by_hierarchy_tier().unwrap();
+        assert_eq!(costs.len(), 1);
+        assert_eq!(
+            (
+                costs[0].call_count,
+                costs[0].input_tokens,
+                costs[0].output_tokens
+            ),
+            (1, 10, 20)
+        );
+        drop(worker);
+
+        let reopened = mirror_test_worker(&dir, &event_store);
+        let retained = event_store.get_events_since_with_id(0, 1).unwrap();
+        for _ in 0..3 {
+            reopened.process_hierarchy_batch(&retained).unwrap();
+        }
+        assert_eq!(
+            reopened.read_store().hierarchy_projection_meta().unwrap(),
+            meta
+        );
+        let costs = reopened.read_store().cost_by_hierarchy_tier().unwrap();
+        assert_eq!(
+            (
+                costs[0].call_count,
+                costs[0].input_tokens,
+                costs[0].output_tokens
+            ),
+            (1, 10, 20)
+        );
+        assert_eq!(
+            event_store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(),
+            Some(0)
+        );
+        competitor.execute_batch("ROLLBACK").unwrap();
+
+        assert_eq!(
+            live_batch(reopened.process_hierarchy_pending_batch()).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            event_store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(),
+            Some(1)
+        );
+        assert_eq!(reopened.catch_up_hierarchy().unwrap(), 1);
+        assert_eq!(reopened.catch_up_hierarchy().unwrap(), 0);
+        assert_eq!(
+            event_store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(),
+            Some(2)
+        );
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), Some(0));
+        let costs = reopened.read_store().cost_by_hierarchy_tier().unwrap();
+        assert_eq!(
+            (
+                costs[0].call_count,
+                costs[0].input_tokens,
+                costs[0].output_tokens
+            ),
+            (2, 20, 40)
+        );
+        assert_eq!(
+            reopened
+                .read_store()
+                .transaction(|txn| txn.projection_watermark(HIERARCHY_PROJECTION_NAME))
+                .unwrap(),
+            2
+        );
+        let meta = reopened.read_store().hierarchy_projection_meta().unwrap();
+        assert_eq!(meta.last_usage_event_id, 2);
+        assert_eq!(meta.last_hierarchy_event_id, 2);
+    }
+
+    #[test]
+    fn missing_ordinary_and_hierarchy_mirrors_remain_terminal_under_real_contention() {
+        for hierarchy in [false, true] {
+            let dir = tempdir().unwrap();
+            let event_path = dir.path().join("events.db");
+            let event_store = Arc::new(EventStore::open(event_path.to_str().unwrap()).unwrap());
+            append_event(
+                &event_store,
+                1,
+                &DomainEventPayload::AgentSpawned {
+                    agent_id: AgentId(1),
+                    name: "Fixture Agent".into(),
+                    role: "QA".into(),
+                    shift_set: 1,
+                    room_id: "empfang".into(),
+                },
+            );
+            let worker = mirror_test_worker(&dir, &event_store);
+            let competitor = rusqlite::Connection::open(&event_path).unwrap();
+            competitor.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let (projection, result) = if hierarchy {
+                (HIERARCHY_PROJECTION_NAME, worker.catch_up_hierarchy())
+            } else {
+                (PROJECTION_NAME, worker.process_pending_batch())
+            };
+            let error = result.unwrap_err();
+            assert!(error
+                .downcast_ref::<sentinel_limbo::event_store::ProjectionOffsetAcquisitionBusy>()
+                .is_some());
+            assert!(live_batch(Err(error)).is_err());
+            assert_eq!(event_store.get_offset(projection).unwrap(), None);
+            assert_eq!(
+                worker
+                    .read_store()
+                    .transaction(|txn| txn.projection_watermark(projection))
+                    .unwrap(),
+                1
+            );
+            competitor.execute_batch("ROLLBACK").unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_rebuild_does_not_defer_writer_contention() {
+        let dir = tempdir().unwrap();
+        let event_path = dir.path().join("events.db");
+        let event_store = Arc::new(EventStore::open(event_path.to_str().unwrap()).unwrap());
+        event_store.update_offset(PROJECTION_NAME, 0).unwrap();
+        event_store
+            .update_offset(HIERARCHY_PROJECTION_NAME, 0)
+            .unwrap();
+        let worker = mirror_test_worker(&dir, &event_store);
+        let competitor = rusqlite::Connection::open(&event_path).unwrap();
+        competitor.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = worker.rebuild().unwrap_err();
+        assert!(live_batch(Err(error)).is_err());
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), Some(0));
+        assert_eq!(
+            event_store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(),
+            Some(0)
+        );
+        competitor.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]

@@ -1,5 +1,18 @@
 # Changelog
 
+- Reuse fully validated funding and leadership-review inventories, session
+  supersession proofs and exact governed-journal predicates only within one
+  unchanged SQLite validation snapshot. Share working-memory journal proofs
+  across one read transaction; preserve bounded validation, corrupt-row
+  rejection before session filtering and fresh proofs after writes or reads.
+  Keep reservation and provider-dispatch authority checks independent (#856).
+
+- Postpone established projection offset mirrors in the live poll loop only
+  after committed view/frontier updates and proved pre-write SQLite writer
+  acquisition contention. Preserve bounded backoff, missing-mirror and
+  authority failures, strict explicit batch/rebuild/catch-up errors, and
+  exactly-once KPI and hierarchy effects across mirror retry and reopen (#856).
+
 - Admit explicitly funded leadership reviews after completed recovery, local
   adoption and expired review-extension history. Retain immutable receipts,
   cumulative spending, exact journal/source binding and unresolved-review

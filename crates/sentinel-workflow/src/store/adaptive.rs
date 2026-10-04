@@ -241,7 +241,10 @@ impl WorkflowStore {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(map_sqlite_error)?;
+        // Journal replay and memory composition share only this read transaction.
+        let scope = crate::domain_store::validation_scope::enter(&tx)?;
         let Some((current_session, _)) = load(&tx, session_id)? else {
+            scope.finish()?;
             return Ok(None);
         };
         authorize(&current_session.grant, current)?;
@@ -333,6 +336,7 @@ impl WorkflowStore {
             source.omitted_count += 1;
         }
         source.validate().map_err(|_| corrupt_store())?;
+        scope.finish()?;
         Ok(Some(source))
     }
 
@@ -2320,6 +2324,20 @@ pub(crate) fn allowance_is_governed_in_journal(
     project: &crate::ProjectId,
     allowance: &crate::SubscriptionCallAllowanceV1,
 ) -> Result<bool, WorkflowError> {
+    crate::domain_store::validation_scope::memoize(
+        connection,
+        "governed-journal-predicate",
+        &(tenant, project, allowance),
+        || allowance_is_governed_in_journal_uncached(connection, tenant, project, allowance),
+    )
+}
+
+fn allowance_is_governed_in_journal_uncached(
+    connection: &Connection,
+    tenant: &crate::TenantId,
+    project: &crate::ProjectId,
+    allowance: &crate::SubscriptionCallAllowanceV1,
+) -> Result<bool, WorkflowError> {
     // Bound only journals naming this allowance; unrelated expired rollovers are not evidence.
     let mut statement = connection.prepare(
         "SELECT root.operation_namespace FROM workflow_operations AS root
@@ -2615,6 +2633,82 @@ mod continuation_tests {
         update_head(&tx, &source, &next).unwrap();
         tx.commit().unwrap();
         next
+    }
+
+    #[test]
+    fn working_memory_outer_scope_preserves_bytes_and_rebuilds_proofs_after_errors() {
+        use crate::domain_store::validation_scope;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(temp.path().join("memory-proof.sqlite")).unwrap();
+        let source = continued_unknown_for_head_test(&store);
+        let effect_id = working_memory_model_effect_id(source.grant.session_id, source.version);
+        let before = (operation_rows(&store), head_rows(&store));
+        let read = |current: &RuntimeAuthoritySnapshotV1| {
+            store.adaptive_working_memory_source(
+                source.grant.session_id,
+                source.version,
+                effect_id,
+                current,
+            )
+        };
+        let (first, scopes) =
+            validation_scope::with_completed_validations(|| read(&source.grant.authority));
+        let expected = encode(&first.unwrap().unwrap()).unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].get("adaptive-journal"), Some(&1));
+        let mut stale = source.grant.authority.clone();
+        stale.assignment_version += 1;
+        let (failed, scopes) = validation_scope::with_completed_validations(|| read(&stale));
+        assert_eq!(
+            failed.unwrap_err().code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+        assert!(scopes.is_empty());
+        assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+        let (second, scopes) =
+            validation_scope::with_completed_validations(|| read(&source.grant.authority));
+        assert_eq!(encode(&second.unwrap().unwrap()).unwrap(), expected);
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].get("adaptive-journal"), Some(&1));
+        {
+            let connection = store.lock().unwrap();
+            assert!(connection.is_autocommit());
+            connection
+                .execute(
+                    "UPDATE workflow_operations SET request_digest='invalid'
+                WHERE operation_namespace=?1 AND operation_id='00000000000000000001'",
+                    [namespace(source.grant.session_id)],
+                )
+                .unwrap();
+        }
+        let (failed, scopes) =
+            validation_scope::with_completed_validations(|| read(&source.grant.authority));
+        assert_eq!(failed.unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert!(scopes.is_empty());
+        assert!(store.lock().unwrap().is_autocommit());
+        // Read-only failure leaves every head and journal response untouched.
+        let after = operation_rows(&store);
+        assert_eq!(after.len(), before.0.len());
+        for (actual, original) in after.iter().zip(&before.0) {
+            assert_eq!(
+                (&actual.0, &actual.1, &actual.3, actual.4),
+                (&original.0, &original.1, &original.3, original.4)
+            );
+        }
+        assert_eq!(head_rows(&store), before.1);
+        let (missing, scopes) = validation_scope::with_completed_validations(|| {
+            store.adaptive_working_memory_source(
+                Uuid::from_u128(9005),
+                1,
+                Uuid::from_u128(9006),
+                &source.grant.authority,
+            )
+        });
+        assert_eq!(missing.unwrap(), None);
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].get("adaptive-journal"), Some(&1));
+        assert!(store.lock().unwrap().is_autocommit());
     }
 
     #[test]

@@ -802,3 +802,352 @@ fn funded_persisted_and_completion_paths_reject_corrupt_receipt_event_and_member
         assert_eq!(rows(&f.store), before);
     }
 }
+
+#[test]
+fn funded_scope_reuses_tenant_inventories_and_session_supersession_across_reviews() {
+    let (mut f, receipt, now) = funded_fixture();
+    let first = dispatch(&f, now);
+    f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &continued(&first, now + 2, 5), now + 2,
+    ).unwrap();
+    let observed = observe_budget_inspection(&f, session(&f), now + 3);
+    let next = observed.active_deadline_ms();
+    budget_context(&mut f, next, "scoped-proof-successor");
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 2);
+    let second = issue(&f, next).unwrap();
+    let expected = f.store.adaptive_leadership_review_calls(
+        &f.leader.tenant_id, f.grant.session_id,
+    ).unwrap();
+    assert!(expected.iter().any(|call| call.grant.review_id == first.grant.review_id));
+    assert!(expected.iter().any(|call| call == &second));
+    let before = rows(&f.store);
+    let connection = f.store.connection.lock().unwrap();
+    for _ in 0..2 {
+        validation_scope::with_scope(&connection, || {
+            let actual = calls_for_session(&connection, &f.leader.tenant_id, f.grant.session_id)?;
+            assert_eq!(encode(&actual)?, encode(&expected)?);
+            let entities = validation_scope::validations("entity");
+            for _ in 0..3 {
+                assert_eq!(calls_for_session(
+                    &connection, &f.leader.tenant_id, Uuid::from_u128(9001),
+                )?, Vec::new());
+                assert_eq!(calls_for_session(
+                    &connection, &f.leader.tenant_id, f.grant.session_id,
+                )?, expected);
+                assert_eq!(validation_scope::validations("entity"), entities);
+                assert_eq!(validation_scope::validations("review-inventory"), 1);
+                assert_eq!(validation_scope::validations("funding-inventory"), 1);
+                assert_eq!(validation_scope::validations("funding-supersession"), 1);
+                assert_eq!(validation_scope::validations("adaptive-journal"), 1);
+            }
+            assert!(calls_for_session(
+                &connection, &TenantId::parse("other-tenant")?, f.grant.session_id,
+            )?.is_empty());
+            assert_eq!(validation_scope::validations("review-inventory"), 2);
+            assert_eq!(validation_scope::validations("funding-inventory"), 1);
+            Ok(())
+        }).unwrap();
+        assert_eq!(validation_scope::validations("funding-inventory"), 0);
+    }
+    drop(connection);
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn funded_supersession_scope_reuses_only_stored_history_after_explicit_replacement() {
+    let (mut f, old, _) = funded_fixture();
+    let now = old.request.limits.expires_at_unix_ms;
+    let draft = supersession_draft(&f, &old, Uuid::new_v4(), now).unwrap();
+    let fresh = f.store.authorize_adaptive_work_funding(
+        &funding_operator(&f), &draft, now,
+    ).unwrap().1;
+    budget_context(&mut f, now, "scoped-unused-replacement");
+    bind(&mut f, &fresh, fresh.request.source.resume_source.base_review_count + 1);
+    let call = issue(&f, now).unwrap();
+    let connection = f.store.connection.lock().unwrap();
+    validation_scope::with_scope(&connection, || {
+        for _ in 0..3 {
+            let stored: AdaptiveLeadershipReviewCallV1 = get_entity(
+                &connection, &f.leader.tenant_id, KIND, &call.review_key,
+            )?.unwrap();
+            assert_eq!(stored, call);
+            assert_eq!(validation_scope::validations("funding-inventory"), 1);
+            assert_eq!(validation_scope::validations("funding-supersession"), 1);
+            assert_eq!(validation_scope::validations("unused-funding-review-traces"), 1);
+        }
+        Ok(())
+    }).unwrap();
+    drop(connection);
+    assert!(supersession_draft(&f, &fresh, Uuid::new_v4(),
+        fresh.request.limits.expires_at_unix_ms).is_err());
+}
+
+#[test]
+fn funded_inventory_scope_pins_external_writes_and_rejects_them_in_the_next_operation() {
+    let (f, _, now) = funded_fixture();
+    issue(&f, now).unwrap();
+    let expected = f.store.adaptive_leadership_review_calls(
+        &f.leader.tenant_id, f.grant.session_id,
+    ).unwrap();
+    let connection = f.store.connection.lock().unwrap();
+    let peer = Connection::open(&f.path).unwrap();
+    validation_scope::with_scope(&connection, || {
+        assert_eq!(calls_for_session(
+            &connection, &f.leader.tenant_id, f.grant.session_id,
+        )?, expected);
+        peer.execute("INSERT INTO company_entities VALUES(?1,'adaptive_work_funding',
+            'unrelated-malformed-funding',1,X'00','invalid')", [&f.leader.tenant_id.0])?;
+        assert_eq!(calls_for_session(
+            &connection, &f.leader.tenant_id, Uuid::from_u128(9002),
+        )?, Vec::new());
+        assert_eq!(calls_for_session(
+            &connection, &f.leader.tenant_id, f.grant.session_id,
+        )?, expected);
+        assert_eq!(validation_scope::validations("review-inventory"), 1);
+        assert_eq!(validation_scope::validations("funding-inventory"), 1);
+        Ok(())
+    }).unwrap();
+    for session_id in [f.grant.session_id, Uuid::from_u128(9002)] {
+        assert_eq!(calls_for_session(&connection, &f.leader.tenant_id, session_id)
+            .unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    }
+    peer.execute("DELETE FROM company_entities WHERE entity_id='unrelated-malformed-funding'", []).unwrap();
+    assert_eq!(calls_for_session(
+        &connection, &f.leader.tenant_id, f.grant.session_id,
+    ).unwrap(), expected);
+    assert!(connection.is_autocommit());
+}
+
+#[test]
+fn funded_inventory_same_connection_writes_invalidate_proofs_and_errors_do_not_escape_rollback() {
+    for announced in [false, true] {
+        let (f, _, now) = funded_fixture();
+        issue(&f, now).unwrap();
+        let expected = f.store.adaptive_leadership_review_calls(
+            &f.leader.tenant_id, f.grant.session_id,
+        ).unwrap();
+        let before = rows(&f.store);
+        let mut connection = f.store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let failed = validation_scope::with_scope(&transaction, || {
+            assert_eq!(calls_for_session(
+                &transaction, &f.leader.tenant_id, f.grant.session_id,
+            )?, expected);
+            if announced {
+                validation_scope::before_write(&transaction)?;
+            }
+            transaction.execute("UPDATE company_entities SET payload=X'00'
+                WHERE entity_kind='adaptive_work_funding'", [])?;
+            for _ in 0..2 {
+                assert_eq!(calls_for_session(
+                    &transaction, &f.leader.tenant_id, Uuid::from_u128(9003),
+                ).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+            }
+            assert_eq!(validation_scope::validations("review-inventory"), 3);
+            Err::<(), _>(corrupt())
+        });
+        assert!(failed.is_err());
+        assert!(!transaction.is_autocommit());
+        assert_eq!(validation_scope::validations("review-inventory"), 0);
+        assert_eq!(calls_for_session(
+            &transaction, &f.leader.tenant_id, f.grant.session_id,
+        ).unwrap(), expected);
+        transaction.rollback().unwrap();
+        assert!(connection.is_autocommit());
+        drop(connection);
+        assert_eq!(rows(&f.store), before);
+    }
+}
+
+#[test]
+fn funded_inventory_unwind_discards_proofs_and_preserves_the_outer_transaction() {
+    let (f, _, now) = funded_fixture();
+    issue(&f, now).unwrap();
+    let mut connection = f.store.connection.lock().unwrap();
+    let transaction = connection.transaction().unwrap();
+    let expected = calls_for_session(&transaction, &f.leader.tenant_id, f.grant.session_id).unwrap();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _scope = validation_scope::enter(&transaction).unwrap();
+        assert_eq!(calls_for_session(
+            &transaction, &f.leader.tenant_id, f.grant.session_id,
+        ).unwrap(), expected);
+        transaction.execute("UPDATE company_entities SET payload=X'00'
+            WHERE entity_kind='adaptive_work_funding'", []).unwrap();
+        panic!("abandon the owned proof scope");
+    }));
+    assert!(panic.is_err());
+    assert!(!transaction.is_autocommit());
+    assert_eq!(validation_scope::validations("funding-inventory"), 0);
+    assert_eq!(calls_for_session(
+        &transaction, &f.leader.tenant_id, f.grant.session_id,
+    ).unwrap(), expected);
+    transaction.rollback().unwrap();
+}
+
+#[test]
+fn funded_inventory_new_operations_reject_corruption_orphans_duplicates_and_unrelated_rows() {
+    for damage in ["funding", "funding-event", "orphan", "duplicate", "review",
+        "membership-event", "membership", "adoption", "adoption-event", "unrelated-review"]
+    {
+        let (f, _, now) = funded_fixture();
+        let call = dispatch(&f, now);
+        f.store.complete_adaptive_leadership_review_call(
+            &f.leader, &continued(&call, now + 2, 5), now + 2,
+        ).unwrap();
+        let connection = f.store.connection.lock().unwrap();
+        calls_for_session(&connection, &f.leader.tenant_id, f.grant.session_id).unwrap();
+        let sql = match damage {
+            "funding" => "UPDATE company_entities SET payload=X'00' WHERE entity_kind='adaptive_work_funding'",
+            "funding-event" => "UPDATE company_events SET payload=X'00' WHERE event_type='adaptive_work_funding_issued'",
+            "orphan" => "DELETE FROM company_entities WHERE entity_kind='adaptive_work_funding'",
+            "duplicate" => "INSERT INTO company_events(event_id,tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms)
+                SELECT 'duplicate-funding-event',tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms
+                FROM company_events WHERE event_type='adaptive_work_funding_issued'",
+            "review" => "UPDATE company_entities SET payload=X'00' WHERE entity_kind='adaptive_leadership_review_call'",
+            "membership-event" => "UPDATE company_events SET payload=X'00' WHERE event_type='adaptive_work_funding_review_issued'",
+            "membership" => "DELETE FROM company_entities WHERE entity_kind='adaptive_work_funding_review'",
+            "adoption" => "DELETE FROM company_entities WHERE entity_kind='adaptive_work_funding_adoption'",
+            "adoption-event" => "DELETE FROM company_events WHERE event_type='adaptive_work_funding_adopted'",
+            _ => "INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+                SELECT tenant_id,'adaptive_leadership_review_call','unrelated-malformed-review',1,X'00','invalid'
+                FROM company_entities WHERE entity_kind='adaptive_work_funding' LIMIT 1",
+        };
+        assert!(connection.execute(sql, []).unwrap() > 0, "{damage}");
+        for _ in 0..2 {
+            assert_eq!(calls_for_session(
+                &connection, &f.leader.tenant_id, Uuid::from_u128(9004),
+            ).unwrap_err().code, WorkflowErrorCode::CorruptStore, "{damage}");
+            assert_eq!(validation_scope::validations("review-inventory"), 0);
+        }
+    }
+}
+
+#[test]
+fn funded_inventory_scopes_keep_tenant_and_byte_bounds() {
+    for kind in ["adaptive_work_funding", KIND] {
+        let (f, _, now) = funded_fixture();
+        issue(&f, now).unwrap();
+        let connection = f.store.connection.lock().unwrap();
+        connection.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<4097)
+            INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+            SELECT ?1,?2,'overflow-'||i,1,X'00','invalid' FROM n",
+            params![f.leader.tenant_id.0, kind]).unwrap();
+        assert_eq!(calls_for_session(&connection, &f.leader.tenant_id, f.grant.session_id)
+            .unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    }
+    let (f, _, now) = funded_fixture();
+    issue(&f, now).unwrap();
+    let connection = f.store.connection.lock().unwrap();
+    let failed = validation_scope::with_scope(&connection, || {
+        validation_scope::charge_bytes(&connection, 64 * 1024 * 1024)?;
+        calls_for_session(&connection, &f.leader.tenant_id, f.grant.session_id)
+    });
+    assert_eq!(failed.unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    assert!(calls_for_session(&connection, &f.leader.tenant_id, f.grant.session_id).is_ok());
+    assert!(connection.is_autocommit());
+}
+
+#[test]
+fn governed_journal_predicate_reuses_only_exact_inputs_and_invalidates_on_write() {
+    let f = budget_fixture(2);
+    let allowance = f.context.source_project.subscription_call.as_ref().unwrap();
+    let mut connection = f.store.connection.lock().unwrap();
+    let transaction = connection.transaction().unwrap();
+    let predicate = |value: &SubscriptionCallAllowanceV1| {
+        crate::store::adaptive::allowance_is_governed_in_journal(
+            &transaction, &f.leader.tenant_id, &f.grant.project_id, value,
+        )
+    };
+    let failed = validation_scope::with_scope(&transaction, || {
+        for _ in 0..3 {
+            assert!(predicate(allowance)?);
+            assert_eq!(validation_scope::validations("governed-journal-predicate"), 1);
+            assert_eq!(validation_scope::validations("adaptive-journal"), 1);
+        }
+        let mut changed = allowance.clone();
+        changed.grant.max_calls += 1;
+        assert!(predicate(&changed)?);
+        changed.allowance_id.push_str("-absent");
+        assert!(!predicate(&changed)?);
+        assert!(!predicate(&changed)?);
+        assert_eq!(validation_scope::validations("governed-journal-predicate"), 3);
+        assert_eq!(validation_scope::validations("adaptive-journal"), 1);
+        assert!(!crate::store::adaptive::allowance_is_governed_in_journal(
+            &transaction, &TenantId::parse("other-tenant")?, &f.grant.project_id, allowance,
+        )?);
+        assert!(!crate::store::adaptive::allowance_is_governed_in_journal(
+            &transaction, &f.leader.tenant_id, &ProjectId::parse("other-project")?, allowance,
+        )?);
+        assert_eq!(validation_scope::validations("governed-journal-predicate"), 5);
+        transaction.execute("UPDATE workflow_operations SET request_digest='invalid'
+            WHERE operation_namespace=?1 AND operation_id='00000000000000000001'",
+            [format!("adaptive-session-v1:{}", f.grant.session_id)])?;
+        assert_eq!(predicate(allowance).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert_eq!(predicate(allowance).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert_eq!(validation_scope::validations("governed-journal-predicate"), 7);
+        Err::<(), _>(corrupt())
+    });
+    assert!(failed.is_err());
+    validation_scope::with_scope(&transaction, || {
+        assert!(predicate(allowance)?);
+        assert_eq!(validation_scope::validations("governed-journal-predicate"), 1);
+        Ok(())
+    }).unwrap();
+    transaction.rollback().unwrap();
+}
+
+#[test]
+fn funded_working_memory_outer_scope_preserves_ready_and_claimed_bytes() {
+    use sha2::Digest;
+
+    let (f, _, now) = funded_fixture();
+    let call = dispatch(&f, now);
+    f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &continued(&call, now + 2, 5), now + 2,
+    ).unwrap();
+    let source = session(&f);
+    let digest = sha2::Sha256::digest(format!(
+        "sentinel.workflow.adaptive-model-effect.v1:{}:{}",
+        source.grant.session_id, source.version,
+    ).as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let effect_id = Uuid::from_bytes(bytes);
+    let before = rows(&f.store);
+    let (ready, scopes) = validation_scope::with_completed_validations(|| {
+        f.store.adaptive_working_memory_source(
+            source.grant.session_id, source.version, effect_id, &source.grant.authority,
+        )
+    });
+    let ready = ready.unwrap().unwrap();
+    assert_eq!(scopes.len(), 1);
+    assert_eq!(scopes[0].get("adaptive-journal"), Some(&1));
+    assert_eq!(scopes[0].get("funding-inventory"), Some(&1));
+    assert_eq!(scopes[0].get("funding-supersession"), Some(&1));
+    assert_eq!(ready.work_funding.as_deref(), source.active_work_funding());
+    assert_eq!(ready.root_model_ceiling, source.grant.max_model_calls);
+    assert_eq!(ready.root_tool_ceiling, source.grant.max_tool_calls);
+    assert_eq!(rows(&f.store), before);
+    f.store.advance_adaptive_session(
+        source.grant.session_id, source.version, Uuid::new_v4(),
+        &AdaptiveTransitionV1::ClaimModel {
+            effect: AdaptiveEffectV1 { id: effect_id, request_digest: DIGEST.into() },
+            previous_observation_digest: source.last_observation.as_ref()
+                .map(|observation| observation.observation_digest.clone()),
+        }, &source.grant.authority, now + 3,
+    ).unwrap();
+    let claimed_rows = rows(&f.store);
+    let (claimed, scopes) = validation_scope::with_completed_validations(|| {
+        f.store.adaptive_working_memory_source(
+            source.grant.session_id, source.version, effect_id, &source.grant.authority,
+        )
+    });
+    assert_eq!(encode(&claimed.unwrap().unwrap()).unwrap(), encode(&ready).unwrap());
+    assert_eq!(scopes.len(), 1);
+    assert_eq!(scopes[0].get("adaptive-journal"), Some(&1));
+    assert_eq!(scopes[0].get("funding-inventory"), Some(&1));
+    assert_eq!(scopes[0].get("funding-supersession"), Some(&1));
+    assert_eq!(rows(&f.store), claimed_rows);
+}
