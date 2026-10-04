@@ -1,5 +1,19 @@
 # Changelog
 
+- Admit explicitly funded leadership reviews after completed recovery, local
+  adoption and expired review-extension history. Retain immutable receipts,
+  cumulative spending, exact journal/source binding and unresolved-review
+  exclusion; verify adoption and historical replay across store reopen (#856).
+  Permit an authenticated, explicit replacement only of an expired proposal
+  that never issued a review. Preserve its old receipt/event and operation
+  replay, count all issuances, and never inherit unused capacity or reroll a
+  refused, dispatched or retired model review.
+
+- Migrate developer builds to Cargo Remote v2 with a pinned GNU Bookworm image,
+  align the project and CI toolchain at Rust 1.99.0, and replace the deprecated
+  atomic fetch_update name and fixed-size slice iterators without changing
+  reconciliation rate limits or decoding semantics.
+
 - Surface measured collector resource totals instead of constant zero values.
   Distinguish unavailable samples from measured zero, average agent stress,
   preserve stalled-agent identity and age, and prevent cumulative kernel I/O

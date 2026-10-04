@@ -66,8 +66,9 @@ bitnet/bitnet-inference
 # Keep pre-compiled WASM test fixtures (needed for CI/test execution)
 !crates/sentinel-wasm/tests/fixtures/*.wasm
 
-# Local Config
+# Local Config (Cargo Remote v2's public profile/pins are versioned)
 .cargo-remote.toml
+!/.cargo-remote.toml
 .make.local
 
 # Claude Code (internal working files)
