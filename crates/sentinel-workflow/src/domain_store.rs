@@ -785,8 +785,11 @@ impl WorkflowStore {
     ) -> Result<Option<ProjectV1>, WorkflowError> {
         tenant_id.validate()?;
         project_id.validate()?;
-        let connection = self.connection.lock().map_err(|_| persistence())?;
-        validated_company_project_in_snapshot(&connection, tenant_id, project_id)
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        let query_key = serde_json::to_vec(&(tenant_id, project_id)).map_err(|_| corrupt())?;
+        self.validated_read_snapshot(&mut connection, "company-project", &query_key, |snapshot| {
+            validated_company_project_in_snapshot(snapshot, tenant_id, project_id)
+        })
     }
 
     /// Returns every durable project after validating the complete entity-row
@@ -795,8 +798,7 @@ impl WorkflowStore {
     pub fn company_projects(&self) -> Result<Vec<ProjectV1>, WorkflowError> {
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
         // Pin discovery without aggregating unrelated projects' proof-arena limits.
-        let snapshot = connection.savepoint()?;
-        let projects = (|| {
+        self.validated_read_snapshot(&mut connection, "company-projects", &[], |snapshot| {
             let mut statement = snapshot
             .prepare(
                 "SELECT tenant_id,entity_kind,entity_id,version,payload,payload_digest FROM company_entities WHERE entity_kind='project' ORDER BY tenant_id,entity_id",
@@ -834,13 +836,11 @@ impl WorkflowStore {
                     return Err(corrupt());
                 }
                 validate_project(&project).map_err(|_| corrupt())?;
-                subscription::validate_persisted(&snapshot, &project).map_err(|_| corrupt())?;
+                subscription::validate_persisted(snapshot, &project).map_err(|_| corrupt())?;
                 Ok(project)
             })
             .collect::<Result<Vec<_>, WorkflowError>>()
-        })()?;
-        snapshot.commit()?;
-        Ok(projects)
+        })
     }
 
     pub fn company_customer_projects(

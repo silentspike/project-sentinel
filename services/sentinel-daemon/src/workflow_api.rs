@@ -44,6 +44,9 @@ mod model_review;
 #[cfg(feature = "llm")]
 pub mod model_work;
 mod project_profiles;
+#[cfg(test)]
+#[path = "workflow_api/tests/reconciliation_status.rs"]
+mod reconciliation_status_tests;
 #[cfg(feature = "llm")]
 mod subscription;
 #[cfg(feature = "llm")]
@@ -56,9 +59,11 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError};
 use std::time::Duration;
 
 use sentinel_common::{
@@ -3222,6 +3227,12 @@ pub struct WorkflowHttpResponse {
     pub body: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ReconciliationStatus {
+    scan_succeeded: bool,
+    last_error: Option<String>,
+}
+
 pub struct WorkflowApi {
     core: Arc<ProductWorkflowCore>,
     delivery: Option<Arc<ProductDeliveryCore>>,
@@ -3238,9 +3249,8 @@ pub struct WorkflowApi {
     request_sales_tenant: Option<TenantId>,
     request_sales_total_limit: u16,
     request_sales_autonomous_enabled: bool,
-    scan_succeeded: AtomicBool,
+    reconciliation_status: Mutex<ReconciliationStatus>,
     collaboration_publication_pending: AtomicUsize,
-    last_error: Mutex<Option<String>>,
     company_sync_cursor: Mutex<Option<(TenantId, ProjectId, WorkItemId)>>,
 }
 
@@ -3427,9 +3437,8 @@ impl WorkflowApi {
             request_sales_tenant,
             request_sales_total_limit,
             request_sales_autonomous_enabled,
-            scan_succeeded: AtomicBool::new(false),
+            reconciliation_status: Mutex::new(ReconciliationStatus::default()),
             collaboration_publication_pending: AtomicUsize::new(usize::MAX),
-            last_error: Mutex::new(None),
             company_sync_cursor: Mutex::new(None),
         })
     }
@@ -3464,9 +3473,8 @@ impl WorkflowApi {
             request_sales_tenant: None,
             request_sales_total_limit: 1,
             request_sales_autonomous_enabled: false,
-            scan_succeeded: AtomicBool::new(false),
+            reconciliation_status: Mutex::new(ReconciliationStatus::default()),
             collaboration_publication_pending: AtomicUsize::new(0),
-            last_error: Mutex::new(None),
             company_sync_cursor: Mutex::new(None),
         })
     }
@@ -3625,9 +3633,7 @@ impl WorkflowApi {
                 if let CompanyWorkflowResponseV1::AgreementProject { project, .. } = &value.response
                 {
                     if let Err(error) = self.ensure_project_planning_call(project) {
-                        if let Ok(mut last_error) = self.last_error.lock() {
-                            *last_error = Some(error.to_owned());
-                        }
+                        self.publish_reconciliation_status(Some(error.to_owned()));
                         return json_error(
                             503,
                             "project_planning_pending",
@@ -3638,9 +3644,7 @@ impl WorkflowApi {
                 }
                 if is_collaboration_command_v1(&envelope.command) {
                     if let Err(error) = self.publish_collaboration_backlog() {
-                        if let Ok(mut last_error) = self.last_error.lock() {
-                            *last_error = Some(error);
-                        }
+                        self.publish_reconciliation_status(Some(error));
                         return json_error(
                             503,
                             "collaboration_publication_pending",
@@ -3807,9 +3811,7 @@ impl WorkflowApi {
         ) {
             Ok(value) => {
                 if let Err(error) = self.publish_collaboration_backlog() {
-                    if let Ok(mut last_error) = self.last_error.lock() {
-                        *last_error = Some(error);
-                    }
+                    self.publish_reconciliation_status(Some(error));
                     return json_error(
                         503,
                         "collaboration_publication_pending",
@@ -3862,9 +3864,7 @@ impl WorkflowApi {
             );
         }
         if let Err(error) = self.publish_collaboration_backlog() {
-            if let Ok(mut last_error) = self.last_error.lock() {
-                *last_error = Some(error);
-            }
+            self.publish_reconciliation_status(Some(error));
             return json_error(
                 503,
                 "collaboration_publication_pending",
@@ -5120,20 +5120,52 @@ impl WorkflowApi {
         if !self.enabled {
             return;
         }
-        let Ok(_batch) = self.reconciliation_fence.try_lock() else {
-            return;
+        let _batch = match self.reconciliation_fence.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(_)) => {
+                self.publish_reconciliation_status(Some(
+                    "reconciliation_fence_poisoned".to_owned(),
+                ));
+                return;
+            }
         };
         // Normal batches may coexist with durable dispatch claims, but never recovery.
-        let Ok(_guard) = self.mutation_fence.try_read() else {
-            return;
+        let _guard = match self.mutation_fence.try_read() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(_)) => {
+                self.publish_reconciliation_status(Some("mutation_fence_poisoned".to_owned()));
+                return;
+            }
         };
         if should_stop() {
             return;
         }
         let result = self.reconcile_batch(&should_stop);
-        self.scan_succeeded.store(result.is_ok(), Ordering::Release);
-        if let Ok(mut last_error) = self.last_error.lock() {
-            *last_error = result.err().map(|error| format!("{:?}", error.code));
+        self.publish_reconciliation_status(result.err().map(|error| format!("{:?}", error.code)));
+    }
+
+    fn publish_reconciliation_status(&self, last_error: Option<String>) {
+        if let Ok(mut status) = self.reconciliation_status.lock() {
+            *status = ReconciliationStatus {
+                scan_succeeded: last_error.is_none(),
+                last_error,
+            };
+        }
+    }
+
+    fn reconciliation_status_snapshot(&self) -> ReconciliationStatus {
+        match self.reconciliation_status.lock() {
+            Ok(status) => status.clone(),
+            Err(poisoned) => ReconciliationStatus {
+                scan_succeeded: false,
+                last_error: poisoned
+                    .into_inner()
+                    .last_error
+                    .clone()
+                    .or_else(|| Some("reconciliation_status_poisoned".to_owned())),
+            },
         }
     }
 
@@ -5553,12 +5585,11 @@ impl WorkflowApi {
         let pending_execution = self.store.pending_executions(MAX_RECONCILE_BATCH);
         let pending_completion = self.store.pending_completion_evidence(MAX_RECONCILE_BATCH);
         let pending_gate = self.store.pending_gate_evidence(MAX_RECONCILE_BATCH);
-        let last_error = self.last_error.lock().ok().and_then(|value| value.clone());
         #[cfg(feature = "llm")]
-        let last_error = match self.adaptive_models_have_unknown_outcome() {
+        let durable_error = match self.adaptive_models_have_unknown_outcome() {
             Ok(true) => Some("UnknownOutcome".to_owned()),
             Err(reason) => Some(reason.to_owned()),
-            Ok(false) => last_error,
+            Ok(false) => None,
         };
         let canonical_event_cursor = self.store.company_event_cursor();
         let delivery_ready = self
@@ -5573,9 +5604,15 @@ impl WorkflowApi {
             .collaboration_publication_pending
             .load(Ordering::Acquire);
         let dependencies_ready = self.core.dependencies_ready() && delivery_ready;
+        // Sample both fields together after durable checks, outside their expensive work.
+        let reconciliation_status = self.reconciliation_status_snapshot();
+        #[cfg(feature = "llm")]
+        let last_error = durable_error.or(reconciliation_status.last_error);
+        #[cfg(not(feature = "llm"))]
+        let last_error = reconciliation_status.last_error;
         let ready = self.enabled
             && dependencies_ready
-            && self.scan_succeeded.load(Ordering::Acquire)
+            && reconciliation_status.scan_succeeded
             && last_error.is_none()
             && pending_execution.is_ok()
             && pending_completion.is_ok()
