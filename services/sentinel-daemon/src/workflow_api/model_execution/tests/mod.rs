@@ -10,6 +10,441 @@ thread_local! {
     static PROVIDER_PREPARATION_COUNTS: std::cell::Cell<(usize, usize)> = const {
         std::cell::Cell::new((0, 0))
     };
+    static EXACT_ADAPTIVE_READ_COUNTS: std::cell::Cell<(usize, usize, usize)> = const {
+        std::cell::Cell::new((0, 0, 0))
+    };
+}
+
+pub(super) fn record_exact_adaptive_snapshot() {
+    EXACT_ADAPTIVE_READ_COUNTS.with(|counts| {
+        let (snapshots, authorities, heads) = counts.get();
+        counts.set((snapshots + 1, authorities, heads));
+    });
+}
+
+pub(super) fn record_exact_adaptive_authority() {
+    EXACT_ADAPTIVE_READ_COUNTS.with(|counts| {
+        let (snapshots, authorities, heads) = counts.get();
+        counts.set((snapshots, authorities + 1, heads));
+    });
+}
+
+pub(super) fn record_exact_adaptive_head() {
+    EXACT_ADAPTIVE_READ_COUNTS.with(|counts| {
+        let (snapshots, authorities, heads) = counts.get();
+        counts.set((snapshots, authorities, heads + 1));
+    });
+}
+
+#[test]
+fn exact_and_reserved_adaptive_reads_acquire_once_per_boundary_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let events = temp.path().join("events.sqlite");
+    let (api, expected, _) = super::super::model_work::configured_adaptive_test_api(&path, &events);
+    let before = super::super::adaptive_leadership_review::tests::discovery_state(&path, &events);
+    let bytes = serde_json::to_vec(&expected).unwrap();
+    EXACT_ADAPTIVE_READ_COUNTS.with(|counts| counts.set((0, 0, 0)));
+    for boundary in 1..=3 {
+        let actual = api
+            .adaptive_provider_authority_for_exact_binding(&expected)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(serde_json::to_vec(&actual).unwrap(), bytes);
+        assert_eq!(
+            EXACT_ADAPTIVE_READ_COUNTS.with(|counts| counts.get()),
+            (2 * boundary - 1, 2 * boundary - 1, 2 * boundary - 1),
+        );
+        let actual = api
+            .adaptive_provider_authority_for_reserved_session(
+                expected.grant.authority.agent_id,
+                expected.grant.session_id,
+                &expected.grant.provider_allowance_id,
+                expected.session_version,
+                expected.effect_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(serde_json::to_vec(&actual).unwrap(), bytes);
+        assert_eq!(
+            EXACT_ADAPTIVE_READ_COUNTS.with(|counts| counts.get()),
+            (2 * boundary, 2 * boundary, 2 * boundary),
+        );
+        assert_eq!(
+            super::super::adaptive_leadership_review::tests::discovery_state(&path, &events),
+            before,
+        );
+    }
+}
+
+#[test]
+fn exact_adaptive_snapshot_rejects_scope_grant_and_effect_tampering_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let events = temp.path().join("events.sqlite");
+    let (api, expected, _) = super::super::model_work::configured_adaptive_test_api(&path, &events);
+    let before = super::super::adaptive_leadership_review::tests::discovery_state(&path, &events);
+    for field in [
+        "schema",
+        "tenant",
+        "project",
+        "work",
+        "assignment",
+        "lineage",
+        "profile",
+        "runtime",
+        "policy",
+        "session",
+        "allowance",
+        "provider",
+        "model",
+        "catalog",
+        "provider_digest",
+        "model_budget",
+        "tool_budget",
+        "output_budget",
+        "duration",
+        "created",
+        "deadline",
+        "version",
+        "effect",
+    ] {
+        let mut changed = expected.clone();
+        match field {
+            "schema" => changed.schema_version += 1,
+            "tenant" => {
+                changed.grant.authority.tenant_id = TenantId::parse("other-tenant").unwrap()
+            }
+            "project" => {
+                changed.grant.authority.project_id = ProjectId::parse("other-project").unwrap()
+            }
+            "work" => {
+                changed.grant.authority.work_item_id = WorkItemId::parse("other-work").unwrap()
+            }
+            "assignment" => changed.assignment_id.push_str("-changed"),
+            "lineage" => changed.grant.authority.assignment_version += 1,
+            "profile" => changed.grant.authority.profile_digest = "0".repeat(64),
+            "runtime" => changed.grant.authority.runtime_digest = "0".repeat(64),
+            "policy" => changed.grant.authority.policy_digest = "0".repeat(64),
+            "session" => changed.grant.session_id = Uuid::new_v4(),
+            "allowance" => changed.grant.provider_allowance_id.push_str("-changed"),
+            "provider" => changed.grant.provider.push_str("-changed"),
+            "model" => changed.grant.model.push_str("-changed"),
+            "catalog" => changed.grant.catalog_digest = "0".repeat(64),
+            "provider_digest" => changed.grant.provider_authority_digest = "0".repeat(64),
+            "model_budget" => changed.grant.max_model_calls += 1,
+            "tool_budget" => changed.grant.max_tool_calls += 1,
+            "output_budget" => changed.grant.max_output_tokens += 1,
+            "duration" => changed.grant.max_call_duration_ms += 1,
+            "created" => changed.grant.created_at_ms += 1,
+            "deadline" => changed.grant.deadline_ms += 1,
+            "version" => changed.session_version += 1,
+            "effect" => changed.effect_id = Uuid::new_v4(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            api.adaptive_provider_authority_for_exact_binding(&changed),
+            if matches!(field, "tenant" | "project") {
+                Err("adaptive exact project missing")
+            } else {
+                Ok(None)
+            },
+            "{field}",
+        );
+        assert_eq!(
+            super::super::adaptive_leadership_review::tests::discovery_state(&path, &events),
+            before,
+            "{field}",
+        );
+    }
+}
+
+#[test]
+fn exact_adaptive_snapshot_missing_head_does_not_create_or_select_another_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let events = temp.path().join("events.sqlite");
+    let (api, mut expected, _) =
+        super::super::model_work::configured_adaptive_test_api(&path, &events);
+    let binding = super::super::model_work::assign_test_work_from(&api, Some(8), 100);
+    let tenant = TenantId::parse(&binding.tenant_id).unwrap();
+    let project_id = ProjectId::parse(&binding.project_id).unwrap();
+    let work = WorkItemId::parse(&binding.work_item_id).unwrap();
+    let snapshot = api
+        .store
+        .adaptive_project_snapshot(&tenant, &project_id, &work, binding.agent_id)
+        .unwrap()
+        .unwrap();
+    let current = api
+        .authority
+        .as_ref()
+        .unwrap()
+        .snapshot_from_validated_project(
+            snapshot.project(),
+            &tenant,
+            &project_id,
+            &work,
+            binding.agent_id,
+            false,
+        )
+        .unwrap();
+    assert!(snapshot.session_for_authority(&current).unwrap().is_none());
+    let allowance = snapshot.project().subscription_call.as_ref().unwrap();
+    let digest = current.canonical_digest().unwrap();
+    expected.grant.session_id = stable_operation_id(
+        "sentinel.workflow.adaptive-session.v1",
+        &format!("{}:{digest}", allowance.allowance_id),
+        allowance.grant.assignment_version,
+    );
+    expected.grant.authority = current;
+    expected.grant.provider_allowance_id = allowance.allowance_id.clone();
+    expected.grant.provider_authority_digest = domain_digest(
+        "sentinel.workflow.adaptive-provider-authority.v1",
+        &[&serde_json::to_vec(&(allowance, &digest)).unwrap()],
+    );
+    expected.grant.created_at_ms = allowance.created_at_unix_ms;
+    expected.grant.deadline_ms = allowance.grant.expires_at_unix_ms;
+    expected.assignment_id = binding.assignment_id.clone();
+    expected.effect_id = stable_operation_id(
+        "sentinel.workflow.adaptive-model-effect.v1",
+        &expected.grant.session_id.to_string(),
+        1,
+    );
+    let selected = select_provider_usage_binding(
+        std::slice::from_ref(snapshot.project()),
+        binding.agent_id,
+        Some(&binding.reservation_id),
+    )
+    .unwrap()
+    .unwrap();
+    drop(snapshot);
+    let before = super::super::adaptive_leadership_review::tests::discovery_state(&path, &events);
+    assert_eq!(
+        api.adaptive_provider_authority_for_exact_binding(&expected),
+        Ok(None),
+    );
+    assert_eq!(
+        api.adaptive_provider_authority_for_reserved_session(
+            binding.agent_id,
+            expected.grant.session_id,
+            &binding.reservation_id,
+            expected.session_version,
+            expected.effect_id,
+        ),
+        Ok(None),
+    );
+    assert_eq!(
+        super::super::adaptive_leadership_review::tests::discovery_state(&path, &events),
+        before,
+    );
+    // Normal scheduling alone creates the head, proving the missing effect was exact.
+    let (created, reconciled) = api
+        .adaptive_provider_authority_from_binding(selected, false)
+        .unwrap();
+    assert!(!reconciled);
+    assert_eq!(created, Some(expected));
+}
+
+#[test]
+fn exact_adaptive_snapshot_reacquires_and_preserves_project_and_head_errors() {
+    for project_error in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, expected, _) =
+            super::super::model_work::configured_adaptive_test_api(&path, &events);
+        assert_eq!(
+            api.adaptive_provider_authority_for_exact_binding(&expected),
+            Ok(Some(expected.clone())),
+        );
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let changed = if project_error {
+            connection
+                .execute(
+                    "UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind='project'",
+                    [],
+                )
+                .unwrap()
+        } else {
+            connection
+                .execute(
+                    "UPDATE workflow_operations SET request_digest='invalid' WHERE operation_namespace=?1",
+                    [format!("adaptive-session-v1:{}", expected.grant.session_id)],
+                )
+                .unwrap()
+        };
+        assert!(changed > 0);
+        let before =
+            super::super::adaptive_leadership_review::tests::discovery_state(&path, &events);
+        assert_eq!(
+            api.adaptive_provider_authority_for_exact_binding(&expected),
+            Err(if project_error {
+                "adaptive exact project unavailable"
+            } else {
+                "adaptive exact session unavailable"
+            }),
+        );
+        assert_eq!(
+            api.adaptive_provider_authority_for_reserved_session(
+                expected.grant.authority.agent_id,
+                expected.grant.session_id,
+                &expected.grant.provider_allowance_id,
+                expected.session_version,
+                expected.effect_id,
+            ),
+            Err(if project_error {
+                "adaptive dispatch projects unavailable"
+            } else {
+                "adaptive dispatch session unavailable"
+            }),
+        );
+        assert_eq!(
+            super::super::adaptive_leadership_review::tests::discovery_state(&path, &events),
+            before,
+        );
+    }
+}
+
+#[test]
+fn exact_adaptive_snapshot_does_not_retain_runtime_profile_between_boundaries() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let events = temp.path().join("events.sqlite");
+    let (mut api, expected, _) =
+        super::super::model_work::configured_adaptive_test_api(&path, &events);
+    assert_eq!(
+        api.adaptive_provider_authority_for_exact_binding(&expected),
+        Ok(Some(expected.clone())),
+    );
+    Arc::make_mut(api.authority.as_mut().unwrap()).workbench_profile_digest = "0".repeat(64);
+    let before = super::super::adaptive_leadership_review::tests::discovery_state(&path, &events);
+    assert_eq!(
+        api.adaptive_provider_authority_for_exact_binding(&expected),
+        Err("adaptive exact runtime authority unavailable"),
+    );
+    assert_eq!(
+        api.adaptive_provider_authority_for_reserved_session(
+            expected.grant.authority.agent_id,
+            expected.grant.session_id,
+            &expected.grant.provider_allowance_id,
+            expected.session_version,
+            expected.effect_id,
+        ),
+        Err("adaptive dispatch runtime authority unavailable"),
+    );
+    assert_eq!(
+        super::super::adaptive_leadership_review::tests::discovery_state(&path, &events),
+        before,
+    );
+}
+
+#[test]
+fn exact_adaptive_snapshot_defers_corrupt_head_until_after_binding_and_runtime_checks() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let events = temp.path().join("events.sqlite");
+    let (mut api, expected, _) =
+        super::super::model_work::configured_adaptive_test_api(&path, &events);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        connection
+            .execute("UPDATE workflow_adaptive_heads SET version=version+1", [])
+            .unwrap()
+            > 0
+    );
+    let before = super::super::adaptive_leadership_review::tests::discovery_state(&path, &events);
+    let mut changed = expected.clone();
+    changed.assignment_id.push_str("-wrong");
+    assert_eq!(
+        api.adaptive_provider_authority_for_exact_binding(&changed),
+        Ok(None)
+    );
+    changed = expected.clone();
+    changed.grant.authority.work_item_id = WorkItemId("invalid/work".into());
+    assert_eq!(
+        api.adaptive_provider_authority_for_exact_binding(&changed),
+        Ok(None)
+    );
+    changed = expected.clone();
+    changed.grant.authority.agent_id = AgentId(0);
+    assert_eq!(
+        api.adaptive_provider_authority_for_exact_binding(&changed),
+        Ok(None)
+    );
+    assert_eq!(
+        api.adaptive_provider_authority_for_exact_binding(&expected),
+        Err("adaptive exact session unavailable")
+    );
+    Arc::make_mut(api.authority.as_mut().unwrap()).workbench_profile_digest = "0".repeat(64);
+    assert_eq!(
+        api.adaptive_provider_authority_for_exact_binding(&expected),
+        Err("adaptive exact runtime authority unavailable")
+    );
+    assert_eq!(
+        api.adaptive_provider_authority_for_reserved_session(
+            expected.grant.authority.agent_id,
+            expected.grant.session_id,
+            &expected.grant.provider_allowance_id,
+            expected.session_version,
+            expected.effect_id,
+        ),
+        Err("adaptive dispatch runtime authority unavailable")
+    );
+    assert_eq!(
+        super::super::adaptive_leadership_review::tests::discovery_state(&path, &events),
+        before
+    );
+}
+
+#[test]
+fn exact_adaptive_read_sources_do_not_reenter_fresh_mutating_acquisitions() {
+    let source = include_str!("../../model_execution.rs");
+    let exact = source
+        .split("pub(super) fn adaptive_provider_authority_for_exact_binding(")
+        .nth(1)
+        .unwrap()
+        .split("pub(super) fn adaptive_provider_authority_for_reserved_session(")
+        .next()
+        .unwrap();
+    let reserved = source
+        .split("pub(super) fn adaptive_provider_authority_for_reserved_session(")
+        .nth(1)
+        .unwrap()
+        .split("fn adaptive_provider_authority_inner(")
+        .next()
+        .unwrap();
+    for read in [exact, reserved] {
+        assert_eq!(read.matches(".adaptive_project_snapshot(").count(), 1);
+        assert_eq!(read.matches(".snapshot_from_validated_project(").count(), 1);
+        assert_eq!(read.matches(".session_for_authority(").count(), 1);
+        assert!(!read.contains(".snapshot_for_admission("));
+        assert!(!read.contains(".company_project("));
+        assert!(!read.contains(".adaptive_session_for_authority("));
+        assert!(!read.contains(".adaptive_provider_authority_from_binding_inner("));
+        assert!(!read.contains(".adaptive_provider_authority_for_exact_binding("));
+        let compact: String = read.split_whitespace().collect();
+        assert!(compact.contains("Some(session),false,true"));
+        assert!(
+            read.find("drop(snapshot)").unwrap()
+                < read
+                    .find("self.evaluate_adaptive_provider_binding(")
+                    .unwrap()
+        );
+    }
+    assert!(reserved.contains(".company_projects()"));
+    let normal = source
+        .split("fn adaptive_provider_authority_from_binding_inner(")
+        .nth(1)
+        .unwrap()
+        .split("fn evaluate_adaptive_provider_binding(")
+        .next()
+        .unwrap();
+    assert!(normal.contains(".company_project("));
+    assert!(normal.contains(".snapshot_for_admission("));
+    assert!(normal.contains(".adaptive_session_for_authority("));
+    assert!(!normal.contains(".adaptive_project_snapshot("));
 }
 
 pub(crate) fn record_provider_selection() {

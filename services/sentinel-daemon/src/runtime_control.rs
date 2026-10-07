@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -49,12 +50,38 @@ pub struct RuntimeReconcileResponse {
     pub errors: Vec<String>,
     #[serde(default)]
     pub elapsed_us: u64,
+    /// Enqueue to dequeue, including tick scheduling and earlier queued work.
+    #[serde(default)]
+    pub queue_wait_us: u64,
+    /// Dequeue to the current owner/restore-fence decision, not a global lock timer.
+    #[serde(default)]
+    pub fence_check_us: u64,
+    /// Dispatcher wait for a reply; excludes HTTP serialization/network transit.
+    #[serde(default)]
+    pub response_wait_us: u64,
+}
+
+impl RuntimeReconcileResponse {
+    pub fn record_dispatch_timing(
+        &mut self,
+        enqueued_at: Instant,
+        dequeued_at: Instant,
+        fence_checked_at: Instant,
+    ) {
+        self.queue_wait_us = duration_us(dequeued_at.saturating_duration_since(enqueued_at));
+        self.fence_check_us = duration_us(fence_checked_at.saturating_duration_since(dequeued_at));
+    }
+}
+
+pub(crate) fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug)]
 pub enum RuntimeControlCommand {
     Reconcile {
         request: RuntimeReconcileRequest,
+        enqueued_at: Instant,
         response_tx: mpsc::SyncSender<RuntimeReconcileResponse>,
     },
     AnalysisFloodTest {
@@ -257,6 +284,24 @@ pub fn write_projection_rebuild_request(data_dir: &Path, tick: u64, reason: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconcile_dispatch_timing_separates_queue_from_fence() {
+        let enqueued = Instant::now();
+        let dequeued = enqueued + Duration::from_micros(200);
+        let checked = dequeued + Duration::from_micros(15);
+        let mut response = RuntimeReconcileResponse {
+            elapsed_us: 30,
+            ..Default::default()
+        };
+        response.record_dispatch_timing(enqueued, dequeued, checked);
+        assert_eq!(response.queue_wait_us, 200);
+        assert_eq!(response.fence_check_us, 15);
+        assert_eq!(response.elapsed_us, 30);
+        response.record_dispatch_timing(checked, dequeued, enqueued);
+        assert_eq!(response.queue_wait_us, 0);
+        assert_eq!(response.fence_check_us, 0);
+    }
 
     #[test]
     fn respawn_backoff_tracker_applies_exponential_backoff_until_blocked() {

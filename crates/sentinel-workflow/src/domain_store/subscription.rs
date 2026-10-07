@@ -471,7 +471,7 @@ fn validate_persisted_uncached(
             stable_domain_id("subscription", &project.tenant_id, operation)
         })
         .collect::<Result<BTreeSet<_>, WorkflowError>>()?;
-    for allowance in project
+    let allowances = project
         .subscription_call
         .iter()
         .chain(project.source_review_previous_call.iter())
@@ -487,22 +487,26 @@ fn validate_persisted_uncached(
                 .iter()
                 .filter_map(|record| record.previous_subscription_call.as_ref()),
         )
-    {
-        if issued.contains(&allowance.allowance_id)
-            || crate::store::adaptive::allowance_is_governed_in_journal(
-                connection,
-                &project.tenant_id,
-                &project.project_id,
-                allowance,
-            )?
-            || allowance.grant.max_duration_ms != 120_000
-        {
-            adaptive_leadership_review::validate_persisted_governed_allowance(
-                connection, project, allowance,
-            )?;
-        }
-    }
-    Ok(())
+        .filter_map(|allowance| {
+            let governed = (|| {
+                Ok::<_, WorkflowError>(
+                    issued.contains(&allowance.allowance_id)
+                        || crate::store::adaptive::allowance_is_governed_in_journal(
+                            connection,
+                            &project.tenant_id,
+                            &project.project_id,
+                            allowance,
+                        )?
+                        || allowance.grant.max_duration_ms != 120_000,
+                )
+            })();
+            match governed {
+                Ok(true) => Some(Ok(allowance)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        });
+    adaptive_leadership_review::validate_governed_allowances(connection, project, allowances)
 }
 
 pub(super) fn renew_for_correction(
@@ -540,6 +544,30 @@ pub(super) fn renew_for_correction(
 #[cfg(test)]
 mod role_tests {
     use super::*;
+
+    #[test]
+    fn subscription_empty_allowance_batch_does_not_discover_unrelated_receipts() {
+        let (_temp, _path, store, _customer, project) =
+            crate::domain_store::tests::accepted_project_fixture();
+        assert!(project.subscription_call.is_none());
+        let connection = store.connection.lock().unwrap();
+        connection.execute(
+            "INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+             VALUES(?1,'adaptive_leadership_review_call','unrelated-review',1,X'00','invalid')",
+            [&project.tenant_id.0],
+        ).unwrap();
+        validation_scope::with_scope(&connection, || {
+            validate_persisted(&connection, &project)?;
+            assert_eq!(
+                validation_scope::validations("governed-allowance-locators"),
+                0
+            );
+            assert_eq!(validation_scope::validations("governed-allowance"), 0);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn subscription_qa_requires_the_review_profile_and_bound_inputs() {
         assert!(subscription_role_supported(

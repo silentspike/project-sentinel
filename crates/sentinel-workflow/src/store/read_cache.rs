@@ -365,6 +365,7 @@ impl ReadCache {
         self.read_keyed(connection, eligible, domain, &[], validate)
     }
 
+    #[cfg(test)]
     pub(super) fn read_keyed<T: Clone + Serialize + Send + 'static>(
         &mut self,
         connection: &Connection,
@@ -373,7 +374,19 @@ impl ReadCache {
         query_key: &[u8],
         validate: impl FnOnce() -> Result<T, WorkflowError>,
     ) -> Result<T, WorkflowError> {
-        let result = self.read_inner(connection, eligible, domain, query_key, validate);
+        self.read_keyed_if(connection, eligible, domain, query_key, validate, |_| true)
+    }
+
+    pub(super) fn read_keyed_if<T: Clone + Serialize + Send + 'static>(
+        &mut self,
+        connection: &Connection,
+        eligible: bool,
+        domain: &'static str,
+        query_key: &[u8],
+        validate: impl FnOnce() -> Result<T, WorkflowError>,
+        retain: impl Fn(&T) -> bool,
+    ) -> Result<T, WorkflowError> {
+        let result = self.read_inner(connection, eligible, domain, query_key, validate, retain);
         if result.is_err() {
             self.clear();
         }
@@ -387,6 +400,7 @@ impl ReadCache {
         domain: &'static str,
         query_key: &[u8],
         validate: impl FnOnce() -> Result<T, WorkflowError>,
+        retain: impl Fn(&T) -> bool,
     ) -> Result<T, WorkflowError> {
         if !eligible || query_key.len() > MAX_KEY_BYTES {
             // Caller-owned transactions may include transient state or rollbacks.
@@ -439,6 +453,10 @@ impl ReadCache {
         if inputs.is_some_and(|inputs| inputs.matches(connection).unwrap_or(false)) {
             if !self.integrity_ok(connection)? {
                 return Err(super::corrupt_store());
+            }
+            if !retain(&value) {
+                self.clear();
+                return Ok(value);
             }
             let size = serialized_json_size(&value).ok().and_then(|bytes| {
                 bytes.checked_add(size_of::<T>() + size_of::<ResultProof>() + key.2.len())
@@ -862,6 +880,36 @@ mod tests {
             assert!(cache.results.len() <= MAX_RESULTS);
             assert!(cache.result_bytes <= MAX_RESULT_BYTES);
         }
+    }
+
+    #[test]
+    fn exact_read_cache_deferred_failures_are_not_retained_as_completed_proofs() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut cache = ReadCache::default();
+        let validations = Cell::new(0);
+        cache.read(&snapshot, true, "valid", || Ok(1_u64)).unwrap();
+        assert_eq!(cache.results.len(), 1);
+        for expected in 1..=2 {
+            let value = cache
+                .read_keyed_if(
+                    &snapshot,
+                    true,
+                    "deferred",
+                    b"scope",
+                    || {
+                        validations.set(validations.get() + 1);
+                        Ok((42_u64, false))
+                    },
+                    |value| value.1,
+                )
+                .unwrap();
+            assert_eq!(value, (42, false));
+            assert_eq!(validations.get(), expected);
+            assert!(cache.results.is_empty());
+            assert!(cache.inputs.is_none());
+        }
+        assert!(!snapshot.is_autocommit());
     }
 
     #[test]
