@@ -2002,8 +2002,14 @@ impl WorkflowStore {
         if review_id.is_nil() {
             return Err(invalid("invalid leadership review identity"));
         }
-        let connection = self.connection.lock().map_err(|_| persistence())?;
-        get_entity(&connection, tenant, KIND, &review_id.to_string())
+        let query_key = serde_json::to_vec(&(tenant, review_id)).map_err(|_| persistence())?;
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        self.validated_read_snapshot(
+            &mut connection,
+            "leadership-review-exact",
+            &query_key,
+            |snapshot| get_entity(snapshot, tenant, KIND, &review_id.to_string()),
+        )
     }
 
     pub fn adaptive_leadership_review_calls(
@@ -2585,6 +2591,270 @@ impl WorkflowStore {
 #[cfg(test)]
 mod tests {
     include!("adaptive_leadership_review/tests.rs");
+
+    #[test]
+    fn exact_review_warm_cache_invalidates_local_and_external_writes() {
+        let f = fixture();
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_call(&f.leader.tenant_id, f.grant.review_id)
+                .unwrap(),
+            None
+        );
+        let call = authorize(&f);
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                .unwrap(),
+            Some(call.clone())
+        );
+        {
+            let query_key =
+                serde_json::to_vec(&(&f.leader.tenant_id, call.grant.review_id)).unwrap();
+            let mut connection = f.store.connection.lock().unwrap();
+            let cached: Option<AdaptiveLeadershipReviewCallV1> = f
+                .store
+                .validated_read_snapshot(
+                    &mut connection,
+                    "leadership-review-exact",
+                    &query_key,
+                    |_| panic!("unchanged exact review must reuse its validated proof"),
+                )
+                .unwrap();
+            assert_eq!(cached, Some(call.clone()));
+        }
+        let dispatched = f
+            .store
+            .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), AUTHORIZED_AT + 1)
+            .unwrap();
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                .unwrap(),
+            Some(dispatched.clone())
+        );
+        let external = WorkflowStore::open(&f.path).unwrap();
+        assert_eq!(
+            external
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE company_entities SET payload_digest=?1
+                     WHERE tenant_id=?2 AND entity_kind=?3 AND entity_id=?4",
+                    params!["0".repeat(64), f.leader.tenant_id.0, KIND, call.review_key],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
+        persist_entity(&external, &dispatched);
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                .unwrap(),
+            Some(dispatched)
+        );
+    }
+
+    #[test]
+    fn exact_review_warm_cache_isolates_tenant_and_review_identity() {
+        let f = fixture();
+        let call = authorize(&f);
+        let foreign = TenantId::parse("tenant-foreign").unwrap();
+        let missing = Uuid::new_v4();
+        for _ in 0..2 {
+            assert_eq!(
+                f.store
+                    .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                    .unwrap(),
+                Some(call.clone())
+            );
+            assert_eq!(
+                f.store
+                    .adaptive_leadership_review_call(&foreign, call.grant.review_id)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                f.store
+                    .adaptive_leadership_review_call(&f.leader.tenant_id, missing)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                f.store
+                    .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+                    .unwrap(),
+                vec![call.clone()]
+            );
+        }
+        assert_eq!(
+            f.store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+                     SELECT ?1,entity_kind,entity_id,version,payload,payload_digest FROM company_entities
+                     WHERE tenant_id=?2 AND entity_kind=?3 AND entity_id=?4",
+                    params![foreign.0, f.leader.tenant_id.0, KIND, call.review_key],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_call(&foreign, call.grant.review_id)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                .unwrap(),
+            Some(call)
+        );
+    }
+
+    #[test]
+    fn exact_review_warm_cache_rejects_corrupt_replay_and_recovers() {
+        let f = budget_fixture(4);
+        let call = dispatch_budget(&f, CONTINUATION_AT + 7);
+        for _ in 0..2 {
+            assert_eq!(
+                f.store
+                    .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                    .unwrap(),
+                Some(call.clone())
+            );
+        }
+        let (operation_id, response): (String, Vec<u8>) = {
+            let connection = f.store.connection.lock().unwrap();
+            let original: (String, Vec<u8>) = connection
+                .query_row(
+                    "SELECT operation_id,response FROM workflow_operations
+                     WHERE operation_namespace=?1 ORDER BY operation_id LIMIT 1",
+                    [format!("adaptive-session-v1:{}", f.grant.session_id)],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE workflow_operations SET response=X'00'
+                         WHERE operation_namespace=?1 AND operation_id=?2",
+                        params![
+                            format!("adaptive-session-v1:{}", f.grant.session_id),
+                            original.0
+                        ],
+                    )
+                    .unwrap(),
+                1
+            );
+            original
+        };
+        let before = rows(&f.store);
+        for _ in 0..2 {
+            assert_eq!(
+                f.store
+                    .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::CorruptStore
+            );
+            assert!(f.store.connection.lock().unwrap().is_autocommit());
+            assert_eq!(rows(&f.store), before);
+        }
+        assert_eq!(
+            f.store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE workflow_operations SET response=?1
+                     WHERE operation_namespace=?2 AND operation_id=?3",
+                    params![
+                        response,
+                        format!("adaptive-session-v1:{}", f.grant.session_id),
+                        operation_id
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                .unwrap(),
+            Some(call)
+        );
+    }
+
+    #[test]
+    fn exact_review_warm_cache_bypasses_outer_transaction_and_rollback() {
+        let f = fixture();
+        let call = authorize(&f);
+        for _ in 0..2 {
+            assert_eq!(
+                f.store
+                    .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                    .unwrap(),
+                Some(call.clone())
+            );
+        }
+        let before = rows(&f.store);
+        let mut transient = call.clone();
+        transient.allowance_id = "transient-review-allowance".into();
+        transient.validate_entity().unwrap();
+        {
+            let connection = f.store.connection.lock().unwrap();
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let payload = encode(&transient).unwrap();
+            let digest = bytes_digest("sentinel.workflow.company-entity-row.v1", &payload).unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE company_entities SET payload=?1,payload_digest=?2
+                         WHERE tenant_id=?3 AND entity_kind=?4 AND entity_id=?5",
+                        params![payload, digest, f.leader.tenant_id.0, KIND, call.review_key],
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                f.store
+                    .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                    .unwrap(),
+                Some(transient.clone())
+            );
+            assert!(!f.store.connection.lock().unwrap().is_autocommit());
+        }
+        {
+            let connection = f.store.connection.lock().unwrap();
+            connection.execute_batch("ROLLBACK").unwrap();
+            assert!(connection.is_autocommit());
+        }
+        assert_eq!(rows(&f.store), before);
+        for _ in 0..2 {
+            assert_eq!(
+                f.store
+                    .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                    .unwrap(),
+                Some(call.clone())
+            );
+        }
+    }
+
     mod resume_policy_tests {
         include!("adaptive_leadership_review/resume_policy_tests.rs");
         mod accounting_reconsideration_tests {

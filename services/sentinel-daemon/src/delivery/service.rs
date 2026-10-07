@@ -81,6 +81,12 @@ pub struct ConfiguredDeliveryCore<I, E, P> {
     publication: P,
 }
 
+#[derive(Debug)]
+pub struct DeliveryReadinessSnapshotV1 {
+    pub readiness: Result<(), DeliveryError>,
+    pub pending_publication_count: usize,
+}
+
 impl<I, S, E> DeliveryCore<I, S, E>
 where
     I: DeliveryIntegrationPort,
@@ -2463,6 +2469,19 @@ where
 
     pub fn readiness(&self) -> Result<(), DeliveryError> {
         self.core.store.health()?;
+        self.adapter_readiness()
+    }
+
+    /// Store failures reject the snapshot; adapter failures retain the validated count.
+    pub fn readiness_snapshot(&self) -> Result<DeliveryReadinessSnapshotV1, DeliveryError> {
+        let pending_publication_count = self.core.store.health_with_pending_count()?;
+        Ok(DeliveryReadinessSnapshotV1 {
+            readiness: self.adapter_readiness(),
+            pending_publication_count,
+        })
+    }
+
+    fn adapter_readiness(&self) -> Result<(), DeliveryError> {
         self.core.require_integration()?;
         self.core.require_execution_saga()?;
         self.core.require_effect_saga()?;
@@ -4024,5 +4043,210 @@ fn require_saga_readiness(
         AdapterReadiness::Unavailable { reason } => {
             Err(DeliveryError::AdapterUnavailable { dependency, reason })
         }
+    }
+}
+
+#[cfg(test)]
+mod readiness_snapshot_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::delivery::{DeliveryEffectReceiptV1, PublicationReceiptV1, PublicationRequestV1};
+
+    const STAGES: [&str; 4] = ["integration", "execution", "effects", "publication"];
+
+    #[derive(Clone, Copy)]
+    enum Fault {
+        None,
+        Unavailable(&'static str),
+        Stale(&'static str),
+    }
+
+    #[derive(Clone)]
+    struct Probe {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        fault: Fault,
+    }
+
+    impl Probe {
+        fn observe(&self, stage: &'static str, digest: ContentDigest) -> AdapterReadiness {
+            self.calls.lock().unwrap().push(stage);
+            if matches!(self.fault, Fault::Unavailable(failed) if failed == stage) {
+                return AdapterReadiness::Unavailable {
+                    reason: format!("{stage} fixture unavailable"),
+                };
+            }
+            AdapterReadiness::Ready {
+                contract_version: DELIVERY_SCHEMA_V1,
+                authority_generation: if matches!(
+                    self.fault,
+                    Fault::Stale(failed) if failed == stage
+                ) {
+                    0
+                } else {
+                    1
+                },
+                contract_digest: digest,
+            }
+        }
+    }
+
+    impl DeliveryIntegrationPort for Probe {
+        fn readiness(&self) -> AdapterReadiness {
+            self.observe("integration", expected_integration_contract_digest())
+        }
+
+        fn execution_saga_readiness(&self) -> AdapterReadiness {
+            self.observe(
+                "execution",
+                expected_workbench_execution_saga_contract_digest(),
+            )
+        }
+
+        fn candidate_authority(
+            &self,
+            _query: &CandidateAuthorityQueryV1,
+        ) -> Result<CandidateAuthoritySnapshotV1, DeliveryError> {
+            panic!("readiness must not request candidate authority")
+        }
+
+        fn authorize(
+            &self,
+            _request: &AuthorityValidationRequestV1,
+        ) -> Result<AuthorityReceiptV1, DeliveryError> {
+            panic!("readiness must not authorize effects")
+        }
+
+        fn execute_qa(
+            &self,
+            _request: &WorkbenchEvidenceRequestV1,
+        ) -> Result<WorkbenchEvidenceReceiptV1, DeliveryError> {
+            panic!("readiness must not execute QA")
+        }
+    }
+
+    impl DeliveryEffectPort for Probe {
+        fn readiness(&self) -> AdapterReadiness {
+            self.observe("effects", expected_effect_saga_contract_digest())
+        }
+
+        fn apply(
+            &self,
+            _request: &DeliveryEffectRequestV1,
+        ) -> Result<DeliveryEffectReceiptV1, DeliveryError> {
+            panic!("readiness must not apply effects")
+        }
+    }
+
+    impl DeliveryPublicationPort for Probe {
+        fn readiness(&self) -> AdapterReadiness {
+            self.observe("publication", expected_publication_contract_digest())
+        }
+
+        fn publish(
+            &self,
+            _request: &PublicationRequestV1,
+        ) -> Result<PublicationReceiptV1, DeliveryError> {
+            panic!("readiness must not publish")
+        }
+    }
+
+    fn fixture(
+        fault: Fault,
+    ) -> (
+        tempfile::TempDir,
+        ConfiguredDeliveryCore<Probe, Probe, Probe>,
+        Probe,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DeliveryStore::open_test_only(&temp.path().join("delivery.redb")).unwrap();
+        let mut aggregate = DeliveryAggregateV1::new("tenant-a", "project-a");
+        aggregate.revision = 1;
+        store
+            .commit(&DeliveryCommitRequestV1 {
+                tenant_id: aggregate.tenant_id.clone(),
+                project_id: aggregate.project_id.clone(),
+                expected_revision: 0,
+                principal_id: "health-probe".to_string(),
+                command_kind: "fixture".to_string(),
+                idempotency_key: "health-1".to_string(),
+                command_digest: ContentDigest::of(&1).unwrap(),
+                aggregate,
+                event_type: "health_fixture".to_string(),
+                event_payload: json!({ "revision": 1 }),
+                committed_at_ms: 1,
+            })
+            .unwrap();
+        let probe = Probe {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fault,
+        };
+        let product = ConfiguredDeliveryCore {
+            core: DeliveryCore::with_ports(store, probe.clone(), probe.clone()),
+            publication: probe.clone(),
+        };
+        (temp, product, probe)
+    }
+
+    #[test]
+    fn readiness_snapshot_preserves_legacy_adapter_order_errors_and_count_without_writes() {
+        let mut faults = vec![Fault::None];
+        for stage in STAGES {
+            faults.push(Fault::Unavailable(stage));
+            faults.push(Fault::Stale(stage));
+        }
+        for fault in faults {
+            let (temp, product, probe) = fixture(fault);
+            let before = std::fs::read(temp.path().join("delivery.redb")).unwrap();
+            let legacy = product.readiness();
+            let legacy_calls = probe.calls.lock().unwrap().clone();
+            probe.calls.lock().unwrap().clear();
+            let snapshot = product.readiness_snapshot().unwrap();
+            assert_eq!(format!("{:?}", snapshot.readiness), format!("{legacy:?}"));
+            assert_eq!(*probe.calls.lock().unwrap(), legacy_calls);
+            let expected_calls = match fault {
+                Fault::None => STAGES.len(),
+                Fault::Unavailable(stage) | Fault::Stale(stage) => {
+                    STAGES
+                        .iter()
+                        .position(|candidate| *candidate == stage)
+                        .unwrap()
+                        + 1
+                }
+            };
+            assert_eq!(legacy_calls.as_slice(), &STAGES[..expected_calls]);
+            assert_eq!(snapshot.pending_publication_count, 1);
+            assert_eq!(
+                snapshot.pending_publication_count,
+                product.pending_publication_count().unwrap()
+            );
+            assert_eq!(
+                std::fs::read(temp.path().join("delivery.redb")).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_snapshot_rejects_store_corruption_before_adapter_checks() {
+        let (temp, product, probe) = fixture(Fault::None);
+        product
+            .core
+            .store
+            .rekey_idempotency_record_test_only(
+                "tenant-a:health-probe:fixture:health-1",
+                "tenant-a:forged:fixture:health-1",
+            )
+            .unwrap();
+        let before = std::fs::read(temp.path().join("delivery.redb")).unwrap();
+        let legacy = product.readiness().unwrap_err();
+        let snapshot = product.readiness_snapshot().unwrap_err();
+        assert!(matches!(&snapshot, DeliveryError::CorruptStore(_)));
+        assert_eq!(snapshot.to_string(), legacy.to_string());
+        assert!(probe.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read(temp.path().join("delivery.redb")).unwrap(),
+            before
+        );
     }
 }

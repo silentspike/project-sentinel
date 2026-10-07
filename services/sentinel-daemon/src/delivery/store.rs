@@ -726,7 +726,26 @@ impl DeliveryStore {
 
     pub fn health(&self) -> Result<(), DeliveryError> {
         self.initialize_schema()?;
+        self.health_with_pending_count().map(|_| ())
+    }
+
+    /// Count publications only after validating the complete local authority.
+    /// Unlike initialization, this snapshot never repairs or writes metadata.
+    pub fn health_with_pending_count(&self) -> Result<usize, DeliveryError> {
         let read = self.db.begin_read()?;
+        let meta = read.open_table(META)?;
+        let schema = meta.get(SCHEMA_KEY)?.ok_or_else(|| {
+            DeliveryError::CorruptStore("delivery schema metadata is missing".to_string())
+        })?;
+        let version: u16 = serde_json::from_slice(schema.value())
+            .map_err(|error| DeliveryError::CorruptStore(error.to_string()))?;
+        if version != SCHEMA_VERSION {
+            return Err(DeliveryError::CorruptStore(format!(
+                "unsupported delivery schema {version}, expected {SCHEMA_VERSION}"
+            )));
+        }
+        drop(schema);
+        drop(meta);
         let mut aggregate_revisions = BTreeMap::new();
         let aggregates = read.open_table(AGGREGATES)?;
         for row in aggregates.iter()? {
@@ -866,6 +885,7 @@ impl DeliveryStore {
                 "journal exists without an aggregate".to_string(),
             ));
         }
+        let mut pending_publication_count = 0;
         let outbox = read.open_table(OUTBOX)?;
         for row in outbox.iter()? {
             let (key, value) = row?;
@@ -913,6 +933,8 @@ impl DeliveryStore {
                         "published receipt binding is invalid".to_string(),
                     ));
                 }
+            } else {
+                pending_publication_count += 1;
             }
         }
         let idempotency = read.open_table(IDEMPOTENCY)?;
@@ -955,7 +977,7 @@ impl DeliveryStore {
                 ));
             }
         }
-        Ok(())
+        Ok(pending_publication_count)
     }
 }
 
@@ -1095,4 +1117,202 @@ fn decode<T: for<'de> Deserialize<'de>>(
 ) -> Result<T, DeliveryError> {
     serde_json::from_slice(bytes)
         .map_err(|error| DeliveryError::CorruptStore(format!("{record_type}: {error}")))
+}
+
+#[cfg(test)]
+mod health_snapshot_tests {
+    use super::*;
+
+    fn fixture(count: u64) -> (tempfile::TempDir, DeliveryStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DeliveryStore::open_test_only(&temp.path().join("delivery.redb")).unwrap();
+        for revision in 1..=count {
+            let mut aggregate = DeliveryAggregateV1::new("tenant-a", "project-a");
+            aggregate.revision = revision;
+            store
+                .commit(&DeliveryCommitRequestV1 {
+                    tenant_id: aggregate.tenant_id.clone(),
+                    project_id: aggregate.project_id.clone(),
+                    expected_revision: revision - 1,
+                    principal_id: "health-probe".to_string(),
+                    command_kind: "fixture".to_string(),
+                    idempotency_key: format!("health-{revision}"),
+                    command_digest: ContentDigest::of(&revision).unwrap(),
+                    aggregate,
+                    event_type: "health_fixture".to_string(),
+                    event_payload: serde_json::json!({ "revision": revision }),
+                    committed_at_ms: revision,
+                })
+                .unwrap();
+        }
+        (temp, store)
+    }
+
+    fn publish_first(store: &DeliveryStore) -> DeliveryOutboxEntryV1 {
+        let entry = store.pending_publications().unwrap().remove(0);
+        let request = &entry.request;
+        store
+            .mark_published(
+                &request.request_digest,
+                PublicationReceiptV1 {
+                    schema_version: SCHEMA_VERSION,
+                    operation_id: request.operation_id.clone(),
+                    event_id: format!("event:{}", entry.project_revision),
+                    aggregate_id: request.aggregate_id.clone(),
+                    row_identity: request.row_identity.clone(),
+                    payload_digest: request.payload_digest.clone(),
+                    request_digest: request.request_digest.clone(),
+                },
+            )
+            .unwrap();
+        entry
+    }
+
+    #[test]
+    fn health_snapshot_matches_legacy_counts_without_writes() {
+        let (empty_temp, empty) = fixture(0);
+        let before = std::fs::read(empty_temp.path().join("delivery.redb")).unwrap();
+        assert_eq!(empty.health_with_pending_count().unwrap(), 0);
+        empty.health().unwrap();
+        assert!(empty.pending_publications().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read(empty_temp.path().join("delivery.redb")).unwrap(),
+            before
+        );
+
+        let (temp, store) = fixture(3);
+        for expected in (0..=3).rev() {
+            let before = std::fs::read(temp.path().join("delivery.redb")).unwrap();
+            for _ in 0..2 {
+                store.health().unwrap();
+                assert_eq!(store.health_with_pending_count().unwrap(), expected);
+                assert_eq!(store.pending_publications().unwrap().len(), expected);
+            }
+            assert_eq!(
+                std::fs::read(temp.path().join("delivery.redb")).unwrap(),
+                before
+            );
+            if expected != 0 {
+                publish_first(&store);
+            }
+        }
+    }
+
+    #[test]
+    fn health_snapshot_validates_published_rows_even_when_no_work_is_pending() {
+        for corrupt_request in [false, true] {
+            let (temp, store) = fixture(1);
+            let published = publish_first(&store);
+            let write = store.db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(OUTBOX).unwrap();
+                let stored = table
+                    .get(published.request.operation_id.as_str())
+                    .unwrap()
+                    .unwrap();
+                let mut entry: DeliveryOutboxEntryV1 = decode(stored.value(), "outbox").unwrap();
+                drop(stored);
+                if corrupt_request {
+                    entry.request.request_digest = ContentDigest::zero();
+                } else {
+                    entry.published_receipt.as_mut().unwrap().row_identity = "forged".to_string();
+                }
+                let bytes = serde_json::to_vec(&entry).unwrap();
+                table
+                    .insert(entry.request.operation_id.as_str(), bytes.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+            assert!(store.pending_publications().unwrap().is_empty());
+            let before = std::fs::read(temp.path().join("delivery.redb")).unwrap();
+            let legacy = store.health().unwrap_err();
+            let snapshot = store.health_with_pending_count().unwrap_err();
+            assert!(matches!(&snapshot, DeliveryError::CorruptStore(_)));
+            assert_eq!(snapshot.to_string(), legacy.to_string());
+            assert_eq!(
+                std::fs::read(temp.path().join("delivery.redb")).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn health_snapshot_does_not_return_a_count_before_idempotency_validation() {
+        let (temp, store) = fixture(1);
+        store
+            .rekey_idempotency_record_test_only(
+                "tenant-a:health-probe:fixture:health-1",
+                "tenant-a:forged:fixture:health-1",
+            )
+            .unwrap();
+        assert_eq!(store.pending_publications().unwrap().len(), 1);
+        let before = std::fs::read(temp.path().join("delivery.redb")).unwrap();
+        let legacy = store.health().unwrap_err();
+        let snapshot = store.health_with_pending_count().unwrap_err();
+        assert!(matches!(&snapshot, DeliveryError::CorruptStore(_)));
+        assert_eq!(snapshot.to_string(), legacy.to_string());
+        assert_eq!(
+            std::fs::read(temp.path().join("delivery.redb")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn health_snapshot_rejects_journal_corruption_before_counting() {
+        let (temp, store) = fixture(1);
+        let pending = store.pending_publications().unwrap().remove(0);
+        let write = store.db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(JOURNAL).unwrap();
+            let stored = table
+                .get(pending.request.operation_id.as_str())
+                .unwrap()
+                .unwrap();
+            let mut entry: DeliveryJournalEntryV1 = decode(stored.value(), "journal").unwrap();
+            drop(stored);
+            entry.event_digest = ContentDigest::zero();
+            let bytes = serde_json::to_vec(&entry).unwrap();
+            table
+                .insert(entry.operation_id.as_str(), bytes.as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+        let before = std::fs::read(temp.path().join("delivery.redb")).unwrap();
+        let legacy = store.health().unwrap_err();
+        let snapshot = store.health_with_pending_count().unwrap_err();
+        assert!(matches!(&snapshot, DeliveryError::CorruptStore(_)));
+        assert_eq!(snapshot.to_string(), legacy.to_string());
+        assert_eq!(
+            std::fs::read(temp.path().join("delivery.redb")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn health_snapshot_never_repairs_missing_schema_metadata() {
+        let (temp, store) = fixture(0);
+        let write = store.db.begin_write().unwrap();
+        {
+            write.open_table(META).unwrap().remove(SCHEMA_KEY).unwrap();
+        }
+        write.commit().unwrap();
+        let before = std::fs::read(temp.path().join("delivery.redb")).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                store.health_with_pending_count(),
+                Err(DeliveryError::CorruptStore(_))
+            ));
+        }
+        let read = store.db.begin_read().unwrap();
+        assert!(read
+            .open_table(META)
+            .unwrap()
+            .get(SCHEMA_KEY)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            std::fs::read(temp.path().join("delivery.redb")).unwrap(),
+            before
+        );
+    }
 }

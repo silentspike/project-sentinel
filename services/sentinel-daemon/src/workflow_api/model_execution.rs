@@ -922,21 +922,24 @@ impl WorkflowApi {
         if !self.model_work_enabled {
             return Ok(false);
         }
-        let projects = self
-            .store
-            .company_projects()
-            .map_err(|_| "adaptive projects unavailable")?;
+        let (projects, sessions) =
+            self.store
+                .adaptive_health_inventory()
+                .map_err(|error| match error {
+                    sentinel_workflow::AdaptiveHealthReadError::Projects(_) => {
+                        "adaptive projects unavailable"
+                    }
+                    sentinel_workflow::AdaptiveHealthReadError::Sessions(_) => {
+                        "adaptive sessions unavailable"
+                    }
+                })?;
         let project_ids: BTreeSet<_> = projects
             .into_iter()
             .map(|project| (project.tenant_id, project.project_id))
             .collect();
         // Health reads durable effect lineage, not permission to perform new work.
         let mut unknown = false;
-        for session in self
-            .store
-            .adaptive_sessions_for_health()
-            .map_err(|_| "adaptive sessions unavailable")?
-        {
+        for session in sessions {
             if !project_ids.contains(&(
                 session.grant.authority.tenant_id.clone(),
                 session.grant.authority.project_id.clone(),
