@@ -624,13 +624,18 @@ fn plan_rejects_digest_mutation_workspace_split_and_free_form_shell() {
         media_type: "application/octet-stream".to_owned(),
         mount_path: "inputs/a".to_owned(),
     };
-    let mut duplicate_input_id = plan(1);
+    let mut repeated_content = plan(1);
     let mut second_input = input.clone();
     second_input.mount_path = "inputs/b".to_owned();
-    duplicate_input_id.steps[0].inputs = vec![input.clone(), second_input];
-    duplicate_input_id = duplicate_input_id.bind_digest().unwrap();
+    repeated_content.steps[0].inputs = vec![input.clone(), second_input];
+    repeated_content = repeated_content.bind_digest().unwrap();
+    repeated_content.validate_at(NOW).unwrap();
+
+    let mut conflicting_content = repeated_content;
+    conflicting_content.steps[0].inputs[1].digest = "b".repeat(64);
+    conflicting_content = conflicting_content.bind_digest().unwrap();
     assert_eq!(
-        duplicate_input_id.validate_at(NOW).unwrap_err().code,
+        conflicting_content.validate_at(NOW).unwrap_err().code,
         WorkflowErrorCode::InvalidInput
     );
 
