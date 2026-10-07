@@ -1,8 +1,10 @@
 use std::any::{Any, TypeId};
-use std::collections::BTreeMap;
-use std::mem::size_of;
+use std::collections::{BTreeMap, HashSet};
+use std::hash::BuildHasher;
+use std::mem::{align_of, size_of};
+use std::sync::Arc;
 
-use rusqlite::types::{Value, ValueRef};
+use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -34,10 +36,93 @@ const SCHEMA_QUERY: &str =
     "SELECT type,name,tbl_name,rootpage,sql FROM main.sqlite_schema ORDER BY type,name";
 
 #[derive(Debug)]
+enum InputValue {
+    Null,
+    Integer(i64),
+    RealBits(u64),
+    Text(Arc<[u8]>),
+    Blob(Arc<[u8]>),
+}
+
+impl InputValue {
+    fn matches(&self, value: ValueRef<'_>) -> bool {
+        match (self, value) {
+            (Self::Null, ValueRef::Null) => true,
+            (Self::Integer(left), ValueRef::Integer(right)) => *left == right,
+            (Self::RealBits(left), ValueRef::Real(right)) => *left == right.to_bits(),
+            (Self::Text(left), ValueRef::Text(right))
+            | (Self::Blob(left), ValueRef::Blob(right)) => left.as_ref() == right,
+            _ => false,
+        }
+    }
+}
+
+fn charge_input(bytes: &mut usize, additional: usize) -> Option<()> {
+    let next = bytes.checked_add(additional)?;
+    if next > MAX_INPUT_BYTES {
+        return None;
+    }
+    *bytes = next;
+    Some(())
+}
+
+fn payload_bytes(length: usize) -> Option<usize> {
+    // Arc's two reference counters and allocation-alignment slack are charged once.
+    length.checked_add(2 * size_of::<usize>() + align_of::<usize>() - 1)
+}
+
+fn interner_bytes(capacity: usize) -> Option<usize> {
+    if capacity == 0 {
+        return Some(0);
+    }
+    // Budget spare hash buckets, control bytes and alignment conservatively,
+    // not just occupied entries. The pool is temporary but overlaps the proof.
+    capacity
+        .checked_mul(2)?
+        .checked_mul(size_of::<Arc<[u8]>>() + size_of::<usize>())?
+        .checked_add(32)
+}
+
+fn intern_bytes<S: BuildHasher>(
+    pool: &mut HashSet<Arc<[u8]>, S>,
+    value: &[u8],
+    bytes: &mut usize,
+) -> Option<Arc<[u8]>> {
+    // Hashes only locate candidates; HashSet compares the complete byte slice.
+    if let Some(existing) = pool.get(value) {
+        return Some(Arc::clone(existing));
+    }
+    let payload = payload_bytes(value.len())?;
+    if bytes.checked_add(payload)? > MAX_INPUT_BYTES {
+        return None;
+    }
+    let previous = interner_bytes(pool.capacity())?;
+    if pool.len() == pool.capacity() {
+        let reserve_capacity = pool
+            .capacity()
+            .checked_add(1)?
+            .checked_next_power_of_two()?
+            .checked_mul(2)?
+            .max(4);
+        // Include both old and new pool storage during a growth operation.
+        let growth = interner_bytes(reserve_capacity)?;
+        if bytes.checked_add(payload)?.checked_add(growth)? > MAX_INPUT_BYTES {
+            return None;
+        }
+        pool.try_reserve(1).ok()?;
+    }
+    let growth = interner_bytes(pool.capacity())?.checked_sub(previous)?;
+    charge_input(bytes, payload.checked_add(growth)?)?;
+    let owned: Arc<[u8]> = Arc::from(value);
+    pool.insert(Arc::clone(&owned));
+    Some(owned)
+}
+
+#[derive(Debug)]
 struct InputTable {
     query: String,
     columns: usize,
-    rows: Vec<Vec<Value>>,
+    rows: Vec<Vec<InputValue>>,
 }
 
 #[derive(Debug)]
@@ -59,7 +144,11 @@ impl Inputs {
         if temporary != 0 || attached != 0 {
             return Ok(None);
         }
-        let mut names = Vec::new();
+        let mut names = Vec::with_capacity(TABLES.len());
+        let mut bytes = size_of::<Self>()
+            + size_of::<HashSet<Arc<[u8]>>>()
+            + size_of::<Vec<String>>()
+            + names.capacity() * size_of::<String>();
         let mut statement = connection.prepare(
             "SELECT name,type,wr FROM pragma_table_list
             WHERE schema='main' AND name!='sqlite_schema' ORDER BY name",
@@ -87,54 +176,70 @@ impl Inputs {
                     return Ok(None);
                 }
             }
+            if charge_input(&mut bytes, name.capacity()).is_none() {
+                return Ok(None);
+            }
             names.push(name);
         }
+        let mut tables = Vec::with_capacity(names.len() + 1);
+        if charge_input(&mut bytes, tables.capacity() * size_of::<InputTable>()).is_none() {
+            return Ok(None);
+        }
+        let mut pool = HashSet::new();
         let queries = std::iter::once(SCHEMA_QUERY.to_owned()).chain(
             names
                 .iter()
                 .map(|name| format!("SELECT rowid,* FROM main.\"{name}\" ORDER BY rowid")),
         );
-        let mut tables = Vec::new();
-        let mut bytes = 0_usize;
         let mut count = 0_usize;
         for query in queries {
             let mut statement = connection.prepare(&query)?;
             let columns = statement.column_count();
-            bytes = bytes.saturating_add(query.capacity() + size_of::<InputTable>());
+            if charge_input(&mut bytes, query.capacity()).is_none() {
+                return Ok(None);
+            }
             let mut rows = statement.query([])?;
             let mut values = Vec::new();
             while let Some(row) = rows.next()? {
                 count += 1;
-                bytes = bytes.saturating_add(size_of::<Vec<Value>>());
+                bytes = bytes.saturating_add(size_of::<Vec<InputValue>>());
                 if count > MAX_INPUT_ROWS || bytes > MAX_INPUT_BYTES {
                     return Ok(None);
                 }
                 let mut cells = Vec::with_capacity(columns);
+                if charge_input(&mut bytes, cells.capacity() * size_of::<InputValue>()).is_none() {
+                    return Ok(None);
+                }
                 for column in 0..columns {
                     let value = row.get_ref(column)?;
-                    let payload = match value {
-                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
-                        _ => 0,
-                    };
-                    bytes = bytes.saturating_add(size_of::<Value>() + payload);
-                    if bytes > MAX_INPUT_BYTES {
-                        return Ok(None);
-                    }
                     // SQLite TEXT need not be valid UTF-8. Optional proof capture
                     // must never panic on corrupt input or poison the store lock.
                     let owned = match value {
-                        ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
-                            Ok(text) => Value::Text(text.to_owned()),
-                            Err(_) => return Ok(None),
-                        },
-                        other => other.into(),
+                        ValueRef::Null => InputValue::Null,
+                        ValueRef::Integer(value) => InputValue::Integer(value),
+                        ValueRef::Real(value) => InputValue::RealBits(value.to_bits()),
+                        ValueRef::Text(value) => {
+                            if std::str::from_utf8(value).is_err() {
+                                return Ok(None);
+                            }
+                            let Some(value) = intern_bytes(&mut pool, value, &mut bytes) else {
+                                return Ok(None);
+                            };
+                            InputValue::Text(value)
+                        }
+                        ValueRef::Blob(value) => {
+                            let Some(value) = intern_bytes(&mut pool, value, &mut bytes) else {
+                                return Ok(None);
+                            };
+                            InputValue::Blob(value)
+                        }
                     };
                     cells.push(owned);
                 }
                 let previous_capacity = values.capacity();
                 values.push(cells);
                 bytes = bytes.saturating_add(
-                    (values.capacity() - previous_capacity) * size_of::<Vec<Value>>(),
+                    (values.capacity() - previous_capacity) * size_of::<Vec<InputValue>>(),
                 );
                 if bytes > MAX_INPUT_BYTES {
                     return Ok(None);
@@ -175,17 +280,7 @@ impl Inputs {
                     return Ok(false);
                 };
                 for (column, expected) in expected.iter().enumerate() {
-                    let equal = match (expected, row.get_ref(column)?) {
-                        (Value::Null, ValueRef::Null) => true,
-                        (Value::Integer(left), ValueRef::Integer(right)) => *left == right,
-                        (Value::Real(left), ValueRef::Real(right)) => {
-                            left.to_bits() == right.to_bits()
-                        }
-                        (Value::Text(left), ValueRef::Text(right)) => left.as_bytes() == right,
-                        (Value::Blob(left), ValueRef::Blob(right)) => left.as_slice() == right,
-                        _ => false,
-                    };
-                    if !equal {
+                    if !expected.matches(row.get_ref(column)?) {
                         return Ok(false);
                     }
                 }
@@ -393,6 +488,19 @@ impl ReadCache {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::mem::size_of_val;
+
+    #[derive(Default)]
+    struct CollisionHasher;
+
+    impl Hasher for CollisionHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, _: &[u8]) {}
+    }
 
     fn database(path: &str) -> Connection {
         let connection = Connection::open(path).unwrap();
@@ -658,10 +766,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("store.sqlite");
         let mut connection = database(path.to_str().unwrap());
-        connection.execute_batch("CREATE INDEX index_value ON workflow_work_items(value); PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        connection.execute_batch("INSERT INTO workflow_work_items SELECT value FROM workflow_work_items;
+            CREATE INDEX index_value ON workflow_work_items(value); PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         let mut cache = ReadCache::default();
         let calls = Cell::new(0);
         read(&mut connection, &mut cache, &calls).unwrap();
+        let table = cache.inputs.as_ref().unwrap().tables.last().unwrap();
+        let (InputValue::Blob(first), InputValue::Blob(second)) =
+            (&table.rows[0][1], &table.rows[1][1])
+        else {
+            panic!("interned index fixture");
+        };
+        assert!(Arc::ptr_eq(first, second));
         let page_size: u32 = connection
             .query_row("PRAGMA page_size", [], |row| row.get(0))
             .unwrap();
@@ -884,6 +1000,230 @@ mod tests {
                 .map(|proof| proof.accounted_bytes)
                 .sum::<usize>()
         );
+    }
+
+    #[test]
+    fn exact_input_values_keep_storage_types_and_real_bits() {
+        let bytes: Arc<[u8]> = Arc::from(b"same".as_slice());
+        let text = InputValue::Text(Arc::clone(&bytes));
+        let blob = InputValue::Blob(bytes);
+        assert!(text.matches(ValueRef::Text(b"same")));
+        assert!(blob.matches(ValueRef::Blob(b"same")));
+        assert!(!text.matches(ValueRef::Blob(b"same")));
+        assert!(!blob.matches(ValueRef::Text(b"same")));
+        assert!(!text.matches(ValueRef::Text(b"diff")));
+        assert!(InputValue::Null.matches(ValueRef::Null));
+        assert!(!InputValue::Null.matches(ValueRef::Integer(0)));
+        assert!(InputValue::Integer(1).matches(ValueRef::Integer(1)));
+        assert!(!InputValue::Integer(1).matches(ValueRef::Real(1.0)));
+        assert!(InputValue::RealBits(1.0_f64.to_bits()).matches(ValueRef::Real(1.0)));
+        assert!(!InputValue::RealBits(1.0_f64.to_bits()).matches(ValueRef::Integer(1)));
+        assert!(!InputValue::RealBits(0.0_f64.to_bits()).matches(ValueRef::Real(-0.0)));
+        let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+        assert!(InputValue::RealBits(nan.to_bits()).matches(ValueRef::Real(nan)));
+        assert!(!InputValue::RealBits(nan.to_bits())
+            .matches(ValueRef::Real(f64::from_bits(0x7ff8_0000_0000_0002))));
+    }
+
+    #[test]
+    fn exact_input_interner_collisions_compare_all_bytes_and_charge_once() {
+        let mut pool = HashSet::<Arc<[u8]>, BuildHasherDefault<CollisionHasher>>::default();
+        let mut bytes = size_of_val(&pool);
+        let first = intern_bytes(&mut pool, b"same", &mut bytes).unwrap();
+        let second = intern_bytes(&mut pool, b"diff", &mut bytes).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_ref(), b"same");
+        assert_eq!(second.as_ref(), b"diff");
+        assert_eq!(pool.len(), 2);
+        assert_eq!(
+            bytes,
+            size_of_val(&pool)
+                + 2 * payload_bytes(4).unwrap()
+                + interner_bytes(pool.capacity()).unwrap()
+        );
+        let before = bytes;
+        let duplicate = intern_bytes(&mut pool, b"same", &mut bytes).unwrap();
+        assert!(Arc::ptr_eq(&first, &duplicate));
+        assert_eq!(bytes, before);
+    }
+
+    #[test]
+    fn exact_input_interner_accounts_headers_capacity_and_boundary() {
+        let mut pool = HashSet::new();
+        let mut bytes = 0;
+        let first = intern_bytes(&mut pool, b"seed", &mut bytes).unwrap();
+        assert_eq!(
+            bytes,
+            payload_bytes(4).unwrap() + interner_bytes(pool.capacity()).unwrap()
+        );
+        assert!(
+            interner_bytes(pool.capacity()).unwrap() > pool.capacity() * size_of::<Arc<[u8]>>()
+        );
+        bytes = MAX_INPUT_BYTES;
+        assert!(Arc::ptr_eq(
+            &first,
+            &intern_bytes(&mut pool, b"seed", &mut bytes).unwrap()
+        ));
+        assert!(intern_bytes(&mut pool, b"next", &mut bytes).is_none());
+        assert_eq!(pool.len(), 1);
+        bytes = MAX_INPUT_BYTES - payload_bytes(4).unwrap();
+        assert!(intern_bytes(&mut pool, b"next", &mut bytes).is_some());
+        assert_eq!(bytes, MAX_INPUT_BYTES);
+        assert_eq!(pool.len(), 2);
+
+        let mut empty = HashSet::new();
+        let mut only_payload = MAX_INPUT_BYTES - payload_bytes(4).unwrap();
+        assert!(intern_bytes(&mut empty, b"seed", &mut only_payload).is_none());
+        assert!(empty.is_empty());
+        assert_eq!(empty.capacity(), 0);
+        assert!(payload_bytes(usize::MAX).is_none());
+        assert!(interner_bytes(usize::MAX).is_none());
+        assert!(charge_input(&mut bytes, usize::MAX).is_none());
+        assert_eq!(bytes, MAX_INPUT_BYTES);
+
+        let mut growing = HashSet::new();
+        let mut used = 0;
+        intern_bytes(&mut growing, b"first", &mut used).unwrap();
+        let capacity = growing.capacity();
+        for index in 1..capacity {
+            intern_bytes(&mut growing, &index.to_le_bytes(), &mut used).unwrap();
+        }
+        assert_eq!(growing.len(), capacity);
+        used = MAX_INPUT_BYTES - payload_bytes(4).unwrap();
+        assert!(intern_bytes(&mut growing, b"next", &mut used).is_none());
+        assert_eq!(growing.capacity(), capacity);
+        assert_eq!(growing.len(), capacity);
+    }
+
+    #[test]
+    fn exact_input_capture_shares_payloads_not_types_rows_or_schema_keys() {
+        let connection = database(":memory:");
+        connection
+            .execute_batch("INSERT INTO workflow_work_items VALUES('old'),(X'6f6c64')")
+            .unwrap();
+        let inputs = Inputs::capture(&connection).unwrap().unwrap();
+        let table = inputs.tables.last().unwrap();
+        assert_eq!(table.rows.len(), 3);
+        let InputValue::Blob(first) = &table.rows[0][1] else {
+            panic!("blob input");
+        };
+        let InputValue::Text(second) = &table.rows[1][1] else {
+            panic!("text input");
+        };
+        let InputValue::Blob(third) = &table.rows[2][1] else {
+            panic!("duplicate blob input");
+        };
+        assert!(Arc::ptr_eq(first, second));
+        assert!(Arc::ptr_eq(first, third));
+        assert!(inputs.matches(&connection).unwrap());
+        connection
+            .execute("UPDATE workflow_work_items SET rowid=4 WHERE rowid=3", [])
+            .unwrap();
+        assert!(!inputs.matches(&connection).unwrap());
+        let inputs = Inputs::capture(&connection).unwrap().unwrap();
+        connection
+            .execute_batch("CREATE INDEX index_value ON workflow_work_items(value)")
+            .unwrap();
+        assert!(!inputs.matches(&connection).unwrap());
+    }
+
+    #[test]
+    fn exact_read_cache_repeated_large_payloads_remain_eligible_without_raising_cap() {
+        let mut connection = database(":memory:");
+        let payload_size = MAX_INPUT_BYTES / 64;
+        connection
+            .execute(
+                "WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n<65)
+                 INSERT INTO workflow_work_items SELECT zeroblob(?1) FROM rows",
+                [i64::try_from(payload_size).unwrap()],
+            )
+            .unwrap();
+        assert!(65 * payload_size > MAX_INPUT_BYTES);
+        let mut cache = ReadCache::default();
+        let calls = Cell::new(0);
+        for _ in 0..2 {
+            let snapshot = connection.savepoint().unwrap();
+            let count: i64 = cache
+                .read(&snapshot, true, "row-count", || {
+                    calls.set(calls.get() + 1);
+                    Ok(snapshot.query_row(
+                        "SELECT COUNT(*) FROM workflow_work_items",
+                        [],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(count, 66);
+            assert!(cache.inputs.as_ref().unwrap().matches(&snapshot).unwrap());
+            snapshot.commit().unwrap();
+        }
+        assert_eq!(calls.get(), 1);
+        let rows = &cache.inputs.as_ref().unwrap().tables.last().unwrap().rows;
+        let InputValue::Blob(first) = &rows[1][1] else {
+            panic!("large blob input");
+        };
+        assert_eq!(first.len(), payload_size);
+        assert!(rows[1..].iter().all(|row| {
+            matches!(&row[1], InputValue::Blob(value) if Arc::ptr_eq(first, value))
+        }));
+    }
+
+    #[test]
+    fn exact_read_cache_unique_large_payloads_still_fall_back_at_unchanged_cap() {
+        let mut connection = database(":memory:");
+        let mut payload = vec![0_u8; MAX_INPUT_BYTES / 64];
+        {
+            let mut insert = connection
+                .prepare("INSERT INTO workflow_work_items VALUES(?1)")
+                .unwrap();
+            for index in 0..65 {
+                payload[0] = index;
+                insert.execute([payload.as_slice()]).unwrap();
+            }
+        }
+        let mut cache = ReadCache::default();
+        let calls = Cell::new(0);
+        for _ in 0..2 {
+            let snapshot = connection.savepoint().unwrap();
+            assert_eq!(
+                cache
+                    .read(&snapshot, true, "overbound", || {
+                        calls.set(calls.get() + 1);
+                        Ok(66_u64)
+                    })
+                    .unwrap(),
+                66
+            );
+            assert!(cache.inputs.is_none());
+            assert!(cache.results.is_empty());
+            snapshot.commit().unwrap();
+        }
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn exact_input_capture_charges_metadata_even_when_payload_alone_fits() {
+        let connection = database(":memory:");
+        connection
+            .execute(
+                "UPDATE workflow_work_items SET value=zeroblob(?1)",
+                [i64::try_from(MAX_INPUT_BYTES - 1).unwrap()],
+            )
+            .unwrap();
+        assert!(Inputs::capture(&connection).unwrap().is_none());
+    }
+
+    #[test]
+    fn exact_input_capture_rejects_invalid_text_even_when_blob_bytes_are_interned() {
+        let connection = database(":memory:");
+        connection
+            .execute_batch("INSERT INTO workflow_work_items VALUES(X'ff')")
+            .unwrap();
+        assert!(Inputs::capture(&connection).unwrap().is_some());
+        connection
+            .execute_batch("INSERT INTO workflow_work_items VALUES(CAST(X'ff' AS TEXT))")
+            .unwrap();
+        assert!(Inputs::capture(&connection).unwrap().is_none());
     }
 
     #[test]

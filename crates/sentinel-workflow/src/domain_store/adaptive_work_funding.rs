@@ -637,65 +637,89 @@ fn reviewed_funding_ids(
     connection: &Connection,
     tenant: &TenantId,
 ) -> Result<BTreeSet<String>, WorkflowError> {
+    reviewed_funding_ids_with_observer(connection, tenant, |_, _| {})
+}
+
+fn reviewed_funding_ids_with_observer(
+    connection: &Connection,
+    tenant: &TenantId,
+    mut before_payload_copy: impl FnMut(&'static str, usize),
+) -> Result<BTreeSet<String>, WorkflowError> {
     // Validate before selection. Do not recursively load the epoch from its
     // own review trace; only sealed row/event shape is needed for a veto.
     validation_scope::memoize(connection, "unused-funding-review-traces", tenant, || {
         let mut used = BTreeSet::new();
-        let rows = {
+        let count: i64 = connection.query_row(
+            "SELECT count(*) FROM (SELECT 1 FROM company_entities
+             WHERE tenant_id=?1 AND entity_kind IN
+             ('adaptive_work_funding_review','adaptive_leadership_review_call') LIMIT 4097)",
+            [&tenant.0],
+            |row| row.get(0),
+        )?;
+        if count > 4096 {
+            return Err(corrupt());
+        }
+        {
             let mut statement = connection.prepare(
                 "SELECT entity_kind,entity_id,version,payload,payload_digest FROM company_entities
                  WHERE tenant_id=?1 AND entity_kind IN
                  ('adaptive_work_funding_review','adaptive_leadership_review_call')
                  ORDER BY entity_kind,entity_id LIMIT 4097",
             )?;
-            let rows = statement.query_map([&tenant.0], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        if rows.len() > 4096 {
-            return Err(corrupt());
-        }
-        for (kind, id, version, payload, digest) in rows {
-            validation_scope::charge_bytes(connection, payload.len())?;
-            if !constant_time_eq(
-                &digest,
-                &bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?,
-            ) {
-                return Err(corrupt());
-            }
-            let funding_id = if kind == REVIEW_KIND {
-                let leaf: FundingReviewLeaf = decode(&payload)?;
-                leaf.validate_entity()?;
-                if leaf.row_binding() != (tenant, kind.as_str(), id.as_str(), stored_u64(version)?)
-                {
+            let mut rows = statement.query([&tenant.0])?;
+            while let Some(row) = rows.next()? {
+                let kind: String = row.get(0)?;
+                let id: String = row.get(1)?;
+                let version: i64 = row.get(2)?;
+                let value = row.get_ref(3)?;
+                let rusqlite::types::ValueRef::Blob(payload) = value else {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        3,
+                        "payload".into(),
+                        value.data_type(),
+                    )
+                    .into());
+                };
+                let digest: String = row.get(4)?;
+                // Charge the borrowed BLOB before any Rust-owned payload copy.
+                validation_scope::charge_bytes(connection, payload.len())?;
+                before_payload_copy("entity", payload.len());
+                let payload = payload.to_vec();
+                if !constant_time_eq(
+                    &digest,
+                    &bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?,
+                ) {
                     return Err(corrupt());
                 }
-                Some(
-                    require_review_binding(&leaf.grant)?
-                        .binding
-                        .funding_id
-                        .clone(),
-                )
-            } else {
-                let call: AdaptiveLeadershipReviewCallV1 = decode(&payload)?;
-                call.validate_entity()?;
-                if call.row_binding() != (tenant, kind.as_str(), id.as_str(), stored_u64(version)?)
-                {
-                    return Err(corrupt());
+                let funding_id = if kind == REVIEW_KIND {
+                    let leaf: FundingReviewLeaf = decode(&payload)?;
+                    leaf.validate_entity()?;
+                    if leaf.row_binding()
+                        != (tenant, kind.as_str(), id.as_str(), stored_u64(version)?)
+                    {
+                        return Err(corrupt());
+                    }
+                    Some(
+                        require_review_binding(&leaf.grant)?
+                            .binding
+                            .funding_id
+                            .clone(),
+                    )
+                } else {
+                    let call: AdaptiveLeadershipReviewCallV1 = decode(&payload)?;
+                    call.validate_entity()?;
+                    if call.row_binding()
+                        != (tenant, kind.as_str(), id.as_str(), stored_u64(version)?)
+                    {
+                        return Err(corrupt());
+                    }
+                    call.grant
+                        .work_funding
+                        .map(|epoch| epoch.binding.funding_id)
+                };
+                if let Some(id) = funding_id {
+                    used.insert(id);
                 }
-                call.grant
-                    .work_funding
-                    .map(|epoch| epoch.binding.funding_id)
-            };
-            if let Some(id) = funding_id {
-                used.insert(id);
             }
         }
         let sequences = {
@@ -712,9 +736,20 @@ fn reviewed_funding_ids(
             return Err(corrupt());
         }
         for sequence in sequences {
+            let payload_bytes: i64 = connection
+                .query_row(
+                    "SELECT CASE WHEN typeof(payload)='blob' THEN length(payload) ELSE -1 END
+                     FROM company_events WHERE sequence=?1",
+                    [sequence],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(corrupt)?;
+            let payload_bytes = usize::try_from(payload_bytes).map_err(|_| corrupt())?;
+            validation_scope::charge_bytes(connection, payload_bytes)?;
+            before_payload_copy("event", payload_bytes);
             let row =
                 read_company_event_row(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
-            validation_scope::charge_bytes(connection, row.payload.len())?;
             let (principal, project, operation, digest, time, funding_id) = if row.event_type
                 == REVIEW_EVENT
             {
@@ -1358,4 +1393,326 @@ fn funding_inventory_and_supersession_scope_keys_keep_tenants_and_sessions_disti
         assert_eq!(validation_scope::validations("funding-supersession"), 0);
     }
     assert!(connection.is_autocommit());
+}
+
+#[cfg(test)]
+mod review_payload_budget_tests {
+    use super::*;
+
+    const ARENA_BYTES: usize = 64 * 1024 * 1024;
+    const NOW: u64 = 1_000_000;
+
+    fn review_leaf() -> FundingReviewLeaf {
+        let tenant = TenantId::parse("review-budget-tenant").unwrap();
+        let project = ProjectId::parse("review-budget-project").unwrap();
+        let work = crate::WorkItemId::parse("review-budget-work").unwrap();
+        let leader =
+            crate::PrincipalAuthorityV1::derive("review-budget-leader", 1, &[1; 32]).unwrap();
+        let principal = AuthenticatedCompanyPrincipalV1 {
+            schema_version: 1,
+            tenant_id: tenant.clone(),
+            principal_id: leader.principal_id.clone(),
+            kind: CompanyPrincipalKindV1::Agent,
+            role: CompanyRoleV1::ProjectManager,
+            customer_id: None,
+            agent_id: Some(crate::AgentId(1)),
+            authority_generation: leader.principal_generation,
+            authority_digest: leader.authority_digest.clone(),
+        };
+        let authority = RuntimeAuthoritySnapshotV1 {
+            schema_version: 1,
+            tenant_id: tenant.clone(),
+            project_id: project.clone(),
+            work_item_id: work.clone(),
+            agent_id: crate::AgentId(2),
+            assignment_version: 1,
+            assignment_digest: "a".repeat(64),
+            organization_generation: 1,
+            organization_digest: "a".repeat(64),
+            principal: crate::PrincipalAuthorityV1::derive("review-budget-developer", 1, &[2; 32])
+                .unwrap(),
+            profile_id: "developer-profile".into(),
+            profile_generation: 1,
+            profile_digest: "a".repeat(64),
+            runtime_key: "bwrap-coding-v1".into(),
+            runtime_generation: 1,
+            runtime_digest: "a".repeat(64),
+            policy_generation: 1,
+            policy_digest: "a".repeat(64),
+            active: true,
+            capabilities: BTreeSet::from(["file.inspect".into()]),
+        };
+        let request = AdaptiveWorkFundingRequestV1 {
+            schema_version: 1,
+            operation_id: Uuid::from_u128(9201),
+            source: AdaptiveWorkFundingSourceV1 {
+                resume_source: crate::AdaptiveResumeSourceV1 {
+                    tenant_id: tenant.clone(),
+                    project_id: project.clone(),
+                    work_item_id: work.clone(),
+                    session_id: Uuid::from_u128(9202),
+                    expected_project_version: 1,
+                    expected_session_version: 1,
+                    project_payload_digest: "a".repeat(64),
+                    root_entry_digest: "a".repeat(64),
+                    head_entry_digest: "a".repeat(64),
+                    continuation_history_digest: "a".repeat(64),
+                    review_history_digest: "a".repeat(64),
+                    assignee_authority: authority.clone(),
+                    base_model_calls: 0,
+                    base_tool_calls: 0,
+                    base_review_count: 0,
+                    base_window_count: 0,
+                    subject: crate::AdaptiveResumeSubjectV1::ReadyForModel {
+                        active_allowance_digest: "a".repeat(64),
+                    },
+                },
+                original_model_call_ceiling: 2,
+                original_tool_call_ceiling: 2,
+                current_model_call_ceiling: 2,
+                current_tool_call_ceiling: 2,
+                predecessor_receipt_digest: None,
+                supersedes_unused_receipt_digest: None,
+            },
+            limits: AdaptiveWorkFundingLimitsV1 {
+                additional_model_calls: 2,
+                additional_tool_calls: 2,
+                additional_reviews: 1,
+                additional_windows: 1,
+                max_window_ms: 180_000,
+                max_call_duration_ms: 1_000,
+                dispatch_margin_ms: crate::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+                expires_at_unix_ms: NOW + 3_600_000,
+            },
+            reason_ref: "review-budget-regression".into(),
+        };
+        let mut issuer = principal.clone();
+        issuer.kind = CompanyPrincipalKindV1::Operator;
+        issuer.agent_id = None;
+        let receipt = AdaptiveWorkFundingReceiptV1 {
+            schema_version: 1,
+            funding_id: adaptive_work_funding_id(
+                &tenant,
+                request.source.resume_source.session_id,
+                request.operation_id,
+            )
+            .unwrap(),
+            request,
+            issuer_principal: issuer,
+            issued_at_unix_ms: NOW,
+        };
+        let epoch = AdaptiveWorkFundingEpochV1 {
+            binding: receipt.binding(1).unwrap(),
+            receipt,
+        };
+        let fingerprint = "a".repeat(64);
+        let grant = AdaptiveLeadershipReviewGrantV1 {
+            schema_version: 5,
+            review_id: crate::adaptive_leadership_review_id(
+                epoch.receipt.request.source.resume_source.session_id,
+                1,
+                &fingerprint,
+            )
+            .unwrap(),
+            project_id: project,
+            expected_project_version: 1,
+            work_item_id: work.clone(),
+            session_id: epoch.receipt.request.source.resume_source.session_id,
+            expected_session_version: 1,
+            expected_reason_code: String::new(),
+            evidence_fingerprint: fingerprint,
+            leadership_principal: principal,
+            leadership_authority: leader,
+            assignment_id: "review-budget-assignment".into(),
+            assignee_authority: authority,
+            provider: "codex-cli".into(),
+            model: "review-budget-model".into(),
+            catalog_digest: "a".repeat(64),
+            max_duration_ms: 1_000,
+            token_policy: crate::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+            expires_at_unix_ms: NOW + 60_000,
+            subject: Some(
+                crate::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted {
+                    budget: Box::new(crate::AdaptiveBudgetWindowAuthorityV1 {
+                        schema_version: 1,
+                        root_allowance: crate::SubscriptionCallAllowanceV1 {
+                            allowance_id: "review-budget-root".into(),
+                            grant: crate::SubscriptionCallGrantV1 {
+                                schema_version: 1,
+                                work_item_id: work,
+                                assignment_id: "review-budget-assignment".into(),
+                                assignment_version: 1,
+                                agent_id: crate::AgentId(2),
+                                provider: "codex-cli".into(),
+                                model: "review-budget-model".into(),
+                                catalog_digest: "a".repeat(64),
+                                max_calls: 2,
+                                max_concurrent: 1,
+                                max_duration_ms: 1_000,
+                                token_policy:
+                                    crate::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+                                expires_at_unix_ms: NOW + 60_000,
+                            },
+                            created_by: "review-budget-leader".into(),
+                            created_at_unix_ms: NOW,
+                            dispatch: None,
+                        },
+                        active_allowance_digest: "a".repeat(64),
+                        continuation_history_digest: "a".repeat(64),
+                        observed_at_ms: NOW,
+                        model_calls_exhausted: true,
+                        deadline_expired: false,
+                        dispatch_slack_insufficient: false,
+                    }),
+                },
+            ),
+            recovery_epoch: None,
+            resume_policy: None,
+            work_funding: Some(Box::new(epoch)),
+        };
+        let leaf = FundingReviewLeaf {
+            schema_version: 1,
+            membership_id: review_id(grant.work_funding.as_ref().unwrap()),
+            grant,
+            operation_id: Uuid::from_u128(9203),
+            context_digest: "a".repeat(64),
+            issued_at_unix_ms: NOW + 1,
+        };
+        leaf.validate_entity().unwrap();
+        leaf
+    }
+
+    fn store_review(connection: &mut Connection, leaf: &FundingReviewLeaf) {
+        let transaction = connection.transaction().unwrap();
+        let tenant = &leaf.grant.leadership_principal.tenant_id;
+        put_entity(
+            &transaction,
+            tenant,
+            REVIEW_KIND,
+            &leaf.membership_id,
+            1,
+            leaf,
+        )
+        .unwrap();
+        append_event(
+            &transaction,
+            &leaf.grant.leadership_principal,
+            leaf.operation_id,
+            &canonical_sha256("sentinel.workflow.adaptive-work-funding-review.v1", leaf).unwrap(),
+            Some(&leaf.grant.project_id),
+            REVIEW_EVENT,
+            leaf,
+            leaf.issued_at_unix_ms,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn selected_review_payload_budget_rejects_before_owned_copy() {
+        for event in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = WorkflowStore::open(directory.path().join("review-budget.sqlite")).unwrap();
+            let mut connection = store.connection.lock().unwrap();
+            let leaf = review_leaf();
+            let tenant = &leaf.grant.leadership_principal.tenant_id;
+            store_review(&mut connection, &leaf);
+            if event {
+                connection
+                    .execute(
+                        "DELETE FROM company_entities WHERE entity_kind=?1",
+                        [REVIEW_KIND],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE company_events SET payload=zeroblob(?1) WHERE event_type=?2",
+                        params![ARENA_BYTES as i64 + 1, REVIEW_EVENT],
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute(
+                        "UPDATE company_entities SET payload=zeroblob(?1) WHERE entity_kind=?2",
+                        params![ARENA_BYTES as i64 + 1, REVIEW_KIND],
+                    )
+                    .unwrap();
+            }
+            let mut copies = 0;
+            let error = reviewed_funding_ids_with_observer(&connection, tenant, |_, _| {
+                copies += 1;
+            })
+            .unwrap_err();
+            assert_eq!(error.code, WorkflowErrorCode::CorruptStore);
+            assert_eq!(copies, 0, "event={event}");
+            assert!(connection.is_autocommit());
+        }
+    }
+
+    #[test]
+    fn selected_review_payloads_are_charged_once_and_retain_the_veto() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(directory.path().join("review-veto.sqlite")).unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let leaf = review_leaf();
+        let tenant = &leaf.grant.leadership_principal.tenant_id;
+        store_review(&mut connection, &leaf);
+        let receipt = &leaf.grant.work_funding.as_ref().unwrap().receipt;
+        let expected = BTreeSet::from([receipt.funding_id.clone()]);
+        let payload_bytes = encode(&leaf).unwrap().len();
+        let proof_bytes = serde_json::to_vec(tenant).unwrap().len()
+            + 256
+            + serde_json::to_vec(&expected).unwrap().len();
+        validation_scope::with_scope(&connection, || {
+            validation_scope::charge_bytes(
+                &connection,
+                ARENA_BYTES - proof_bytes - 2 * payload_bytes,
+            )?;
+            let mut copies = Vec::new();
+            let used = reviewed_funding_ids_with_observer(&connection, tenant, |kind, bytes| {
+                copies.push((kind, bytes));
+            })?;
+            assert_eq!(used, expected);
+            assert_eq!(
+                copies,
+                vec![("entity", payload_bytes), ("event", payload_bytes)]
+            );
+            assert_eq!(
+                require_never_reviewed_funding(&connection, receipt)
+                    .unwrap_err()
+                    .code,
+                transition().code
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(connection.is_autocommit());
+    }
+
+    #[test]
+    fn selected_review_overflow_rejects_before_copying_a_valid_first_match() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(directory.path().join("review-overflow.sqlite")).unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let leaf = review_leaf();
+        let tenant = &leaf.grant.leadership_principal.tenant_id;
+        store_review(&mut connection, &leaf);
+        connection.execute(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<4096)
+             INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+             SELECT ?1,?2,'zz-overflow-'||i,1,X'00','invalid' FROM n",
+            params![tenant.0, REVIEW_KIND],
+        ).unwrap();
+        let mut copies = 0;
+        assert_eq!(
+            reviewed_funding_ids_with_observer(&connection, tenant, |_, _| {
+                copies += 1;
+            })
+            .unwrap_err()
+            .code,
+            WorkflowErrorCode::CorruptStore
+        );
+        assert_eq!(copies, 0);
+        assert!(connection.is_autocommit());
+    }
 }

@@ -142,6 +142,14 @@ fn assert_invalid_receipt(value: &AdaptiveWorkFundingReceiptV1) {
     assert!(value.resulting_model_call_ceiling().is_err());
     assert!(value.resulting_tool_call_ceiling().is_err());
     assert!(value.binding(3).is_err());
+    let binding = receipt_for(request()).binding(3).unwrap();
+    assert!(value.validate_binding(&binding).is_err());
+    let epoch = AdaptiveWorkFundingEpochV1 {
+        receipt: value.clone(),
+        binding,
+    };
+    assert!(epoch.validate().is_err());
+    assert!(epoch.evidence_ref().is_err());
 }
 
 fn assert_invalid_shape(value: &AdaptiveWorkFundingRequestV1) {
@@ -1215,4 +1223,265 @@ fn legacy_resume_policy_request_wire_and_funding_request_remain_unchanged() {
         serde_json::from_value(encoded.clone()).unwrap();
     assert_eq!(decoded, legacy);
     assert!(serde_json::from_value::<AdaptiveWorkFundingRequestV1>(encoded).is_err());
+}
+
+// Keep the pre-correction validating derivation as an independent parity oracle.
+fn reference_binding_limits(
+    request: &AdaptiveWorkFundingRequestV1,
+) -> Result<AdaptiveWorkFundingBindingLimitsV1, WorkflowError> {
+    request.validate_shape()?;
+    let source = &request.source.resume_source;
+    Ok(AdaptiveWorkFundingBindingLimitsV1 {
+        total_model_call_ceiling: request.resulting_model_call_ceiling()?,
+        total_tool_call_ceiling: request.resulting_tool_call_ceiling()?,
+        total_review_ceiling: source
+            .base_review_count
+            .checked_add(request.limits.additional_reviews)
+            .ok_or_else(invalid)?,
+        total_window_ceiling: source
+            .base_window_count
+            .checked_add(request.limits.additional_windows)
+            .ok_or_else(invalid)?,
+        max_window_ms: request.limits.max_window_ms,
+        max_call_duration_ms: request.limits.max_call_duration_ms,
+        dispatch_margin_ms: request.limits.dispatch_margin_ms,
+        expires_at_unix_ms: request.limits.expires_at_unix_ms,
+    })
+}
+
+fn reference_validate_binding(
+    receipt: &AdaptiveWorkFundingReceiptV1,
+    binding: &AdaptiveWorkFundingBindingV1,
+) -> Result<(), WorkflowError> {
+    receipt.validate()?;
+    binding.validate()?;
+    if binding.funding_id != receipt.funding_id
+        || binding.receipt_digest != receipt.receipt_digest()?
+        || binding.limits != reference_binding_limits(&receipt.request)?
+        || binding.ordinal <= receipt.request.source.resume_source.base_review_count
+    {
+        return Err(WorkflowError::new(
+            WorkflowErrorCode::AuthorityConflict,
+            false,
+            "adaptive work funding binding does not match receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn reference_binding(
+    receipt: &AdaptiveWorkFundingReceiptV1,
+    ordinal: u16,
+) -> Result<AdaptiveWorkFundingBindingV1, WorkflowError> {
+    receipt.validate()?;
+    let binding = AdaptiveWorkFundingBindingV1 {
+        schema_version: 1,
+        funding_id: receipt.funding_id.clone(),
+        receipt_digest: receipt.receipt_digest()?,
+        ordinal,
+        limits: reference_binding_limits(&receipt.request)?,
+    };
+    reference_validate_binding(receipt, &binding)?;
+    Ok(binding)
+}
+
+#[test]
+fn post_validation_derivation_preserves_binding_bytes_and_digest_domains() {
+    let mut capped = successor_request();
+    capped.source.current_model_call_ceiling = ADAPTIVE_SESSION_MAX_CALLS - 2;
+    capped.source.current_tool_call_ceiling = ADAPTIVE_SESSION_MAX_CALLS - 3;
+    capped.limits.additional_reviews =
+        ADAPTIVE_RESUME_MAX_REVIEWS - capped.source.resume_source.base_review_count;
+    capped.source.resume_source.base_window_count = capped.source.resume_source.base_review_count;
+    capped.limits.additional_windows = capped.limits.additional_reviews;
+    let mut model_only = request();
+    model_only.limits.additional_tool_calls = 0;
+    let mut tool_only = request();
+    tool_only.limits.additional_model_calls = 0;
+    let mut superseding = successor_request();
+    superseding.source.supersedes_unused_receipt_digest = Some("b".repeat(64));
+    for request in [
+        request(),
+        successor_request(),
+        capped,
+        model_only,
+        tool_only,
+        superseding,
+    ] {
+        let value = receipt_for(request);
+        let before = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            value.receipt_digest().unwrap(),
+            canonical_sha256("sentinel.workflow.adaptive-work-funding-receipt.v1", &value).unwrap()
+        );
+        assert_eq!(
+            value.resulting_model_call_ceiling().unwrap(),
+            value.request.resulting_model_call_ceiling().unwrap()
+        );
+        assert_eq!(
+            value.resulting_tool_call_ceiling().unwrap(),
+            value.request.resulting_tool_call_ceiling().unwrap()
+        );
+        let first = value.request.source.resume_source.base_review_count + 1;
+        let last = first - 1 + value.request.limits.additional_reviews;
+        for ordinal in [first, last] {
+            let expected = reference_binding(&value, ordinal).unwrap();
+            let actual = value.binding(ordinal).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert_eq!(
+                actual.canonical_digest().unwrap(),
+                canonical_sha256(
+                    "sentinel.workflow.adaptive-work-funding-binding.v1",
+                    &expected
+                )
+                .unwrap()
+            );
+            value.validate_binding(&actual).unwrap();
+            assert_eq!(
+                actual.limits,
+                reference_binding_limits(&value.request).unwrap()
+            );
+        }
+        assert_eq!(serde_json::to_vec(&value).unwrap(), before);
+    }
+}
+
+#[test]
+fn malformed_nested_receipts_still_fail_before_post_validation_derivation() {
+    let valid = receipt_for(request());
+    let binding = valid.binding(3).unwrap();
+    for (path, replacement) in [
+        (
+            "/request/source/resume_source/head_entry_digest",
+            serde_json::json!("bad"),
+        ),
+        (
+            "/request/source/current_model_call_ceiling",
+            serde_json::json!(u16::MAX),
+        ),
+        (
+            "/request/limits/additional_model_calls",
+            serde_json::json!(u16::MAX),
+        ),
+        (
+            "/request/limits/additional_reviews",
+            serde_json::json!(u16::MAX),
+        ),
+        ("/request/limits/additional_windows", serde_json::json!(0)),
+        ("/request/limits/dispatch_margin_ms", serde_json::json!(0)),
+        (
+            "/request/limits/max_call_duration_ms",
+            serde_json::json!(u64::MAX),
+        ),
+        (
+            "/request/limits/expires_at_unix_ms",
+            serde_json::json!(u64::MAX),
+        ),
+        ("/issued_at_unix_ms", serde_json::json!(0)),
+        (
+            "/issuer_principal/authority_digest",
+            serde_json::json!("bad"),
+        ),
+    ] {
+        let mut encoded = serde_json::to_value(&valid).unwrap();
+        *encoded.pointer_mut(path).unwrap() = replacement;
+        let changed: AdaptiveWorkFundingReceiptV1 = serde_json::from_value(encoded).unwrap();
+        assert_invalid_receipt(&changed);
+        assert_eq!(
+            format!("{:?}", changed.binding(3).unwrap_err()),
+            format!("{:?}", reference_binding(&changed, 3).unwrap_err()),
+            "{path}"
+        );
+        assert_eq!(
+            format!("{:?}", changed.validate_binding(&binding).unwrap_err()),
+            format!(
+                "{:?}",
+                reference_validate_binding(&changed, &binding).unwrap_err()
+            ),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn malformed_binding_and_limits_retain_validation_errors_and_precedence() {
+    let value = receipt_for(request());
+    let binding = value.binding(3).unwrap();
+    for (path, replacement) in [
+        ("/schema_version", serde_json::json!(2)),
+        ("/funding_id", serde_json::json!("free text")),
+        ("/receipt_digest", serde_json::json!("bad")),
+        ("/ordinal", serde_json::json!(0)),
+        ("/ordinal", serde_json::json!(6)),
+        ("/limits/total_model_call_ceiling", serde_json::json!(0)),
+        (
+            "/limits/total_tool_call_ceiling",
+            serde_json::json!(u16::MAX),
+        ),
+        ("/limits/total_review_ceiling", serde_json::json!(0)),
+        ("/limits/total_review_ceiling", serde_json::json!(u16::MAX)),
+        ("/limits/total_window_ceiling", serde_json::json!(0)),
+        ("/limits/total_window_ceiling", serde_json::json!(6)),
+        ("/limits/max_window_ms", serde_json::json!(u64::MAX)),
+        ("/limits/max_call_duration_ms", serde_json::json!(0)),
+        ("/limits/dispatch_margin_ms", serde_json::json!(0)),
+        ("/limits/expires_at_unix_ms", serde_json::json!(u64::MAX)),
+    ] {
+        let mut encoded = serde_json::to_value(&binding).unwrap();
+        *encoded.pointer_mut(path).unwrap() = replacement;
+        let changed: AdaptiveWorkFundingBindingV1 = serde_json::from_value(encoded).unwrap();
+        if path.starts_with("/limits/") {
+            assert!(changed.limits.validate().is_err(), "{path}");
+        }
+        assert!(changed.validate().is_err(), "{path}");
+        assert!(changed.canonical_digest().is_err(), "{path}");
+        assert_eq!(
+            format!("{:?}", value.validate_binding(&changed).unwrap_err()),
+            format!(
+                "{:?}",
+                reference_validate_binding(&value, &changed).unwrap_err()
+            ),
+            "{path}"
+        );
+    }
+    let mut bad_receipt = value.clone();
+    bad_receipt.issuer_principal.role = CompanyRoleV1::Developer;
+    let mut bad_binding = binding.clone();
+    bad_binding.schema_version = 2;
+    assert_eq!(
+        bad_receipt.validate_binding(&bad_binding).unwrap_err().code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+    for ordinal in [0, 1, 2, 6, u16::MAX] {
+        assert_eq!(
+            format!("{:?}", value.binding(ordinal).unwrap_err()),
+            format!("{:?}", reference_binding(&value, ordinal).unwrap_err())
+        );
+    }
+    for (path, replacement) in [
+        ("/funding_id", serde_json::json!("work-funding-other")),
+        ("/receipt_digest", serde_json::json!("a".repeat(64))),
+        ("/limits/total_model_call_ceiling", serde_json::json!(13)),
+        ("/ordinal", serde_json::json!(2)),
+    ] {
+        let mut encoded = serde_json::to_value(&binding).unwrap();
+        *encoded.pointer_mut(path).unwrap() = replacement;
+        let changed: AdaptiveWorkFundingBindingV1 = serde_json::from_value(encoded).unwrap();
+        changed.validate().unwrap();
+        assert_eq!(
+            value.validate_binding(&changed).unwrap_err().code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+        assert_eq!(
+            format!("{:?}", value.validate_binding(&changed).unwrap_err()),
+            format!(
+                "{:?}",
+                reference_validate_binding(&value, &changed).unwrap_err()
+            ),
+            "{path}"
+        );
+    }
 }

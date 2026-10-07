@@ -115,8 +115,8 @@ fn historical_adaptive_provider_project_uncached(
         {
             return Err(corrupt());
         }
-        // Validate the entire bounded selection, even after finding a match.
-        if historical_project_matches(&project, root, claimed_at_ms)? && selected.is_none() {
+        // All snapshots are validated above; matching stops after the newest hit.
+        if selected.is_none() && historical_project_matches(&project, root, claimed_at_ms)? {
             selected = Some(project);
         }
     }

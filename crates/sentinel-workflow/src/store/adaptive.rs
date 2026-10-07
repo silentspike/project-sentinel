@@ -242,6 +242,36 @@ impl WorkflowStore {
         })
     }
 
+    /// Health inventories share one exact-input proof, not authority for new effects.
+    pub fn adaptive_health_inventory(
+        &self,
+    ) -> Result<(Vec<crate::ProjectV1>, Vec<AdaptiveSessionV1>), AdaptiveHealthReadError> {
+        let mut connection = self.lock().map_err(AdaptiveHealthReadError::Projects)?;
+        let mut validating_sessions = false;
+        self.validated_read_snapshot(
+            &mut connection,
+            "adaptive-project-health-inventory",
+            &[],
+            |tx| {
+                // Preserve the separate per-project validation budgets.
+                let projects = crate::domain_store::validated_company_projects_in_snapshot(tx)?;
+                validating_sessions = true;
+                let sessions = crate::domain_store::validation_scope::with_scope(tx, || {
+                    adaptive_health_inventory(tx)
+                })?;
+                validating_sessions = false;
+                Ok((projects, sessions))
+            },
+        )
+        .map_err(|error| {
+            if validating_sessions {
+                AdaptiveHealthReadError::Sessions(error)
+            } else {
+                AdaptiveHealthReadError::Projects(error)
+            }
+        })
+    }
+
     /// Private historical pointers from one authorized, fully replayed read snapshot.
     pub fn adaptive_working_memory_source(
         &self,
@@ -254,107 +284,114 @@ impl WorkflowStore {
         if session_id.is_nil() || provider_version == 0 || effect_id.is_nil() {
             return Err(authority_conflict());
         }
+        let query_key = encode(&(session_id, provider_version, effect_id, current))?;
         let mut connection = self.lock()?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(map_sqlite_error)?;
-        // Journal replay and memory composition share only this read transaction.
-        let scope = crate::domain_store::validation_scope::enter(&tx)?;
-        let Some((current_session, _)) = load(&tx, session_id)? else {
-            scope.finish()?;
-            return Ok(None);
-        };
-        authorize(&current_session.grant, current)?;
-        require_head(&tx, &current_session)?;
-        let effect_matches = match &current_session.cursor {
-            crate::AdaptiveCursorV1::ReadyForModel => {
-                current_session.version == provider_version
-                    && working_memory_model_effect_id(session_id, provider_version) == effect_id
-            }
-            crate::AdaptiveCursorV1::ModelPending { effect }
-            | crate::AdaptiveCursorV1::ModelUnknown { effect } => {
-                provider_version.checked_add(1) == Some(current_session.version)
-                    && effect.id == effect_id
-            }
-            _ => false,
-        };
-        if !effect_matches {
-            return Err(authority_conflict());
-        }
-        let (head_entry_digest, prefix) =
-            evidence_entry(&tx, &namespace(session_id), provider_version)?;
-        let session = prefix.session;
-        if session.grant != current_session.grant {
-            return Err(corrupt_store());
-        }
-        let mut rows = working_memory_rows(&tx, &session)?;
-        let completed_tool_count = u16::try_from(rows.len()).map_err(|_| corrupt_store())?;
-        let latest_test = rows
-            .iter()
-            .rfind(|row| row.tool_kind == AdaptiveWorkingMemoryToolKindV1::RunTests)
-            .cloned();
-        if rows.len() > ADAPTIVE_WORKING_MEMORY_MAX_ROWS {
-            rows = rows.split_off(rows.len() - ADAPTIVE_WORKING_MEMORY_MAX_ROWS);
-            if let Some(test) = &latest_test {
-                if !rows
-                    .iter()
-                    .any(|row| row.session_version == test.session_version)
-                {
-                    rows.remove(0);
-                    rows.insert(0, test.clone());
+        self.validated_read_snapshot(
+            &mut connection,
+            "adaptive-working-memory-source",
+            &query_key,
+            |tx| {
+                // Cache reuse still requires fresh exact SQL inputs and index integrity.
+                let scope = crate::domain_store::validation_scope::enter(tx)?;
+                let Some((current_session, _)) = load(tx, session_id)? else {
+                    scope.finish()?;
+                    return Ok(None);
+                };
+                authorize(&current_session.grant, current)?;
+                require_head(tx, &current_session)?;
+                let effect_matches = match &current_session.cursor {
+                    crate::AdaptiveCursorV1::ReadyForModel => {
+                        current_session.version == provider_version
+                            && working_memory_model_effect_id(session_id, provider_version)
+                                == effect_id
+                    }
+                    crate::AdaptiveCursorV1::ModelPending { effect }
+                    | crate::AdaptiveCursorV1::ModelUnknown { effect } => {
+                        provider_version.checked_add(1) == Some(current_session.version)
+                            && effect.id == effect_id
+                    }
+                    _ => false,
+                };
+                if !effect_matches {
+                    return Err(authority_conflict());
                 }
-            }
-        }
-        let mut source = AdaptiveWorkingMemorySourceV1 {
-            schema_version: 1,
-            session_id,
-            authority: session.grant.authority.clone(),
-            provider_version,
-            effect_id,
-            head_version: session.version,
-            head_entry_digest,
-            last_observation: session.last_observation.clone(),
-            model_calls: session.model_calls,
-            tool_calls: session.tool_calls,
-            root_model_ceiling: session.grant.max_model_calls,
-            root_tool_ceiling: session.grant.max_tool_calls,
-            active_model_ceiling: session.active_model_ceiling(),
-            continuation_windows: u16::try_from(
-                session
-                    .continuation
-                    .as_ref()
-                    .map_or(0, |state| state.authorizations.len()),
-            )
-            .map_err(|_| corrupt_store())?,
-            completed_tool_count,
-            omitted_count: completed_tool_count - rows.len() as u16,
-            rows,
-            work_funding: session.active_work_funding().cloned().map(Box::new),
-        };
-        while serde_json::to_vec(&source)
-            .map_err(|_| corrupt_store())?
-            .len()
-            > ADAPTIVE_WORKING_MEMORY_MAX_BYTES
-        {
-            let index = source
-                .rows
-                .iter()
-                .position(|row| {
-                    source
-                        .rows
-                        .last()
-                        .is_some_and(|last| last.session_version != row.session_version)
-                        && latest_test
+                let (head_entry_digest, prefix) =
+                    evidence_entry(tx, &namespace(session_id), provider_version)?;
+                let session = prefix.session;
+                if session.grant != current_session.grant {
+                    return Err(corrupt_store());
+                }
+                let mut rows = working_memory_rows(tx, &session)?;
+                let completed_tool_count =
+                    u16::try_from(rows.len()).map_err(|_| corrupt_store())?;
+                let latest_test = rows
+                    .iter()
+                    .rfind(|row| row.tool_kind == AdaptiveWorkingMemoryToolKindV1::RunTests)
+                    .cloned();
+                if rows.len() > ADAPTIVE_WORKING_MEMORY_MAX_ROWS {
+                    rows = rows.split_off(rows.len() - ADAPTIVE_WORKING_MEMORY_MAX_ROWS);
+                    if let Some(test) = &latest_test {
+                        if !rows
+                            .iter()
+                            .any(|row| row.session_version == test.session_version)
+                        {
+                            rows.remove(0);
+                            rows.insert(0, test.clone());
+                        }
+                    }
+                }
+                let mut source = AdaptiveWorkingMemorySourceV1 {
+                    schema_version: 1,
+                    session_id,
+                    authority: session.grant.authority.clone(),
+                    provider_version,
+                    effect_id,
+                    head_version: session.version,
+                    head_entry_digest,
+                    last_observation: session.last_observation.clone(),
+                    model_calls: session.model_calls,
+                    tool_calls: session.tool_calls,
+                    root_model_ceiling: session.grant.max_model_calls,
+                    root_tool_ceiling: session.grant.max_tool_calls,
+                    active_model_ceiling: session.active_model_ceiling(),
+                    continuation_windows: u16::try_from(
+                        session
+                            .continuation
                             .as_ref()
-                            .is_none_or(|test| test.session_version != row.session_version)
-                })
-                .ok_or_else(corrupt_store)?;
-            source.rows.remove(index);
-            source.omitted_count += 1;
-        }
-        source.validate().map_err(|_| corrupt_store())?;
-        scope.finish()?;
-        Ok(Some(source))
+                            .map_or(0, |state| state.authorizations.len()),
+                    )
+                    .map_err(|_| corrupt_store())?,
+                    completed_tool_count,
+                    omitted_count: completed_tool_count - rows.len() as u16,
+                    rows,
+                    work_funding: session.active_work_funding().cloned().map(Box::new),
+                };
+                while serde_json::to_vec(&source)
+                    .map_err(|_| corrupt_store())?
+                    .len()
+                    > ADAPTIVE_WORKING_MEMORY_MAX_BYTES
+                {
+                    let index = source
+                        .rows
+                        .iter()
+                        .position(|row| {
+                            source
+                                .rows
+                                .last()
+                                .is_some_and(|last| last.session_version != row.session_version)
+                                && latest_test
+                                    .as_ref()
+                                    .is_none_or(|test| test.session_version != row.session_version)
+                        })
+                        .ok_or_else(corrupt_store)?;
+                    source.rows.remove(index);
+                    source.omitted_count += 1;
+                }
+                source.validate().map_err(|_| corrupt_store())?;
+                scope.finish()?;
+                Ok(Some(source))
+            },
+        )
     }
 
     /// Exact journal identity for a separately authorized recovery intervention.

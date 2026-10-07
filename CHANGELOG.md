@@ -1,5 +1,17 @@
 # Changelog
 
+- Intern identical typed SQL proof payloads through exact shared byte slices
+  within the existing bounded cache; keep full byte/schema/row equality,
+  index-integrity checks and overflow fallback. Read adaptive health projects
+  and sessions through one snapshot while retaining independent validation
+  budgets, failure classification and fresh external-outcome checks. Reuse
+  authority-bound working-memory proofs and count delivery publications during
+  the existing complete health validation instead of rescanning it (#856).
+  Reuse exact leadership-call proofs, derive receipt bindings after one public
+  validation, and skip match-only historical hashes after selection without
+  skipping any history validation. Charge funding-scan payloads before owned
+  copies; retain the existing row/byte limits and corruption rejection.
+
 - Batch immutable historical Workbench observation reads within one bounded
   context. Share fresh authority proofs only for identical caller/project/work/
   agent bindings within each read fence; revalidate after all reads and retain

@@ -799,47 +799,7 @@ impl WorkflowStore {
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
         // Pin discovery without aggregating unrelated projects' proof-arena limits.
         self.validated_read_snapshot(&mut connection, "company-projects", &[], |snapshot| {
-            let mut statement = snapshot
-            .prepare(
-                "SELECT tenant_id,entity_kind,entity_id,version,payload,payload_digest FROM company_entities WHERE entity_kind='project' ORDER BY tenant_id,entity_id",
-            )
-            .map_err(WorkflowError::from)?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })
-                .map_err(WorkflowError::from)?;
-            rows.map(|row| {
-                let (tenant, kind, id, version, payload, payload_digest) =
-                    row.map_err(WorkflowError::from)?;
-                if kind != "project"
-                    || version <= 0
-                    || !constant_time_eq(
-                        &bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?,
-                        &payload_digest,
-                    )
-                {
-                    return Err(corrupt());
-                }
-                let project: ProjectV1 = decode(&payload)?;
-                if project.tenant_id.0 != tenant
-                    || project.project_id.0 != id
-                    || project.version != stored_u64(version)?
-                {
-                    return Err(corrupt());
-                }
-                validate_project(&project).map_err(|_| corrupt())?;
-                subscription::validate_persisted(snapshot, &project).map_err(|_| corrupt())?;
-                Ok(project)
-            })
-            .collect::<Result<Vec<_>, WorkflowError>>()
+            validated_company_projects_in_snapshot(snapshot)
         })
     }
 
@@ -7592,6 +7552,53 @@ impl CompanyEntity for ProjectV1 {
     fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
         subscription::validate_persisted(connection, self)
     }
+}
+
+/// Reuses the caller's pinned transaction and the canonical entity/proof validation.
+pub(crate) fn validated_company_projects_in_snapshot(
+    connection: &Connection,
+) -> Result<Vec<ProjectV1>, WorkflowError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT tenant_id,entity_kind,entity_id,version,payload,payload_digest FROM company_entities WHERE entity_kind='project' ORDER BY tenant_id,entity_id",
+        )
+        .map_err(WorkflowError::from)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(WorkflowError::from)?;
+    rows.map(|row| {
+        let (tenant, kind, id, version, payload, payload_digest) =
+            row.map_err(WorkflowError::from)?;
+        if kind != "project"
+            || version <= 0
+            || !constant_time_eq(
+                &bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?,
+                &payload_digest,
+            )
+        {
+            return Err(corrupt());
+        }
+        let project: ProjectV1 = decode(&payload)?;
+        if project.tenant_id.0 != tenant
+            || project.project_id.0 != id
+            || project.version != stored_u64(version)?
+        {
+            return Err(corrupt());
+        }
+        validate_project(&project).map_err(|_| corrupt())?;
+        subscription::validate_persisted(connection, &project).map_err(|_| corrupt())?;
+        Ok(project)
+    })
+    .collect::<Result<Vec<_>, WorkflowError>>()
 }
 
 /// Reuses the caller's pinned transaction and the canonical entity/proof validation.
