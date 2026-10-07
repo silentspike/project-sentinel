@@ -508,6 +508,28 @@ impl CompanyAuthority {
             .company_project(tenant_id, project_id)
             .map_err(map_authority_store_error)?
             .ok_or(WorkflowPortError::AuthorityConflict)?;
+        self.snapshot_from_validated_project(
+            &project,
+            tenant_id,
+            project_id,
+            work_item_id,
+            agent_id,
+            require_serving_state,
+        )
+    }
+
+    fn snapshot_from_validated_project(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        work_item_id: &WorkItemId,
+        agent_id: AgentId,
+        require_serving_state: bool,
+    ) -> Result<RuntimeAuthoritySnapshotV1, WorkflowPortError> {
+        if project.tenant_id != *tenant_id || project.project_id != *project_id {
+            return Err(WorkflowPortError::AuthorityConflict);
+        }
         let work = project
             .work_items
             .get(work_item_id)
@@ -527,12 +549,11 @@ impl CompanyAuthority {
             .principals
             .principal(&participant.principal_id)
             .ok_or(WorkflowPortError::AuthorityConflict)?;
-        let capability_coverage = sentinel_workflow::execution_capability_coverage_is_admitted(
-            &project, work, assignment,
-        )
-        .map_err(map_authority_store_error)?;
+        let capability_coverage =
+            sentinel_workflow::execution_capability_coverage_is_admitted(project, work, assignment)
+                .map_err(map_authority_store_error)?;
         let (profile, profile_digest) =
-            self.profile_for_project_role(&project, work.spec.required_role)?;
+            self.profile_for_project_role(project, work.spec.required_role)?;
         if assignment.agent_id != agent_id
             || participant.role != assignment.role
             || principal.principal.agent_id != Some(agent_id)
@@ -799,11 +820,7 @@ impl CompanyAuthority {
                 .cmp(&right.mount_path)
                 .then_with(|| left.artifact_id.cmp(&right.artifact_id))
         });
-        if inputs.windows(2).any(|pair| {
-            pair[0].mount_path == pair[1].mount_path || pair[0].artifact_id == pair[1].artifact_id
-        }) {
-            return Err(execution_authority_conflict());
-        }
+        validate_execution_input_mounts(&inputs)?;
         Ok(inputs)
     }
 
@@ -1135,6 +1152,26 @@ fn execution_input_unavailable() -> WorkflowError {
         true,
         "execution dependency artifact is unavailable",
     )
+}
+
+fn validate_execution_input_mounts(inputs: &[ArtifactInputV1]) -> Result<(), WorkflowError> {
+    let mut digests = HashMap::new();
+    let mut mounts: Vec<&Path> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let mount = Path::new(&input.mount_path);
+        // CAS identity describes content; isolation and overlap belong to paths.
+        if digests
+            .insert(input.artifact_id.as_str(), input.digest.as_str())
+            .is_some_and(|previous| previous != input.digest)
+            || mounts
+                .iter()
+                .any(|previous| mount.starts_with(previous) || previous.starts_with(mount))
+        {
+            return Err(execution_authority_conflict());
+        }
+        mounts.push(mount);
+    }
+    Ok(())
 }
 
 fn execution_intent_port_error(error: WorkflowPortError) -> WorkflowError {
@@ -6623,6 +6660,51 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     use super::*;
+
+    #[test]
+    fn execution_input_mounts_allow_one_blob_at_distinct_paths() {
+        let input = |path: &str, media: &str| ArtifactInputV1 {
+            artifact_id: "shared-empty-blob".into(),
+            digest: "a".repeat(64),
+            media_type: media.into(),
+            mount_path: path.into(),
+        };
+        let values = vec![
+            input("package/__init__.py", "text/x-python"),
+            input("package/tests/__init__.py", "text/x-python"),
+            input("package/LICENSE", "text/plain"),
+        ];
+        assert!(validate_execution_input_mounts(&values).is_ok());
+    }
+
+    #[test]
+    fn execution_input_mounts_reject_conflicting_content_and_path_overlap() {
+        let first = ArtifactInputV1 {
+            artifact_id: "blob".into(),
+            digest: "a".repeat(64),
+            media_type: "text/plain".into(),
+            mount_path: "inputs/file".into(),
+        };
+        for (path, digest) in [
+            ("other/file", "b".repeat(64)),
+            ("inputs/file", "a".repeat(64)),
+            ("inputs/file/child", "a".repeat(64)),
+            ("inputs", "a".repeat(64)),
+        ] {
+            let mut other = first.clone();
+            other.mount_path = path.into();
+            other.digest = digest;
+            assert_eq!(
+                validate_execution_input_mounts(&[first.clone(), other])
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::AuthorityConflict,
+            );
+        }
+        let mut sibling = first.clone();
+        sibling.mount_path = "inputs/file-extra".into();
+        assert!(validate_execution_input_mounts(&[first, sibling]).is_ok());
+    }
 
     thread_local! {
         pub(super) static WORKBENCH_AUTHORITY_READS: std::cell::Cell<usize> = const {

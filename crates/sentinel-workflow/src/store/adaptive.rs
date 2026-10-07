@@ -37,6 +37,50 @@ mod working_memory_tests;
 const MAX_JOURNAL_ENTRIES: usize = 512;
 const MAX_SCOPED_ADAPTIVE_HEADS: usize = 64;
 
+/// Validated SQL facts for one preparation boundary, not reusable effect authority.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdaptiveProjectReadSnapshot {
+    project: crate::ProjectV1,
+    work_item_id: crate::WorkItemId,
+    agent_id: crate::AgentId,
+    heads: Result<Vec<AdaptiveSessionV1>, DeferredHeadReadError>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeferredHeadReadError {
+    code: WorkflowErrorCode,
+    retryable: bool,
+    message: &'static str,
+}
+
+impl AdaptiveProjectReadSnapshot {
+    pub fn project(&self) -> &crate::ProjectV1 {
+        &self.project
+    }
+
+    pub fn session_for_authority(
+        &self,
+        current: &RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<AdaptiveSessionV1>, WorkflowError> {
+        current.validate()?;
+        if current.tenant_id != self.project.tenant_id
+            || current.project_id != self.project.project_id
+            || current.work_item_id != self.work_item_id
+            || current.agent_id != self.agent_id
+        {
+            return Err(authority_conflict());
+        }
+        match &self.heads {
+            Ok(heads) => select_scoped_adaptive_head(heads, current),
+            Err(error) => Err(WorkflowError::new(
+                error.code,
+                error.retryable,
+                error.message,
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
@@ -445,6 +489,52 @@ impl WorkflowStore {
             "adaptive-authority-head",
             &query_key,
             |tx| adaptive_session_for_authority_on_connection(tx, current),
+        )
+    }
+
+    /// Pins project provenance and all competing scoped heads in one SQL read.
+    /// Callers still derive fresh non-SQL authority and reacquire after any I/O.
+    pub fn adaptive_project_snapshot(
+        &self,
+        tenant_id: &crate::TenantId,
+        project_id: &crate::ProjectId,
+        work_item_id: &crate::WorkItemId,
+        agent_id: crate::AgentId,
+    ) -> Result<Option<AdaptiveProjectReadSnapshot>, WorkflowError> {
+        tenant_id.validate()?;
+        project_id.validate()?;
+        let query_key = encode(&(tenant_id, project_id, work_item_id, agent_id))?;
+        let mut connection = self.lock()?;
+        self.validated_read_snapshot_if(
+            &mut connection,
+            "adaptive-project-scope",
+            &query_key,
+            |tx| {
+                let Some(project) = crate::domain_store::validated_company_project_in_snapshot(
+                    tx, tenant_id, project_id,
+                )?
+                else {
+                    return Ok(None);
+                };
+                // Preserve binding/runtime-before-head error order without
+                // reacquiring SQL facts. Failed head proofs are never retained.
+                let heads =
+                    scoped_adaptive_heads(tx, tenant_id, project_id, work_item_id, agent_id)
+                        .map_err(|error| DeferredHeadReadError {
+                            code: error.code,
+                            retryable: error.retryable,
+                            message: error.message,
+                        });
+                Ok(Some(AdaptiveProjectReadSnapshot {
+                    project,
+                    work_item_id: work_item_id.clone(),
+                    agent_id,
+                    heads,
+                }))
+            },
+            |view: &Option<AdaptiveProjectReadSnapshot>| {
+                view.as_ref().is_none_or(|snapshot| snapshot.heads.is_ok())
+            },
         )
     }
 
@@ -2805,20 +2895,36 @@ fn adaptive_session_for_authority_on_connection(
     connection: &Connection,
     current: &RuntimeAuthoritySnapshotV1,
 ) -> Result<Option<AdaptiveSessionV1>, WorkflowError> {
+    let heads = scoped_adaptive_heads(
+        connection,
+        &current.tenant_id,
+        &current.project_id,
+        &current.work_item_id,
+        current.agent_id,
+    )?;
+    select_scoped_adaptive_head(&heads, current)
+}
+
+fn scoped_adaptive_heads(
+    connection: &Connection,
+    tenant_id: &crate::TenantId,
+    project_id: &crate::ProjectId,
+    work_item_id: &crate::WorkItemId,
+    agent_id: crate::AgentId,
+) -> Result<Vec<AdaptiveSessionV1>, WorkflowError> {
     let mut statement = connection.prepare(
         "SELECT authority_digest,session_id,version,updated_at_ms FROM workflow_adaptive_heads WHERE tenant_id=?1 AND project_id=?2 AND work_item_id=?3 AND agent_id=?4 ORDER BY authority_digest LIMIT ?5"
     ).map_err(map_sqlite_error)?;
     let mut rows = statement
         .query(params![
-            current.tenant_id.0,
-            current.project_id.0,
-            current.work_item_id.0,
-            i64::from(current.agent_id.0),
+            tenant_id.0,
+            project_id.0,
+            work_item_id.0,
+            i64::from(agent_id.0),
             (MAX_SCOPED_ADAPTIVE_HEADS + 1) as i64
         ])
         .map_err(map_sqlite_error)?;
-    let mut exact = None;
-    let mut drifted_assignment = false;
+    let mut heads = Vec::new();
     let mut count = 0;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         count += 1;
@@ -2835,21 +2941,34 @@ fn adaptive_session_for_authority_on_connection(
         let (session, _) = load(connection, head.session_id)?.ok_or_else(corrupt_store)?;
         validate_head(&head, &session)?;
         let source = &session.grant.authority;
-        if source.tenant_id != current.tenant_id
-            || source.project_id != current.project_id
-            || source.work_item_id != current.work_item_id
-            || source.agent_id != current.agent_id
+        if source.tenant_id != *tenant_id
+            || source.project_id != *project_id
+            || source.work_item_id != *work_item_id
+            || source.agent_id != agent_id
             || !constant_time_eq(&stored_digest, &source.canonical_digest()?)
         {
             return Err(corrupt_store());
         }
+        heads.push(session);
+    }
+    Ok(heads)
+}
+
+fn select_scoped_adaptive_head(
+    heads: &[AdaptiveSessionV1],
+    current: &RuntimeAuthoritySnapshotV1,
+) -> Result<Option<AdaptiveSessionV1>, WorkflowError> {
+    let mut exact = None;
+    let mut drifted_assignment = false;
+    for session in heads {
+        let source = &session.grant.authority;
         // An exact head must not hide another campaign with spent assignment authority.
         if source.assignment_version == current.assignment_version {
             if source != current {
                 drifted_assignment = true;
             } else {
                 authorize(&session.grant, current)?;
-                if exact.replace(session).is_some() {
+                if exact.replace(session.clone()).is_some() {
                     return Err(corrupt_store());
                 }
             }

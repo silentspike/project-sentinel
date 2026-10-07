@@ -18,6 +18,7 @@ use crate::{
 
 pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 3;
 pub(crate) mod adaptive;
+pub use adaptive::AdaptiveProjectReadSnapshot;
 mod read_cache;
 mod revisions;
 pub(crate) use revisions::require_completed_source;
@@ -206,6 +207,17 @@ impl WorkflowStore {
         query_key: &[u8],
         validate: impl FnOnce(&Connection) -> Result<T, WorkflowError>,
     ) -> Result<T, WorkflowError> {
+        self.validated_read_snapshot_if(connection, domain, query_key, validate, |_| true)
+    }
+
+    pub(crate) fn validated_read_snapshot_if<T: Clone + Serialize + Send + 'static>(
+        &self,
+        connection: &mut Connection,
+        domain: &'static str,
+        query_key: &[u8],
+        validate: impl FnOnce(&Connection) -> Result<T, WorkflowError>,
+        retain: impl Fn(&T) -> bool,
+    ) -> Result<T, WorkflowError> {
         let eligible = connection.is_autocommit();
         let mut cache = self.validated_reads.lock().ok();
         // Keep the proof private under both locks until snapshot cleanup succeeds.
@@ -213,9 +225,14 @@ impl WorkflowStore {
         let result = (|| {
             let snapshot = connection.savepoint()?;
             let value = match cache.as_mut() {
-                Some(cache) => cache.read_keyed(&snapshot, eligible, domain, query_key, || {
-                    validate(&snapshot)
-                }),
+                Some(cache) => cache.read_keyed_if(
+                    &snapshot,
+                    eligible,
+                    domain,
+                    query_key,
+                    || validate(&snapshot),
+                    retain,
+                ),
                 None => validate(&snapshot),
             }?;
             snapshot.commit()?;

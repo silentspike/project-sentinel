@@ -100,6 +100,8 @@ impl WorkflowApi {
             let (producer_agent, artifact, media_type) = authority
                 .resolve_execution_input(project, contract)
                 .map_err(|_| "model input producer is not current and complete")?;
+            // This wrapper completes one request-local verified reader before
+            // any content escapes; authority is still resolved per contract.
             let files = read_verified_artifact_text(
                 &authority.artifact_roots,
                 producer_agent,
@@ -233,5 +235,73 @@ mod tests {
             Sha256::digest(context.artifact_inputs[0].files[0].content.as_bytes())
         );
         assert!(context.validate_dispatch(1).is_err());
+    }
+
+    #[test]
+    fn model_input_repeated_empty_and_nonempty_content_keeps_path_order_and_prompt_bytes() {
+        let mut context = context();
+        context.artifact_inputs[0].files = [
+            ("lib/__init__.py", ""),
+            ("lib/a.py", "value = 1\n"),
+            ("lib/b.py", "value = 1\n"),
+            ("tests/__init__.py", ""),
+        ]
+        .into_iter()
+        .map(|(path, content)| VerifiedArtifactTextFile {
+            path: path.into(),
+            sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+            content: content.into(),
+        })
+        .collect();
+        validate_model_artifact_inputs(&context.task, &context.artifact_inputs).unwrap();
+        let prompt = context.prompt().unwrap();
+        for file in &context.artifact_inputs[0].files {
+            assert!(prompt.contains(&file.path));
+        }
+        let restored: ModelWorkContext =
+            serde_json::from_slice(&serde_json::to_vec(&context).unwrap()).unwrap();
+        assert_eq!(restored.artifact_inputs, context.artifact_inputs);
+        assert_eq!(restored.prompt().unwrap(), prompt);
+    }
+
+    #[test]
+    fn model_input_bounds_charge_repeated_bytes_and_files_across_artifacts() {
+        let mut context = context();
+        let mut second = context.artifact_inputs[0].clone();
+        second.contract.name = "second-source".into();
+        context.task.inputs.push(second.contract.clone());
+        context.artifact_inputs.push(second);
+        for input in &mut context.artifact_inputs {
+            input.files = (0..MAX_INPUT_FILES / 2)
+                .map(|index| {
+                    let content = "x".repeat(MAX_INPUT_BYTES / MAX_INPUT_FILES);
+                    VerifiedArtifactTextFile {
+                        path: format!("file-{index:02}.py"),
+                        sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+                        content,
+                    }
+                })
+                .collect();
+        }
+        validate_model_artifact_inputs(&context.task, &context.artifact_inputs).unwrap();
+        let mut oversized = context.clone();
+        let file = &mut oversized.artifact_inputs[1].files[0];
+        file.content.push('x');
+        file.sha256 = format!("{:x}", Sha256::digest(file.content.as_bytes()));
+        assert_eq!(
+            validate_model_artifact_inputs(&oversized.task, &oversized.artifact_inputs),
+            Err("model input exceeds its bound")
+        );
+        context.artifact_inputs[1]
+            .files
+            .push(VerifiedArtifactTextFile {
+                path: "last-empty.py".into(),
+                sha256: format!("{:x}", Sha256::digest(b"")),
+                content: String::new(),
+            });
+        assert_eq!(
+            validate_model_artifact_inputs(&context.task, &context.artifact_inputs),
+            Err("model input exceeds its bound")
+        );
     }
 }
