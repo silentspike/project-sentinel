@@ -277,6 +277,11 @@ impl AdaptiveWorkFundingRequestV1 {
     /// Pure requested ceiling, not an adopted or authorized runtime allowance.
     pub fn resulting_model_call_ceiling(&self) -> Result<u16, WorkflowError> {
         self.validate_shape()?;
+        self.resulting_model_call_ceiling_after_validation()
+    }
+
+    // Private derivations require a successful request shape validation.
+    fn resulting_model_call_ceiling_after_validation(&self) -> Result<u16, WorkflowError> {
         checked_call_ceiling(
             self.source.current_model_call_ceiling,
             self.limits.additional_model_calls,
@@ -286,6 +291,10 @@ impl AdaptiveWorkFundingRequestV1 {
     /// Pure requested ceiling, not an adopted or authorized runtime allowance.
     pub fn resulting_tool_call_ceiling(&self) -> Result<u16, WorkflowError> {
         self.validate_shape()?;
+        self.resulting_tool_call_ceiling_after_validation()
+    }
+
+    fn resulting_tool_call_ceiling_after_validation(&self) -> Result<u16, WorkflowError> {
         checked_call_ceiling(
             self.source.current_tool_call_ceiling,
             self.limits.additional_tool_calls,
@@ -298,12 +307,13 @@ impl AdaptiveWorkFundingRequestV1 {
         canonical_sha256("sentinel.workflow.adaptive-work-funding-request.v1", self)
     }
 
-    fn binding_limits(&self) -> Result<AdaptiveWorkFundingBindingLimitsV1, WorkflowError> {
-        self.validate_shape()?;
+    fn binding_limits_after_validation(
+        &self,
+    ) -> Result<AdaptiveWorkFundingBindingLimitsV1, WorkflowError> {
         let source = &self.source.resume_source;
         Ok(AdaptiveWorkFundingBindingLimitsV1 {
-            total_model_call_ceiling: self.resulting_model_call_ceiling()?,
-            total_tool_call_ceiling: self.resulting_tool_call_ceiling()?,
+            total_model_call_ceiling: self.resulting_model_call_ceiling_after_validation()?,
+            total_tool_call_ceiling: self.resulting_tool_call_ceiling_after_validation()?,
             total_review_ceiling: source
                 .base_review_count
                 .checked_add(self.limits.additional_reviews)
@@ -363,19 +373,24 @@ impl AdaptiveWorkFundingReceiptV1 {
     /// Immutable leaf content digest, not proof that the leaf was issued or stored.
     pub fn receipt_digest(&self) -> Result<String, WorkflowError> {
         self.validate()?;
+        self.receipt_digest_after_validation()
+    }
+
+    // Called only after this receipt and its nested request have validated.
+    fn receipt_digest_after_validation(&self) -> Result<String, WorkflowError> {
         canonical_sha256("sentinel.workflow.adaptive-work-funding-receipt.v1", self)
     }
 
     /// Describes requested ceilings only; no runtime allowance is issued here.
     pub fn resulting_model_call_ceiling(&self) -> Result<u16, WorkflowError> {
         self.validate()?;
-        self.request.resulting_model_call_ceiling()
+        self.request.resulting_model_call_ceiling_after_validation()
     }
 
     /// Describes requested ceilings only; no runtime allowance is issued here.
     pub fn resulting_tool_call_ceiling(&self) -> Result<u16, WorkflowError> {
         self.validate()?;
-        self.request.resulting_tool_call_ceiling()
+        self.request.resulting_tool_call_ceiling_after_validation()
     }
 
     /// Constructs a descriptive binding, never a review grant or adoption receipt.
@@ -384,11 +399,15 @@ impl AdaptiveWorkFundingReceiptV1 {
         let binding = AdaptiveWorkFundingBindingV1 {
             schema_version: 1,
             funding_id: self.funding_id.clone(),
-            receipt_digest: self.receipt_digest()?,
+            receipt_digest: self.receipt_digest_after_validation()?,
             ordinal,
-            limits: self.request.binding_limits()?,
+            limits: self.request.binding_limits_after_validation()?,
         };
-        self.validate_binding(&binding)?;
+        binding.validate()?;
+        // Digest and limits came from this validated receipt; only ordinal remains.
+        if binding.ordinal <= self.request.source.resume_source.base_review_count {
+            return Err(binding_conflict());
+        }
         Ok(binding)
     }
 
@@ -400,15 +419,11 @@ impl AdaptiveWorkFundingReceiptV1 {
         self.validate()?;
         binding.validate()?;
         if binding.funding_id != self.funding_id
-            || binding.receipt_digest != self.receipt_digest()?
-            || binding.limits != self.request.binding_limits()?
+            || binding.receipt_digest != self.receipt_digest_after_validation()?
+            || binding.limits != self.request.binding_limits_after_validation()?
             || binding.ordinal <= self.request.source.resume_source.base_review_count
         {
-            return Err(WorkflowError::new(
-                WorkflowErrorCode::AuthorityConflict,
-                false,
-                "adaptive work funding binding does not match receipt",
-            ));
+            return Err(binding_conflict());
         }
         Ok(())
     }
@@ -440,6 +455,14 @@ fn checked_call_ceiling(current: u16, additional: u16) -> Result<u16, WorkflowEr
         .checked_add(additional)
         .filter(|total| *total <= ADAPTIVE_SESSION_MAX_CALLS)
         .ok_or_else(invalid)
+}
+
+fn binding_conflict() -> WorkflowError {
+    WorkflowError::new(
+        WorkflowErrorCode::AuthorityConflict,
+        false,
+        "adaptive work funding binding does not match receipt",
+    )
 }
 
 fn invalid() -> WorkflowError {

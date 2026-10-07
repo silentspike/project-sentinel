@@ -45,6 +45,8 @@ pub use port::*;
 pub use project_planning::*;
 pub use request_provider::*;
 pub use sentinel_common::AgentId;
-pub use store::{ExecutionRevisionV1, WorkflowStore, WORKFLOW_STORE_SCHEMA_VERSION};
+pub use store::{
+    AdaptiveHealthReadError, ExecutionRevisionV1, WorkflowStore, WORKFLOW_STORE_SCHEMA_VERSION,
+};
 
 pub const WORKFLOW_SCHEMA_VERSION: u16 = 1;
