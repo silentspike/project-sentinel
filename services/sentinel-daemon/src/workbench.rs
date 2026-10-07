@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1775,12 +1775,26 @@ fn open_verified_source_artifact(
     expected_artifact_kind: Option<&str>,
     expected_media_type: &str,
 ) -> anyhow::Result<(PathBuf, VerifiedArtifactManifest)> {
+    let opened = open_pinned_verified_source_artifact(
+        artifact_roots,
+        source_agent,
+        project_id,
+        manifest_digest,
+        expected_artifact_kind,
+        expected_media_type,
+    )?;
+    Ok((opened.scope_path, opened.manifest))
+}
+
+fn resolve_verified_source_artifact_scope(
+    source_base: &Path,
+    source_agent: AgentId,
+    project_id: &str,
+    manifest_digest: &str,
+) -> anyhow::Result<PathBuf> {
     if !valid_lower_sha256(manifest_digest) {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
-    let source_base = artifact_roots
-        .get(&source_agent)
-        .ok_or(WorkbenchStoreError::OutputRejected)?;
     let source_base = canonical_daemon_real_directory(source_base)?;
     let source_project =
         canonical_daemon_child_directory(&source_base, daemon_scope_component(project_id)?)?;
@@ -1813,7 +1827,37 @@ fn open_verified_source_artifact(
     if matches.len() != 1 {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
-    let source_scope = matches.pop().expect("exactly one source scope");
+    Ok(matches.pop().expect("exactly one source scope"))
+}
+
+struct PinnedArtifactManifest {
+    scope_path: PathBuf,
+    scope: File,
+    file: File,
+    bytes: Vec<u8>,
+    manifest: VerifiedArtifactManifest,
+}
+
+fn open_pinned_verified_source_artifact(
+    artifact_roots: &HashMap<AgentId, PathBuf>,
+    source_agent: AgentId,
+    project_id: &str,
+    manifest_digest: &str,
+    expected_artifact_kind: Option<&str>,
+    expected_media_type: &str,
+) -> anyhow::Result<PinnedArtifactManifest> {
+    if !valid_lower_sha256(manifest_digest) {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let source_base = artifact_roots
+        .get(&source_agent)
+        .ok_or(WorkbenchStoreError::OutputRejected)?;
+    let source_scope = resolve_verified_source_artifact_scope(
+        source_base,
+        source_agent,
+        project_id,
+        manifest_digest,
+    )?;
     let source_directory = open_pinned_daemon_artifact_directory(&source_scope)?;
     let manifest_name = format!("{manifest_digest}.manifest.json");
     let mut manifest_file = open_scoped_daemon_artifact_file(
@@ -1847,7 +1891,230 @@ fn open_verified_source_artifact(
     {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
-    Ok((source_scope, manifest))
+    Ok(PinnedArtifactManifest {
+        scope_path: source_scope,
+        scope: source_directory,
+        file: manifest_file,
+        bytes,
+        manifest,
+    })
+}
+
+/// Request-local content verification, never a producer authority cache.
+struct VerifiedArtifactReader {
+    source_base: PathBuf,
+    source_agent: AgentId,
+    project_id: String,
+    manifest_digest: String,
+    opened: PinnedArtifactManifest,
+    blobs_path: PathBuf,
+    blobs: File,
+    read_leaves: Vec<Option<PinnedArtifactLeaf>>,
+}
+
+struct PinnedArtifactLeaf {
+    name: String,
+    file: File,
+    bytes: Vec<u8>,
+}
+
+impl VerifiedArtifactReader {
+    fn open(
+        artifact_roots: &HashMap<AgentId, PathBuf>,
+        source_agent: AgentId,
+        project_id: &str,
+        manifest_digest: &str,
+        artifact_kind: &str,
+        media_type: &str,
+    ) -> anyhow::Result<Self> {
+        let opened = open_pinned_verified_source_artifact(
+            artifact_roots,
+            source_agent,
+            project_id,
+            manifest_digest,
+            Some(artifact_kind),
+            media_type,
+        )?;
+        let mut paths = BTreeSet::new();
+        for entry in &opened.manifest.entries {
+            if !is_canonical_relative_path(&entry.path)
+                || !valid_lower_sha256(&entry.sha256)
+                || entry.blob_id != format!("sha256:{}", entry.sha256)
+                || !paths.insert(&entry.path)
+            {
+                return Err(WorkbenchStoreError::OutputRejected.into());
+            }
+        }
+        let blobs_path = canonical_daemon_child_directory(&opened.scope_path, "blobs")?;
+        let blobs = open_pinned_daemon_artifact_directory(&blobs_path)?;
+        let read_leaves = opened.manifest.entries.iter().map(|_| None).collect();
+        Ok(Self {
+            source_base: artifact_roots
+                .get(&source_agent)
+                .ok_or(WorkbenchStoreError::OutputRejected)?
+                .clone(),
+            source_agent,
+            project_id: project_id.to_owned(),
+            manifest_digest: manifest_digest.to_owned(),
+            opened,
+            blobs_path,
+            blobs,
+            read_leaves,
+        })
+    }
+
+    fn read_entry(&mut self, index: usize, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+        let entry = self
+            .opened
+            .manifest
+            .entries
+            .get(index)
+            .ok_or(WorkbenchStoreError::OutputRejected)?;
+        if entry.size_bytes > max_bytes {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+        let mut file = open_scoped_daemon_artifact_file(
+            &self.blobs,
+            &entry.sha256,
+            max_bytes,
+            Some(entry.size_bytes),
+        )?;
+        if file.metadata()?.mode() & 0o222 != 0 {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+        let mut bytes = Vec::new();
+        file.by_ref().take(max_bytes + 1).read_to_end(&mut bytes)?;
+        revalidate_scoped_daemon_artifact_file(&self.blobs, &entry.sha256, &file)?;
+        if bytes.len() as u64 != entry.size_bytes || hex_sha256(&bytes) != entry.sha256 {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+        if let Some(previous) = &self.read_leaves[index] {
+            revalidate_scoped_daemon_artifact_file(&self.blobs, &previous.name, &previous.file)?;
+            if bytes != previous.bytes {
+                return Err(WorkbenchStoreError::OutputRejected.into());
+            }
+        } else {
+            self.read_leaves[index] = Some(PinnedArtifactLeaf {
+                name: entry.sha256.clone(),
+                file,
+                bytes: bytes.clone(),
+            });
+        }
+        Ok(bytes)
+    }
+
+    fn finish(mut self) -> anyhow::Result<()> {
+        let scope_path = resolve_verified_source_artifact_scope(
+            &self.source_base,
+            self.source_agent,
+            &self.project_id,
+            &self.manifest_digest,
+        )?;
+        if scope_path != self.opened.scope_path {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+        revalidate_pinned_daemon_artifact_directory(&scope_path, &self.opened.scope)?;
+        let blobs_path = canonical_daemon_child_directory(&scope_path, "blobs")?;
+        if blobs_path != self.blobs_path {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+        revalidate_pinned_daemon_artifact_directory(&blobs_path, &self.blobs)?;
+        let manifest_name = format!("{}.manifest.json", self.manifest_digest);
+        revalidate_scoped_daemon_artifact_file(
+            &self.opened.scope,
+            &manifest_name,
+            &self.opened.file,
+        )?;
+        // The manifest can be owner-writable: identity alone cannot detect an
+        // in-place edit. Compare the complete bytes, not another digest.
+        self.opened
+            .file
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        let mut bytes = Vec::new();
+        self.opened
+            .file
+            .by_ref()
+            .take(MAX_ARTIFACT_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        revalidate_scoped_daemon_artifact_file(
+            &self.opened.scope,
+            &manifest_name,
+            &self.opened.file,
+        )?;
+        if bytes != self.opened.bytes {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+        // Keep every opened leaf pinned until the batch is complete. Identity
+        // checks reject replacement/linking; exact bytes also catch in-place edits.
+        for leaf in self.read_leaves.iter_mut().flatten() {
+            revalidate_scoped_daemon_artifact_file(&self.blobs, &leaf.name, &leaf.file)?;
+            let metadata = leaf
+                .file
+                .metadata()
+                .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+            let size = leaf.bytes.len() as u64;
+            validate_daemon_artifact_file_metadata(&metadata, size, Some(size))?;
+            if metadata.mode() & 0o222 != 0 {
+                return Err(WorkbenchStoreError::OutputRejected.into());
+            }
+            leaf.file
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+            let mut current = Vec::new();
+            leaf.file
+                .by_ref()
+                .take(size + 1)
+                .read_to_end(&mut current)
+                .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+            revalidate_scoped_daemon_artifact_file(&self.blobs, &leaf.name, &leaf.file)?;
+            if current != leaf.bytes || leaf.file.metadata()?.mode() & 0o222 != 0 {
+                return Err(WorkbenchStoreError::OutputRejected.into());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "llm", test))]
+    fn read_text(mut self, max_bytes: usize) -> anyhow::Result<Vec<VerifiedArtifactTextFile>> {
+        let total = self
+            .opened
+            .manifest
+            .entries
+            .iter()
+            .try_fold(0u64, |total, entry| total.checked_add(entry.size_bytes))
+            .ok_or(WorkbenchStoreError::OutputRejected)?;
+        if total > max_bytes as u64 {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+        let mut entries: Vec<_> = (0..self.opened.manifest.entries.len()).collect();
+        entries.sort_by(|left, right| {
+            self.opened.manifest.entries[*left]
+                .path
+                .cmp(&self.opened.manifest.entries[*right].path)
+        });
+        let mut files = Vec::with_capacity(entries.len());
+        for index in entries {
+            let bytes = self.read_entry(index, max_bytes as u64)?;
+            let content =
+                String::from_utf8(bytes).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+            if content
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+            {
+                return Err(WorkbenchStoreError::OutputRejected.into());
+            }
+            let entry = &self.opened.manifest.entries[index];
+            files.push(VerifiedArtifactTextFile {
+                path: entry.path.clone(),
+                sha256: entry.sha256.clone(),
+                content,
+            });
+        }
+        self.finish()?;
+        Ok(files)
+    }
 }
 
 /// Read only a manifest-declared immutable file. The caller must first bind the
@@ -1866,45 +2133,23 @@ pub fn read_verified_artifact_file(
     if !is_canonical_relative_path(path) || max_bytes == 0 || max_bytes > MAX_PREVIEW_FILE_BYTES {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
-    let (source_scope, manifest) = open_verified_source_artifact(
+    let mut reader = VerifiedArtifactReader::open(
         artifact_roots,
         source_agent,
         project_id,
         manifest_digest,
-        Some(artifact_kind),
+        artifact_kind,
         media_type,
     )?;
-    let mut paths = BTreeSet::new();
-    for entry in &manifest.entries {
-        if !is_canonical_relative_path(&entry.path)
-            || !valid_lower_sha256(&entry.sha256)
-            || entry.blob_id != format!("sha256:{}", entry.sha256)
-            || !paths.insert(&entry.path)
-        {
-            return Err(WorkbenchStoreError::OutputRejected.into());
-        }
-    }
-    let entry = manifest
+    let index = reader
+        .opened
+        .manifest
         .entries
         .iter()
-        .find(|entry| entry.path == path)
+        .position(|entry| entry.path == path)
         .ok_or(WorkbenchStoreError::OutputRejected)?;
-    if entry.size_bytes > max_bytes {
-        return Err(WorkbenchStoreError::OutputRejected.into());
-    }
-    let blobs_root = canonical_daemon_child_directory(&source_scope, "blobs")?;
-    let blobs = open_pinned_daemon_artifact_directory(&blobs_root)?;
-    let mut file =
-        open_scoped_daemon_artifact_file(&blobs, &entry.sha256, max_bytes, Some(entry.size_bytes))?;
-    if file.metadata()?.mode() & 0o222 != 0 {
-        return Err(WorkbenchStoreError::OutputRejected.into());
-    }
-    let mut bytes = Vec::new();
-    file.by_ref().take(max_bytes + 1).read_to_end(&mut bytes)?;
-    revalidate_scoped_daemon_artifact_file(&blobs, &entry.sha256, &file)?;
-    if bytes.len() as u64 != entry.size_bytes || hex_sha256(&bytes) != entry.sha256 {
-        return Err(WorkbenchStoreError::OutputRejected.into());
-    }
+    let bytes = reader.read_entry(index, max_bytes)?;
+    reader.finish()?;
     Ok(bytes)
 }
 
@@ -1933,54 +2178,15 @@ pub(crate) fn read_verified_artifact_text(
     if max_bytes == 0 || max_bytes > MAX_MODEL_SOURCE_BYTES {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
-    let (_, mut manifest) = open_verified_source_artifact(
+    VerifiedArtifactReader::open(
         artifact_roots,
         source_agent,
         project_id,
         manifest_digest,
-        Some(artifact_kind),
+        artifact_kind,
         media_type,
-    )?;
-    let total = manifest
-        .entries
-        .iter()
-        .try_fold(0u64, |total, entry| total.checked_add(entry.size_bytes))
-        .ok_or(WorkbenchStoreError::OutputRejected)?;
-    if total > max_bytes as u64 {
-        return Err(WorkbenchStoreError::OutputRejected.into());
-    }
-    manifest
-        .entries
-        .sort_by(|left, right| left.path.cmp(&right.path));
-    manifest
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let bytes = read_verified_artifact_file(
-                artifact_roots,
-                source_agent,
-                project_id,
-                manifest_digest,
-                artifact_kind,
-                media_type,
-                &entry.path,
-                max_bytes as u64,
-            )?;
-            let content =
-                String::from_utf8(bytes).map_err(|_| WorkbenchStoreError::OutputRejected)?;
-            if content
-                .chars()
-                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
-            {
-                return Err(WorkbenchStoreError::OutputRejected.into());
-            }
-            Ok(VerifiedArtifactTextFile {
-                path: entry.path,
-                sha256: entry.sha256,
-                content,
-            })
-        })
-        .collect()
+    )?
+    .read_text(max_bytes)
 }
 
 pub(crate) fn stage_verified_artifact_inputs(
@@ -2267,6 +2473,24 @@ fn open_pinned_daemon_artifact_directory(path: &Path) -> anyhow::Result<File> {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
     Ok(directory)
+}
+
+fn revalidate_pinned_daemon_artifact_directory(
+    path: &Path,
+    directory: &File,
+) -> anyhow::Result<()> {
+    let current = fs::symlink_metadata(path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let opened = directory
+        .metadata()
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if current.file_type().is_symlink()
+        || !current.is_dir()
+        || current.dev() != opened.dev()
+        || current.ino() != opened.ino()
+    {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(())
 }
 
 fn open_scoped_daemon_artifact_file(
@@ -6256,6 +6480,361 @@ mod tests {
                 assert!(!root.join("inputs").exists());
                 assert!(!root.join("workspace").exists());
             }
+        }
+    }
+
+    fn model_artifact_fixture(
+        root: &Path,
+        files: &[(&str, &[u8])],
+    ) -> (HashMap<AgentId, PathBuf>, PathBuf, String) {
+        let agent_root = root.join("agent-06");
+        let artifacts = agent_root.join("artifacts");
+        let scope = artifacts.join("project-source/source-work");
+        fs::create_dir_all(scope.join("blobs")).unwrap();
+        fs::write(agent_root.join(".nano-runtime"), "AGENT-06").unwrap();
+        let mut entries = Vec::new();
+        for (path, bytes) in files {
+            let digest = hex_sha256(bytes);
+            let blob = scope.join("blobs").join(&digest);
+            if !blob.exists() {
+                fs::write(&blob, bytes).unwrap();
+                fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+            }
+            entries.push(serde_json::json!({
+                "path": path, "blob_id": format!("sha256:{digest}"),
+                "sha256": digest, "size_bytes": bytes.len(),
+            }));
+        }
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schema_version": WORKBENCH_SCHEMA_VERSION,
+            "invocation_id": "018f3f32-4f01-7f2c-a6c1-f6f4a81b2897",
+            "input_digest": "a".repeat(64), "project_id": "project-source",
+            "work_item_id": "source-work", "workspace_id": "project-source:source-work",
+            "agent_id": 6, "artifact_kind": "source_tree", "media_type": "text/x-python",
+            "runtime_key": WORKBENCH_RUNTIME_BWRAP, "tool_profile": "python-coding-v1",
+            "tool_profile_digest": "b".repeat(64), "policy_digest": "c".repeat(64),
+            "entries": entries,
+        }))
+        .unwrap();
+        let digest = hex_sha256(&manifest);
+        fs::write(scope.join(format!("{digest}.manifest.json")), manifest).unwrap();
+        (HashMap::from([(AgentId(6), artifacts)]), scope, digest)
+    }
+
+    fn model_artifact_reader(
+        roots: &HashMap<AgentId, PathBuf>,
+        digest: &str,
+    ) -> VerifiedArtifactReader {
+        VerifiedArtifactReader::open(
+            roots,
+            AgentId(6),
+            "project-source",
+            digest,
+            "source_tree",
+            "text/x-python",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn verified_artifact_reader_rejects_manifest_replacement_and_in_place_edits() {
+        for replace in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (roots, scope, digest) =
+                model_artifact_fixture(directory.path(), &[("a.py", b"value = 1\n")]);
+            let mut reader = model_artifact_reader(&roots, &digest);
+            assert_eq!(reader.read_entry(0, 1024).unwrap(), b"value = 1\n");
+            let path = scope.join(format!("{digest}.manifest.json"));
+            if replace {
+                // Even a byte-identical replacement must invalidate the pin.
+                let replacement = scope.join("replacement.json");
+                fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+                fs::rename(replacement, &path).unwrap();
+            } else {
+                let before = fs::metadata(&path).unwrap();
+                let mut bytes = fs::read(&path).unwrap();
+                let offset = bytes.iter().position(|byte| *byte == b'a').unwrap();
+                bytes[offset] = b'z';
+                fs::write(&path, bytes).unwrap();
+                assert_eq!(before.ino(), fs::metadata(&path).unwrap().ino());
+                assert_eq!(before.len(), fs::metadata(&path).unwrap().len());
+            }
+            let error = reader.finish().unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<WorkbenchStoreError>(),
+                Some(WorkbenchStoreError::OutputRejected)
+            ));
+        }
+    }
+
+    #[test]
+    fn verified_artifact_reader_rejects_linked_manifest_at_completion() {
+        for symlink in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (roots, scope, digest) =
+                model_artifact_fixture(directory.path(), &[("a.py", b"value = 1\n")]);
+            let reader = model_artifact_reader(&roots, &digest);
+            let manifest = scope.join(format!("{digest}.manifest.json"));
+            let alias = scope.join("alias.json");
+            if symlink {
+                fs::rename(&manifest, &alias).unwrap();
+                std::os::unix::fs::symlink(alias, &manifest).unwrap();
+            } else {
+                fs::hard_link(&manifest, alias).unwrap();
+            }
+            assert!(reader.read_text(1024).is_err());
+        }
+    }
+
+    #[test]
+    fn verified_artifact_reader_rejects_new_ambiguous_or_invalid_scope() {
+        for invalid_scope in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (roots, scope, digest) =
+                model_artifact_fixture(directory.path(), &[("a.py", b"value = 1\n")]);
+            let reader = model_artifact_reader(&roots, &digest);
+            let other = scope.with_file_name("other-work");
+            if invalid_scope {
+                std::os::unix::fs::symlink(&scope, &other).unwrap();
+            } else {
+                fs::create_dir(&other).unwrap();
+                fs::write(
+                    other.join(format!("{digest}.manifest.json")),
+                    &reader.opened.bytes,
+                )
+                .unwrap();
+            }
+            assert!(reader.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn verified_artifact_reader_rejects_scope_blob_directory_and_marker_changes() {
+        for change in ["scope", "blobs", "marker"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (roots, scope, digest) =
+                model_artifact_fixture(directory.path(), &[("a.py", b"value = 1\n")]);
+            let mut reader = model_artifact_reader(&roots, &digest);
+            assert_eq!(reader.read_entry(0, 1024).unwrap(), b"value = 1\n");
+            match change {
+                "scope" => {
+                    fs::rename(&scope, scope.with_file_name("retired-work")).unwrap();
+                    fs::create_dir(&scope).unwrap();
+                    fs::create_dir(scope.join("blobs")).unwrap();
+                    fs::write(
+                        scope.join(format!("{digest}.manifest.json")),
+                        &reader.opened.bytes,
+                    )
+                    .unwrap();
+                    fs::remove_file(
+                        scope
+                            .with_file_name("retired-work")
+                            .join(format!("{digest}.manifest.json")),
+                    )
+                    .unwrap();
+                }
+                "blobs" => {
+                    fs::rename(scope.join("blobs"), scope.join("retired-blobs")).unwrap();
+                    fs::create_dir(scope.join("blobs")).unwrap();
+                }
+                "marker" => {
+                    fs::write(directory.path().join("agent-06/.nano-runtime"), "AGENT-07").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(reader.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn verified_artifact_reader_revalidates_previously_read_leaves_at_completion() {
+        for change in [
+            "replace", "symlink", "hardlink", "corrupt", "writable", "size",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (roots, scope, digest) = model_artifact_fixture(
+                directory.path(),
+                &[("a.py", b"value = 1\n"), ("b.py", b"value = 2\n")],
+            );
+            let mut reader = model_artifact_reader(&roots, &digest);
+            assert_eq!(reader.read_entry(0, 1024).unwrap(), b"value = 1\n");
+            let blob = scope.join("blobs").join(hex_sha256(b"value = 1\n"));
+            let alias = scope.join("alias-blob");
+            match change {
+                "replace" => {
+                    fs::write(&alias, b"value = 1\n").unwrap();
+                    fs::set_permissions(&alias, fs::Permissions::from_mode(0o444)).unwrap();
+                    fs::rename(&alias, &blob).unwrap();
+                }
+                "symlink" => {
+                    fs::rename(&blob, &alias).unwrap();
+                    std::os::unix::fs::symlink(alias, &blob).unwrap();
+                }
+                "hardlink" => {
+                    fs::hard_link(&blob, alias).unwrap();
+                }
+                "corrupt" | "size" => {
+                    fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
+                    let bytes = if change == "corrupt" {
+                        &b"value = 9\n"[..]
+                    } else {
+                        &b"short"[..]
+                    };
+                    fs::write(&blob, bytes).unwrap();
+                    fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+                }
+                "writable" => {
+                    fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            // The next, distinct leaf is healthy; completion must still reject
+            // the stale earlier bytes rather than returning a partial snapshot.
+            assert_eq!(reader.read_entry(1, 1024).unwrap(), b"value = 2\n");
+            let error = reader.finish().unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<WorkbenchStoreError>(),
+                Some(WorkbenchStoreError::OutputRejected)
+            ));
+        }
+    }
+
+    #[test]
+    fn verified_artifact_reader_rechecks_each_repeated_leaf_without_a_blob_cache() {
+        for change in [
+            "corrupt",
+            "symlink",
+            "hardlink",
+            "writable",
+            "size",
+            "special-mode",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let bytes = b"value = 1\n";
+            let (roots, scope, digest) =
+                model_artifact_fixture(directory.path(), &[("a.py", bytes), ("b.py", bytes)]);
+            let mut reader = model_artifact_reader(&roots, &digest);
+            assert_eq!(reader.read_entry(0, 1024).unwrap(), bytes);
+            let blob = scope.join("blobs").join(hex_sha256(bytes));
+            match change {
+                "corrupt" | "size" => {
+                    fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
+                    fs::write(
+                        &blob,
+                        if change == "corrupt" {
+                            &b"value = 2\n"[..]
+                        } else {
+                            &b"short"[..]
+                        },
+                    )
+                    .unwrap();
+                    fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+                }
+                "symlink" => {
+                    let other = scope.join("other-blob");
+                    fs::rename(&blob, &other).unwrap();
+                    std::os::unix::fs::symlink(other, &blob).unwrap();
+                }
+                "hardlink" => {
+                    fs::hard_link(&blob, scope.join("alias-blob")).unwrap();
+                }
+                "writable" | "special-mode" => {
+                    let mode = if change == "writable" { 0o644 } else { 0o4444 };
+                    fs::set_permissions(&blob, fs::Permissions::from_mode(mode)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = reader.read_entry(1, 1024).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<WorkbenchStoreError>(),
+                Some(WorkbenchStoreError::OutputRejected)
+            ));
+            assert!(reader.read_text(1024).is_err());
+        }
+    }
+
+    #[test]
+    fn verified_artifact_reader_preserves_repeated_empty_nonempty_bytes_and_total_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_files: [(&str, &[u8]); 4] = [
+            ("tests/__init__.py", b""),
+            ("lib/b.py", b"value = 1\n"),
+            ("lib/__init__.py", b""),
+            ("lib/a.py", b"value = 1\n"),
+        ];
+        let (roots, scope, digest) = model_artifact_fixture(directory.path(), &source_files);
+        let total: usize = source_files.iter().map(|(_, bytes)| bytes.len()).sum();
+        let files = model_artifact_reader(&roots, &digest)
+            .read_text(total)
+            .unwrap();
+        let mut expected: Vec<_> = source_files
+            .iter()
+            .map(|(path, bytes)| VerifiedArtifactTextFile {
+                path: (*path).into(),
+                sha256: hex_sha256(bytes),
+                content: String::from_utf8(bytes.to_vec()).unwrap(),
+            })
+            .collect();
+        expected.sort_by(|left, right| left.path.cmp(&right.path));
+        assert_eq!(files, expected);
+        assert_eq!(
+            serde_json::to_vec(&files).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert_eq!(fs::read_dir(scope.join("blobs")).unwrap().count(), 2);
+        assert!(model_artifact_reader(&roots, &digest)
+            .read_text(total - 1)
+            .is_err());
+
+        let mut overflow = model_artifact_reader(&roots, &digest);
+        overflow.opened.manifest.entries[0].size_bytes = u64::MAX;
+        assert!(overflow.read_text(64 * 1024).is_err());
+        assert!(!directory.path().join("agent-06/inputs").exists());
+    }
+
+    #[test]
+    fn verified_artifact_reader_rejects_duplicate_and_noncanonical_inventory() {
+        for paths in [["a.py", "a.py"], ["a.py", "../b.py"], ["a.py", "dir//b.py"]] {
+            let directory = tempfile::tempdir().unwrap();
+            let (roots, _, digest) = model_artifact_fixture(
+                directory.path(),
+                &[(paths[0], b"value = 1\n"), (paths[1], b"value = 1\n")],
+            );
+            assert!(VerifiedArtifactReader::open(
+                &roots,
+                AgentId(6),
+                "project-source",
+                &digest,
+                "source_tree",
+                "text/x-python",
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn verified_artifact_reader_accepts_all_empty_files_with_unchanged_positive_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let (roots, _, digest) =
+            model_artifact_fixture(directory.path(), &[("z.py", b""), ("a.py", b"")]);
+        let read = |budget| {
+            read_verified_artifact_text(
+                &roots,
+                AgentId(6),
+                "project-source",
+                &digest,
+                "source_tree",
+                "text/x-python",
+                budget,
+            )
+        };
+        let files = read(1).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "a.py");
+        assert_eq!(files[1].path, "z.py");
+        assert!(files.iter().all(|file| file.content.is_empty()));
+        for budget in [0, 64 * 1024 + 1] {
+            assert!(read(budget).is_err());
         }
     }
 

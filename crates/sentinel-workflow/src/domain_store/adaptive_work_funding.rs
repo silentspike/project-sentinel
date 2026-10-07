@@ -840,6 +840,21 @@ fn superseded_unused_receipts(
     )
 }
 
+fn superseded_validated_receipts(
+    connection: &Connection,
+    tenant: &TenantId,
+    session_id: Uuid,
+    receipts: &[AdaptiveWorkFundingReceiptV1],
+) -> Result<BTreeSet<String>, WorkflowError> {
+    // Callers already validated the complete tenant inventory in this scope.
+    validation_scope::memoize(
+        connection,
+        "funding-supersession",
+        &(tenant, session_id),
+        || superseded_unused_receipts_uncached(connection, receipts),
+    )
+}
+
 fn superseded_unused_receipts_uncached(
     connection: &Connection,
     receipts: &[AdaptiveWorkFundingReceiptV1],
@@ -892,6 +907,7 @@ fn require_unfunded_source(
     now_ms: u64,
     supersedes_unused_receipt_digest: Option<&str>,
 ) -> Result<(AdaptiveWorkFundingSourceV1, u64), WorkflowError> {
+    let scope = validation_scope::enter(connection)?;
     let receipts = funding_receipts(connection, tenant, session_id)?;
     if receipts.len() >= 128 {
         return Err(transition());
@@ -900,7 +916,7 @@ fn require_unfunded_source(
         connection, tenant, project_id, session_id, now_ms, None,
     )?;
     let adopted = adopted_epochs(&session);
-    let superseded = superseded_unused_receipts(connection, tenant, session_id)?;
+    let superseded = superseded_validated_receipts(connection, tenant, session_id, &receipts)?;
     let pending = receipts
         .iter()
         .filter(|receipt| {
@@ -934,6 +950,7 @@ fn require_unfunded_source(
         supersedes_unused_receipt_digest: supersedes_unused_receipt_digest.map(str::to_owned),
     };
     source.validate()?;
+    scope.finish()?;
     Ok((source, session.grant.max_call_duration_ms))
 }
 
@@ -944,9 +961,10 @@ pub(super) fn require_unfunded_review_lane(
 ) -> Result<(), WorkflowError> {
     let tenant = &session.grant.authority.tenant_id;
     let session_id = session.grant.session_id;
+    let scope = validation_scope::enter(connection)?;
     let receipts = funding_receipts(connection, tenant, session_id)?;
     let adopted = adopted_epochs(session);
-    let superseded = superseded_unused_receipts(connection, tenant, session_id)?;
+    let superseded = superseded_validated_receipts(connection, tenant, session_id, &receipts)?;
     // Selection and authorization are separate reads. A concurrently issued
     // live proposal must be reselected, not stranded by an older unfunded call.
     if receipts.iter().any(|receipt| {
@@ -956,6 +974,7 @@ pub(super) fn require_unfunded_review_lane(
     }) {
         return Err(transition());
     }
+    scope.finish()?;
     Ok(())
 }
 
@@ -1063,7 +1082,8 @@ impl WorkflowStore {
         }
         let receipts = funding_receipts(&transaction, tenant, session_id)?;
         let adopted = adopted_epochs(&session);
-        let superseded = superseded_unused_receipts(&transaction, tenant, session_id)?;
+        let superseded =
+            superseded_validated_receipts(&transaction, tenant, session_id, &receipts)?;
         let pending: Vec<_> = receipts
             .iter()
             .filter(|receipt| {
@@ -1378,6 +1398,7 @@ fn funding_inventory_and_supersession_scope_keys_keep_tenants_and_sessions_disti
             assert!(funding_receipts(&connection, &first, one)?.is_empty());
             assert!(funding_receipts(&connection, &first, two)?.is_empty());
             assert_eq!(validation_scope::validations("funding-inventory"), 1);
+            assert!(superseded_validated_receipts(&connection, &first, one, &[])?.is_empty());
             for _ in 0..3 {
                 assert!(superseded_unused_receipts(&connection, &first, one)?.is_empty());
                 assert!(superseded_unused_receipts(&connection, &first, two)?.is_empty());

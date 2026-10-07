@@ -502,6 +502,224 @@ fn company_model_claim_rejects_reassignment_after_organization_snapshot_without_
 }
 
 #[test]
+fn adaptive_project_snapshot_reuses_one_bound_project_and_head_without_writes() {
+    let fixture = fixture();
+    let authority = &fixture.root.authority;
+    let before = snapshot(&fixture.store);
+    for _ in 0..2 {
+        let view = fixture
+            .store
+            .adaptive_project_snapshot(
+                &authority.tenant_id,
+                &authority.project_id,
+                &authority.work_item_id,
+                authority.agent_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.project(), &fixture.project);
+        assert_eq!(
+            view.session_for_authority(authority)
+                .unwrap()
+                .unwrap()
+                .grant,
+            fixture.root
+        );
+        let mut drift = authority.clone();
+        drift.runtime_generation += 1;
+        assert_eq!(
+            view.session_for_authority(&drift).unwrap_err().code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+        let mut foreign = authority.clone();
+        foreign.work_item_id = WorkItemId::parse("foreign-work").unwrap();
+        assert_eq!(
+            view.session_for_authority(&foreign).unwrap_err().code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+    }
+    assert_eq!(snapshot(&fixture.store), before);
+}
+
+#[test]
+fn adaptive_project_snapshot_refreshes_head_without_inventing_company_dispatch() {
+    let fixture = fixture();
+    let authority = &fixture.root.authority;
+    let before = fixture
+        .store
+        .adaptive_project_snapshot(
+            &authority.tenant_id,
+            &authority.project_id,
+            &authority.work_item_id,
+            authority.agent_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(before
+        .project()
+        .subscription_call
+        .as_ref()
+        .unwrap()
+        .dispatch
+        .is_none());
+    core(&fixture.store, authority, None)
+        .advance_company_adaptive_model_with_clock(
+            fixture.root.session_id,
+            1,
+            Uuid::from_u128(CLAIM_OPERATION),
+            &claim(200, None),
+            authority,
+            || NOW + 1,
+        )
+        .unwrap();
+    let after = fixture
+        .store
+        .adaptive_project_snapshot(
+            &authority.tenant_id,
+            &authority.project_id,
+            &authority.work_item_id,
+            authority.agent_id,
+        )
+        .unwrap()
+        .unwrap();
+    // An adaptive reservation changes the head, not the separate provider claim.
+    assert_eq!(after.project(), before.project());
+    assert!(after
+        .project()
+        .subscription_call
+        .as_ref()
+        .unwrap()
+        .dispatch
+        .is_none());
+    assert_eq!(
+        after
+            .session_for_authority(authority)
+            .unwrap()
+            .unwrap()
+            .version,
+        2
+    );
+    assert_eq!(
+        before
+            .session_for_authority(authority)
+            .unwrap()
+            .unwrap()
+            .version,
+        1
+    );
+}
+
+#[test]
+fn adaptive_project_snapshot_preserves_outer_transaction_and_head_error_stage() {
+    let fixture = fixture();
+    let authority = &fixture.root.authority;
+    let before = snapshot(&fixture.store);
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .execute_batch("BEGIN")
+        .unwrap();
+    let view = fixture
+        .store
+        .adaptive_project_snapshot(
+            &authority.tenant_id,
+            &authority.project_id,
+            &authority.work_item_id,
+            authority.agent_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        view.session_for_authority(authority)
+            .unwrap()
+            .unwrap()
+            .version,
+        1
+    );
+    assert!(!fixture.store.lock().unwrap().is_autocommit());
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .execute_batch("ROLLBACK")
+        .unwrap();
+    assert_eq!(snapshot(&fixture.store), before);
+    // An external commit invalidates the cached combined proof.
+    let peer = rusqlite::Connection::open(&fixture.path).unwrap();
+    peer.execute("UPDATE workflow_adaptive_heads SET version=version+1", [])
+        .unwrap();
+    let rejected = fixture
+        .store
+        .adaptive_project_snapshot(
+            &authority.tenant_id,
+            &authority.project_id,
+            &authority.work_item_id,
+            authority.agent_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected.project(), &fixture.project);
+    assert_eq!(
+        rejected.session_for_authority(authority).unwrap_err().code,
+        WorkflowErrorCode::CorruptStore
+    );
+    peer.execute("UPDATE workflow_adaptive_heads SET version=version-1", [])
+        .unwrap();
+    let repaired = fixture
+        .store
+        .adaptive_project_snapshot(
+            &authority.tenant_id,
+            &authority.project_id,
+            &authority.work_item_id,
+            authority.agent_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repaired
+            .session_for_authority(authority)
+            .unwrap()
+            .unwrap()
+            .version,
+        1
+    );
+}
+
+#[test]
+fn adaptive_project_snapshot_keeps_project_corruption_classification() {
+    let fixture = fixture();
+    let authority = &fixture.root.authority;
+    fixture
+        .store
+        .adaptive_project_snapshot(
+            &authority.tenant_id,
+            &authority.project_id,
+            &authority.work_item_id,
+            authority.agent_id,
+        )
+        .unwrap();
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE company_entities SET payload='{}' WHERE entity_kind='project'",
+            [],
+        )
+        .unwrap();
+    assert!(fixture
+        .store
+        .adaptive_project_snapshot(
+            &authority.tenant_id,
+            &authority.project_id,
+            &authority.work_item_id,
+            authority.agent_id,
+        )
+        .is_err());
+}
+
+#[test]
 fn company_model_claim_commits_once_and_preserves_exact_replay() {
     let fixture = fixture();
     let core = core(&fixture.store, &fixture.root.authority, None);

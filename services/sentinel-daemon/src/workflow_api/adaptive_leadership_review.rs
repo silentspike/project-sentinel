@@ -1686,7 +1686,8 @@ impl WorkflowApi {
             .authority
             .as_ref()
             .ok_or("leadership runtime missing")?
-            .snapshot_for_admission(
+            .snapshot_from_validated_project(
+                &project,
                 &project.tenant_id,
                 &project.project_id,
                 &binding.grant.work_item_id,
@@ -2323,6 +2324,42 @@ impl WorkflowApi {
 pub(crate) mod tests {
     use super::*;
     use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
+
+    #[test]
+    fn leadership_preparation_reuses_only_the_current_validated_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (mut api, expected) = fixture(&path, &events);
+        let before = discovery_state(&path, &events);
+        assert_eq!(
+            api.prepare_leadership_review(&expected.binding).unwrap(),
+            expected,
+        );
+        Arc::make_mut(api.authority.as_mut().unwrap()).workbench_profile_digest = "0".repeat(64);
+        assert_eq!(
+            api.prepare_leadership_review(&expected.binding),
+            Err("leadership assignee unavailable"),
+        );
+        assert_eq!(discovery_state(&path, &events), before);
+        let source = include_str!("adaptive_leadership_review.rs");
+        let preparation = source
+            .split("pub(super) fn prepare_leadership_review(")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) fn accept_leadership_review(")
+            .next()
+            .unwrap();
+        assert_eq!(preparation.matches(".company_project(").count(), 1);
+        assert_eq!(
+            preparation
+                .matches(".snapshot_from_validated_project(")
+                .count(),
+            1
+        );
+        assert!(!preparation.contains(".snapshot_for_admission("));
+        assert!(preparation.contains(".adaptive_session_for_authority("));
+    }
 
     #[test]
     fn unmarked_leadership_context_and_prompt_preserve_legacy_bytes() {

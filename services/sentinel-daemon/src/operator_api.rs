@@ -2261,16 +2261,35 @@ fn dispatch_runtime_reconcile(
     state: &AppState,
 ) -> std::result::Result<RuntimeReconcileResponse, ApiError> {
     let (response_tx, response_rx) = mpsc::sync_channel(1);
+    let enqueued_at = Instant::now();
     state
         .runtime_tx
         .send(RuntimeControlCommand::Reconcile {
             request: payload,
+            enqueued_at,
             response_tx,
         })
         .map_err(|_| ApiError::ServiceUnavailable("Runtime-Control-Channel nicht verfuegbar"))?;
-    response_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Reconcile Timeout"))
+    receive_runtime_reconcile_response(response_rx, enqueued_at, Duration::from_secs(10))
+}
+
+fn receive_runtime_reconcile_response(
+    receiver: mpsc::Receiver<RuntimeReconcileResponse>,
+    enqueued_at: Instant,
+    timeout: Duration,
+) -> std::result::Result<RuntimeReconcileResponse, ApiError> {
+    match receiver.recv_timeout(timeout) {
+        Ok(mut response) => {
+            response.response_wait_us = crate::runtime_control::duration_us(enqueued_at.elapsed());
+            Ok(response)
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(ApiError::ServiceUnavailable("Runtime-Reconcile Timeout"))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ApiError::ServiceUnavailable(
+            "Runtime-Reconcile response channel disconnected",
+        )),
+    }
 }
 
 fn dispatch_runtime_analysis_flood_test(
@@ -6411,6 +6430,7 @@ mod tests {
             RuntimeControlCommand::Reconcile {
                 request,
                 response_tx,
+                ..
             } => {
                 assert!(request.respawn_missing);
                 assert!(!request.dry_run);
@@ -6440,6 +6460,9 @@ mod tests {
                         blocked_agents: Vec::new(),
                         errors: Vec::new(),
                         elapsed_us: 0,
+                        queue_wait_us: 0,
+                        fence_check_us: 0,
+                        response_wait_us: 0,
                     })
                     .unwrap();
             }
@@ -6476,6 +6499,54 @@ mod tests {
         assert_eq!(payload.respawned_agents, 2);
         assert!(payload.projection_rebuild_requested);
         assert_eq!(payload.repair_last_status, "repaired");
+    }
+
+    #[test]
+    fn reconcile_reply_preserves_execution_and_dispatch_timing() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(RuntimeReconcileResponse {
+                accepted: true,
+                elapsed_us: 42,
+                queue_wait_us: 150,
+                fence_check_us: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        let enqueued = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let response =
+            receive_runtime_reconcile_response(receiver, enqueued, Duration::ZERO).unwrap();
+        assert!(response.accepted);
+        assert_eq!(response.elapsed_us, 42);
+        assert_eq!(response.queue_wait_us, 150);
+        assert_eq!(response.fence_check_us, 5);
+        assert!(response.response_wait_us >= 1_000);
+    }
+
+    #[test]
+    fn reconcile_reply_distinguishes_disconnection_from_timeout() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+        let disconnected =
+            receive_runtime_reconcile_response(receiver, Instant::now(), Duration::ZERO)
+                .unwrap_err()
+                .to_response();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let timeout = receive_runtime_reconcile_response(receiver, Instant::now(), Duration::ZERO)
+            .unwrap_err()
+            .to_response();
+        drop(sender);
+        assert_eq!(disconnected.status, 503);
+        assert_eq!(timeout.status, 503);
+        let disconnected: serde_json::Value = serde_json::from_slice(&disconnected.body).unwrap();
+        let timeout: serde_json::Value = serde_json::from_slice(&timeout.body).unwrap();
+        assert_eq!(
+            disconnected["error"],
+            "Runtime-Reconcile response channel disconnected"
+        );
+        assert_eq!(timeout["error"], "Runtime-Reconcile Timeout");
     }
 
     #[test]

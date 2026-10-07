@@ -2032,21 +2032,25 @@ fn retain_read_only_or_reject_fenced_runtime_command(
     current_shift: u8,
     rejection_status: &str,
     rejection_note: &str,
+    dequeued_at: std::time::Instant,
 ) -> Option<RuntimeControlCommand> {
     match command {
         read_only @ RuntimeControlCommand::StateHash { .. } => Some(read_only),
         RuntimeControlCommand::Reconcile {
             request,
+            enqueued_at,
             response_tx,
         } => {
-            let _ = response_tx.send(RuntimeReconcileResponse {
+            let mut response = RuntimeReconcileResponse {
                 accepted: false,
                 dry_run: request.dry_run,
                 current_shift,
                 repair_last_status: rejection_status.to_string(),
                 errors: vec![rejection_note.to_string()],
                 ..RuntimeReconcileResponse::default()
-            });
+            };
+            response.record_dispatch_timing(enqueued_at, dequeued_at, std::time::Instant::now());
+            let _ = response_tx.send(response);
             None
         }
         RuntimeControlCommand::AnalysisFloodTest {
@@ -5278,6 +5282,9 @@ fn run_runtime_reconcile(
         blocked_agents,
         errors,
         elapsed_us: elapsed_started.elapsed().as_micros() as u64,
+        queue_wait_us: 0,
+        fence_check_us: 0,
+        response_wait_us: 0,
     }
 }
 
@@ -9236,6 +9243,7 @@ fn ecs_tick_loop(
         }
 
         while let Ok(command) = runtime_rx.try_recv() {
+            let dequeued_at = std::time::Instant::now();
             let command = if world_background_allowed {
                 Some(command)
             } else if world_owner_allowed {
@@ -9244,6 +9252,7 @@ fn ecs_tick_loop(
                     current_shift,
                     "restore_fence_active",
                     "Runtime mutation is blocked while restore recovery is active",
+                    dequeued_at,
                 )
             } else {
                 retain_read_only_or_reject_fenced_runtime_command(
@@ -9251,6 +9260,7 @@ fn ecs_tick_loop(
                     current_shift,
                     "world_authority_unavailable",
                     "World mutation authority is unavailable on this node",
+                    dequeued_at,
                 )
             };
             let Some(command) = command else {
@@ -9259,10 +9269,11 @@ fn ecs_tick_loop(
             match command {
                 RuntimeControlCommand::Reconcile {
                     request,
+                    enqueued_at,
                     response_tx,
                 } => {
                     if restore_fence.is_active() {
-                        let response = RuntimeReconcileResponse {
+                        let mut response = RuntimeReconcileResponse {
                             accepted: false,
                             dry_run: request.dry_run,
                             current_shift,
@@ -9271,10 +9282,16 @@ fn ecs_tick_loop(
                                 .to_string()],
                             ..RuntimeReconcileResponse::default()
                         };
+                        response.record_dispatch_timing(
+                            enqueued_at,
+                            dequeued_at,
+                            std::time::Instant::now(),
+                        );
                         let _ = response_tx.send(response);
                         continue;
                     }
-                    let response = execute_runtime_reconcile(
+                    let fence_checked_at = std::time::Instant::now();
+                    let mut response = execute_runtime_reconcile(
                         tick_count,
                         current_shift,
                         &all_agents,
@@ -9297,6 +9314,7 @@ fn ecs_tick_loop(
                         &mut respawn_backoff,
                         RuntimeReconcileSource::Operator,
                     );
+                    response.record_dispatch_timing(enqueued_at, dequeued_at, fence_checked_at);
                     let _ = response_tx.send(response);
                 }
                 RuntimeControlCommand::AnalysisFloodTest {
