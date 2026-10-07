@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -715,14 +715,16 @@ fn validate_step(step: &ExecutionStepV1) -> Result<(), WorkflowError> {
     }
     step.resource_bounds.validate()?;
     step.gate_expectation.validate()?;
-    let mut input_ids = BTreeSet::new();
+    let mut input_ids = BTreeMap::new();
     let mut input_mounts: Vec<&str> = Vec::new();
     for input in &step.inputs {
         validate_identifier(&input.artifact_id)?;
         validate_digest(&input.digest)?;
         validate_media_type(&input.media_type)?;
         validate_relative_path(&input.mount_path)?;
-        if !input_ids.insert(&input.artifact_id)
+        if input_ids
+            .insert(&input.artifact_id, &input.digest)
+            .is_some_and(|digest| digest != &input.digest)
             || input_mounts
                 .iter()
                 .any(|mount| canonical_paths_overlap(mount, &input.mount_path))
@@ -1065,4 +1067,129 @@ fn invalid(message: &'static str) -> WorkflowError {
 
 fn authority(message: &'static str) -> WorkflowError {
     WorkflowError::new(WorkflowErrorCode::AuthorityConflict, false, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+
+    fn input_step() -> ExecutionStepV1 {
+        ExecutionStepV1 {
+            step_id: Uuid::new_v4(),
+            invocation_id: Uuid::new_v4(),
+            ordinal: 0,
+            workspace_id: "project:work".into(),
+            capabilities: BTreeSet::from(["file.inspect".into()]),
+            inputs: Vec::new(),
+            command_policy: Vec::new(),
+            tool: ExecutionToolV1::InspectFile {
+                path: "lib/a.py".into(),
+                max_bytes: 1024,
+            },
+            outputs: vec![OutputExpectationV1 {
+                name: "inspection".into(),
+                kind: "source_tree".into(),
+                required: true,
+                digest_algorithm: "sha256".into(),
+            }],
+            artifacts: Vec::new(),
+            gate_expectation: GateExpectationV1 {
+                profile_id: WORK_ITEM_GATE_PROFILE.into(),
+                profile_generation: 1,
+                profile_digest: "a".repeat(64),
+                required_checks: BTreeSet::from(["check".into()]),
+            },
+            resource_bounds: ExecutionResourceBoundsV1 {
+                wall_time_ms: 1000,
+                cpu_time_ms: 1000,
+                memory_bytes: 1024 * 1024,
+                process_count: 1,
+                file_bytes: 1024,
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+            },
+            deadline_unix_ms: 1000,
+        }
+    }
+
+    fn repeated_blob_step() -> ExecutionStepV1 {
+        let mut step = input_step();
+        let nonempty_digest = format!("{:x}", Sha256::digest(b"value = 1\n"));
+        for (path, digest, media_type) in [
+            (
+                "lib/__init__.py",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "text/x-python",
+            ),
+            (
+                "tests/__init__.py",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "text/plain",
+            ),
+            ("lib/a.py", nonempty_digest.as_str(), "text/x-python"),
+            ("lib/b.py", nonempty_digest.as_str(), "text/plain"),
+        ] {
+            step.inputs.push(ArtifactInputV1 {
+                artifact_id: format!("sha256:{digest}"),
+                digest: digest.into(),
+                media_type: media_type.into(),
+                mount_path: path.into(),
+            });
+        }
+        step
+    }
+
+    #[test]
+    fn step_admission_accepts_stable_repeated_blobs_at_distinct_mounts() {
+        let step = repeated_blob_step();
+        validate_step(&step).unwrap();
+        assert_eq!(step.inputs[0].artifact_id, step.inputs[1].artifact_id);
+        assert_ne!(step.inputs[0].media_type, step.inputs[1].media_type);
+        assert_eq!(step.inputs[2].artifact_id, step.inputs[3].artifact_id);
+    }
+
+    #[test]
+    fn step_admission_rejects_conflicting_identity_and_overlapping_mounts() {
+        let original = repeated_blob_step();
+        let mut conflicting = original.clone();
+        conflicting.inputs[1].digest = "c".repeat(64);
+        let error = validate_step(&conflicting).unwrap_err();
+        assert_eq!(error.code, WorkflowErrorCode::InvalidInput);
+        assert_eq!(
+            error.message,
+            "artifact input identity or mount path is duplicated"
+        );
+        for path in ["lib/__init__.py", "lib", "lib/__init__.py/child"] {
+            let mut overlapping = original.clone();
+            overlapping.inputs[1].mount_path = path.into();
+            assert!(validate_step(&overlapping).is_err());
+        }
+        let mut invalid_media = original.clone();
+        invalid_media.inputs[1].media_type = "invalid".into();
+        assert!(validate_step(&invalid_media).is_err());
+    }
+
+    #[test]
+    fn step_admission_keeps_read_only_input_output_and_mutation_boundaries() {
+        let original = repeated_blob_step();
+        let mut output_overlap = original.clone();
+        output_overlap.artifacts.push(ArtifactExpectationV1 {
+            artifact_kind: "source_tree".into(),
+            media_type: "text/x-python".into(),
+            required_paths: vec!["lib".into()],
+        });
+        assert!(validate_step(&output_overlap).is_err());
+        for path in ["lib/a.py", "lib", "lib/a.py/child"] {
+            let mut mutation = original.clone();
+            mutation.capabilities = BTreeSet::from(["file.write".into()]);
+            mutation.tool = ExecutionToolV1::WriteFile {
+                path: path.into(),
+                content: "changed".into(),
+                expected_sha256: None,
+            };
+            assert!(validate_step(&mutation).is_err());
+        }
+    }
 }

@@ -24,6 +24,7 @@ pub use budget_review_extension::{
 
 const KIND: &str = "adaptive_leadership_review_call";
 const MAX_TENANT_REVIEW_SCAN: usize = 4096;
+const MAX_GOVERNED_LOCATOR_BYTES: usize = 256 * 1024;
 const ABANDONED_KIND: &str = "adaptive_leadership_abandoned_allowance";
 const EXPIRED_CONTINUATION_KIND: &str = "adaptive_leadership_expired_continuation";
 const BUDGET_LIMIT_KIND: &str = "adaptive_budget_window_limit";
@@ -1118,9 +1119,109 @@ pub(super) fn validate_persisted_governed_allowance(
     validation_scope::memoize(
         connection,
         "governed-allowance",
-        &(project, allowance),
+        &(&project.tenant_id, &project.project_id, allowance),
         || validate_persisted_governed_allowance_uncached(connection, project, allowance),
     )
+}
+
+// Fallible, lazy selection preserves classification/validation error order.
+pub(super) fn validate_governed_allowances<'a>(
+    connection: &Connection,
+    project: &ProjectV1,
+    allowances: impl IntoIterator<Item = Result<&'a SubscriptionCallAllowanceV1, WorkflowError>>,
+) -> Result<(), WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        for allowance in allowances {
+            let allowance = allowance?;
+            let locators = validation_scope::inventory(
+                connection,
+                "governed-allowance-locators",
+                &project.tenant_id,
+                // Discovery is advisory: an unrelated malformed JSON row
+                // must not change the legacy query's error precedence.
+                || {
+                    Ok(governed_allowance_locators(connection, &project.tenant_id)
+                        .ok()
+                        .flatten())
+                },
+            )?;
+            match locators {
+                Some(locators) => {
+                    let ids = locators.0.get(&allowance.allowance_id);
+                    validation_scope::memoize(
+                        connection,
+                        "governed-allowance",
+                        &(&project.tenant_id, &project.project_id, allowance),
+                        || {
+                            validate_governed_allowance_ids(
+                                connection,
+                                project,
+                                allowance,
+                                ids.map_or(&[], Vec::as_slice),
+                            )
+                        },
+                    )?;
+                }
+                None => validate_persisted_governed_allowance(connection, project, allowance)?,
+            }
+        }
+        Ok(())
+    })
+}
+
+#[derive(Clone)]
+struct GovernedAllowanceLocators(std::sync::Arc<BTreeMap<String, Vec<String>>>);
+
+impl serde::Serialize for GovernedAllowanceLocators {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+fn governed_allowance_locators(
+    connection: &Connection,
+    tenant: &TenantId,
+) -> Result<Option<GovernedAllowanceLocators>, WorkflowError> {
+    // Do not filter by project: a second tenant receipt for the same allowance
+    // is ambiguous even when its project differs. Locators never certify leaves.
+    let mut statement = connection.prepare(
+        "SELECT entity_id,json_extract(payload,'$.continuation.provider_allowance_id')
+         FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 LIMIT 4097",
+    )?;
+    let mut rows = statement.query(params![tenant.0, KIND])?;
+    let mut locators = BTreeMap::<String, Vec<String>>::new();
+    let mut bytes = 0usize;
+    let mut count = 0usize;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        if count > MAX_TENANT_REVIEW_SCAN {
+            return Ok(None);
+        }
+        // Inspect borrowed SQLite bytes before allocating optional storage.
+        let rusqlite::types::ValueRef::Text(allowance) = row.get_ref(1)? else {
+            continue;
+        };
+        let allowance = std::str::from_utf8(allowance).map_err(|_| persistence())?;
+        if locators.get(allowance).is_some_and(|ids| ids.len() == 2) {
+            continue;
+        }
+        let rusqlite::types::ValueRef::Text(id) = row.get_ref(0)? else {
+            return Ok(None);
+        };
+        let id = std::str::from_utf8(id).map_err(|_| persistence())?;
+        let cost = allowance.len().saturating_add(id.len()).saturating_add(256);
+        if bytes.saturating_add(cost) > MAX_GOVERNED_LOCATOR_BYTES {
+            return Ok(None);
+        }
+        bytes += cost;
+        locators
+            .entry(allowance.to_owned())
+            .or_default()
+            .push(id.to_owned());
+    }
+    Ok(Some(GovernedAllowanceLocators(std::sync::Arc::new(
+        locators,
+    ))))
 }
 
 fn validate_persisted_governed_allowance_uncached(
@@ -1137,6 +1238,15 @@ fn validate_persisted_governed_allowance_uncached(
             |row| row.get::<_, String>(0),
         )?
         .collect::<Result<Vec<_>, _>>()?;
+    validate_governed_allowance_ids(connection, project, allowance, &ids)
+}
+
+fn validate_governed_allowance_ids(
+    connection: &Connection,
+    project: &ProjectV1,
+    allowance: &SubscriptionCallAllowanceV1,
+    ids: &[String],
+) -> Result<(), WorkflowError> {
     if ids.len() != 1 {
         return Err(corrupt());
     }
@@ -2591,6 +2701,310 @@ impl WorkflowStore {
 #[cfg(test)]
 mod tests {
     include!("adaptive_leadership_review/tests.rs");
+
+    #[test]
+    fn governed_allowance_batch_compact_keys_preserve_exact_allowance_bytes_and_digest() {
+        let f = budget_fixture(2);
+        let mut project = f.context.source_project.clone();
+        let allowance = project.subscription_call.clone().unwrap();
+        let bytes = serde_json::to_vec(&allowance).unwrap();
+        let digest = crate::adaptive_budget_allowance_digest(&allowance).unwrap();
+        let compact =
+            serde_json::to_vec(&(&project.tenant_id, &project.project_id, &allowance)).unwrap();
+        assert!(compact.len() < serde_json::to_vec(&(&project, &allowance)).unwrap().len());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&compact).unwrap(),
+            serde_json::json!([project.tenant_id, project.project_id, allowance])
+        );
+        let connection = f.store.connection.lock().unwrap();
+        validation_scope::with_scope(&connection, || {
+            validate_governed_allowances(&connection, &project, [Ok(&allowance), Ok(&allowance)])?;
+            let proofs = validation_scope::validations("governed-allowance");
+            assert_eq!(proofs, 1);
+            project.version += 1;
+            project.updated_at_unix_ms += 1;
+            validate_persisted_governed_allowance(&connection, &project, &allowance)?;
+            validate_governed_allowances(&connection, &project, [Ok(&allowance)])?;
+            assert_eq!(validation_scope::validations("governed-allowance"), proofs);
+            assert_eq!(
+                validation_scope::validations("governed-allowance-locators"),
+                1
+            );
+            for mutation in 0..5 {
+                let mut changed = allowance.clone();
+                match mutation {
+                    0 => changed.grant.max_duration_ms -= 1,
+                    1 => changed.grant.expires_at_unix_ms += 1,
+                    2 => changed.created_at_unix_ms += 1,
+                    3 => changed.created_by.push_str("-other"),
+                    _ => {
+                        changed.dispatch = Some(crate::SubscriptionCallDispatchV1 {
+                            request_id: format!("company-provider-{}", changed.allowance_id),
+                            request_digest: DIGEST.into(),
+                            dispatched_at_unix_ms: changed.created_at_unix_ms,
+                        })
+                    }
+                }
+                let single = validate_persisted_governed_allowance(&connection, &project, &changed)
+                    .unwrap_err();
+                let batched = validate_governed_allowances(&connection, &project, [Ok(&changed)])
+                    .unwrap_err();
+                assert_eq!(single, batched);
+                assert_eq!(single.code, WorkflowErrorCode::CorruptStore);
+            }
+            let mut other = project.clone();
+            other.project_id = ProjectId::parse("different-project")?;
+            assert_eq!(
+                validate_governed_allowances(&connection, &other, [Ok(&allowance)])
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::CorruptStore
+            );
+            other = project.clone();
+            other.tenant_id = TenantId::parse("different-tenant")?;
+            assert_eq!(
+                validate_governed_allowances(&connection, &other, [Ok(&allowance)])
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::CorruptStore
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&allowance).unwrap(), bytes);
+        assert_eq!(
+            crate::adaptive_budget_allowance_digest(&allowance).unwrap(),
+            digest
+        );
+    }
+
+    #[test]
+    fn governed_allowance_batch_stops_before_later_classification_errors() {
+        let f = budget_fixture(2);
+        let project = &f.context.source_project;
+        let mut missing = project.subscription_call.clone().unwrap();
+        missing.allowance_id.push_str("-missing");
+        let connection = f.store.connection.lock().unwrap();
+        let selected = std::iter::once(Ok(&missing)).chain(std::iter::once_with(|| {
+            panic!("later classification must not run after receipt failure")
+        }));
+        assert_eq!(
+            validate_governed_allowances(&connection, project, selected)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
+        let error = invalid("classification failed first");
+        assert_eq!(
+            validate_governed_allowances(
+                &connection,
+                project,
+                [Err(invalid("classification failed first"))]
+            )
+            .unwrap_err(),
+            error
+        );
+    }
+
+    #[test]
+    fn governed_allowance_batch_revalidates_mutation_and_rollback() {
+        let f = budget_fixture(2);
+        let project = &f.context.source_project;
+        let allowance = project.subscription_call.as_ref().unwrap();
+        let mut connection = f.store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let insert_duplicate = || {
+            transaction.execute(
+            "INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+             SELECT tenant_id,entity_kind,'duplicate-locator',version,payload,payload_digest
+             FROM company_entities WHERE entity_kind=?1
+             AND json_extract(payload,'$.continuation.provider_allowance_id')=?2 LIMIT 1",
+            params![KIND, allowance.allowance_id],
+        )
+        };
+        let duplicate_count = || {
+            transaction.query_row(
+                "SELECT COUNT(*) FROM company_entities WHERE entity_id='duplicate-locator'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+        };
+        let failed = validation_scope::with_scope(&transaction, || {
+            validate_governed_allowances(&transaction, project, [Ok(allowance)])?;
+            assert_eq!(insert_duplicate()?, 1);
+            assert_eq!(duplicate_count()?, 1);
+            let error =
+                validate_governed_allowances(&transaction, project, [Ok(allowance)]).unwrap_err();
+            assert_eq!(error.code, WorkflowErrorCode::CorruptStore);
+            Err::<(), _>(error)
+        });
+        assert!(failed.is_err());
+        assert!(!transaction.is_autocommit());
+        // The owned scope rolls back its insert, but not the outer transaction.
+        assert_eq!(duplicate_count().unwrap(), 0);
+        validate_governed_allowances(&transaction, project, [Ok(allowance)]).unwrap();
+        assert_eq!(
+            validation_scope::validations("governed-allowance-locators"),
+            0
+        );
+        // A mutation preceding a validation savepoint must survive its failure.
+        assert_eq!(insert_duplicate().unwrap(), 1);
+        assert_eq!(
+            validate_governed_allowances(&transaction, project, [Ok(allowance)])
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
+        assert_eq!(duplicate_count().unwrap(), 1);
+        transaction.rollback().unwrap();
+        validate_persisted_governed_allowance(&connection, project, allowance).unwrap();
+    }
+
+    fn locator_connection() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE company_entities(tenant_id TEXT,entity_kind TEXT,entity_id TEXT,payload BLOB);",
+        ).unwrap();
+        connection
+    }
+
+    #[test]
+    fn governed_allowance_locators_match_sql_text_equality_missing_and_duplicate_selection() {
+        let connection = locator_connection();
+        let tenant = TenantId::parse("locator-tenant").unwrap();
+        let values = [
+            serde_json::json!("allowance-a"),
+            serde_json::json!("allowance-a"),
+            serde_json::json!("allowance-a"),
+            serde_json::json!("allowance-b"),
+            serde_json::json!(null),
+            serde_json::json!(17),
+            serde_json::json!(true),
+            serde_json::json!(["nested"]),
+            serde_json::json!({"nested": "value"}),
+        ];
+        for (index, value) in values.iter().enumerate() {
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "continuation": {"provider_allowance_id": value},
+                "grant": {"project_id": format!("project-{index}")},
+            }))
+            .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO company_entities VALUES(?1,?2,?3,?4)",
+                    params![tenant.0, KIND, format!("receipt-{index}"), payload],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO company_entities SELECT 'foreign-tenant',entity_kind,
+            entity_id,payload FROM company_entities",
+                [],
+            )
+            .unwrap();
+        let locators = governed_allowance_locators(&connection, &tenant)
+            .unwrap()
+            .unwrap();
+        for allowance in [
+            "allowance-a",
+            "allowance-b",
+            "absent",
+            "17",
+            "true",
+            "[\"nested\"]",
+            "{\"nested\":\"value\"}",
+        ] {
+            let mut statement = connection
+                .prepare(
+                    "SELECT entity_id FROM company_entities
+                WHERE tenant_id=?1 AND entity_kind=?2
+                AND json_extract(payload,'$.continuation.provider_allowance_id')=?3 LIMIT 2",
+                )
+                .unwrap();
+            let expected = statement
+                .query_map(params![tenant.0, KIND, allowance], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let actual = locators.0.get(allowance).cloned().unwrap_or_default();
+            assert_eq!(actual, expected, "{allowance}");
+        }
+        assert_eq!(locators.0["allowance-a"].len(), 2);
+    }
+
+    #[test]
+    fn governed_allowance_locator_overflow_falls_back_without_partial_absence() {
+        for oversized_bytes in [false, true] {
+            let f = budget_fixture(2);
+            let project = &f.context.source_project;
+            let allowance = project.subscription_call.as_ref().unwrap();
+            let connection = f.store.connection.lock().unwrap();
+            if oversized_bytes {
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "continuation": {"provider_allowance_id": "x".repeat(MAX_GOVERNED_LOCATOR_BYTES)},
+                })).unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO company_entities
+                    (tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+                    VALUES(?1,?2,'oversized-locator',1,?3,'invalid')",
+                        params![project.tenant_id.0, KIND, payload],
+                    )
+                    .unwrap();
+            } else {
+                connection.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL
+                    SELECT i+1 FROM n WHERE i<4097)
+                    INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+                    SELECT ?1,?2,'overflow-'||i,1,X'7b7d','invalid' FROM n",
+                    params![project.tenant_id.0, KIND]).unwrap();
+            }
+            assert!(governed_allowance_locators(&connection, &project.tenant_id)
+                .unwrap()
+                .is_none());
+            let single = validate_persisted_governed_allowance(&connection, project, allowance);
+            let batched = validate_governed_allowances(&connection, project, [Ok(allowance)]);
+            assert_eq!(single, batched);
+            let mut missing = allowance.clone();
+            missing.allowance_id.push_str("-absent");
+            assert_eq!(
+                validate_governed_allowances(&connection, project, [Ok(&missing)])
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::CorruptStore
+            );
+            assert!(connection.is_autocommit());
+        }
+    }
+
+    #[test]
+    fn governed_allowance_malformed_locator_fallback_keeps_legacy_error_precedence() {
+        let f = budget_fixture(2);
+        let project = &f.context.source_project;
+        let allowance = project.subscription_call.as_ref().unwrap();
+        let connection = f.store.connection.lock().unwrap();
+        connection.execute(
+            "INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+             SELECT tenant_id,entity_kind,'duplicate-locator',version,payload,payload_digest
+             FROM company_entities WHERE entity_kind=?1
+             AND json_extract(payload,'$.continuation.provider_allowance_id')=?2 LIMIT 1",
+            params![KIND, allowance.allowance_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+             VALUES(?1,?2,'zz-malformed-locator',1,CAST('{' AS BLOB),'invalid')",
+            params![project.tenant_id.0, KIND],
+        ).unwrap();
+        assert!(governed_allowance_locators(&connection, &project.tenant_id).is_err());
+        let single =
+            validate_persisted_governed_allowance(&connection, project, allowance).unwrap_err();
+        let batch =
+            validate_governed_allowances(&connection, project, [Ok(allowance)]).unwrap_err();
+        assert_eq!(single, batch);
+        assert_eq!(batch.code, WorkflowErrorCode::CorruptStore);
+    }
 
     #[test]
     fn exact_review_warm_cache_invalidates_local_and_external_writes() {
@@ -6957,6 +7371,11 @@ mod tests {
         f.store
             .complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 2)
             .unwrap();
+        let project = f
+            .store
+            .company_project(&f.leader.tenant_id, &f.grant.project_id)
+            .unwrap()
+            .unwrap();
         let mut abandoned = f
             .store
             .adaptive_leadership_abandoned_allowance(
@@ -6989,6 +7408,16 @@ mod tests {
                 &f.context.source_session.grant.provider_allowance_id
             )
             .is_err());
+        {
+            let connection = f.store.connection.lock().unwrap();
+            let allowance = project.subscription_call.as_ref().unwrap();
+            let single = validate_persisted_governed_allowance(&connection, &project, allowance)
+                .unwrap_err();
+            let batch =
+                validate_governed_allowances(&connection, &project, [Ok(allowance)]).unwrap_err();
+            assert_eq!(single, batch);
+            assert_eq!(batch.code, WorkflowErrorCode::CorruptStore);
+        }
         assert_eq!(rows(&f.store), before);
     }
 

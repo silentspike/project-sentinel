@@ -1188,3 +1188,54 @@ fn funded_working_memory_outer_scope_preserves_ready_and_claimed_bytes() {
     assert_eq!(scopes[0].get("funding-supersession"), Some(&1));
     assert_eq!(rows(&f.store), claimed_rows);
 }
+
+#[test]
+fn governed_funding_batch_keeps_receipt_membership_journal_and_adoption_checks() {
+    for damage in ["missing", "duplicate-cross-project", "receipt-seal", "funding-event",
+        "membership", "adoption", "adoption-event", "abandoned", "journal"]
+    {
+        let (f, _, now) = funded_fixture();
+        let call = dispatch(&f, now);
+        let completed = f.store.complete_adaptive_leadership_review_call(
+            &f.leader, &continued(&call, now + 2, 5), now + 2,
+        ).unwrap();
+        let project = f.store.company_project(&f.leader.tenant_id, &f.grant.project_id)
+            .unwrap().unwrap();
+        let allowance = project.subscription_call.as_ref().unwrap();
+        let connection = f.store.connection.lock().unwrap();
+        validate_governed_allowances(&connection, &project, [Ok(allowance)]).unwrap();
+        let sql = match damage {
+            "missing" => "DELETE FROM company_entities WHERE entity_kind=?1 AND entity_id=?2",
+            "duplicate-cross-project" => "INSERT INTO company_entities
+                (tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+                SELECT tenant_id,entity_kind,'foreign-project-duplicate',version,
+                CAST(json_set(payload,'$.grant.project_id','foreign-project') AS BLOB),payload_digest
+                FROM company_entities WHERE entity_kind=?1 AND entity_id=?2",
+            "receipt-seal" => "UPDATE company_entities SET payload_digest='invalid'
+                WHERE entity_kind=?1 AND entity_id=?2",
+            "funding-event" => "DELETE FROM company_events
+                WHERE event_type='adaptive_work_funding_issued' AND ?1 IS NOT NULL AND ?2 IS NOT NULL",
+            "membership" => "DELETE FROM company_entities
+                WHERE entity_kind='adaptive_work_funding_review' AND ?1 IS NOT NULL AND ?2 IS NOT NULL",
+            "adoption" => "DELETE FROM company_entities
+                WHERE entity_kind='adaptive_work_funding_adoption' AND ?1 IS NOT NULL AND ?2 IS NOT NULL",
+            "adoption-event" => "DELETE FROM company_events
+                WHERE event_type='adaptive_work_funding_adopted' AND ?1 IS NOT NULL AND ?2 IS NOT NULL",
+            "abandoned" => "UPDATE company_entities SET payload_digest='invalid'
+                WHERE entity_kind='adaptive_leadership_abandoned_allowance'
+                AND ?1 IS NOT NULL AND ?2 IS NOT NULL",
+            _ => "UPDATE workflow_operations SET request_digest='invalid'
+                WHERE operation_namespace LIKE 'adaptive-session-v1:%'
+                AND ?1 IS NOT NULL AND ?2 IS NOT NULL",
+        };
+        assert!(connection.execute(sql, params![KIND, completed.review_key]).unwrap() > 0,
+            "{damage}");
+        let single = validate_persisted_governed_allowance(&connection, &project, allowance)
+            .unwrap_err();
+        let batch = validate_governed_allowances(&connection, &project, [Ok(allowance)])
+            .unwrap_err();
+        assert_eq!(single, batch, "{damage}");
+        assert_eq!(batch.code, WorkflowErrorCode::CorruptStore, "{damage}");
+        assert!(connection.is_autocommit());
+    }
+}

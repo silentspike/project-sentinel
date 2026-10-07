@@ -1,5 +1,13 @@
 # Changelog
 
+- Bind exact employee preparation to one validated project/head read per
+  boundary; retain fresh runtime authority and full competing-head checks.
+  Batch bounded funding provenance and immutable artifact reads while retaining
+  receipt, descriptor, digest and end-of-read identity checks. Allow identical
+  blobs at distinct nonoverlapping input paths without relaxing scope or content
+  validation. Separate reconcile queue/fence/response timing from execution and
+  distinguish a disconnected reply channel from an elapsed timeout (#856).
+
 - Intern identical typed SQL proof payloads through exact shared byte slices
   within the existing bounded cache; keep full byte/schema/row equality,
   index-integrity checks and overflow fallback. Read adaptive health projects

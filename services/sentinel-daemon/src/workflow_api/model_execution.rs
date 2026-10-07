@@ -1382,13 +1382,21 @@ impl WorkflowApi {
         expected: &AdaptiveProviderAuthority,
     ) -> Result<Option<AdaptiveProviderAuthority>, &'static str> {
         let scope = &expected.grant.authority;
-        let project = self
+        #[cfg(test)]
+        tests::record_exact_adaptive_snapshot();
+        let snapshot = self
             .store
-            .company_project(&scope.tenant_id, &scope.project_id)
+            .adaptive_project_snapshot(
+                &scope.tenant_id,
+                &scope.project_id,
+                &scope.work_item_id,
+                scope.agent_id,
+            )
             .map_err(|_| "adaptive exact project unavailable")?
             .ok_or("adaptive exact project missing")?;
+        let project = snapshot.project();
         let Some(binding) = select_provider_usage_binding(
-            std::slice::from_ref(&project),
+            std::slice::from_ref(project),
             scope.agent_id,
             Some(&expected.grant.provider_allowance_id),
         )?
@@ -1401,11 +1409,14 @@ impl WorkflowApi {
         {
             return Ok(None);
         }
+        #[cfg(test)]
+        tests::record_exact_adaptive_authority();
         let current = self
             .authority
             .as_ref()
             .ok_or("adaptive authority unavailable")?
-            .snapshot_for_admission(
+            .snapshot_from_validated_project(
+                project,
                 &scope.tenant_id,
                 &scope.project_id,
                 &scope.work_item_id,
@@ -1416,9 +1427,10 @@ impl WorkflowApi {
         if &current != scope {
             return Ok(None);
         }
-        let Some(session) = self
-            .store
-            .adaptive_session_for_authority(&current)
+        #[cfg(test)]
+        tests::record_exact_adaptive_head();
+        let Some(session) = snapshot
+            .session_for_authority(&current)
             .map_err(|_| "adaptive exact session unavailable")?
         else {
             return Ok(None);
@@ -1427,8 +1439,16 @@ impl WorkflowApi {
         if session.effective_grant() != expected.grant {
             return Ok(None);
         }
-        let (actual, _) =
-            self.adaptive_provider_authority_from_binding_inner(binding, false, true)?;
+        let project = project.clone();
+        drop(snapshot);
+        let (actual, _) = self.evaluate_adaptive_provider_binding(
+            binding,
+            &project,
+            current,
+            Some(session),
+            false,
+            true,
+        )?;
         Ok(actual.filter(|actual| actual == expected))
     }
 
@@ -1448,22 +1468,38 @@ impl WorkflowApi {
         else {
             return Ok(None);
         };
+        let tenant = TenantId::parse(&binding.tenant_id).map_err(|_| "invalid adaptive tenant")?;
+        let project_id =
+            ProjectId::parse(&binding.project_id).map_err(|_| "invalid adaptive project")?;
+        let work_item_id =
+            WorkItemId::parse(&binding.work_item_id).map_err(|_| "invalid adaptive work item")?;
+        #[cfg(test)]
+        tests::record_exact_adaptive_snapshot();
+        let snapshot = self
+            .store
+            .adaptive_project_snapshot(&tenant, &project_id, &work_item_id, agent_id)
+            .map_err(|_| "adaptive dispatch runtime authority unavailable")?
+            .ok_or("adaptive dispatch runtime authority unavailable")?;
+        let project = snapshot.project();
+        #[cfg(test)]
+        tests::record_exact_adaptive_authority();
         let current = self
             .authority
             .as_ref()
             .ok_or("adaptive authority unavailable")?
-            .snapshot_for_admission(
-                &TenantId::parse(&binding.tenant_id).map_err(|_| "invalid adaptive tenant")?,
-                &ProjectId::parse(&binding.project_id).map_err(|_| "invalid adaptive project")?,
-                &WorkItemId::parse(&binding.work_item_id)
-                    .map_err(|_| "invalid adaptive work item")?,
+            .snapshot_from_validated_project(
+                project,
+                &tenant,
+                &project_id,
+                &work_item_id,
                 agent_id,
                 false,
             )
             .map_err(|_| "adaptive dispatch runtime authority unavailable")?;
-        let Some(session) = self
-            .store
-            .adaptive_session_for_authority(&current)
+        #[cfg(test)]
+        tests::record_exact_adaptive_head();
+        let Some(session) = snapshot
+            .session_for_authority(&current)
             .map_err(|_| "adaptive dispatch session unavailable")?
         else {
             return Ok(None);
@@ -1473,14 +1509,42 @@ impl WorkflowApi {
         {
             return Ok(None);
         }
-        self.adaptive_provider_authority_for_exact_binding(&AdaptiveProviderAuthority {
+        let expected = AdaptiveProviderAuthority {
             schema_version: 3,
             grant: session.effective_grant(),
             session_version,
             effect_id,
             assignment_id: binding.assignment_id,
-            previous_observation: session.last_observation,
-        })
+            previous_observation: session.last_observation.clone(),
+        };
+        // Inventory proves global uniqueness; this binding uses the same fresh
+        // project/head facts as the reserved effect, never a new queue selection.
+        let Some(binding) = select_provider_usage_binding(
+            std::slice::from_ref(project),
+            agent_id,
+            Some(allowance_id),
+        )?
+        else {
+            return Ok(None);
+        };
+        if binding.work_item_id != current.work_item_id.0
+            || binding.assignment_id != expected.assignment_id
+            || binding.assignment_version != current.assignment_version
+            || current != expected.grant.authority
+        {
+            return Ok(None);
+        }
+        let project = project.clone();
+        drop(snapshot);
+        let (actual, _) = self.evaluate_adaptive_provider_binding(
+            binding,
+            &project,
+            current,
+            Some(session),
+            false,
+            true,
+        )?;
+        Ok(actual.filter(|actual| actual == &expected))
     }
 
     fn adaptive_provider_authority_inner(
@@ -1500,14 +1564,13 @@ impl WorkflowApi {
         binding: ProviderUsageBinding,
         reconcile_tools: bool,
     ) -> Result<(Option<AdaptiveProviderAuthority>, bool), &'static str> {
-        self.adaptive_provider_authority_from_binding_inner(binding, reconcile_tools, false)
+        self.adaptive_provider_authority_from_binding_inner(binding, reconcile_tools)
     }
 
     fn adaptive_provider_authority_from_binding_inner(
         &self,
         binding: ProviderUsageBinding,
         reconcile_tools: bool,
-        existing_only: bool,
     ) -> Result<(Option<AdaptiveProviderAuthority>, bool), &'static str> {
         let agent_id = binding.agent_id;
         let Some(subscription) = binding
@@ -1546,6 +1609,40 @@ impl WorkflowApi {
             .store
             .adaptive_session_for_authority(&current)
             .map_err(|_| "adaptive continuation head unavailable")?;
+        self.evaluate_adaptive_provider_binding(
+            binding,
+            &project,
+            current,
+            existing,
+            reconcile_tools,
+            false,
+        )
+    }
+
+    fn evaluate_adaptive_provider_binding(
+        &self,
+        binding: ProviderUsageBinding,
+        project: &sentinel_workflow::ProjectV1,
+        current: RuntimeAuthoritySnapshotV1,
+        existing: Option<AdaptiveSessionV1>,
+        reconcile_tools: bool,
+        existing_only: bool,
+    ) -> Result<(Option<AdaptiveProviderAuthority>, bool), &'static str> {
+        let Some(subscription) = binding
+            .subscription_grant
+            .as_ref()
+            .filter(|grant| grant.max_calls > 0)
+        else {
+            return Ok((None, false));
+        };
+        let allowance = project
+            .subscription_call
+            .as_ref()
+            .filter(|allowance| allowance.allowance_id == binding.reservation_id)
+            .ok_or("adaptive allowance changed")?;
+        if &allowance.grant != subscription || allowance.dispatch.is_some() {
+            return Err("adaptive allowance is already consumed or changed");
+        }
         if existing.as_ref().is_some_and(|session| {
             session.continuation.is_some()
                 && session.active_provider_allowance_id() != allowance.allowance_id
