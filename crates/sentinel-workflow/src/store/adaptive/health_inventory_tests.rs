@@ -230,6 +230,95 @@ fn health_inventory_empty_store_is_read_only_across_reopen() {
 }
 
 #[test]
+fn combined_health_inventory_matches_separate_reads_and_is_read_only() {
+    let fixture = Fixture::new();
+    let session = fixture.unknown(&grant());
+    let expected_projects = fixture.store.company_projects().unwrap();
+    let expected_sessions = fixture.store.adaptive_sessions_for_health().unwrap();
+    assert_eq!(expected_sessions, vec![session]);
+    let before = durable_rows(&fixture.store);
+    for store in [&fixture.store, &fixture.reopen()] {
+        let before_changes = changes(store);
+        for _ in 0..3 {
+            let (projects, sessions) = store.adaptive_health_inventory().unwrap();
+            assert_eq!(projects, expected_projects);
+            assert_eq!(sessions, expected_sessions);
+            assert_eq!(durable_rows(store), before);
+            assert_eq!(changes(store), before_changes);
+        }
+    }
+}
+
+#[test]
+fn combined_health_inventory_reuses_one_exact_proof_and_rejects_changed_project() {
+    let fixture = Fixture::new();
+    fixture.unknown(&grant());
+    fixture.store.adaptive_health_inventory().unwrap();
+    let (_, validations) =
+        crate::domain_store::validation_scope::with_completed_validations(|| {
+            fixture.store.adaptive_health_inventory().unwrap()
+        });
+    assert!(validations.is_empty());
+    fixture.store.lock().unwrap().execute(
+        "INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest) VALUES('tenant','project','damaged',1,?1,?2)",
+        params![b"{}".as_slice(), "invalid"],
+    ).unwrap();
+    let before = durable_rows(&fixture.store);
+    let before_changes = changes(&fixture.store);
+    assert!(matches!(
+        fixture.store.adaptive_health_inventory(),
+        Err(AdaptiveHealthReadError::Projects(WorkflowError {
+            code: WorkflowErrorCode::CorruptStore,
+            ..
+        }))
+    ));
+    assert_eq!(durable_rows(&fixture.store), before);
+    assert_eq!(changes(&fixture.store), before_changes);
+}
+
+#[test]
+fn combined_health_inventory_rejects_missing_journal_after_warm_read() {
+    let fixture = Fixture::new();
+    let session = fixture.begin(&grant());
+    fixture.store.adaptive_health_inventory().unwrap();
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM workflow_operations WHERE operation_namespace=?1",
+            params![namespace(session.grant.session_id)],
+        )
+        .unwrap();
+    let before = durable_rows(&fixture.store);
+    let before_changes = changes(&fixture.store);
+    assert!(matches!(
+        fixture.store.adaptive_health_inventory(),
+        Err(AdaptiveHealthReadError::Sessions(WorkflowError {
+            code: WorkflowErrorCode::CorruptStore,
+            ..
+        }))
+    ));
+    assert_eq!(durable_rows(&fixture.store), before);
+    assert_eq!(changes(&fixture.store), before_changes);
+}
+
+#[test]
+fn combined_health_inventory_does_not_hide_later_corruption_after_unknown_session() {
+    let fixture = Fixture::new();
+    fixture.unknown(&grant());
+    fixture.store.adaptive_health_inventory().unwrap();
+    fixture.store.lock().unwrap().execute(
+        "INSERT INTO workflow_operations(operation_namespace,operation_id,request_digest,response,created_at_ms) VALUES(?1,'bad','invalid',?2,1)",
+        params![namespace(Uuid::from_u128(999_999)), b"{}".as_slice()],
+    ).unwrap();
+    assert!(matches!(
+        fixture.store.adaptive_health_inventory(),
+        Err(AdaptiveHealthReadError::Sessions(_))
+    ));
+}
+
+#[test]
 fn adaptive_cached_reads_reuse_exact_authorized_head_and_digest_proof() {
     let fixture = Fixture::new();
     let session = fixture.unknown(&grant());

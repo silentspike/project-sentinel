@@ -5625,14 +5625,16 @@ impl WorkflowApi {
             Ok(false) => None,
         };
         let canonical_event_cursor = self.store.company_event_cursor();
-        let delivery_ready = self
+        let delivery_snapshot = self
             .delivery
             .as_ref()
-            .is_some_and(|delivery| delivery.readiness().is_ok());
-        let delivery_publication_pending = self
-            .delivery
+            .and_then(|delivery| delivery.readiness_snapshot().ok());
+        let delivery_ready = delivery_snapshot
             .as_ref()
-            .and_then(|delivery| delivery.pending_publication_count().ok());
+            .is_some_and(|snapshot| snapshot.readiness.is_ok());
+        let delivery_publication_pending = delivery_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.pending_publication_count);
         let collaboration_publication_pending = self
             .collaboration_publication_pending
             .load(Ordering::Acquire);

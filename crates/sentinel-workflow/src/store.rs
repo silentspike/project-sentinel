@@ -24,6 +24,12 @@ pub(crate) use revisions::require_completed_source;
 pub use revisions::ExecutionRevisionV1;
 const MAX_NOT_FOUND_RECONCILES: u16 = 3;
 
+#[derive(Debug)]
+pub enum AdaptiveHealthReadError {
+    Projects(WorkflowError),
+    Sessions(WorkflowError),
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workflow_schema_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
