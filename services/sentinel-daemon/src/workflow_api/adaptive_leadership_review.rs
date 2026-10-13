@@ -339,16 +339,32 @@ impl LeadershipContext {
                 {
                     call_ceiling = 0;
                 }
+                let session = &self.source.source_session;
+                let funding_status = if session
+                    .active_work_funding()
+                    .is_some_and(|active| active.same_epoch(epoch))
+                {
+                    "already-adopted current epoch"
+                } else {
+                    "proposed-awaiting-adoption epoch"
+                };
+                let issued_windows = session
+                    .continuation
+                    .as_ref()
+                    .map_or(0, |state| state.authorizations.len());
                 finite_policy = format!(
-                    " One explicitly issued finite work-funding epoch is proposed for independent review, not an operator Continue decision. Original ROOT model/tool ceilings remain {}/{}; original remaining model/tool calls {}/{} (saturating at zero). Previously adopted current ceilings at issuance were {}/{}; proposed funded total ceilings are {}/{}; proposed funded remaining model/tool calls {}/{}. Already spent model/tool calls: {}/{}. Global review ordinal {}, total review/window ceilings {}/{}. Epoch deadline {}ms Unix time; issuance never refunds spent calls. Sealed funding evidence: {}. Only a genuine Continue adopted into this same session permits a bounded productive window. Defer is admissible and terminal for this head; expiry or retirement does not request another reconsideration.",
+                    " Operative funded total model/tool ceilings for this review: {}/{}; employee model/tool calls spent {}/{}, remaining {}/{}. Validated funding status: {funding_status}, not an operator Continue decision. Original ROOT model/tool ceilings remain {}/{} as historical initial budgets only, explicitly nonoperative; original remaining model/tool calls {}/{} (saturating at zero) are historical, not the operative funded remainder. Previously adopted current ceilings at issuance were {}/{}. Leadership reviews are separate from employee model/tool calls: global review ordinal {}, total review ceiling {}, reviews remaining after this issuance {}. Actual continuation windows issued {issued_windows}, total window ceiling {}, windows remaining {} (not a review ordinal). Epoch deadline {}ms Unix time; issuance never refunds spent calls or resets counts. Sealed funding evidence: {}. Proposed funding is not yet employee execution authority; already-adopted funding does not authorize work beyond the active window. Only a genuine Continue adopted into this same session permits another bounded productive window. Defer is independently admissible and terminal for this head; this accounting is not an instruction to Continue or override a model decision. Expiry or retirement does not request another reconsideration.",
+                    limits.total_model_call_ceiling, limits.total_tool_call_ceiling,
+                    self.source.source_session.model_calls, self.source.source_session.tool_calls,
+                    remaining, limits.total_tool_call_ceiling.saturating_sub(self.source.source_session.tool_calls),
                     facts.original_model_call_ceiling, facts.original_tool_call_ceiling,
                     facts.original_model_call_ceiling.saturating_sub(self.source.source_session.model_calls),
                     facts.original_tool_call_ceiling.saturating_sub(self.source.source_session.tool_calls),
                     facts.current_model_call_ceiling, facts.current_tool_call_ceiling,
-                    limits.total_model_call_ceiling, limits.total_tool_call_ceiling,
-                    remaining, limits.total_tool_call_ceiling.saturating_sub(self.source.source_session.tool_calls),
-                    self.source.source_session.model_calls, self.source.source_session.tool_calls,
-                    epoch.binding.ordinal, limits.total_review_ceiling, limits.total_window_ceiling,
+                    epoch.binding.ordinal, limits.total_review_ceiling,
+                    limits.total_review_ceiling.saturating_sub(epoch.binding.ordinal),
+                    limits.total_window_ceiling,
+                    usize::from(limits.total_window_ceiling).saturating_sub(issued_windows),
                     limits.expires_at_unix_ms, epoch.evidence_ref().map_err(|_| "leadership funding evidence invalid")?,
                 );
             }
@@ -2324,6 +2340,300 @@ impl WorkflowApi {
 pub(crate) mod tests {
     use super::*;
     use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
+
+    // Synthetic journal adoption only, never provider or customer acceptance evidence.
+    pub(crate) fn funded_prompt_fixture() -> (
+        LeadershipContext,
+        LeadershipContext,
+        super::super::model_execution::AdaptiveModelContext,
+    ) {
+        let (_temp, api, session) =
+            super::super::adaptive_resume_policy::tests::unreviewed_policy_root_with_limits(
+                120_000, false, 4, 4,
+            );
+        let now = now_unix_ms();
+        let operator = api.principals.principal("operator").unwrap();
+        let request = api
+            .store
+            .adaptive_work_funding_draft(
+                &operator.principal,
+                &session.grant.authority.project_id,
+                session.grant.session_id,
+                Uuid::new_v4(),
+                "synthetic-prompt-accounting",
+                sentinel_workflow::AdaptiveWorkFundingLimitsV1 {
+                    additional_model_calls: 4,
+                    additional_tool_calls: 4,
+                    additional_reviews: 4,
+                    additional_windows: 4,
+                    max_window_ms: 300_000,
+                    max_call_duration_ms: 120_000,
+                    dispatch_margin_ms: sentinel_workflow::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+                    expires_at_unix_ms: now + 600_000,
+                },
+                now,
+            )
+            .unwrap();
+        api.store
+            .authorize_adaptive_work_funding(&operator.principal, &request, now)
+            .unwrap();
+        let project = api
+            .store
+            .company_project(
+                &session.grant.authority.tenant_id,
+                &session.grant.authority.project_id,
+            )
+            .unwrap()
+            .unwrap();
+        reconcile_review_at(&api, &project, now);
+        let agent = api
+            .principals
+            .principal("pm")
+            .unwrap()
+            .principal
+            .agent_id
+            .unwrap();
+        let call = api.leadership_review_for_agent(agent).unwrap().unwrap();
+        let proposed = api
+            .prepare_leadership_review(&LeadershipAuthority::from_call(&call))
+            .unwrap();
+        let (id, digest) =
+            super::super::adaptive_resume_policy::tests::claim_review(&api, &proposed);
+        let completion = ModelExecutionCompletion {
+            context: ModelExecutionContext::AdaptiveLeadershipReview(Box::new(proposed.clone())),
+            content: serde_json::json!({"schema_version":5,"decision":{
+                "kind":"continue","additional_model_calls":4,"window_ms":180_000,
+                "rationale":"Synthetic finite window for prompt tests.",
+                "evidence_refs":[proposed.source.evidence_refs[0]],
+            }})
+            .to_string(),
+            admissible: true,
+        };
+        persist(&api, &completion, &proposed, &id, &digest, true);
+        api.accept_leadership_review_at(&completion, &proposed, &id, &digest, now_unix_ms())
+            .unwrap();
+        let adopted = api
+            .store
+            .adaptive_session_for_authority(&session.grant.authority)
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.grant, session.grant);
+        assert_eq!((adopted.model_calls, adopted.tool_calls), (0, 0));
+        let binding = api
+            .adaptive_provider_authority(session.grant.authority.agent_id)
+            .unwrap()
+            .unwrap();
+        let model = api.prepare_adaptive_model(&binding).unwrap();
+        // A second review requires journaled work, not just a later clock sample.
+        let effect = sentinel_workflow::AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "a".repeat(64),
+        };
+        let tool_effect = sentinel_workflow::AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "c".repeat(64),
+        };
+        let tool = sentinel_common::WorkbenchTool::InspectFile {
+            path: "src/main.rs".into(),
+            max_bytes: 1024,
+        };
+        let tool_digest = sentinel_workflow::adaptive_tool_digest(&tool).unwrap();
+        let observation = sentinel_common::WorkbenchPrivateObservation::from_result(
+            &sentinel_common::WorkbenchMessage::Result {
+                schema_version: sentinel_common::WORKBENCH_SCHEMA_VERSION,
+                invocation_id: tool_effect.id.to_string(),
+                input_digest: tool_effect.request_digest.clone(),
+                outcome: sentinel_common::WorkbenchOutcome::Succeeded,
+                resources: sentinel_common::WorkbenchResourceUsage::default(),
+                artifacts: Vec::new(),
+                output: std::collections::BTreeMap::from([(
+                    "content".into(),
+                    "Synthetic bounded inspection.".into(),
+                )]),
+                error: None,
+            },
+        )
+        .unwrap();
+        let mut progressed = adopted.clone();
+        for command in [
+            AdaptiveTransitionV1::ClaimModel {
+                effect: effect.clone(),
+                previous_observation_digest: None,
+            },
+            AdaptiveTransitionV1::ResolveModel {
+                effect,
+                result_digest: "b".repeat(64),
+                decision: sentinel_workflow::AdaptiveModelDecisionV1::Tool {
+                    tool,
+                    tool_digest: tool_digest.clone(),
+                },
+            },
+            AdaptiveTransitionV1::ClaimTool {
+                effect: tool_effect.clone(),
+                tool_digest,
+            },
+            AdaptiveTransitionV1::ObserveTool {
+                observation: sentinel_workflow::AdaptiveObservationRefV1 {
+                    effect: tool_effect,
+                    observation_digest: observation.digest().to_owned(),
+                },
+            },
+        ] {
+            progressed = api
+                .store
+                .advance_adaptive_session(
+                    session.grant.session_id,
+                    progressed.version,
+                    Uuid::new_v4(),
+                    &command,
+                    &session.grant.authority,
+                    now_unix_ms(),
+                )
+                .unwrap()
+                .1;
+        }
+        let project = api
+            .store
+            .company_project(
+                &session.grant.authority.tenant_id,
+                &session.grant.authority.project_id,
+            )
+            .unwrap()
+            .unwrap();
+        reconcile_review_at(&api, &project, progressed.active_deadline_ms() + 1);
+        let calls = api
+            .store
+            .adaptive_leadership_review_calls(&project.tenant_id, session.grant.session_id)
+            .unwrap();
+        let next = calls
+            .iter()
+            .find(|next| next.grant.review_id != call.grant.review_id)
+            .expect("expired adopted window must expose its next review");
+        let current = LeadershipContext {
+            binding: LeadershipAuthority::from_call(next),
+            source: next.context.clone(),
+            context_digest: next.context_digest().unwrap(),
+            private_observation: Some(observation),
+            accounting: None,
+            accounting_correction: None,
+        };
+        (proposed, current, model)
+    }
+
+    #[test]
+    fn funded_prompt_distinguishes_proposed_and_adopted_identity_and_exact_counts() {
+        let (proposed, adopted, _) = funded_prompt_fixture();
+        for (context, status, other, reviews, windows, spent) in [
+            (
+                &proposed,
+                "proposed-awaiting-adoption",
+                "already-adopted current",
+                1,
+                0,
+                0,
+            ),
+            (
+                &adopted,
+                "already-adopted current",
+                "proposed-awaiting-adoption",
+                2,
+                1,
+                1,
+            ),
+        ] {
+            let before = serde_json::to_vec(context).unwrap();
+            let prompt = context.prompt().unwrap();
+            assert!(prompt.contains(&format!("Validated funding status: {status} epoch")));
+            assert!(!prompt.contains(&format!("Validated funding status: {other} epoch")));
+            assert!(prompt.contains("historical initial budgets only, explicitly nonoperative"));
+            assert!(
+                prompt.find("Operative funded total").unwrap()
+                    < prompt.find("Original ROOT model/tool ceilings").unwrap()
+            );
+            assert!(prompt.contains(&format!("Operative funded total model/tool ceilings for this review: 8/8; employee model/tool calls spent {spent}/{spent}, remaining {}/{}.", 8 - spent, 8 - spent)));
+            assert!(prompt.contains(&format!("global review ordinal {reviews}, total review ceiling 4, reviews remaining after this issuance {}.", 4 - reviews)));
+            assert!(prompt.contains(&format!("Actual continuation windows issued {windows}, total window ceiling 4, windows remaining {} (not a review ordinal).", 4 - windows)));
+            assert!(prompt.contains("Defer is independently admissible and terminal for this head"));
+            assert!(prompt.contains("not an instruction to Continue or override a model decision"));
+            assert_eq!(serde_json::to_vec(context).unwrap(), before);
+        }
+        // Shape-only exhausted-root regression; no journal writes or execution claims.
+        for context in [&proposed, &adopted] {
+            let mut exhausted = context.clone();
+            exhausted.source.source_session.model_calls = 4;
+            exhausted.source.source_session.tool_calls = 4;
+            let Some(sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted {
+                budget,
+            }) = &mut exhausted.binding.grant.subject
+            else {
+                unreachable!();
+            };
+            budget.model_calls_exhausted = true;
+            budget.dispatch_slack_insufficient = exhausted
+                .source
+                .source_session
+                .model_admission_at(budget.observed_at_ms)
+                == sentinel_workflow::AdaptiveModelAdmissionV1::InsufficientSlack;
+            if exhausted
+                .source
+                .source_session
+                .active_work_funding()
+                .is_none()
+            {
+                let epoch = exhausted.binding.grant.work_funding.as_mut().unwrap();
+                epoch.receipt.request.source.resume_source.base_model_calls = 4;
+                epoch.receipt.request.source.resume_source.base_tool_calls = 4;
+                epoch.binding = epoch.receipt.binding(epoch.binding.ordinal).unwrap();
+                exhausted
+                    .source
+                    .evidence_refs
+                    .retain(|reference| !reference.starts_with("adaptive-work-funding:"));
+                exhausted
+                    .source
+                    .evidence_refs
+                    .push(epoch.evidence_ref().unwrap());
+                exhausted.binding.grant.evidence_fingerprint =
+                    adaptive_leadership_evidence_fingerprint(
+                        &exhausted.source.tool_catalog,
+                        &exhausted.source.evidence_refs,
+                    )
+                    .unwrap();
+                exhausted.binding.grant.review_id = adaptive_leadership_review_id(
+                    exhausted.binding.grant.session_id,
+                    exhausted.binding.grant.expected_session_version,
+                    &exhausted.binding.grant.evidence_fingerprint,
+                )
+                .unwrap();
+            }
+            let prompt = exhausted.prompt().unwrap();
+            assert!(prompt.contains("Operative funded total model/tool ceilings for this review: 8/8; employee model/tool calls spent 4/4, remaining 4/4."));
+            assert!(prompt.contains("original remaining model/tool calls 0/0 (saturating at zero) are historical, not the operative funded remainder"));
+        }
+        let active = adopted.source.source_session.active_work_funding().unwrap();
+        let epoch = adopted.binding.grant.work_funding.as_ref().unwrap();
+        assert_ne!(active.binding.ordinal, epoch.binding.ordinal);
+        assert!(active.same_epoch(epoch));
+        // Version advance without a matching adopted identity is invalid, not proof of adoption.
+        let mut unadopted = proposed.clone();
+        unadopted.source.source_session.version += 1;
+        assert!(unadopted.prompt().is_err());
+        let mut foreign = adopted.clone();
+        foreign
+            .source
+            .source_session
+            .continuation
+            .as_mut()
+            .unwrap()
+            .authorizations
+            .last_mut()
+            .unwrap()
+            .work_funding
+            .as_mut()
+            .unwrap()
+            .binding
+            .receipt_digest = "f".repeat(64);
+        assert!(foreign.prompt().is_err());
+    }
 
     #[test]
     fn leadership_preparation_reuses_only_the_current_validated_project() {

@@ -195,7 +195,6 @@ impl AdaptiveWorkFundingLimitsV1 {
     pub fn validate(&self) -> Result<(), WorkflowError> {
         if self.additional_model_calls > ADAPTIVE_SESSION_MAX_CALLS
             || self.additional_tool_calls > ADAPTIVE_SESSION_MAX_CALLS
-            || (self.additional_model_calls == 0 && self.additional_tool_calls == 0)
             || !(1..=ADAPTIVE_RESUME_MAX_REVIEWS).contains(&self.additional_reviews)
             || self.dispatch_margin_ms != ADAPTIVE_RESUME_DISPATCH_MARGIN_MS
         {
@@ -221,6 +220,14 @@ impl AdaptiveWorkFundingRequestV1 {
         self.limits.validate()?;
         validate_identifier(&self.reason_ref)?;
         if self.schema_version != 1 || self.operation_id.is_nil() {
+            return Err(invalid());
+        }
+        // Zero call additions renew only an existing adopted funding lineage;
+        // the store verifies the predecessor and exact current source.
+        if self.limits.additional_model_calls == 0
+            && self.limits.additional_tool_calls == 0
+            && self.source.predecessor_receipt_digest.is_none()
+        {
             return Err(invalid());
         }
         let model_ceiling = checked_call_ceiling(
@@ -474,4 +481,70 @@ fn invalid() -> WorkflowError {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    include!("adaptive_work_funding/tests.rs");
+
+    fn renewal_request() -> AdaptiveWorkFundingRequestV1 {
+        let mut value = successor_request();
+        value.source.current_model_call_ceiling = 64;
+        value.source.current_tool_call_ceiling = 64;
+        value.source.resume_source.base_model_calls = 26;
+        value.source.resume_source.base_tool_calls = 23;
+        value.limits.additional_model_calls = 0;
+        value.limits.additional_tool_calls = 0;
+        value
+    }
+
+    #[test]
+    fn zero_call_renewal_preserves_capped_totals_and_receipt_shape() {
+        let value = renewal_request();
+        value.validate_at(&operator(), NOW).unwrap();
+        assert_eq!(value.resulting_model_call_ceiling().unwrap(), 64);
+        assert_eq!(value.resulting_tool_call_ceiling().unwrap(), 64);
+        let receipt = receipt_for(value);
+        let ordinal = receipt.request.source.resume_source.base_review_count + 1;
+        let binding = receipt.binding(ordinal).unwrap();
+        assert_eq!(binding.limits.total_model_call_ceiling, 64);
+        assert_eq!(binding.limits.total_tool_call_ceiling, 64);
+        let encoded = serde_json::to_vec(&receipt).unwrap();
+        let decoded: AdaptiveWorkFundingReceiptV1 = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, receipt);
+        assert_eq!(
+            decoded.receipt_digest().unwrap(),
+            receipt.receipt_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn zero_call_renewal_rejects_missing_predecessor_exhaustion_and_unbounded_limits() {
+        let mut value = renewal_request();
+        value.source.predecessor_receipt_digest = None;
+        assert_invalid_shape(&value);
+        // A root-only source is valid shape but is not a renewal predecessor.
+        value.source.original_model_call_ceiling = 64;
+        value.source.original_tool_call_ceiling = 64;
+        value.source.validate().unwrap();
+        assert_invalid_shape(&value);
+        for model in [true, false] {
+            let mut value = renewal_request();
+            if model {
+                value.source.resume_source.base_model_calls = 64;
+            } else {
+                value.source.resume_source.base_tool_calls = 64;
+            }
+            assert_invalid_shape(&value);
+        }
+        let mut value = renewal_request();
+        value.limits.additional_windows = 0;
+        assert_invalid_shape(&value);
+        let mut value = renewal_request();
+        value.source.resume_source.base_review_count = ADAPTIVE_RESUME_MAX_REVIEWS - 1;
+        assert_invalid_shape(&value);
+        let mut value = renewal_request();
+        value.limits.additional_model_calls = 1;
+        assert_invalid_shape(&value);
+        assert!(renewal_request()
+            .validate_at(&operator(), NOW + 3_600_000)
+            .is_err());
+    }
+}
