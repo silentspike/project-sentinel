@@ -117,6 +117,223 @@ fn funding_operator(f: &Fixture) -> AuthenticatedCompanyPrincipalV1 {
     operator
 }
 
+fn capped_renewal_fixture(calls: u16) -> (Fixture, AdaptiveWorkFundingReceiptV1, u64) {
+    let mut f = budget_fixture(2);
+    let now = CONTINUATION_AT + 7;
+    let operator = funding_operator(&f);
+    let source = session(&f);
+    let request = f.store.adaptive_work_funding_draft(
+        &operator, &f.grant.project_id, f.grant.session_id, Uuid::new_v4(),
+        "fund-to-lifetime-cap", AdaptiveWorkFundingLimitsV1 {
+            additional_model_calls: 64 - source.funded_model_call_ceiling(),
+            additional_tool_calls: 64 - source.funded_tool_call_ceiling(),
+            additional_reviews: 3,
+            additional_windows: 3,
+            max_window_ms: WINDOW_MS,
+            max_call_duration_ms: source.grant.max_call_duration_ms,
+            dispatch_margin_ms: crate::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+            expires_at_unix_ms: now + 3_600_000,
+        }, now,
+    ).unwrap();
+    let receipt = f.store.authorize_adaptive_work_funding(&operator, &request, now).unwrap().1;
+    bind(&mut f, &receipt, receipt.request.source.resume_source.base_review_count + 1);
+    let call = dispatch(&f, now);
+    f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &continued(&call, now + 2, calls), now + 2,
+    ).unwrap();
+    let progressed = observe_budget_inspection(&f, session(&f), now + 3);
+    assert_eq!((progressed.funded_model_call_ceiling(), progressed.funded_tool_call_ceiling()), (64, 64));
+    let next = progressed.active_deadline_ms();
+    budget_context(&mut f, next, "capped-renewal-head");
+    (f, receipt, next)
+}
+
+fn zero_call_renewal_draft(
+    f: &Fixture,
+    predecessor: &AdaptiveWorkFundingReceiptV1,
+    now: u64,
+) -> Result<crate::AdaptiveWorkFundingRequestV1, WorkflowError> {
+    let mut limits = predecessor.request.limits.clone();
+    limits.additional_model_calls = 0;
+    limits.additional_tool_calls = 0;
+    limits.expires_at_unix_ms = now + 3_600_000;
+    f.store.adaptive_work_funding_draft(
+        &funding_operator(f), &f.grant.project_id, f.grant.session_id, Uuid::new_v4(),
+        "renew-only-reviews-and-windows", limits, now,
+    )
+}
+
+#[test]
+fn zero_call_renewal_at_64_preserves_spending_defer_history_and_independent_adoption() {
+    let (mut f, predecessor, now) = capped_renewal_fixture(5);
+    bind(&mut f, &predecessor, predecessor.request.source.resume_source.base_review_count + 2);
+    let refused_call = dispatch(&f, now);
+    let refused = f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &defer(&refused_call), now + 2,
+    ).unwrap();
+    let source = session(&f);
+    let history = source.continuation.as_ref().unwrap().authorizations.clone();
+    assert_eq!((source.model_calls, source.tool_calls), (3, 2));
+    assert_eq!(f.store.adaptive_work_funding_for_review(
+        &f.leader.tenant_id, f.grant.session_id, now + 3,
+    ).unwrap(), None);
+    budget_context(&mut f, now + 3, "explicit-renewal-after-retained-defer");
+    let request = zero_call_renewal_draft(&f, &predecessor, now + 3).unwrap();
+    assert_eq!(request.source.predecessor_receipt_digest, Some(predecessor.receipt_digest().unwrap()));
+    let operator = funding_operator(&f);
+    let (replayed, receipt) = f.store.authorize_adaptive_work_funding(
+        &operator, &request, now + 3,
+    ).unwrap();
+    assert!(!replayed);
+    assert_eq!(session(&f), source);
+    assert_eq!((receipt.resulting_model_call_ceiling().unwrap(), receipt.resulting_tool_call_ceiling().unwrap()), (64, 64));
+    let after_issue = rows(&f.store);
+    assert_eq!(f.store.authorize_adaptive_work_funding(
+        &operator, &request, now + 4,
+    ).unwrap(), (true, receipt.clone()));
+    assert_eq!(rows(&f.store), after_issue);
+    bind(&mut f, &receipt, request.source.resume_source.base_review_count + 1);
+    let review = dispatch(&f, now + 4);
+    assert_eq!(session(&f), source);
+    f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &continued(&review, now + 6, 5), now + 6,
+    ).unwrap();
+    let adopted = session(&f);
+    assert_eq!(adopted.grant, source.grant);
+    assert_eq!((adopted.model_calls, adopted.tool_calls), (3, 2));
+    assert_eq!((adopted.funded_model_call_ceiling(), adopted.funded_tool_call_ceiling()), (64, 64));
+    assert_eq!(adopted.active_model_ceiling(), source.model_calls + 5);
+    assert!(adopted.requires_fresh_observation());
+    assert!(adopted.continuation.as_ref().unwrap().authorizations.starts_with(&history));
+    assert_eq!(adopted.continuation.as_ref().unwrap().authorizations.len(), history.len() + 1);
+    assert_eq!(f.store.adaptive_leadership_review_call(
+        &f.leader.tenant_id, refused.grant.review_id,
+    ).unwrap(), Some(refused));
+    assert_eq!(f.store.adaptive_work_funding(
+        &f.leader.tenant_id, f.grant.session_id, predecessor.request.operation_id,
+    ).unwrap(), Some(predecessor));
+    let before_replay = rows(&f.store);
+    assert_eq!(f.store.authorize_adaptive_work_funding(
+        &operator, &request, receipt.request.limits.expires_at_unix_ms + 1,
+    ).unwrap(), (true, receipt.clone()));
+    assert_eq!(f.store.adaptive_work_funding_draft(
+        &operator, &f.grant.project_id, f.grant.session_id, request.operation_id,
+        &request.reason_ref, request.limits.clone(), receipt.request.limits.expires_at_unix_ms + 1,
+    ).unwrap(), request);
+    assert_eq!(rows(&f.store), before_replay);
+    assert_eq!(WorkflowStore::open(&f.path).unwrap().adaptive_session(
+        f.grant.session_id, &f.grant.assignee_authority,
+    ).unwrap(), Some(adopted));
+}
+
+#[test]
+fn zero_call_renewal_rejects_missing_wrong_or_unadopted_predecessor_without_writes() {
+    let (f, predecessor, now) = capped_renewal_fixture(5);
+    let request = zero_call_renewal_draft(&f, &predecessor, now).unwrap();
+    let before = rows(&f.store);
+    for digest in [None, Some("f".repeat(64))] {
+        let mut forged = request.clone();
+        forged.source.predecessor_receipt_digest = digest;
+        assert!(f.store.authorize_adaptive_work_funding(&funding_operator(&f), &forged, now).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+    let (unadopted, receipt, at) = funded_fixture();
+    let before = rows(&unadopted.store);
+    assert!(zero_call_renewal_draft(&unadopted, &receipt, at).is_err());
+    let mut forged = receipt.request.clone();
+    forged.operation_id = Uuid::new_v4();
+    forged.limits.additional_model_calls = 0;
+    forged.limits.additional_tool_calls = 0;
+    forged.source.current_model_call_ceiling = receipt.resulting_model_call_ceiling().unwrap();
+    forged.source.current_tool_call_ceiling = receipt.resulting_tool_call_ceiling().unwrap();
+    forged.source.predecessor_receipt_digest = Some(receipt.receipt_digest().unwrap());
+    forged.validate_shape().unwrap();
+    assert!(unadopted.store.authorize_adaptive_work_funding(
+        &funding_operator(&unadopted), &forged, at,
+    ).is_err());
+    assert_eq!(rows(&unadopted.store), before);
+}
+
+#[test]
+fn zero_call_renewal_rejects_stale_head_and_current_totals_without_writes() {
+    let (f, predecessor, now) = capped_renewal_fixture(5);
+    let request = zero_call_renewal_draft(&f, &predecessor, now).unwrap();
+    for model in [true, false] {
+        let mut forged = request.clone();
+        if model {
+            forged.source.current_model_call_ceiling -= 1;
+        } else {
+            forged.source.current_tool_call_ceiling -= 1;
+        }
+        forged.validate_shape().unwrap();
+        let before = rows(&f.store);
+        assert!(f.store.authorize_adaptive_work_funding(&funding_operator(&f), &forged, now).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+    f.store.advance_adaptive_session(
+        f.grant.session_id, session(&f).version, Uuid::new_v4(),
+        &AdaptiveTransitionV1::Cancel, &f.grant.assignee_authority, now + 1,
+    ).unwrap();
+    let before = rows(&f.store);
+    assert!(f.store.authorize_adaptive_work_funding(&funding_operator(&f), &request, now + 2).is_err());
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn zero_call_renewal_rejects_actual_lifetime_exhaustion_without_writes() {
+    let (mut f, predecessor, _) = capped_renewal_fixture(62);
+    let mut source = session(&f);
+    let mut at = source.updated_at_ms + 1;
+    while source.model_calls < 64 {
+        source = observe_budget_inspection(&f, source, at);
+        at += 4;
+    }
+    assert_eq!(source.model_calls, 64);
+    assert_eq!(source.funded_model_call_ceiling(), 64);
+    let now = source.active_deadline_ms();
+    budget_context(&mut f, now, "spent-lifetime-budget");
+    let before = rows(&f.store);
+    assert!(zero_call_renewal_draft(&f, &predecessor, now).is_err());
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn zero_call_renewal_competing_issuance_commits_one_receipt_and_rejects_changed_replay() {
+    let (f, predecessor, now) = capped_renewal_fixture(5);
+    let requests = [zero_call_renewal_draft(&f, &predecessor, now).unwrap(),
+        zero_call_renewal_draft(&f, &predecessor, now).unwrap()];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut jobs = Vec::new();
+    for request in requests {
+        let store = WorkflowStore::open(&f.path).unwrap();
+        let operator = funding_operator(&f);
+        let barrier = barrier.clone();
+        jobs.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.authorize_adaptive_work_funding(&operator, &request, now)
+        }));
+    }
+    let results = jobs.into_iter().map(|job| job.join().unwrap()).collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let receipt = &results.iter().find_map(|result| result.as_ref().ok()).unwrap().1;
+    assert_eq!(session(&f).active_work_funding().unwrap().receipt, predecessor);
+    let before = rows(&f.store);
+    assert_eq!(f.store.authorize_adaptive_work_funding(
+        &funding_operator(&f), &receipt.request, now + 1,
+    ).unwrap(), (true, receipt.clone()));
+    let mut changed = receipt.request.clone();
+    changed.limits.additional_reviews += 1;
+    assert!(f.store.authorize_adaptive_work_funding(&funding_operator(&f), &changed, now + 1).is_err());
+    assert_eq!(rows(&f.store), before);
+    let connection = f.store.connection.lock().unwrap();
+    let counts: (i64, i64) = connection.query_row(
+        "SELECT (SELECT count(*) FROM company_entities WHERE entity_kind='adaptive_work_funding'),
+                (SELECT count(*) FROM company_events WHERE event_type='adaptive_work_funding_issued')",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(counts, (2, 2));
+}
+
 fn supersession_draft(
     f: &Fixture,
     receipt: &AdaptiveWorkFundingReceiptV1,

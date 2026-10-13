@@ -76,7 +76,18 @@ impl WorkflowApi {
         let Some(authority) = self.authority.as_ref() else {
             return Ok(false);
         };
-        let Ok(current) = authority.snapshot_for_admission(
+        #[cfg(test)]
+        super::tests::read_cohorts::record_acquisition("known_rejection");
+        let Ok(Some(snapshot)) = self.store.adaptive_project_snapshot(
+            &project.tenant_id,
+            &project.project_id,
+            &allowance.grant.work_item_id,
+            allowance.grant.agent_id,
+        ) else {
+            return Ok(false);
+        };
+        let Ok(current) = authority.snapshot_from_validated_project(
+            snapshot.project(),
             &project.tenant_id,
             &project.project_id,
             &allowance.grant.work_item_id,
@@ -85,12 +96,13 @@ impl WorkflowApi {
         ) else {
             return Ok(false);
         };
-        let session = match self.store.adaptive_session_for_authority(&current) {
+        let session = match snapshot.session_for_authority(&current) {
             Ok(Some(session)) => session,
             Ok(None) => return Ok(false),
             Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => return Ok(false),
             Err(_) => return Err("known rejection session unavailable"),
         };
+        drop(snapshot);
         let AdaptiveCursorV1::ModelPending { effect } = &session.cursor else {
             return Ok(false);
         };
