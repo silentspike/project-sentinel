@@ -1,5 +1,14 @@
 # Changelog
 
+- Reconcile existing adaptive tool effects independently of provider admission,
+  using bounded rotating scope discovery, fresh authority and exact recovery
+  identity. Keep model/session creation out of this progress phase, reject
+  expired unstarted effects, and retain original started-effect receipts.
+  Keep tool dispatch/reconciliation waits out of provider selection. Preserve scoped
+  failures across partial passes and own worker startup, panic and shutdown.
+  Do not refresh bound-provider debounce for active, recovered or already
+  preparing requests; newly admitted preparation retains attempt backoff (#856).
+
 - Avoid repeated preparation of the same bound provider request while its task
   waits for admission; keep scheduling ownership separate from durable provider
   and orphan authority, releasing it on every task exit. Defer leadership

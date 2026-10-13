@@ -3,6 +3,101 @@ use std::sync::{OnceLock, Weak};
 
 use super::*;
 
+#[cfg(feature = "llm")]
+mod independent_tool_progress {
+    use super::*;
+
+    fn api() -> WorkflowApi {
+        let mut api = enabled_api();
+        api.model_work_enabled = true;
+        api
+    }
+
+    #[test]
+    fn tool_progress_does_not_wait_for_company_scan_or_publish_scan_success() {
+        let api = api();
+        let _scan = api.reconciliation_fence.lock().unwrap();
+        assert!(api.reconcile_adaptive_tools_until(|| false).unwrap());
+        assert_status(&api, false, None);
+        assert!(api.adaptive_tool_progress_cursor.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn tool_progress_contention_recovery_and_stop_preserve_status_and_error() {
+        let api = api();
+        api.publish_reconciliation_status(Some("existing-scan-error".to_owned()));
+        *api.adaptive_tool_progress_error.lock().unwrap() = Some("existing-tool-error".to_owned());
+        {
+            let _pass = api.adaptive_tool_progress_fence.lock().unwrap();
+            assert!(!api.reconcile_adaptive_tools_until(|| false).unwrap());
+        }
+        {
+            let _recovery = api.mutation_fence.write().unwrap();
+            assert!(!api.reconcile_adaptive_tools_until(|| false).unwrap());
+        }
+        assert!(!api.reconcile_adaptive_tools_until(|| true).unwrap());
+        assert_status(&api, false, Some("existing-scan-error"));
+        assert_eq!(
+            api.adaptive_tool_progress_error.lock().unwrap().as_deref(),
+            Some("existing-tool-error")
+        );
+        assert!(api.adaptive_tool_progress_cursor.lock().unwrap().is_none());
+        assert!(api.reconcile_adaptive_tools_until(|| false).unwrap());
+        assert!(api.adaptive_tool_progress_error.lock().unwrap().is_none());
+        assert_status(&api, false, Some("existing-scan-error"));
+    }
+
+    #[test]
+    fn poisoned_tool_progress_fences_and_hints_fail_closed_in_health() {
+        for poison_hints in [false, true] {
+            let api = api();
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                if poison_hints {
+                    let _guard = api.adaptive_tool_progress_hints.lock().unwrap();
+                    panic!("poison hints");
+                } else {
+                    let _guard = api.adaptive_tool_progress_fence.lock().unwrap();
+                    panic!("poison progress fence");
+                }
+            }))
+            .is_err());
+            assert!(api.reconcile_adaptive_tools_until(|| false).is_err());
+            assert!(api.adaptive_tool_progress_error.lock().unwrap().is_some());
+            assert!(!api.health().ready);
+            assert!(api.health().last_error.is_some());
+            assert_status(&api, false, None);
+        }
+    }
+
+    #[test]
+    fn tool_progress_cancellation_after_failure_retains_health_error() {
+        let api = api();
+        *api.adaptive_tool_progress_hints.lock().unwrap() = Arc::new(vec![(
+            TenantId::parse("tenant-progress-missing").unwrap(),
+            ProjectId::parse("project-progress-missing").unwrap(),
+            WorkItemId::parse("work-progress-missing").unwrap(),
+            AgentId(7),
+        )]);
+        let checks = AtomicUsize::new(0);
+        let cancelled = AtomicBool::new(false);
+        let stop = || {
+            if checks.fetch_add(1, Ordering::SeqCst) == 2 {
+                // Allow the selected attempt, then observe cancellation after its failure.
+                cancelled.store(true, Ordering::SeqCst);
+                return false;
+            }
+            cancelled.load(Ordering::SeqCst)
+        };
+        assert!(api.reconcile_adaptive_tools_until(stop).is_err());
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(api.adaptive_tool_progress_error.lock().unwrap().is_some());
+        assert_eq!(api.adaptive_tool_progress_failures.lock().unwrap().len(), 1);
+        assert!(!api.health().ready);
+        assert!(api.health().last_error.is_some());
+        assert_status(&api, false, None);
+    }
+}
+
 fn enabled_api() -> WorkflowApi {
     let mut api = WorkflowApi::disabled().unwrap();
     api.enabled = true;
