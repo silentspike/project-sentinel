@@ -906,6 +906,7 @@ fn require_unfunded_source(
     session_id: Uuid,
     now_ms: u64,
     supersedes_unused_receipt_digest: Option<&str>,
+    limits: &AdaptiveWorkFundingLimitsV1,
 ) -> Result<(AdaptiveWorkFundingSourceV1, u64), WorkflowError> {
     let scope = validation_scope::enter(connection)?;
     let receipts = funding_receipts(connection, tenant, session_id)?;
@@ -916,6 +917,16 @@ fn require_unfunded_source(
         connection, tenant, project_id, session_id, now_ms, None,
     )?;
     let adopted = adopted_epochs(&session);
+    if limits.additional_model_calls == 0 && limits.additional_tool_calls == 0 {
+        // Renewal cannot borrow an unadopted proposal or refund actual spending.
+        let predecessor = session.active_work_funding().ok_or_else(transition)?;
+        if !receipts.contains(&predecessor.receipt)
+            || session.model_calls >= session.funded_model_call_ceiling()
+            || session.tool_calls >= session.funded_tool_call_ceiling()
+        {
+            return Err(transition());
+        }
+    }
     let superseded = superseded_validated_receipts(connection, tenant, session_id, &receipts)?;
     let pending = receipts
         .iter()
@@ -1248,6 +1259,7 @@ impl WorkflowStore {
             session_id,
             now_ms,
             supersedes_unused_receipt_digest,
+            &limits,
         )?;
         let request = AdaptiveWorkFundingRequestV1 {
             schema_version: 1,
@@ -1300,6 +1312,7 @@ impl WorkflowStore {
             source.session_id,
             now_ms,
             request.source.supersedes_unused_receipt_digest.as_deref(),
+            &request.limits,
         )?;
         if fresh != request.source || request.limits.max_call_duration_ms != duration {
             return Err(transition());
