@@ -543,22 +543,38 @@ impl WorkflowApi {
             }
             // Existing-task review verifies assignee lineage, not serving duty.
             // Fresh developer model/tool admission still requires serving health.
-            let authority = match self
+            let runtime = self
                 .authority
                 .as_ref()
-                .ok_or("leadership runtime unavailable")?
-                .snapshot_for_admission(
-                    &project.tenant_id,
-                    &project.project_id,
-                    &work.spec.work_item_id,
-                    assignments[0].agent_id,
-                    false,
-                ) {
+                .ok_or("leadership runtime unavailable")?;
+            let snapshot = match self.store.adaptive_project_snapshot(
+                &project.tenant_id,
+                &project.project_id,
+                &work.spec.work_item_id,
+                assignments[0].agent_id,
+            ) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => continue,
+                Err(error) => match map_authority_store_error(error) {
+                    WorkflowPortError::AuthorityConflict => continue,
+                    _ => return Err("leadership assignee authority unavailable"),
+                },
+            };
+            let authority = match runtime.snapshot_from_validated_project(
+                snapshot.project(),
+                &project.tenant_id,
+                &project.project_id,
+                &work.spec.work_item_id,
+                assignments[0].agent_id,
+                false,
+            ) {
                 Ok(authority) => authority,
                 Err(WorkflowPortError::AuthorityConflict) => continue,
                 Err(_) => return Err("leadership assignee authority unavailable"),
             };
-            match self.store.adaptive_session_for_authority(&authority) {
+            let session = snapshot.session_for_authority(&authority);
+            drop(snapshot);
+            match session {
                 Ok(Some(session)) => sessions.push(session),
                 Ok(None) => {}
                 // A stale assignment remains non-serving without blocking other
@@ -4671,6 +4687,257 @@ pub(crate) mod tests {
                 payload, format!("{:x}", hash.finalize())],
         ).unwrap();
         assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn review_sessions_paired_proof_matches_legacy_at_scoped_head_limit() {
+        // Pin the existing store head-count boundary; do not alter any validator budget.
+        const LEGACY_SCOPED_HEAD_LIMIT: u64 = 64;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, expected) =
+            super::super::adaptive_recovery::tests::fixture(&path, &events, false);
+        let scope = &expected.grant.authority;
+        let project = api
+            .store
+            .company_project(&scope.tenant_id, &scope.project_id)
+            .unwrap()
+            .unwrap();
+        // Independent historical assignment lineages compete within the same exact scope.
+        for index in 1..=LEGACY_SCOPED_HEAD_LIMIT {
+            let mut grant = expected.grant.clone();
+            grant.session_id = Uuid::new_v4();
+            grant.authority.assignment_version += index;
+            api.store
+                .begin_adaptive_session(&grant, &grant.authority, grant.created_at_ms)
+                .unwrap();
+            if index < LEGACY_SCOPED_HEAD_LIMIT - 1 {
+                continue;
+            }
+            let before = discovery_state(&path, &events);
+            for _ in 0..2 {
+                let authority = api
+                    .authority
+                    .as_ref()
+                    .unwrap()
+                    .snapshot_for_admission(
+                        &scope.tenant_id,
+                        &scope.project_id,
+                        &scope.work_item_id,
+                        scope.agent_id,
+                        false,
+                    )
+                    .unwrap();
+                let legacy = api.store.adaptive_session_for_authority(&authority);
+                let paired = api
+                    .store
+                    .adaptive_project_snapshot(
+                        &scope.tenant_id,
+                        &scope.project_id,
+                        &scope.work_item_id,
+                        scope.agent_id,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(paired.project(), &project);
+                let selected = paired.session_for_authority(&authority);
+                drop(paired);
+                if index == LEGACY_SCOPED_HEAD_LIMIT - 1 {
+                    assert_eq!(legacy.unwrap(), Some(expected.clone()));
+                    assert_eq!(selected.unwrap(), Some(expected.clone()));
+                    assert_eq!(
+                        api.review_sessions(&project).unwrap(),
+                        vec![expected.clone()]
+                    );
+                } else {
+                    assert_eq!(
+                        legacy.unwrap_err().code,
+                        WorkflowErrorCode::AuthorityConflict
+                    );
+                    assert_eq!(
+                        selected.unwrap_err().code,
+                        WorkflowErrorCode::AuthorityConflict
+                    );
+                    assert!(api.review_sessions(&project).unwrap().is_empty());
+                }
+            }
+            assert_eq!(discovery_state(&path, &events), before);
+        }
+    }
+
+    #[test]
+    fn review_sessions_matches_legacy_results_without_trusting_caller_assignment() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, expected) =
+            super::super::adaptive_recovery::tests::fixture(&path, &events, false);
+        let scope = &expected.grant.authority;
+        let project = api
+            .store
+            .company_project(&scope.tenant_id, &scope.project_id)
+            .unwrap()
+            .unwrap();
+        let authority = api
+            .authority
+            .as_ref()
+            .unwrap()
+            .snapshot_for_admission(
+                &scope.tenant_id,
+                &scope.project_id,
+                &scope.work_item_id,
+                scope.agent_id,
+                false,
+            )
+            .unwrap();
+        let legacy = api
+            .store
+            .adaptive_session_for_authority(&authority)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy, expected);
+        let mut stale_hint = project.clone();
+        let work = stale_hint.work_items.get_mut(&scope.work_item_id).unwrap();
+        let assignment = work
+            .assignments
+            .iter_mut()
+            .find(|assignment| assignment.active)
+            .unwrap();
+        assignment.assignment_version += 1;
+        assignment.profile.digest = "0".repeat(64);
+        let before = discovery_state(&path, &events);
+        for hint in [&project, &stale_hint] {
+            assert_eq!(api.review_sessions(hint).unwrap(), vec![legacy.clone()]);
+        }
+        assert_eq!(discovery_state(&path, &events), before);
+        let source = include_str!("adaptive_leadership_review.rs");
+        let review = source
+            .split("pub(super) fn review_sessions(")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) fn reconcile_adaptive_leadership_reviews(")
+            .next()
+            .unwrap();
+        assert_eq!(review.matches(".adaptive_project_snapshot(").count(), 1);
+        assert_eq!(
+            review.matches(".snapshot_from_validated_project(").count(),
+            1
+        );
+        assert_eq!(review.matches(".session_for_authority(").count(), 1);
+        assert!(!review.contains(".snapshot_for_admission("));
+        assert!(!review.contains(".adaptive_session_for_authority("));
+        assert!(review.contains("drop(snapshot)"));
+    }
+
+    #[test]
+    fn review_sessions_uses_fresh_assignment_and_session_with_stale_project_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (mut api, context) = fixture(&path, &events);
+        let old = &context.binding.grant.assignee_authority;
+        change_review_assignee(&mut api, &context, "assignment");
+        let current = api
+            .authority
+            .as_ref()
+            .unwrap()
+            .snapshot_for_admission(
+                &old.tenant_id,
+                &old.project_id,
+                &old.work_item_id,
+                old.agent_id,
+                false,
+            )
+            .unwrap();
+        assert_ne!(current, *old);
+        let mut grant = context.source.source_session.grant.clone();
+        grant.session_id = Uuid::new_v4();
+        grant.authority = current.clone();
+        // Synthetic durable session discovery only; no provider or customer acceptance.
+        let (_, expected) = api
+            .store
+            .begin_adaptive_session(&grant, &current, now_unix_ms().max(grant.created_at_ms))
+            .unwrap();
+        let before = discovery_state(&path, &events);
+        assert_eq!(
+            api.review_sessions(&context.source.source_project).unwrap(),
+            vec![expected],
+        );
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+
+    #[test]
+    fn review_sessions_skips_incompatible_current_assignment_and_profile() {
+        for change in ["assignment", "profile", "principal_generation", "policy"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("company.sqlite");
+            let events = temp.path().join("events.sqlite");
+            let (mut api, context) = fixture(&path, &events);
+            change_review_assignee(&mut api, &context, change);
+            let before = discovery_state(&path, &events);
+            assert!(
+                api.review_sessions(&context.source.source_project)
+                    .unwrap()
+                    .is_empty(),
+                "{change}"
+            );
+            assert_eq!(discovery_state(&path, &events), before, "{change}");
+        }
+    }
+
+    #[test]
+    fn review_sessions_rejects_tampered_head_and_suffix_after_warm_read() {
+        for suffix in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("company.sqlite");
+            let events = temp.path().join("events.sqlite");
+            let (mut api, expected) =
+                super::super::adaptive_recovery::tests::fixture(&path, &events, false);
+            let scope = &expected.grant.authority;
+            let project = api
+                .store
+                .company_project(&scope.tenant_id, &scope.project_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                api.review_sessions(&project).unwrap(),
+                vec![expected.clone()]
+            );
+            let connection = sentinel_limbo::rusqlite::Connection::open(&path).unwrap();
+            let changed = if suffix {
+                connection.execute(
+                    "INSERT INTO workflow_operations(operation_namespace,operation_id,request_digest,response,created_at_ms) SELECT operation_namespace,?2,request_digest,response,created_at_ms FROM workflow_operations WHERE operation_namespace=?1 AND operation_id=?3",
+                    sentinel_limbo::rusqlite::params![format!("adaptive-session-v1:{}", expected.grant.session_id),
+                        format!("{:020}", expected.version + 1), format!("{:020}", expected.version)],
+                ).unwrap()
+            } else {
+                connection
+                    .execute(
+                        "UPDATE workflow_adaptive_heads SET version=version+1 WHERE session_id=?1",
+                        [expected.grant.session_id.to_string()],
+                    )
+                    .unwrap()
+            };
+            assert_eq!(changed, 1);
+            let before = discovery_state(&path, &events);
+            let digest = api
+                .authority
+                .as_ref()
+                .unwrap()
+                .workbench_profile_digest
+                .clone();
+            Arc::make_mut(api.authority.as_mut().unwrap()).workbench_profile_digest =
+                "0".repeat(64);
+            // Preserve authority-conflict precedence over deferred head proof errors.
+            assert!(api.review_sessions(&project).unwrap().is_empty());
+            Arc::make_mut(api.authority.as_mut().unwrap()).workbench_profile_digest = digest;
+            assert_eq!(
+                api.review_sessions(&project),
+                Err("leadership session unavailable")
+            );
+            assert_eq!(discovery_state(&path, &events), before);
+        }
     }
 
     #[test]
