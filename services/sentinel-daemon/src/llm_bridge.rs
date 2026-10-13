@@ -2320,15 +2320,14 @@ pub mod bridge {
                     continue;
                 }
 
-                last_call_tick.insert(agent_id, current_tick);
-                {
-                    let mut ticks = llm_activity_ticks.lock().unwrap();
-                    ticks.insert(agent_id, current_tick);
-                    let retention_ticks =
-                        config.min_ticks_between_calls.saturating_mul(24).max(120);
-                    ticks.retain(|_, last_tick| {
-                        current_tick.saturating_sub(*last_tick) <= retention_ticks
-                    });
+                if usage_authority.is_none() {
+                    record_provider_preparation_attempt(
+                        &mut last_call_tick,
+                        &llm_activity_ticks,
+                        agent_id,
+                        current_tick,
+                        config.min_ticks_between_calls,
+                    );
                 }
 
                 let request_id = agent_runtime_request_id(&perception, usage_authority.as_ref());
@@ -2374,6 +2373,17 @@ pub mod bridge {
                 } else {
                     None
                 };
+                if preparation_guard.is_some() {
+                    // Exact duplicates and recovery do not start a new attempt.
+                    // Owned preparation failures and capacity misses still back off.
+                    record_provider_preparation_attempt(
+                        &mut last_call_tick,
+                        &llm_activity_ticks,
+                        agent_id,
+                        current_tick,
+                        config.min_ticks_between_calls,
+                    );
+                }
                 let mut request = build_gateway_request(
                     &perception,
                     &state_store,
@@ -2892,6 +2902,20 @@ pub mod bridge {
                 }
             })
             .or_insert(p);
+    }
+
+    fn record_provider_preparation_attempt(
+        last_call_tick: &mut HashMap<AgentId, u64>,
+        llm_activity_ticks: &SharedLlmActivityTicks,
+        agent_id: AgentId,
+        current_tick: u64,
+        min_ticks_between_calls: u64,
+    ) {
+        last_call_tick.insert(agent_id, current_tick);
+        let mut ticks = llm_activity_ticks.lock().unwrap();
+        ticks.insert(agent_id, current_tick);
+        let retention_ticks = min_ticks_between_calls.saturating_mul(24).max(120);
+        ticks.retain(|_, last_tick| current_tick.saturating_sub(*last_tick) <= retention_ticks);
     }
 
     fn should_retry_perception(perception: &Perception) -> bool {
@@ -6431,6 +6455,351 @@ pub mod bridge {
             }
         }
 
+        struct CooldownTestResolver {
+            legacy: ExactValidationResolver,
+            selections: Mutex<HashMap<AgentId, usize>>,
+            fail_context: bool,
+        }
+
+        impl ProviderUsageAuthorityResolver for CooldownTestResolver {
+            fn allows_unbound_provider_usage(&self) -> bool {
+                true
+            }
+
+            fn resolve_provider_usage_authority(
+                &self,
+                agent_id: AgentId,
+            ) -> Result<Option<ProviderExecutionAuthority>, &'static str> {
+                self.legacy.resolve_provider_usage_authority(agent_id)
+            }
+
+            fn prepare_provider_usage_candidate(
+                &self,
+                agent_id: AgentId,
+            ) -> Result<Option<PreparedProviderCandidate>, &'static str> {
+                *self.selections.lock().unwrap().entry(agent_id).or_default() += 1;
+                Ok(Some(PreparedProviderCandidate {
+                    authority: self.legacy.resolve_provider_usage_authority(agent_id)?,
+                    prepared_context: None,
+                }))
+            }
+
+            fn validate_provider_usage_authority(
+                &self,
+                expected: &ProviderExecutionAuthority,
+            ) -> Result<bool, &'static str> {
+                self.legacy.validate_provider_usage_authority(expected)
+            }
+
+            fn model_work_context(
+                &self,
+                expected: &ProviderExecutionAuthority,
+            ) -> Result<Option<ModelWorkContext>, &'static str> {
+                if self.fail_context {
+                    self.legacy.context_calls.fetch_add(1, Ordering::SeqCst);
+                    return Err("synthetic owned preparation failure");
+                }
+                self.legacy.model_work_context(expected)
+            }
+        }
+
+        struct CooldownBridgeFixture {
+            _directory: tempfile::TempDir,
+            resolver: Arc<CooldownTestResolver>,
+            store: Arc<EventStore>,
+            telemetry: Arc<BridgeTelemetry>,
+            activity: SharedLlmActivityTicks,
+            provider_calls: Arc<std::sync::atomic::AtomicUsize>,
+            release_response: Arc<tokio::sync::Notify>,
+            perception_tx: mpsc::Sender<Perception>,
+            shutdown_tx: watch::Sender<bool>,
+            bridge: tokio::task::JoinHandle<Result<(), &'static str>>,
+            provider_task: tokio::task::JoinHandle<()>,
+        }
+
+        impl CooldownBridgeFixture {
+            async fn start(fail_context: bool, reserved: bool) -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let context: ModelWorkContext =
+                    crate::workflow_api::model_work::test_context().into();
+                let resolver = Arc::new(CooldownTestResolver {
+                    legacy: ExactValidationResolver::new(context),
+                    selections: Mutex::new(HashMap::new()),
+                    fail_context,
+                });
+                let store = Arc::new(EventStore::open(":memory:").unwrap());
+                if reserved {
+                    let authority = resolver.legacy.context.binding();
+                    assert!(store
+                        .reserve_request(
+                            &authority.request_id(),
+                            &"a".repeat(64),
+                            &authority.agent_id().to_string(),
+                        )
+                        .unwrap());
+                }
+                let state = Arc::new(
+                    StateStore::open(directory.path().join("state.redb").to_str().unwrap())
+                        .unwrap(),
+                );
+                let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let release_response = Arc::new(tokio::sync::Notify::new());
+                let (gateway_url, provider_task) = start_mock_agent_provider(
+                    Arc::clone(&provider_calls),
+                    None,
+                    Some(Arc::clone(&release_response)),
+                )
+                .await;
+                let config = LlmBridgeConfig {
+                    gateway_url,
+                    credential: "test-credential".into(),
+                    max_concurrent: 1,
+                    min_ticks_between_calls: 5,
+                    request_timeout: Duration::from_secs(5),
+                    shutdown_drain_timeout: Duration::from_secs(2),
+                    usage_v2_enabled: true,
+                    completion_retry_interval: Duration::from_secs(3600),
+                    provider_usage_authority: Some(resolver.clone()),
+                    ..Default::default()
+                };
+                let (perception_tx, perception_rx) = mpsc::channel();
+                let (action_tx, _action_rx) = mpsc::channel();
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let telemetry = Arc::new(BridgeTelemetry::default());
+                let activity = Arc::new(Mutex::new(HashMap::new()));
+                let bridge = tokio::spawn(run_llm_bridge_with_store(
+                    config,
+                    perception_rx,
+                    action_tx,
+                    Arc::clone(&telemetry),
+                    state,
+                    Arc::clone(&store),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::clone(&activity),
+                    shutdown_rx,
+                    Arc::new(RwLock::new(true)),
+                ));
+                Self {
+                    _directory: directory,
+                    resolver,
+                    store,
+                    telemetry,
+                    activity,
+                    provider_calls,
+                    release_response,
+                    perception_tx,
+                    shutdown_tx,
+                    bridge,
+                    provider_task,
+                }
+            }
+
+            fn bound_agent(&self) -> AgentId {
+                self.resolver.legacy.context.binding().agent_id()
+            }
+
+            fn perception(&self, tick: u64) -> Perception {
+                let mut perception = recovery_test_perception();
+                perception.agent_id = self.bound_agent();
+                perception.tick = Tick(tick);
+                perception
+            }
+
+            fn selection_count(&self, agent_id: AgentId) -> usize {
+                self.resolver
+                    .selections
+                    .lock()
+                    .unwrap()
+                    .get(&agent_id)
+                    .copied()
+                    .unwrap_or(0)
+            }
+
+            async fn send_selected(&self, perception: Perception) {
+                let agent_id = perception.agent_id;
+                let before = self.selection_count(agent_id);
+                self.perception_tx.send(perception).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while self.selection_count(agent_id) == before {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("eligible perception did not reach fresh selection");
+            }
+
+            async fn send_rate_limited(&self, perception: Perception) {
+                let agent_id = perception.agent_id;
+                let selections = self.selection_count(agent_id);
+                let before = self
+                    .telemetry
+                    .calls_skipped_rate_limit
+                    .load(Ordering::SeqCst);
+                self.perception_tx.send(perception).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while self
+                        .telemetry
+                        .calls_skipped_rate_limit
+                        .load(Ordering::SeqCst)
+                        == before
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("owned attempt did not enforce cooldown");
+                assert_eq!(self.selection_count(agent_id), selections);
+            }
+
+            async fn wait_provider_calls(&self, count: usize) {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while self.provider_calls.load(Ordering::SeqCst) < count {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("provider request was not observed");
+                assert_eq!(self.provider_calls.load(Ordering::SeqCst), count);
+            }
+
+            async fn stop(self) {
+                self.shutdown_tx.send(true).unwrap();
+                self.release_response.notify_waiters();
+                tokio::time::timeout(Duration::from_secs(3), self.bridge)
+                    .await
+                    .expect("cooldown bridge did not drain")
+                    .unwrap()
+                    .unwrap();
+                self.provider_task.abort();
+            }
+        }
+
+        #[tokio::test]
+        async fn active_exact_duplicates_do_not_extend_nonzero_agent_cooldown() {
+            let f = CooldownBridgeFixture::start(false, false).await;
+            f.send_selected(f.perception(55)).await;
+            f.wait_provider_calls(1).await;
+            let contexts = f.resolver.legacy.context_calls.load(Ordering::SeqCst);
+            for tick in [60, 61] {
+                let mut duplicate = f.perception(tick);
+                duplicate.is_directly_addressed = true;
+                f.send_selected(duplicate).await;
+                assert_eq!(f.activity.lock().unwrap().get(&f.bound_agent()), Some(&55));
+            }
+            f.send_selected(f.perception(62)).await;
+            assert_eq!(f.activity.lock().unwrap().get(&f.bound_agent()), Some(&55));
+            assert_eq!(f.telemetry.calls_total.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                f.resolver.legacy.context_calls.load(Ordering::SeqCst),
+                contexts
+            );
+            assert_eq!(
+                f.telemetry.calls_skipped_rate_limit.load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(f.provider_calls.load(Ordering::SeqCst), 1);
+            f.stop().await;
+        }
+
+        #[tokio::test]
+        async fn recovery_only_exact_requests_do_not_start_nonzero_agent_cooldown() {
+            let f = CooldownBridgeFixture::start(false, true).await;
+            let request_id = f.resolver.legacy.context.binding().request_id();
+            let reserved = f.store.get_completion(&request_id).unwrap().unwrap();
+            for tick in [55, 56] {
+                f.send_selected(f.perception(tick)).await;
+                assert!(!f.activity.lock().unwrap().contains_key(&f.bound_agent()));
+            }
+            assert_eq!(f.resolver.legacy.context_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(f.resolver.legacy.validation_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(f.telemetry.calls_total.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                f.telemetry.calls_skipped_rate_limit.load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(f.provider_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                f.store.get_completion(&request_id).unwrap().unwrap(),
+                reserved
+            );
+            f.stop().await;
+        }
+
+        #[tokio::test]
+        async fn owned_preparation_failure_preserves_cooldown_other_agent_and_urgency() {
+            let f = CooldownBridgeFixture::start(true, false).await;
+            f.send_selected(f.perception(55)).await;
+            assert_eq!(f.activity.lock().unwrap().get(&f.bound_agent()), Some(&55));
+            f.send_rate_limited(f.perception(56)).await;
+            let other = recovery_test_perception();
+            assert_ne!(other.agent_id, f.bound_agent());
+            f.send_selected(other.clone()).await;
+            f.wait_provider_calls(1).await;
+            let mut other_limited = other.clone();
+            other_limited.tick = Tick(56);
+            f.send_rate_limited(other_limited).await;
+            for tick in [56, 57] {
+                let mut urgent = f.perception(tick);
+                if tick == 56 {
+                    urgent.is_directly_addressed = true;
+                } else {
+                    urgent.heard_text = "continue".into();
+                }
+                f.send_selected(urgent).await;
+                assert_eq!(
+                    f.activity.lock().unwrap().get(&f.bound_agent()),
+                    Some(&tick)
+                );
+            }
+            let mut impulse = f.perception(60);
+            impulse.has_operator_impulse = true;
+            f.send_selected(impulse.clone()).await;
+            impulse.tick = Tick(61);
+            f.send_rate_limited(impulse).await;
+            f.send_selected(f.perception(65)).await;
+            assert_eq!(f.activity.lock().unwrap().get(&f.bound_agent()), Some(&65));
+            assert_eq!(f.activity.lock().unwrap().get(&other.agent_id), Some(&55));
+            assert_eq!(f.resolver.legacy.context_calls.load(Ordering::SeqCst), 5);
+            assert!(f
+                .store
+                .get_completion(&f.resolver.legacy.context.binding().request_id())
+                .unwrap()
+                .is_none());
+            assert_eq!(f.provider_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(f.telemetry.calls_total.load(Ordering::SeqCst), 1);
+            f.stop().await;
+        }
+
+        #[tokio::test]
+        async fn owned_capacity_miss_preserves_nonzero_cooldown_and_unbound_backoff() {
+            let f = CooldownBridgeFixture::start(false, false).await;
+            let blocker = recovery_test_perception();
+            assert_ne!(blocker.agent_id, f.bound_agent());
+            f.send_selected(blocker.clone()).await;
+            f.wait_provider_calls(1).await;
+            f.send_selected(f.perception(55)).await;
+            assert_eq!(f.activity.lock().unwrap().get(&f.bound_agent()), Some(&55));
+            f.send_rate_limited(f.perception(56)).await;
+            let mut blocker_limited = blocker;
+            blocker_limited.tick = Tick(56);
+            f.send_rate_limited(blocker_limited).await;
+            f.send_selected(f.perception(60)).await;
+            assert_eq!(f.activity.lock().unwrap().get(&f.bound_agent()), Some(&60));
+            assert_eq!(f.resolver.legacy.context_calls.load(Ordering::SeqCst), 2);
+            assert!(f
+                .store
+                .get_completion(&f.resolver.legacy.context.binding().request_id())
+                .unwrap()
+                .is_none());
+            assert_eq!(f.provider_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(f.telemetry.calls_total.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                f.telemetry.calls_skipped_rate_limit.load(Ordering::SeqCst),
+                2
+            );
+            f.stop().await;
+        }
+
         #[tokio::test]
         async fn reserved_model_recovery_precedes_deferred_context_preparation() {
             let dir = tempfile::tempdir().unwrap();
@@ -6496,7 +6865,7 @@ pub mod bridge {
         }
 
         #[tokio::test]
-        async fn queued_leadership_expiry_never_reserves_or_sends_http() {
+        async fn queued_exact_duplicates_preserve_nonzero_cooldown_and_fresh_expiry() {
             let dir = tempfile::tempdir().unwrap();
             let event_path = dir.path().join("events.sqlite");
             let (_, mut review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
@@ -6535,7 +6904,7 @@ pub mod bridge {
                 max_concurrent: 1,
                 request_timeout: Duration::from_secs(5),
                 shutdown_drain_timeout: Duration::from_secs(2),
-                min_ticks_between_calls: 0,
+                min_ticks_between_calls: 5,
                 usage_v2_enabled: true,
                 completion_retry_interval: Duration::from_secs(3600),
                 provider_usage_authority: Some(resolver.clone()),
@@ -6545,6 +6914,7 @@ pub mod bridge {
             let (action_tx, _action_rx) = mpsc::channel();
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let telemetry = Arc::new(BridgeTelemetry::default());
+            let activity = Arc::new(Mutex::new(HashMap::new()));
             let bridge = tokio::spawn(run_llm_bridge_with_store(
                 config,
                 perception_rx,
@@ -6553,7 +6923,7 @@ pub mod bridge {
                 state,
                 Arc::clone(&store),
                 Arc::new(AtomicBool::new(false)),
-                Arc::new(Mutex::new(HashMap::new())),
+                Arc::clone(&activity),
                 shutdown_rx,
                 Arc::new(RwLock::new(true)),
             ));
@@ -6599,6 +6969,10 @@ pub mod bridge {
                 })
                 .await
                 .expect("duplicate queued perception was not evaluated");
+                assert_eq!(
+                    activity.lock().unwrap().get(&expected.agent_id()),
+                    Some(&55)
+                );
             }
             assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 1);
             assert_eq!(telemetry.calls_total.load(Ordering::SeqCst), 2);
@@ -6615,8 +6989,7 @@ pub mod bridge {
                 .expect("queued review was not checked after capacity became available");
             let mut retry = recovery_test_perception();
             retry.agent_id = expected.agent_id();
-            retry.is_directly_addressed = true;
-            retry.tick = Tick(59);
+            retry.tick = Tick(60);
             perception_tx.send(retry).unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
                 while resolver.validation_calls.load(Ordering::SeqCst) < 2 {
@@ -6633,6 +7006,10 @@ pub mod bridge {
                 .unwrap();
             assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 2);
             assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                activity.lock().unwrap().get(&expected.agent_id()),
+                Some(&60)
+            );
             assert_eq!(store.reservation_calls.load(Ordering::SeqCst), 1);
             assert!(store
                 .get_completion(&expected.request_id())

@@ -15,6 +15,182 @@ use sentinel_workflow::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(super) type AdaptiveToolProgressScope = (TenantId, ProjectId, WorkItemId, AgentId);
+type AdaptiveToolProgressFailureKey = (TenantId, ProjectId, WorkItemId, u16);
+
+fn adaptive_tool_progress_failure_key(
+    scope: &AdaptiveToolProgressScope,
+) -> AdaptiveToolProgressFailureKey {
+    (
+        scope.0.clone(),
+        scope.1.clone(),
+        scope.2.clone(),
+        scope.3 .0,
+    )
+}
+
+fn record_adaptive_tool_progress_result(
+    failures: &mut BTreeMap<AdaptiveToolProgressFailureKey, String>,
+    scope: &AdaptiveToolProgressScope,
+    result: Result<Option<()>, &'static str>,
+) {
+    match result {
+        Err(reason) => {
+            failures.insert(adaptive_tool_progress_failure_key(scope), reason.to_owned());
+        }
+        Ok(Some(())) => {
+            failures.remove(&adaptive_tool_progress_failure_key(scope));
+        }
+        Ok(None) => {}
+    }
+}
+
+fn prune_adaptive_tool_progress_failures(
+    failures: &mut BTreeMap<AdaptiveToolProgressFailureKey, String>,
+    authoritative_scopes: &BTreeSet<AdaptiveToolProgressFailureKey>,
+) {
+    failures.retain(|scope, _| authoritative_scopes.contains(scope));
+}
+
+fn compare_adaptive_tool_progress_scopes(
+    left: &AdaptiveToolProgressScope,
+    right: &AdaptiveToolProgressScope,
+) -> std::cmp::Ordering {
+    (&left.0, &left.1, &left.2, left.3 .0).cmp(&(&right.0, &right.1, &right.2, right.3 .0))
+}
+
+fn adaptive_tool_progress_start(
+    scopes: &[AdaptiveToolProgressScope],
+    cursor: Option<&AdaptiveToolProgressScope>,
+) -> usize {
+    scopes.partition_point(|scope| {
+        cursor.is_some_and(|last| {
+            compare_adaptive_tool_progress_scopes(scope, last) != std::cmp::Ordering::Greater
+        })
+    })
+}
+
+#[cfg(test)]
+mod adaptive_tool_progress_cursor_tests {
+    use super::*;
+
+    fn scope(agent: u16) -> AdaptiveToolProgressScope {
+        (
+            TenantId::parse("tenant-progress").unwrap(),
+            ProjectId::parse("project-progress").unwrap(),
+            WorkItemId::parse("work-progress").unwrap(),
+            AgentId(agent),
+        )
+    }
+
+    #[test]
+    fn healthy_partial_and_stopped_rechecks_preserve_other_scope_failures() {
+        let failed = scope(1);
+        let healthy = scope(2);
+        let mut failures = BTreeMap::new();
+        record_adaptive_tool_progress_result(&mut failures, &failed, Err("first failure"));
+        record_adaptive_tool_progress_result(&mut failures, &healthy, Ok(Some(())));
+        record_adaptive_tool_progress_result(&mut failures, &failed, Ok(None));
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures
+                .get(&adaptive_tool_progress_failure_key(&failed))
+                .map(String::as_str),
+            Some("first failure")
+        );
+        record_adaptive_tool_progress_result(&mut failures, &failed, Err("current failure"));
+        assert_eq!(
+            failures
+                .get(&adaptive_tool_progress_failure_key(&failed))
+                .map(String::as_str),
+            Some("current failure")
+        );
+        record_adaptive_tool_progress_result(&mut failures, &failed, Ok(Some(())));
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn authoritative_scope_removal_prunes_only_absent_keys() {
+        let present = scope(1);
+        let removed = scope(2);
+        let mut failures = BTreeMap::new();
+        record_adaptive_tool_progress_result(&mut failures, &present, Err("retained failure"));
+        record_adaptive_tool_progress_result(&mut failures, &removed, Err("removed failure"));
+        // An authoritative scope remains present even when excluded from dispatch hints.
+        let authoritative_scopes = BTreeSet::from([adaptive_tool_progress_failure_key(&present)]);
+        prune_adaptive_tool_progress_failures(&mut failures, &authoritative_scopes);
+        assert_eq!(failures.len(), 1);
+        assert!(failures.contains_key(&adaptive_tool_progress_failure_key(&present)));
+        prune_adaptive_tool_progress_failures(&mut failures, &BTreeSet::new());
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn cursor_starts_strictly_after_present_or_removed_scope_and_wraps() {
+        let scopes = vec![scope(1), scope(3), scope(5)];
+        assert_eq!(adaptive_tool_progress_start(&scopes, None), 0);
+        assert_eq!(adaptive_tool_progress_start(&scopes, Some(&scope(1))), 1);
+        assert_eq!(adaptive_tool_progress_start(&scopes, Some(&scope(2))), 1);
+        assert_eq!(adaptive_tool_progress_start(&scopes, Some(&scope(5))), 3);
+        assert_eq!(adaptive_tool_progress_start(&[], Some(&scope(5))), 0);
+    }
+
+    #[test]
+    fn scope_order_includes_tenant_project_work_and_numeric_agent() {
+        let base = scope(1);
+        let mut later_tenant = base.clone();
+        later_tenant.0 = TenantId::parse("tenant-z").unwrap();
+        let mut later_project = base.clone();
+        later_project.1 = ProjectId::parse("project-z").unwrap();
+        let mut later_work = base.clone();
+        later_work.2 = WorkItemId::parse("work-z").unwrap();
+        let mut scopes = [
+            later_tenant,
+            later_work,
+            scope(2),
+            later_project,
+            base.clone(),
+        ];
+        scopes.sort_by(compare_adaptive_tool_progress_scopes);
+        assert_eq!(scopes[0], base);
+        assert_eq!(scopes[1], scope(2));
+        assert_eq!(scopes[2].2 .0, "work-z");
+        assert_eq!(scopes[3].1 .0, "project-z");
+        assert_eq!(scopes[4].0 .0, "tenant-z");
+    }
+
+    #[test]
+    fn denied_prefix_cannot_starve_later_scopes_across_bounded_passes() {
+        let scopes: Vec<_> = (0..MAX_RECONCILE_BATCH + 5)
+            .map(|agent| scope(u16::try_from(agent).unwrap()))
+            .collect();
+        let mut cursor = None;
+        let mut examined = BTreeSet::new();
+        for _ in 0..2 {
+            let start = adaptive_tool_progress_start(&scopes, cursor.as_ref());
+            let pass: Vec<_> = scopes[start..]
+                .iter()
+                .chain(scopes[..start].iter())
+                .take(MAX_RECONCILE_BATCH)
+                .cloned()
+                .collect();
+            assert_eq!(pass.len(), MAX_RECONCILE_BATCH);
+            assert_eq!(
+                pass.iter()
+                    .map(|scope| scope.3 .0)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                pass.len()
+            );
+            for denied_or_pending in pass {
+                cursor = Some(denied_or_pending.clone());
+                examined.insert(denied_or_pending.3 .0);
+            }
+        }
+        assert_eq!(examined.len(), scopes.len());
+    }
+}
+
 const ADAPTIVE_MODEL_WORK_MAX_CALLS: u16 = 16;
 const QA_SCHEMA_ERROR: &str = "source review is not strict JSON";
 const QA_SCHEMA_RECOVERY_REASON: &str = "strict-json-correction";
@@ -22,6 +198,8 @@ const QA_SCHEMA_MAX_CORRECTIONS: usize = 2;
 const ADAPTIVE_TOOL_SCHEMA_ERROR: &str = "adaptive tool is invalid";
 const ADAPTIVE_TOOL_SCHEMA_RESOLUTION: &str = "adaptive-first-model-tool-schema";
 const ADAPTIVE_CONTEXT_SLOW_READ_MS: u64 = 100;
+const ADAPTIVE_TOOL_PROGRESS_PASS_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(50);
 
 struct AdaptiveContextReadPhase {
     phase: &'static str,
@@ -1375,19 +1553,8 @@ impl WorkflowApi {
                     },
                 ))
             }
-            // Drain the exact claimed effect even after the model allowance
-            // expires. Submit still rejects a fresh expired reservation; Poll
-            // and Recover cannot issue a new model call or tool identity.
-            AdaptiveCursorV1::ToolPending { effect, .. }
-            | AdaptiveCursorV1::ToolUnknown { effect, .. } => {
-                if now_unix_ms() >= session.active_deadline_ms()
-                    && !self
-                        .workbench
-                        .as_ref()
-                        .ok_or("adaptive Workbench unavailable")?
-                        .adaptive_tool_was_started(&session, effect)
-                        .map_err(|_| "adaptive tool dispatch status unavailable")?
-                {
+            AdaptiveCursorV1::ToolPending { .. } | AdaptiveCursorV1::ToolUnknown { .. } => {
+                if !self.adaptive_claimed_tool_can_progress(&session, now_unix_ms())? {
                     return Ok(None);
                 }
                 Ok(Some(0))
@@ -1396,6 +1563,225 @@ impl WorkflowApi {
             AdaptiveCursorV1::ReadyForModel => Ok(Some(if session.version > 1 { 1 } else { 2 })),
         };
         Ok(priority?.map(|rank| (rank, session.updated_at_ms)))
+    }
+
+    fn adaptive_claimed_tool_can_progress(
+        &self,
+        session: &AdaptiveSessionV1,
+        now: u64,
+    ) -> Result<bool, &'static str> {
+        let effect = match &session.cursor {
+            AdaptiveCursorV1::ToolPending { effect, .. }
+            | AdaptiveCursorV1::ToolUnknown { effect, .. } => effect,
+            _ => return Ok(true),
+        };
+        // Only an already-started exact invocation may drain past its deadline.
+        if now < session.active_deadline_ms() {
+            return Ok(true);
+        }
+        self.workbench
+            .as_ref()
+            .ok_or("adaptive Workbench unavailable")?
+            .adaptive_tool_was_started(session, effect)
+            .map_err(|_| "adaptive tool dispatch status unavailable")
+    }
+
+    pub(super) fn refresh_existing_adaptive_tool_hints(
+        &self,
+        projects: &[sentinel_workflow::ProjectV1],
+    ) -> Result<(), WorkflowError> {
+        // The caller supplies the complete freshly validated company-project inventory.
+        // Eligibility filtering alone is not proof that a failed scope was removed.
+        let authoritative_scopes: BTreeSet<_> = projects
+            .iter()
+            .filter_map(|project| {
+                project.subscription_call.as_ref().map(|allowance| {
+                    (
+                        project.tenant_id.clone(),
+                        project.project_id.clone(),
+                        allowance.grant.work_item_id.clone(),
+                        allowance.grant.agent_id.0,
+                    )
+                })
+            })
+            .collect();
+        // Inventory supplies scope hints only; every examined scope is refreshed below.
+        let mut scopes: Vec<_> = projects
+            .iter()
+            .filter(|project| {
+                project.lifecycle_state == sentinel_workflow::ProjectLifecycleStateV1::Active
+            })
+            .filter_map(|project| {
+                project
+                    .subscription_call
+                    .as_ref()
+                    .filter(|allowance| {
+                        allowance.grant.max_calls > 0 && allowance.dispatch.is_none()
+                    })
+                    .map(|allowance| {
+                        (
+                            project.tenant_id.clone(),
+                            project.project_id.clone(),
+                            allowance.grant.work_item_id.clone(),
+                            allowance.grant.agent_id,
+                        )
+                    })
+            })
+            .collect();
+        scopes.sort_by(compare_adaptive_tool_progress_scopes);
+        scopes.dedup();
+        prune_adaptive_tool_progress_failures(
+            &mut *self
+                .adaptive_tool_progress_failures
+                .lock()
+                .map_err(|_| workflow_unavailable())?,
+            &authoritative_scopes,
+        );
+        *self
+            .adaptive_tool_progress_hints
+            .lock()
+            .map_err(|_| workflow_unavailable())? = Arc::new(scopes);
+        Ok(())
+    }
+
+    pub(super) fn reconcile_existing_adaptive_tool_hints(
+        &self,
+        scopes: &[(TenantId, ProjectId, WorkItemId, AgentId)],
+        should_stop: &impl Fn() -> bool,
+    ) -> Result<(), WorkflowError> {
+        if !self.model_work_enabled || should_stop() {
+            return self.existing_adaptive_tool_progress_status();
+        }
+        // Poisoned bookkeeping cannot authorize an otherwise unrecordable attempt.
+        drop(
+            self.adaptive_tool_progress_failures
+                .lock()
+                .map_err(|_| workflow_unavailable())?,
+        );
+        // Callers supply the sorted, deduplicated IDs published by hint refresh.
+        let started = std::time::Instant::now();
+        let cursor = self
+            .adaptive_tool_progress_cursor
+            .lock()
+            .map_err(|_| workflow_unavailable())?
+            .clone();
+        let start = adaptive_tool_progress_start(scopes, cursor.as_ref());
+        for scope in scopes[start..]
+            .iter()
+            .chain(scopes[..start].iter())
+            .take(MAX_RECONCILE_BATCH)
+        {
+            if should_stop() {
+                break;
+            }
+            // Denied, absent and pending scopes consume the same fair examination budget.
+            *self
+                .adaptive_tool_progress_cursor
+                .lock()
+                .map_err(|_| workflow_unavailable())? = Some(scope.clone());
+            let result = self.reconcile_existing_adaptive_tool_scope(scope, should_stop);
+            record_adaptive_tool_progress_result(
+                &mut *self
+                    .adaptive_tool_progress_failures
+                    .lock()
+                    .map_err(|_| workflow_unavailable())?,
+                scope,
+                result,
+            );
+            if let Err(reason) = result {
+                log_reconciliation_failure("adaptive_tool_progress", reason);
+            }
+            // Soft bound: one synchronous I/O may exceed the budget; do not start another.
+            if started.elapsed() >= ADAPTIVE_TOOL_PROGRESS_PASS_BUDGET {
+                break;
+            }
+        }
+        self.existing_adaptive_tool_progress_status()
+    }
+
+    fn existing_adaptive_tool_progress_status(&self) -> Result<(), WorkflowError> {
+        if !self
+            .adaptive_tool_progress_failures
+            .lock()
+            .map_err(|_| workflow_unavailable())?
+            .is_empty()
+        {
+            return Err(workflow_unavailable());
+        }
+        Ok(())
+    }
+
+    fn reconcile_existing_adaptive_tool_scope(
+        &self,
+        scope: &AdaptiveToolProgressScope,
+        should_stop: &impl Fn() -> bool,
+    ) -> Result<Option<()>, &'static str> {
+        let (tenant, project_id, work_item_id, agent_id) = scope;
+        let snapshot = self
+            .store
+            .adaptive_project_snapshot(tenant, project_id, work_item_id, *agent_id)
+            .map_err(|_| "adaptive tool project unavailable")?
+            .ok_or("adaptive tool project missing")?;
+        let project = snapshot.project();
+        let Some(allowance) = project.subscription_call.as_ref() else {
+            return Ok(Some(()));
+        };
+        let Some(binding) = select_provider_usage_binding(
+            std::slice::from_ref(project),
+            *agent_id,
+            Some(&allowance.allowance_id),
+        )?
+        else {
+            return Ok(Some(()));
+        };
+        if binding.work_item_id != work_item_id.0 {
+            return Err("adaptive tool work item changed");
+        }
+        let current = self
+            .authority
+            .as_ref()
+            .ok_or("adaptive authority unavailable")?
+            .snapshot_from_validated_project(
+                project,
+                tenant,
+                project_id,
+                work_item_id,
+                *agent_id,
+                false,
+            )
+            .map_err(|_| "adaptive runtime authority unavailable")?;
+        let Some(session) = snapshot
+            .session_for_authority(&current)
+            .map_err(|_| "adaptive continuation head unavailable")?
+        else {
+            return Ok(Some(()));
+        };
+        if !matches!(
+            session.cursor,
+            AdaptiveCursorV1::ReadyForTool { .. }
+                | AdaptiveCursorV1::ToolPending { .. }
+                | AdaptiveCursorV1::ToolUnknown { .. }
+        ) || (matches!(session.cursor, AdaptiveCursorV1::ReadyForTool { .. })
+            && (session.tool_calls >= session.funded_tool_call_ceiling()
+                || now_unix_ms() >= session.active_deadline_ms()))
+        {
+            return Ok(Some(()));
+        }
+        let project = project.clone();
+        drop(snapshot);
+        if should_stop() {
+            return Ok(None);
+        }
+        // Existing-only evaluation retains allowance/continuation proofs but cannot mint a session.
+        self.evaluate_adaptive_provider_binding(
+            binding,
+            &project,
+            current,
+            Some(session),
+            true,
+            true,
+        )?;
+        Ok(Some(()))
     }
 
     pub(super) fn adaptive_provider_authority(
@@ -1768,6 +2154,9 @@ impl WorkflowApi {
                     | AdaptiveCursorV1::ToolUnknown { .. }
             );
         if reconciled_tools {
+            if !self.adaptive_claimed_tool_can_progress(&session, now_unix_ms())? {
+                return Ok((None, false));
+            }
             session = self.reconcile_adaptive_tool(session)?;
         }
         let governed_window = session

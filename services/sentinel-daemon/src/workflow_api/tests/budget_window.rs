@@ -13,6 +13,7 @@ use crate::workbench::{
     WorkbenchCoordinator, WorkbenchInvocationStore,
 };
 use sentinel_common::{WorkbenchMessage, WorkbenchOutcome, WorkbenchResourceUsage};
+use sentinel_limbo::rusqlite;
 use sentinel_workflow::{
     adaptive_budget_allowance_digest, adaptive_budget_history_digest, adaptive_tool_digest,
     AdaptiveBudgetWindowAuthorityV1, AdaptiveEffectV1, AdaptiveLeadershipReviewCallV1,
@@ -86,6 +87,774 @@ fn stop_receipt_agent(fixture: &Fixture) {
         .find(|agent| agent.agent_id == fixture.session.grant.authority.agent_id.0)
         .unwrap();
     agent.adapter_health_state = Some(sentinel_common::NanoHealthState::Stopped);
+}
+
+#[test]
+fn existing_tool_progress_pass_adopts_exact_receipts_without_provider_discovery() {
+    for continued in [false, true] {
+        for unknown in [false, true] {
+            let mut fixture = if continued {
+                Fixture::continued()
+            } else {
+                Fixture::productive_root()
+            };
+            let now = now_unix_ms();
+            let request = fixture.claim_tool(now);
+            let observation = fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+            let effect = AdaptiveEffectV1 {
+                id: Uuid::parse_str(&request.invocation_id).unwrap(),
+                request_digest: request.input_digest.clone(),
+            };
+            if unknown {
+                fixture.advance(
+                    AdaptiveTransitionV1::MarkUnknown {
+                        effect: effect.clone(),
+                    },
+                    now,
+                );
+            }
+            let before = fixture.read();
+            let record = fixture.tools.load(&request.invocation_id).unwrap().unwrap();
+            let projects = fixture.api.store.company_projects().unwrap();
+            let facts = fixture.tool_progress_non_model_facts();
+            let calls = fixture.calls();
+            stop_receipt_agent(&fixture);
+            fixture.with_terminal_workbench_service(|| {
+                fixture.run_existing_tool_progress().unwrap();
+                let adopted = fixture.read();
+                let mut expected = before.clone();
+                expected.cursor = AdaptiveCursorV1::ReadyForModel;
+                expected.version += 1;
+                expected.updated_at_ms = adopted.updated_at_ms;
+                expected.last_observation = Some(AdaptiveObservationRefV1 {
+                    effect,
+                    observation_digest: observation.digest().to_owned(),
+                });
+                if let Some(continuation) = expected.continuation.as_mut() {
+                    continuation.observation_required = false;
+                }
+                assert!(adopted.updated_at_ms >= before.updated_at_ms);
+                assert_eq!(adopted, expected);
+                let journal = fixture.tool_progress_journal();
+                for _ in 0..3 {
+                    fixture.run_existing_tool_progress().unwrap();
+                    assert_eq!(fixture.read(), expected);
+                    assert_eq!(fixture.tool_progress_journal(), journal);
+                }
+            });
+            assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+            assert_eq!(fixture.calls(), calls);
+            assert_eq!(fixture.api.store.company_projects().unwrap(), projects);
+            assert_eq!(
+                fixture.tools.load(&request.invocation_id).unwrap().unwrap(),
+                record
+            );
+        }
+    }
+}
+
+#[test]
+fn existing_tool_progress_pass_recovers_expired_started_receipts_without_process() {
+    for unknown in [false, true] {
+        let mut fixture = Fixture::expired_productive_root();
+        let started_at = fixture.session.updated_at_ms + 1;
+        assert!(started_at < fixture.session.active_deadline_ms());
+        let request = fixture.claim_tool(started_at);
+        let observation =
+            fixture.retain_tool_result(&request, started_at, started_at, PRIVATE_CONTENT);
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::parse_str(&request.invocation_id).unwrap(),
+            request_digest: request.input_digest.clone(),
+        };
+        if unknown {
+            fixture.advance(
+                AdaptiveTransitionV1::MarkUnknown {
+                    effect: effect.clone(),
+                },
+                started_at,
+            );
+        }
+        let before = fixture.read();
+        let record = fixture.tools.load(&request.invocation_id).unwrap().unwrap();
+        assert!(record.started_at_ms.is_some());
+        assert!(record.state.is_terminal());
+        assert!(now_unix_ms() > request.deadline_unix_ms);
+        let facts = fixture.tool_progress_non_model_facts();
+        stop_receipt_agent(&fixture);
+        fixture.with_terminal_workbench_service(|| {
+            fixture.run_existing_tool_progress().unwrap();
+            let adopted = fixture.read();
+            let mut expected = before.clone();
+            expected.cursor = AdaptiveCursorV1::ReadyForModel;
+            expected.version += 1;
+            expected.updated_at_ms = adopted.updated_at_ms;
+            expected.last_observation = Some(AdaptiveObservationRefV1 {
+                effect,
+                observation_digest: observation.digest().to_owned(),
+            });
+            assert_eq!(adopted, expected);
+            assert!(adopted.updated_at_ms > before.active_deadline_ms());
+            let journal = fixture.tool_progress_journal();
+            fixture.run_existing_tool_progress().unwrap();
+            assert_eq!(fixture.read(), expected);
+            assert_eq!(fixture.tool_progress_journal(), journal);
+        });
+        assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+        assert_eq!(
+            fixture.tools.load(&request.invocation_id).unwrap().unwrap(),
+            record
+        );
+    }
+}
+
+#[test]
+fn existing_tool_progress_pass_skips_missing_heads_without_creating_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let mut api = super::model_work::configured_test_api(&path);
+    super::model_work::assign_test_work_from_at(&api, Some(8), 0, now_unix_ms());
+    Fixture::attach_workbench(&mut api);
+    let projects = api.store.company_projects().unwrap();
+    assert!(projects
+        .iter()
+        .any(|project| project.subscription_call.is_some()));
+    let query = "SELECT * FROM workflow_operations ORDER BY operation_namespace,operation_id";
+    let before = tool_progress_sql_rows(&path, query);
+    let heads = tool_progress_sql_rows(
+        &path,
+        "SELECT * FROM workflow_adaptive_heads ORDER BY session_id",
+    );
+    assert!(heads.is_empty());
+    for _ in 0..3 {
+        let discovered = api.store.company_projects().unwrap();
+        api.refresh_existing_adaptive_tool_hints(&discovered)
+            .unwrap();
+        api.reconcile_adaptive_tools_until(|| false).unwrap();
+        assert_eq!(tool_progress_sql_rows(&path, query), before);
+        assert_eq!(
+            tool_progress_sql_rows(
+                &path,
+                "SELECT * FROM workflow_adaptive_heads ORDER BY session_id"
+            ),
+            heads
+        );
+        assert_eq!(api.store.company_projects().unwrap(), projects);
+    }
+}
+
+#[test]
+fn existing_tool_progress_pass_leaves_non_tool_heads_and_provider_rows_unchanged() {
+    for state in [
+        "ready",
+        "model_pending",
+        "model_unknown",
+        "blocked",
+        "completion",
+    ] {
+        let mut fixture = Fixture::productive_root();
+        let now = now_unix_ms();
+        if state != "ready" {
+            let effect = fixture.claim_model(now);
+            match state {
+                "model_unknown" => {
+                    fixture.advance(AdaptiveTransitionV1::MarkUnknown { effect }, now);
+                }
+                "blocked" | "completion" => fixture.advance(
+                    AdaptiveTransitionV1::ResolveModel {
+                        effect,
+                        result_digest: "b".repeat(64),
+                        decision: if state == "blocked" {
+                            AdaptiveModelDecisionV1::Blocked {
+                                reason_code: "fixture_blocked".into(),
+                            }
+                        } else {
+                            AdaptiveModelDecisionV1::ProposeCompletion {
+                                artifact_digest: "c".repeat(64),
+                            }
+                        },
+                    },
+                    now,
+                ),
+                _ => {}
+            }
+        }
+        let before = fixture.read();
+        let journal = fixture.tool_progress_journal();
+        let facts = fixture.tool_progress_non_model_facts();
+        fixture.with_terminal_workbench_service(|| {
+            for _ in 0..3 {
+                fixture.run_existing_tool_progress().unwrap();
+                assert_eq!(fixture.read(), before, "{state}");
+                assert_eq!(fixture.tool_progress_journal(), journal, "{state}");
+                assert_eq!(fixture.tool_progress_non_model_facts(), facts, "{state}");
+            }
+        });
+    }
+}
+
+#[test]
+fn existing_tool_progress_pass_skips_expired_unclaimed_tool_without_claim() {
+    let mut fixture = Fixture::expired_productive_root();
+    let historical = fixture.session.updated_at_ms + 1;
+    let effect = fixture.claim_model(historical);
+    let tool = WorkbenchTool::InspectFile {
+        path: "src/main.rs".into(),
+        max_bytes: 1024,
+    };
+    fixture.advance(
+        AdaptiveTransitionV1::ResolveModel {
+            effect,
+            result_digest: "b".repeat(64),
+            decision: AdaptiveModelDecisionV1::Tool {
+                tool_digest: adaptive_tool_digest(&tool).unwrap(),
+                tool,
+            },
+        },
+        historical,
+    );
+    assert!(matches!(
+        fixture.session.cursor,
+        AdaptiveCursorV1::ReadyForTool { .. }
+    ));
+    let AdaptiveCursorV1::ReadyForTool { tool, .. } = &fixture.session.cursor else {
+        panic!("expected an unclaimed model-selected tool");
+    };
+    let tool_effect = fixture
+        .api
+        .workbench
+        .as_ref()
+        .unwrap()
+        .adaptive_tool_effect(&fixture.session, tool)
+        .unwrap();
+    assert!(fixture
+        .tools
+        .load(&tool_effect.id.to_string())
+        .unwrap()
+        .is_none());
+    let before = fixture.read();
+    let journal = fixture.tool_progress_journal();
+    let facts = fixture.tool_progress_non_model_facts();
+    fixture.with_terminal_workbench_service(|| {
+        fixture.run_existing_tool_progress().unwrap();
+    });
+    assert_eq!(fixture.read(), before);
+    assert_eq!(fixture.tool_progress_journal(), journal);
+    assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+    assert!(fixture
+        .tools
+        .load(&tool_effect.id.to_string())
+        .unwrap()
+        .is_none());
+}
+
+struct NoExpiredToolStart;
+
+impl crate::workbench::WorkbenchRuntimeClient for NoExpiredToolStart {
+    fn exchange(
+        &mut self,
+        _agent_id: AgentId,
+        _request: sentinel_common::NanoExecRequest,
+    ) -> anyhow::Result<crate::workbench::WorkbenchRuntimeExchange<'_>> {
+        panic!("expired unstarted invocation must not reach a runtime exchange");
+    }
+}
+
+#[test]
+fn existing_tool_progress_pass_skips_expired_missing_and_reserved_invocations() {
+    for reserved in [false, true] {
+        let mut fixture = Fixture::expired_productive_root();
+        let historical = fixture.session.updated_at_ms + 1;
+        let request = fixture.claim_tool(historical);
+        if reserved {
+            fixture.tools.reserve(&request, historical).unwrap();
+        }
+        let before = fixture.read();
+        let record = fixture.tools.load(&request.invocation_id).unwrap();
+        let journal = fixture.tool_progress_journal();
+        let facts = fixture.tool_progress_non_model_facts();
+        fixture.with_terminal_workbench_service(|| {
+            fixture.run_existing_tool_progress().unwrap();
+        });
+        let authority = fixture.api.authority.as_ref().unwrap();
+        let (profile, digest) = authority
+            .profile_for_binding(&request.tool_profile)
+            .unwrap();
+        let coordinator = WorkbenchCoordinator::new(&fixture.tools, profile, digest);
+        assert!(coordinator
+            .submit(
+                &mut NoExpiredToolStart,
+                &request,
+                authority.as_ref(),
+                now_unix_ms(),
+            )
+            .is_err());
+        assert_eq!(fixture.read(), before);
+        assert_eq!(fixture.tool_progress_journal(), journal);
+        assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+        assert_eq!(fixture.tools.load(&request.invocation_id).unwrap(), record);
+    }
+}
+
+#[test]
+fn existing_tool_progress_pass_rejects_revoked_lineage_before_receipt_adoption() {
+    for revoked in [false, true] {
+        let mut fixture = Fixture::continued();
+        let now = now_unix_ms();
+        let request = fixture.claim_tool(now);
+        fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+        let before = fixture.read();
+        let record = fixture.tools.load(&request.invocation_id).unwrap().unwrap();
+        if revoked {
+            let mut authority = fixture.api.authority.as_ref().unwrap().as_ref().clone();
+            assert!(Arc::make_mut(&mut authority.agent_capabilities)
+                .get_mut(&request.agent_id)
+                .unwrap()
+                .remove(sentinel_common::WORKBENCH_RETAIN_OBSERVATION));
+            fixture.api.authority = Some(Arc::new(authority));
+            Fixture::attach_workbench(&mut fixture.api);
+        } else {
+            reassign_receipt_work(&fixture, false);
+        }
+        let journal = fixture.tool_progress_journal();
+        let facts = fixture.tool_progress_non_model_facts();
+        fixture.with_terminal_workbench_service(|| {
+            assert!(fixture.run_existing_tool_progress().is_err());
+        });
+        assert_eq!(fixture.read(), before);
+        assert_eq!(fixture.tool_progress_journal(), journal);
+        assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+        assert_eq!(
+            fixture.tools.load(&request.invocation_id).unwrap().unwrap(),
+            record
+        );
+    }
+}
+
+#[test]
+fn existing_tool_progress_pass_rechecks_revocation_after_scope_snapshot() {
+    let mut fixture = Fixture::continued();
+    let now = now_unix_ms();
+    let request = fixture.claim_tool(now);
+    fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+    let before = fixture.read();
+    let record = fixture.tools.load(&request.invocation_id).unwrap().unwrap();
+    let journal = fixture.tool_progress_journal();
+    let facts = fixture.tool_progress_non_model_facts();
+    let projects = fixture.api.store.company_projects().unwrap();
+    fixture
+        .api
+        .refresh_existing_adaptive_tool_hints(&projects)
+        .unwrap();
+    let checks = std::cell::Cell::new(0);
+    let should_stop = || {
+        let check = checks.get() + 1;
+        checks.set(check);
+        // Worker, hint-pass and candidate checks precede the post-snapshot fence.
+        if check == 4 {
+            reassign_receipt_work(&fixture, false);
+        }
+        false
+    };
+    fixture.with_terminal_workbench_service(|| {
+        assert!(fixture
+            .api
+            .reconcile_adaptive_tools_until(should_stop)
+            .is_err());
+    });
+    assert!(
+        checks.get() >= 4,
+        "revocation must occur after the scoped snapshot"
+    );
+    assert_eq!(fixture.read(), before);
+    assert_eq!(fixture.tool_progress_journal(), journal);
+    assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+    assert_eq!(
+        fixture.tools.load(&request.invocation_id).unwrap().unwrap(),
+        record
+    );
+}
+
+#[test]
+fn provider_candidate_selection_never_reads_or_adopts_pending_tool_receipts() {
+    for continued in [false, true] {
+        for unknown in [false, true] {
+            let mut fixture = if continued {
+                Fixture::continued()
+            } else {
+                Fixture::productive_root()
+            };
+            let now = now_unix_ms();
+            let request = fixture.claim_tool(now);
+            let observation = fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+            if unknown {
+                fixture.advance(
+                    AdaptiveTransitionV1::MarkUnknown {
+                        effect: AdaptiveEffectV1 {
+                            id: Uuid::parse_str(&request.invocation_id).unwrap(),
+                            request_digest: request.input_digest.clone(),
+                        },
+                    },
+                    now,
+                );
+            }
+            let before = fixture.read();
+            let journal = fixture.tool_progress_journal();
+            let facts = fixture.tool_progress_non_model_facts();
+            let record = fixture.tools.load(&request.invocation_id).unwrap().unwrap();
+            fixture.with_terminal_workbench_service(|| {
+                super::tests::WORKBENCH_AUTHORITY_READS.with(|reads| reads.set(0));
+                for _ in 0..3 {
+                    let _candidate = crate::llm_bridge::bridge::ProviderUsageAuthorityResolver::prepare_provider_usage_candidate(
+                        &fixture.api,
+                        request.agent_id,
+                    ).unwrap();
+                    assert_eq!(
+                        super::tests::WORKBENCH_AUTHORITY_READS.with(|reads| reads.get()),
+                        0
+                    );
+                    assert_eq!(fixture.read(), before);
+                    assert_eq!(fixture.tool_progress_journal(), journal);
+                    assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+                    assert_eq!(
+                        fixture.tools.load(&request.invocation_id).unwrap().unwrap(),
+                        record
+                    );
+                }
+                fixture.run_existing_tool_progress().unwrap();
+                let adopted = fixture.read();
+                assert_eq!(adopted.version, before.version + 1);
+                assert_eq!(
+                    (adopted.model_calls, adopted.tool_calls),
+                    (before.model_calls, before.tool_calls)
+                );
+                assert_eq!(
+                    adopted.last_observation.as_ref().unwrap().observation_digest,
+                    observation.digest()
+                );
+                assert_eq!(
+                    fixture.tool_progress_transition_versions("observe_tool").len(),
+                    1
+                );
+            });
+            assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+            assert_eq!(
+                fixture.tools.load(&request.invocation_id).unwrap().unwrap(),
+                record
+            );
+        }
+    }
+}
+
+#[test]
+fn independent_tool_worker_latches_scope_failure_across_healthy_and_empty_soft_cuts() {
+    for remove_scope in [false, true] {
+        let mut fixture = Fixture::productive_root();
+        let now = now_unix_ms();
+        let request = fixture.claim_tool(now);
+        let observation = fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+        let before = fixture.read();
+        let failed_scope = fixture.tool_progress_scope_key();
+        let record = fixture.tools.load(&request.invocation_id).unwrap().unwrap();
+        let healthy = fixture.add_tool_progress_project(10_000, true);
+        let empty = fixture.add_tool_progress_project(20_000, false);
+        let facts = fixture.tool_progress_non_model_facts();
+        let journal = fixture.tool_progress_journal();
+        let mut expected_facts = facts.clone();
+        let adapter = fixture.api.workbench.take().unwrap();
+        fixture.refresh_tool_progress_hints();
+        fixture.set_tool_progress_next_scope(&failed_scope);
+        let (result, examined) = fixture.record_tool_progress_pass(true);
+        assert!(result.is_err());
+        assert_eq!(examined, vec![failed_scope.clone()]);
+        let failures = fixture
+            .api
+            .adaptive_tool_progress_failures
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(failures.len(), 1);
+        assert!(failures.contains_key(&failed_scope));
+        let health_error = fixture.api.adaptive_tool_progress_health_error();
+        assert!(health_error.is_some());
+        for scope in [&healthy, &empty] {
+            fixture.refresh_tool_progress_hints();
+            fixture.set_tool_progress_next_scope(scope);
+            let (result, examined) = fixture.record_tool_progress_pass(true);
+            assert!(
+                result.is_err(),
+                "the unvisited failure must remain reported"
+            );
+            assert_eq!(examined, vec![(*scope).clone()]);
+            assert_eq!(
+                *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+                failures
+            );
+            assert_eq!(
+                fixture.api.adaptive_tool_progress_health_error(),
+                health_error
+            );
+            assert_eq!(fixture.read(), before);
+            assert_eq!(fixture.tool_progress_journal(), journal);
+            assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+        }
+        if remove_scope {
+            let project = fixture.project();
+            fixture
+                .api
+                .store
+                .apply_company_command(
+                    &fixture.api.principals.principal("pm").unwrap().principal,
+                    Uuid::new_v4(),
+                    &CompanyWorkflowCommandV1::RaiseBlocker {
+                        project_id: project.project_id.clone(),
+                        expected_version: project.version,
+                        work_item_id: Some(before.grant.authority.work_item_id.clone()),
+                        cause_ref: "tool-progress-fixture-dependency".into(),
+                        owner: AgentId(5),
+                    },
+                    now_unix_ms(),
+                )
+                .unwrap();
+            let blocked = fixture.project();
+            assert_eq!(
+                blocked.lifecycle_state,
+                sentinel_workflow::ProjectLifecycleStateV1::Blocked
+            );
+            assert_eq!(blocked.subscription_call, project.subscription_call);
+            let blocked_journal = fixture.tool_progress_journal();
+            // Eligibility exclusion is not authoritative allowance-scope removal.
+            fixture.refresh_tool_progress_hints();
+            assert!(!fixture.tool_progress_hint_keys().contains(&failed_scope));
+            assert_eq!(
+                *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+                failures
+            );
+            assert!(fixture
+                .api
+                .reconcile_adaptive_tools_until(|| false)
+                .is_err());
+            assert_eq!(
+                fixture.api.adaptive_tool_progress_health_error(),
+                health_error
+            );
+            assert_eq!(fixture.read(), before);
+            assert_eq!(fixture.tool_progress_journal(), blocked_journal);
+
+            fixture
+                .api
+                .store
+                .apply_company_command(
+                    &fixture.api.principals.principal("pm").unwrap().principal,
+                    Uuid::new_v4(),
+                    &CompanyWorkflowCommandV1::ResolveBlocker {
+                        project_id: blocked.project_id,
+                        expected_version: blocked.version,
+                        blocker_id: blocked.blockers.last().unwrap().blocker_id.clone(),
+                        resolution_ref: "fixture dependency restored for operator abandonment"
+                            .into(),
+                    },
+                    now_unix_ms(),
+                )
+                .unwrap();
+            fixture.abandon_tool_progress_fixture_allowance();
+            let archived = fixture.project();
+            assert!(archived.subscription_call.is_none());
+            assert_eq!(
+                archived
+                    .abandoned_subscription_calls
+                    .last()
+                    .unwrap()
+                    .allowance
+                    .allowance_id,
+                project.subscription_call.as_ref().unwrap().allowance_id
+            );
+            let removed_journal = fixture.tool_progress_journal();
+            expected_facts = fixture.tool_progress_non_model_facts();
+            assert_eq!(
+                expected_facts[0], facts[0],
+                "fixture removal must not mint model effects"
+            );
+            assert_eq!(
+                *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+                failures
+            );
+            // Only fresh discovery of the genuinely absent allowance prunes its failure.
+            fixture.refresh_tool_progress_hints();
+            assert!(fixture
+                .api
+                .adaptive_tool_progress_failures
+                .lock()
+                .unwrap()
+                .is_empty());
+            fixture
+                .api
+                .reconcile_adaptive_tools_until(|| false)
+                .unwrap();
+            assert_eq!(fixture.read(), before);
+            assert_eq!(fixture.tool_progress_journal(), removed_journal);
+        } else {
+            // Restoring the real adapter is not a fresh validation of the failed scope.
+            fixture.api.workbench = Some(adapter);
+            fixture.refresh_tool_progress_hints();
+            assert_eq!(
+                *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+                failures
+            );
+            fixture.set_tool_progress_next_scope(&failed_scope);
+            fixture.with_terminal_workbench_service(|| {
+                let (result, examined) = fixture.record_tool_progress_pass(true);
+                assert!(result.unwrap());
+                assert_eq!(examined, vec![failed_scope]);
+            });
+            let adopted = fixture.read();
+            assert_eq!(adopted.version, before.version + 1);
+            assert_eq!(
+                adopted.last_observation.unwrap().observation_digest,
+                observation.digest()
+            );
+        }
+        assert!(fixture
+            .api
+            .adaptive_tool_progress_failures
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(fixture.api.adaptive_tool_progress_health_error().is_none());
+        assert_eq!(fixture.tool_progress_non_model_facts(), expected_facts);
+        assert_eq!(
+            fixture.tools.load(&request.invocation_id).unwrap().unwrap(),
+            record
+        );
+    }
+}
+
+#[test]
+fn independent_tool_worker_count_bound_rotates_without_erasing_an_unvisited_failure() {
+    let mut fixture = Fixture::productive_root();
+    let now = now_unix_ms();
+    let request = fixture.claim_tool(now);
+    fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+    for index in 0..MAX_RECONCILE_BATCH + 5 {
+        fixture.add_tool_progress_project(10_000 + index as u128 * 100, false);
+    }
+    let failed_scope = fixture.tool_progress_scope_key();
+    fixture.api.workbench = None;
+    fixture.refresh_tool_progress_hints();
+    let expected = fixture.tool_progress_hint_keys();
+    assert!(expected.len() > MAX_RECONCILE_BATCH);
+    fixture.set_tool_progress_next_scope(&failed_scope);
+    let (result, examined) = fixture.record_tool_progress_pass(true);
+    assert!(result.is_err());
+    assert_eq!(examined, vec![failed_scope.clone()]);
+    let failures = fixture
+        .api
+        .adaptive_tool_progress_failures
+        .lock()
+        .unwrap()
+        .clone();
+    let health_error = fixture.api.adaptive_tool_progress_health_error();
+    let mut next = (expected
+        .iter()
+        .position(|scope| scope == &failed_scope)
+        .unwrap()
+        + 1)
+        % expected.len();
+    let mut visited = BTreeSet::from([failed_scope]);
+    let journal = fixture.tool_progress_journal();
+    let facts = fixture.tool_progress_non_model_facts();
+    // Actual passes may hit the time cap before the count cap; neither may restart at the prefix.
+    for _ in 0..expected.len() {
+        fixture.refresh_tool_progress_hints();
+        let (result, examined) = fixture.record_tool_progress_pass(false);
+        assert!(result.is_err());
+        assert!(!examined.is_empty());
+        assert!(examined.len() <= MAX_RECONCILE_BATCH);
+        for scope in examined {
+            assert_eq!(scope, expected[next]);
+            visited.insert(scope);
+            next = (next + 1) % expected.len();
+        }
+        assert_eq!(
+            *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+            failures
+        );
+        assert_eq!(
+            fixture.api.adaptive_tool_progress_health_error(),
+            health_error
+        );
+        if visited.len() == expected.len() {
+            break;
+        }
+    }
+    assert_eq!(visited, expected.into_iter().collect::<BTreeSet<_>>());
+    assert_eq!(fixture.tool_progress_journal(), journal);
+    assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+}
+
+#[test]
+fn concurrent_normal_selector_and_tool_worker_adopt_one_existing_observation() {
+    let mut fixture = Fixture::productive_root();
+    let now = now_unix_ms();
+    let request = fixture.claim_tool(now);
+    let observation = fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+    let before = fixture.read();
+    let facts = fixture.tool_progress_non_model_facts();
+    let record = fixture.tools.load(&request.invocation_id).unwrap().unwrap();
+    fixture.refresh_tool_progress_hints();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|threads| {
+        let selector = threads.spawn(|| fixture.with_terminal_workbench_service(|| {
+            super::tests::WORKBENCH_AUTHORITY_READS.with(|reads| reads.set(0));
+            barrier.wait();
+            let result = crate::llm_bridge::bridge::ProviderUsageAuthorityResolver::prepare_provider_usage_candidate(
+                &fixture.api,
+                request.agent_id,
+            );
+            assert_eq!(super::tests::WORKBENCH_AUTHORITY_READS.with(|reads| reads.get()), 0);
+            let _candidate = result.unwrap();
+        }));
+        let worker = threads.spawn(|| {
+            fixture.with_terminal_workbench_service(|| {
+                barrier.wait();
+                assert!(fixture
+                    .api
+                    .reconcile_adaptive_tools_until(|| false)
+                    .unwrap());
+            })
+        });
+        selector.join().unwrap();
+        worker.join().unwrap();
+    });
+    let adopted = fixture.read();
+    assert_eq!(adopted.version, before.version + 1);
+    assert_eq!(
+        (adopted.model_calls, adopted.tool_calls),
+        (before.model_calls, before.tool_calls)
+    );
+    assert_eq!(
+        adopted.last_observation.unwrap().observation_digest,
+        observation.digest()
+    );
+    assert_eq!(
+        fixture
+            .tool_progress_transition_versions("claim_tool")
+            .len(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .tool_progress_transition_versions("observe_tool")
+            .len(),
+        1
+    );
+    let journal = fixture.tool_progress_journal();
+    fixture.with_terminal_workbench_service(|| fixture.run_existing_tool_progress().unwrap());
+    assert_eq!(fixture.tool_progress_journal(), journal);
+    assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+    assert_eq!(
+        fixture.tools.load(&request.invocation_id).unwrap().unwrap(),
+        record
+    );
 }
 
 #[test]
@@ -796,6 +1565,28 @@ fn committed_private_tool_observation_is_readable_without_a_live_process() {
         .is_err());
 }
 
+type ToolProgressSqlRows = Vec<Vec<rusqlite::types::Value>>;
+type ToolProgressScopeKey = (TenantId, ProjectId, WorkItemId, u16);
+type ToolProgressRecordedPass = (Result<bool, WorkflowError>, Vec<ToolProgressScopeKey>);
+
+fn tool_progress_sql_rows(path: &Path, query: &str) -> ToolProgressSqlRows {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let mut statement = connection.prepare(query).unwrap();
+    let columns = statement.column_count();
+    let rows = statement
+        .query_map([], |row| {
+            (0..columns)
+                .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
 struct Fixture {
     api: WorkflowApi,
     session: AdaptiveSessionV1,
@@ -855,6 +1646,303 @@ pub(crate) fn exhausted_budget_review_fixture(
 }
 
 impl Fixture {
+    fn abandon_tool_progress_fixture_allowance(&self) {
+        let project = self.project();
+        assert_eq!(
+            project.lifecycle_state,
+            sentinel_workflow::ProjectLifecycleStateV1::Active
+        );
+        let allowance = project.subscription_call.as_ref().unwrap();
+        assert!(allowance.dispatch.is_none());
+        let request_id = format!("company-provider-{}", allowance.allowance_id);
+        let request_digest = format!("{:x}", Sha256::digest(request_id.as_bytes()));
+        let events = self.api.event_store.as_ref().unwrap();
+        // Reserve and cancel a fixture request before sending; no model completion is invented.
+        events
+            .reserve_llm_request(
+                &request_id,
+                &request_digest,
+                &allowance.grant.agent_id.to_string(),
+            )
+            .unwrap();
+        self.api
+            .store
+            .apply_company_command(
+                &self
+                    .api
+                    .principals
+                    .principal("developer-6")
+                    .unwrap()
+                    .principal,
+                Uuid::new_v4(),
+                &CompanyWorkflowCommandV1::ClaimSubscriptionCall {
+                    project_id: project.project_id.clone(),
+                    expected_version: project.version,
+                    allowance_id: allowance.allowance_id.clone(),
+                    request_id: request_id.clone(),
+                    request_digest: request_digest.clone(),
+                },
+                now_unix_ms(),
+            )
+            .unwrap();
+        assert!(events
+            .resolve_llm_completion_terminal(
+                &request_id,
+                &request_digest,
+                "fixture operator abandoned an unsent reserved request",
+            )
+            .unwrap());
+        let operator = self.api.principals.principal("operator").unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "project_id": project.project_id,
+            "allowance_id": allowance.allowance_id,
+        }))
+        .unwrap();
+        assert_eq!(
+            self.api
+                .abandon_project_provider_call(&operator, &body)
+                .status,
+            200
+        );
+    }
+
+    fn tool_progress_scope_key(&self) -> ToolProgressScopeKey {
+        let authority = &self.session.grant.authority;
+        (
+            authority.tenant_id.clone(),
+            authority.project_id.clone(),
+            authority.work_item_id.clone(),
+            authority.agent_id.0,
+        )
+    }
+
+    fn add_tool_progress_project(
+        &self,
+        operation: u128,
+        with_session: bool,
+    ) -> ToolProgressScopeKey {
+        let binding = super::model_work::assign_test_work_from_at(
+            &self.api,
+            Some(8),
+            operation,
+            now_unix_ms(),
+        );
+        let tenant = TenantId::parse(&binding.tenant_id).unwrap();
+        let project_id = ProjectId::parse(&binding.project_id).unwrap();
+        let work = WorkItemId::parse(&binding.work_item_id).unwrap();
+        if with_session {
+            let project = self
+                .api
+                .store
+                .company_project(&tenant, &project_id)
+                .unwrap()
+                .unwrap();
+            let selected = select_provider_usage_binding(
+                std::slice::from_ref(&project),
+                binding.agent_id,
+                Some(&binding.reservation_id),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(self
+                .api
+                .adaptive_provider_authority_from_binding(selected, false)
+                .unwrap()
+                .0
+                .is_some());
+        }
+        (tenant, project_id, work, binding.agent_id.0)
+    }
+
+    fn refresh_tool_progress_hints(&self) {
+        let projects = self.api.store.company_projects().unwrap();
+        self.api
+            .refresh_existing_adaptive_tool_hints(&projects)
+            .unwrap();
+    }
+
+    fn tool_progress_hint_keys(&self) -> Vec<ToolProgressScopeKey> {
+        self.api
+            .adaptive_tool_progress_hints
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|scope| {
+                (
+                    scope.0.clone(),
+                    scope.1.clone(),
+                    scope.2.clone(),
+                    scope.3 .0,
+                )
+            })
+            .collect()
+    }
+
+    fn set_tool_progress_next_scope(&self, key: &ToolProgressScopeKey) {
+        let hints = self
+            .api
+            .adaptive_tool_progress_hints
+            .lock()
+            .unwrap()
+            .clone();
+        let index = hints
+            .iter()
+            .position(|scope| {
+                (
+                    scope.0.clone(),
+                    scope.1.clone(),
+                    scope.2.clone(),
+                    scope.3 .0,
+                ) == *key
+            })
+            .unwrap();
+        *self.api.adaptive_tool_progress_cursor.lock().unwrap() =
+            Some(hints[(index + hints.len() - 1) % hints.len()].clone());
+    }
+
+    fn record_tool_progress_pass(&self, force_soft_cut: bool) -> ToolProgressRecordedPass {
+        let last = std::cell::RefCell::new(
+            self.api
+                .adaptive_tool_progress_cursor
+                .lock()
+                .unwrap()
+                .clone(),
+        );
+        let examined = std::cell::RefCell::new(Vec::new());
+        let record_cursor = || {
+            let current = self
+                .api
+                .adaptive_tool_progress_cursor
+                .lock()
+                .unwrap()
+                .clone();
+            let mut previous = last.borrow_mut();
+            if current != *previous {
+                if let Some(scope) = &current {
+                    examined.borrow_mut().push((
+                        scope.0.clone(),
+                        scope.1.clone(),
+                        scope.2.clone(),
+                        scope.3 .0,
+                    ));
+                }
+                *previous = current;
+            }
+        };
+        let checks = std::cell::Cell::new(0);
+        let should_stop = || {
+            record_cursor();
+            let check = checks.get() + 1;
+            checks.set(check);
+            if force_soft_cut && check == 3 {
+                // Delay the first candidate check past the 50 ms soft budget, not a speed assertion.
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            false
+        };
+        let result = self.api.reconcile_adaptive_tools_until(should_stop);
+        record_cursor();
+        let examined = examined.borrow().clone();
+        (result, examined)
+    }
+
+    fn tool_progress_transition_versions(&self, kind: &str) -> Vec<u64> {
+        let connection = rusqlite::Connection::open_with_flags(
+            self.temp.path().join("company.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut statement = connection.prepare(
+            "SELECT json_extract(response,'$.session.version') FROM workflow_operations WHERE length(operation_id)=20 AND json_extract(response,'$.session.grant.session_id')=?1 AND json_extract(response,'$.command.kind')=?2 ORDER BY operation_id",
+        ).unwrap();
+        let versions = statement
+            .query_map(
+                rusqlite::params![self.session.grant.session_id.to_string(), kind],
+                |row| {
+                    let version: i64 = row.get(0)?;
+                    Ok(u64::try_from(version).expect("session version must be nonnegative"))
+                },
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        versions
+    }
+
+    fn expired_productive_root() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let created = now_unix_ms() - 600_000;
+        let mut api = super::model_work::configured_test_api(&temp.path().join("company.sqlite"));
+        let binding = super::model_work::assign_test_work_from_at(&api, Some(8), 0, created);
+        api.subscription_allowance_id = Some(binding.reservation_id.clone());
+        api.event_store = Some(
+            sentinel_limbo::EventStore::open(temp.path().join("events.sqlite").to_str().unwrap())
+                .unwrap(),
+        );
+        // Seed the exact historical binding; today's live selector must reject expiry.
+        let projects = api.store.company_projects().unwrap();
+        let exact = select_provider_usage_binding(
+            &projects,
+            binding.agent_id,
+            Some(&binding.reservation_id),
+        )
+        .unwrap()
+        .unwrap();
+        let (authority, reconciled) = api
+            .adaptive_provider_authority_from_binding(exact, false)
+            .unwrap();
+        assert!(!reconciled);
+        let authority = authority.unwrap();
+        let session = api
+            .store
+            .adaptive_session(authority.grant.session_id, &authority.grant.authority)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.grant.created_at_ms, created);
+        assert!(now_unix_ms() > session.active_deadline_ms());
+        Self::attach_workbench(&mut api);
+        let tools =
+            Arc::new(WorkbenchInvocationStore::open(temp.path().join("workbench.redb")).unwrap());
+        Self {
+            api,
+            session,
+            tools,
+            temp,
+        }
+    }
+
+    fn run_existing_tool_progress(&self) -> Result<(), WorkflowError> {
+        let projects = self.api.store.company_projects().unwrap();
+        self.api.refresh_existing_adaptive_tool_hints(&projects)?;
+        self.api
+            .reconcile_adaptive_tools_until(|| false)
+            .map(|_| ())
+    }
+
+    fn tool_progress_journal(&self) -> ToolProgressSqlRows {
+        tool_progress_sql_rows(
+            &self.temp.path().join("company.sqlite"),
+            "SELECT * FROM workflow_operations ORDER BY operation_namespace,operation_id",
+        )
+    }
+
+    fn tool_progress_non_model_facts(&self) -> [ToolProgressSqlRows; 3] {
+        [
+            tool_progress_sql_rows(
+                &self.temp.path().join("company.sqlite"),
+                "SELECT * FROM workflow_operations WHERE operation_id='00000000000000000001' OR json_extract(response,'$.command.kind') IN ('claim_model','resolve_model') ORDER BY operation_namespace,operation_id",
+            ),
+            tool_progress_sql_rows(
+                &self.temp.path().join("events.sqlite"),
+                "SELECT * FROM llm_completion_outbox ORDER BY request_id",
+            ),
+            tool_progress_sql_rows(
+                &self.temp.path().join("events.sqlite"),
+                "SELECT * FROM events ORDER BY id",
+            ),
+        ]
+    }
+
     fn productive_root() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let (mut api, binding, _) = super::model_work::configured_adaptive_test_api(
