@@ -169,6 +169,83 @@ fn failed_reconciliation_batch_publishes_its_actual_failure() {
     assert_eq!(health.last_error.as_deref(), Some("PersistenceFailure"));
 }
 
+#[test]
+fn terminal_company_worker_failure_cannot_be_cleared_by_a_later_healthy_pass() {
+    let api = enabled_api();
+    api.publish_reconciliation_status(None);
+    assert_status(&api, true, None);
+    api.mark_company_reconciliation_worker_failed();
+    for _ in 0..2 {
+        api.publish_reconciliation_status(None);
+        assert_status(&api, false, Some("company_reconciliation_worker_failed"));
+        let health = api.health();
+        assert!(!health.ready);
+        assert_eq!(
+            health.last_error.as_deref(),
+            Some("company_reconciliation_worker_failed")
+        );
+    }
+}
+
+#[test]
+fn terminal_company_worker_failure_is_visible_before_first_scan_and_with_poisoned_status() {
+    let api = enabled_api();
+    poison_status(&api);
+    api.mark_company_reconciliation_worker_failed();
+    assert_status(&api, false, Some("company_reconciliation_worker_failed"));
+    assert!(!api.health().ready);
+    assert_eq!(
+        api.health().last_error.as_deref(),
+        Some("company_reconciliation_worker_failed")
+    );
+}
+
+#[test]
+fn reconciliation_phase_observation_preserves_values_errors_and_single_execution() {
+    let api = enabled_api();
+    let calls = AtomicUsize::new(0);
+    let success: Result<u16, &'static str> = api.trace_reconciliation_phase("fixture", || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(7)
+    });
+    assert_eq!(success, Ok(7));
+    let failure: Result<u16, &'static str> = api.trace_reconciliation_phase("fixture", || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err("fixture failure")
+    });
+    assert_eq!(failure, Err("fixture failure"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_status(&api, false, None);
+}
+
+#[test]
+fn cancellation_after_publication_or_inventory_never_publishes_full_scan_success() {
+    for stop_at in [1, 2] {
+        for previous in [None, Some(None), Some(Some("existing error"))] {
+            let mut api = enabled_api();
+            api.event_store = Some(sentinel_limbo::EventStore::open(":memory:").unwrap());
+            if let Some(previous) = previous {
+                api.publish_reconciliation_status(previous.map(str::to_owned));
+            }
+            let before = api.reconciliation_status_snapshot();
+            let calls = AtomicUsize::new(0);
+            api.reconcile_pending_until(|| calls.fetch_add(1, Ordering::SeqCst) >= stop_at);
+            let after = api.reconciliation_status_snapshot();
+            assert_eq!(after.scan_succeeded, before.scan_succeeded);
+            assert_eq!(after.last_error, before.last_error);
+        }
+    }
+}
+
+#[test]
+fn failed_scan_error_is_not_suppressed_by_a_later_cancellation() {
+    let api = enabled_api();
+    api.publish_reconciliation_status(None);
+    let calls = AtomicUsize::new(0);
+    api.reconcile_pending_until(|| calls.fetch_add(1, Ordering::SeqCst) > 0);
+    assert_status(&api, false, Some("PersistenceFailure"));
+}
+
 struct PublishDuringDependencyCheck {
     api: OnceLock<Weak<WorkflowApi>>,
     error: Option<String>,

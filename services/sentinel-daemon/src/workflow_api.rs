@@ -32,6 +32,8 @@ mod adaptive_review_epoch;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/budget_window.rs"]
 mod budget_window_tests;
+mod company_reconciliation_worker;
+pub(crate) use company_reconciliation_worker::CompanyReconciliationWorker;
 mod delivery_intent;
 mod delivery_runtime;
 #[cfg(all(test, feature = "llm"))]
@@ -65,7 +67,6 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-#[cfg(any(test, feature = "llm"))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -160,6 +161,7 @@ const PROFILE_GENERATION: u64 = 1;
 const RUNTIME_GENERATION: u64 = 1;
 const DISPATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RECONCILE_BATCH: usize = 32;
+const SLOW_RECONCILIATION_PHASE_MS: u128 = 250;
 const MAX_PRINCIPAL_BINDINGS_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTION_INTENT_STEPS: usize = 16;
 const MAX_COLLABORATION_ASSIGNMENT_LOAD: u16 = COLLABORATION_POLICY_MAX_PARTICIPANTS;
@@ -3360,12 +3362,15 @@ pub struct WorkflowApi {
     request_sales_total_limit: u16,
     request_sales_autonomous_enabled: bool,
     reconciliation_status: Mutex<ReconciliationStatus>,
+    company_reconciliation_worker_failed: AtomicBool,
     collaboration_publication_pending: AtomicUsize,
     company_sync_cursor: Mutex<Option<(TenantId, ProjectId, WorkItemId)>>,
     #[cfg(feature = "llm")]
     adaptive_tool_progress_cursor: Mutex<Option<(TenantId, ProjectId, WorkItemId, AgentId)>>,
     #[cfg(feature = "llm")]
     adaptive_tool_progress_hints: Mutex<Arc<Vec<model_execution::AdaptiveToolProgressScope>>>,
+    #[cfg(feature = "llm")]
+    adaptive_tool_progress_inventory_generation: AtomicU64,
     #[cfg(feature = "llm")]
     adaptive_tool_progress_fence: Mutex<()>,
     #[cfg(feature = "llm")]
@@ -3561,12 +3566,15 @@ impl WorkflowApi {
             request_sales_total_limit,
             request_sales_autonomous_enabled,
             reconciliation_status: Mutex::new(ReconciliationStatus::default()),
+            company_reconciliation_worker_failed: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(usize::MAX),
             company_sync_cursor: Mutex::new(None),
             #[cfg(feature = "llm")]
             adaptive_tool_progress_cursor: Mutex::new(None),
             #[cfg(feature = "llm")]
             adaptive_tool_progress_hints: Mutex::new(Arc::new(Vec::new())),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_inventory_generation: AtomicU64::new(0),
             #[cfg(feature = "llm")]
             adaptive_tool_progress_fence: Mutex::new(()),
             #[cfg(feature = "llm")]
@@ -3609,12 +3617,15 @@ impl WorkflowApi {
             request_sales_total_limit: 1,
             request_sales_autonomous_enabled: false,
             reconciliation_status: Mutex::new(ReconciliationStatus::default()),
+            company_reconciliation_worker_failed: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(0),
             company_sync_cursor: Mutex::new(None),
             #[cfg(feature = "llm")]
             adaptive_tool_progress_cursor: Mutex::new(None),
             #[cfg(feature = "llm")]
             adaptive_tool_progress_hints: Mutex::new(Arc::new(Vec::new())),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_inventory_generation: AtomicU64::new(0),
             #[cfg(feature = "llm")]
             adaptive_tool_progress_fence: Mutex::new(()),
             #[cfg(feature = "llm")]
@@ -5374,8 +5385,35 @@ impl WorkflowApi {
         if should_stop() {
             return;
         }
-        let result = self.reconcile_batch(&should_stop);
+        let result =
+            self.trace_reconciliation_phase("full_scan", || self.reconcile_batch(&should_stop));
+        if result.is_ok() && should_stop() {
+            return;
+        }
         self.publish_reconciliation_status(result.err().map(|error| format!("{:?}", error.code)));
+    }
+
+    fn trace_reconciliation_phase<T, E>(
+        &self,
+        phase: &'static str,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let initial_scan = !self.reconciliation_status_snapshot().scan_succeeded;
+        if initial_scan {
+            tracing::info!(phase, "Company initial reconciliation phase started");
+        }
+        let started = std::time::Instant::now();
+        let result = action();
+        let elapsed_ms = started.elapsed().as_millis();
+        if initial_scan || elapsed_ms >= SLOW_RECONCILIATION_PHASE_MS {
+            tracing::info!(
+                phase,
+                elapsed_ms,
+                accepted = result.is_ok(),
+                "Company reconciliation phase completed"
+            );
+        }
+        result
     }
 
     fn publish_reconciliation_status(&self, last_error: Option<String>) {
@@ -5387,7 +5425,22 @@ impl WorkflowApi {
         }
     }
 
+    pub(super) fn mark_company_reconciliation_worker_failed(&self) {
+        self.company_reconciliation_worker_failed
+            .store(true, Ordering::Release);
+    }
+
     fn reconciliation_status_snapshot(&self) -> ReconciliationStatus {
+        // A later manual pass cannot revive the owner thread that actually terminated.
+        if self
+            .company_reconciliation_worker_failed
+            .load(Ordering::Acquire)
+        {
+            return ReconciliationStatus {
+                scan_succeeded: false,
+                last_error: Some("company_reconciliation_worker_failed".to_owned()),
+            };
+        }
         match self.reconciliation_status.lock() {
             Ok(status) => status.clone(),
             Err(poisoned) => ReconciliationStatus {
@@ -5407,10 +5460,11 @@ impl WorkflowApi {
         // blocked. Publishing evidence does not authorize a failed QA release.
         publish_after_reconciliation(result, || {
             if let Some(delivery) = self.delivery.as_ref() {
-                delivery
-                    .publish_pending()
-                    .map(|_| ())
-                    .map_err(delivery_workflow_error)
+                self.trace_reconciliation_phase("delivery_publication", || {
+                    delivery.publish_pending()
+                })
+                .map(|_| ())
+                .map_err(delivery_workflow_error)
             } else {
                 Ok(())
             }
@@ -5418,7 +5472,10 @@ impl WorkflowApi {
     }
 
     fn reconcile_work_batch(&self, should_stop: &impl Fn() -> bool) -> Result<(), WorkflowError> {
-        self.publish_collaboration_backlog().map_err(|_| {
+        self.trace_reconciliation_phase("collaboration_publication", || {
+            self.publish_collaboration_backlog()
+        })
+        .map_err(|_| {
             log_reconciliation_failure("collaboration_publication", "publication unavailable");
             workflow_unavailable()
         })?;
@@ -5426,17 +5483,26 @@ impl WorkflowApi {
             return Ok(());
         }
         #[cfg(feature = "llm")]
-        self.reconcile_sales_intake().inspect_err(|_| {
-            log_reconciliation_failure("sales_intake", "intake reconciliation failed");
-        })?;
-        let projects = self.store.company_projects().inspect_err(|_| {
-            log_reconciliation_failure("project_scan", "project ledger unavailable");
-        })?;
-        #[cfg(feature = "llm")]
-        self.refresh_existing_adaptive_tool_hints(&projects)
+        self.trace_reconciliation_phase("sales_intake", || self.reconcile_sales_intake())
             .inspect_err(|_| {
-                log_reconciliation_failure("adaptive_tool_hints", "scope discovery failed");
+                log_reconciliation_failure("sales_intake", "intake reconciliation failed");
             })?;
+        #[cfg(feature = "llm")]
+        let tool_inventory_generation = self
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire);
+        let projects = self
+            .trace_reconciliation_phase("project_inventory", || self.store.company_projects())
+            .inspect_err(|_| {
+                log_reconciliation_failure("project_scan", "project ledger unavailable");
+            })?;
+        #[cfg(feature = "llm")]
+        self.trace_reconciliation_phase("tool_hint_inventory", || {
+            self.refresh_existing_adaptive_tool_hints(&projects, tool_inventory_generation)
+        })
+        .inspect_err(|_| {
+            log_reconciliation_failure("adaptive_tool_hints", "scope discovery failed");
+        })?;
         if should_stop() {
             return Ok(());
         }
@@ -5454,14 +5520,18 @@ impl WorkflowApi {
                 continue;
             }
             #[cfg(feature = "llm")]
-            self.reconcile_unknown_adaptive_models(&project)
-                .map_err(|reason| {
-                    log_reconciliation_failure("unknown_model", reason);
-                    workflow_unavailable()
-                })?;
+            self.trace_reconciliation_phase("unknown_model_recovery", || {
+                self.reconcile_unknown_adaptive_models(&project)
+            })
+            .map_err(|reason| {
+                log_reconciliation_failure("unknown_model", reason);
+                workflow_unavailable()
+            })?;
             #[cfg(feature = "llm")]
             if self
-                .reconcile_adaptive_leadership_reviews(&project)
+                .trace_reconciliation_phase("adaptive_leadership", || {
+                    self.reconcile_adaptive_leadership_reviews(&project)
+                })
                 .map_err(|reason| {
                     log_reconciliation_failure("adaptive_leadership", reason);
                     workflow_unavailable()
