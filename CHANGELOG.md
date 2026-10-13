@@ -1,5 +1,12 @@
 # Changelog
 
+- Own the full company reconciliation worker through startup, panic and shutdown,
+  retaining terminal worker failure in readiness. Trace slow and initial scan
+  phases without private payloads, and reduce repeated existing-task project and
+  session proof acquisition while preserving fresh authority. Retire freshly
+  verified idle scope hints, republish after durable tool decisions, and fence
+  inventory replacement and failure pruning against newer metadata (#856).
+
 - Reconcile existing adaptive tool effects independently of provider admission,
   using bounded rotating scope discovery, fresh authority and exact recovery
   identity. Keep model/session creation out of this progress phase, reject
