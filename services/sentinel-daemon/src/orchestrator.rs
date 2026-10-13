@@ -3375,6 +3375,22 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             }
         })
         .context("start M0 company workflow reconciler")?;
+    #[cfg(feature = "llm")]
+    let mut workflow_tool_progress = {
+        match crate::workflow_api::AdaptiveToolProgressWorker::spawn(
+            Arc::clone(&workflow_api),
+            Arc::clone(&shutdown),
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                shutdown.store(true, Ordering::SeqCst);
+                if !join_workflow_reconciler(workflow_reconcile_handle, Duration::from_secs(6)) {
+                    warn!("Company workflow worker did not finish after progress startup failed");
+                }
+                return Err(error).context("start existing company tool progress worker");
+            }
+        }
+    };
     let ecs_llm_circuit_open = Arc::clone(&llm_circuit_open);
     let ecs_llm_activity_ticks = Arc::clone(&llm_activity_ticks);
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
@@ -3757,6 +3773,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     if !join_workflow_reconciler(workflow_reconcile_handle, Duration::from_secs(6)) {
         warn!("Company-Workflow-Reconciler konnte nicht sauber beendet werden");
     }
+    #[cfg(feature = "llm")]
+    workflow_tool_progress
+        .stop_and_join()
+        .map_err(anyhow::Error::msg)?;
     // Action-Channel schliessen damit ECS-Thread aufwacht falls er blockt
     drop(action_tx);
     drop(operator_tx);
