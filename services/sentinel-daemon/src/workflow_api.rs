@@ -50,16 +50,22 @@ mod reconciliation_status_tests;
 #[cfg(feature = "llm")]
 mod subscription;
 #[cfg(feature = "llm")]
+mod tool_progress_worker;
+#[cfg(feature = "llm")]
+pub(crate) use tool_progress_worker::AdaptiveToolProgressWorker;
+#[cfg(feature = "llm")]
 mod unknown_model_evidence;
 mod work_correction;
 
+#[cfg(feature = "llm")]
+use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(any(test, feature = "llm"))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3356,6 +3362,19 @@ pub struct WorkflowApi {
     reconciliation_status: Mutex<ReconciliationStatus>,
     collaboration_publication_pending: AtomicUsize,
     company_sync_cursor: Mutex<Option<(TenantId, ProjectId, WorkItemId)>>,
+    #[cfg(feature = "llm")]
+    adaptive_tool_progress_cursor: Mutex<Option<(TenantId, ProjectId, WorkItemId, AgentId)>>,
+    #[cfg(feature = "llm")]
+    adaptive_tool_progress_hints: Mutex<Arc<Vec<model_execution::AdaptiveToolProgressScope>>>,
+    #[cfg(feature = "llm")]
+    adaptive_tool_progress_fence: Mutex<()>,
+    #[cfg(feature = "llm")]
+    adaptive_tool_progress_error: Mutex<Option<String>>,
+    #[cfg(feature = "llm")]
+    adaptive_tool_progress_failures:
+        Mutex<BTreeMap<(TenantId, ProjectId, WorkItemId, u16), String>>,
+    #[cfg(feature = "llm")]
+    adaptive_tool_progress_worker_failed: AtomicBool,
 }
 
 impl std::fmt::Debug for WorkflowApi {
@@ -3544,6 +3563,18 @@ impl WorkflowApi {
             reconciliation_status: Mutex::new(ReconciliationStatus::default()),
             collaboration_publication_pending: AtomicUsize::new(usize::MAX),
             company_sync_cursor: Mutex::new(None),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_cursor: Mutex::new(None),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_hints: Mutex::new(Arc::new(Vec::new())),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_fence: Mutex::new(()),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_error: Mutex::new(None),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_failures: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_worker_failed: AtomicBool::new(false),
         })
     }
 
@@ -3580,6 +3611,18 @@ impl WorkflowApi {
             reconciliation_status: Mutex::new(ReconciliationStatus::default()),
             collaboration_publication_pending: AtomicUsize::new(0),
             company_sync_cursor: Mutex::new(None),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_cursor: Mutex::new(None),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_hints: Mutex::new(Arc::new(Vec::new())),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_fence: Mutex::new(()),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_error: Mutex::new(None),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_failures: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "llm")]
+            adaptive_tool_progress_worker_failed: AtomicBool::new(false),
         })
     }
 
@@ -5220,6 +5263,91 @@ impl WorkflowApi {
         self.reconcile_pending_until(|| false);
     }
 
+    #[cfg(feature = "llm")]
+    pub fn reconcile_adaptive_tools_until(
+        &self,
+        should_stop: impl Fn() -> bool,
+    ) -> Result<bool, WorkflowError> {
+        if !self.enabled || !self.model_work_enabled || should_stop() {
+            return Ok(false);
+        }
+        if self
+            .adaptive_tool_progress_worker_failed
+            .load(Ordering::Acquire)
+        {
+            return self.record_adaptive_tool_progress_result(Err(workflow_unavailable()));
+        }
+        // Tool receipts must not wait behind the full company scan. Recovery
+        // still excludes both workers through the existing mutation fence.
+        let _pass = match self.adaptive_tool_progress_fence.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => {
+                return self.record_adaptive_tool_progress_result(Err(workflow_unavailable()));
+            }
+        };
+        let _mutation = match self.mutation_fence.try_read() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => {
+                return self.record_adaptive_tool_progress_result(Err(workflow_unavailable()));
+            }
+        };
+        let hints = match self.adaptive_tool_progress_hints.lock() {
+            Ok(hints) => Arc::clone(&hints),
+            Err(_) => {
+                return self.record_adaptive_tool_progress_result(Err(workflow_unavailable()));
+            }
+        };
+        let result = self.reconcile_existing_adaptive_tool_hints(&hints, &should_stop);
+        if result.is_ok() && should_stop() {
+            return Ok(false);
+        }
+        self.record_adaptive_tool_progress_result(result)
+    }
+
+    #[cfg(feature = "llm")]
+    pub(super) fn mark_adaptive_tool_progress_worker_failed(&self) {
+        self.adaptive_tool_progress_worker_failed
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "llm")]
+    fn adaptive_tool_progress_health_error(&self) -> Option<String> {
+        if self
+            .adaptive_tool_progress_worker_failed
+            .load(Ordering::Acquire)
+        {
+            return Some("adaptive_tool_progress_worker_failed".to_owned());
+        }
+        match self.adaptive_tool_progress_error.lock() {
+            Ok(error) if error.is_some() => return error.clone(),
+            Err(_) => return Some("adaptive_tool_progress_error_poisoned".to_owned()),
+            _ => {}
+        }
+        match self.adaptive_tool_progress_failures.lock() {
+            Ok(failures) if failures.is_empty() => None,
+            Ok(_) => Some("adaptive_tool_progress_scope_failed".to_owned()),
+            Err(_) => Some("adaptive_tool_progress_failures_poisoned".to_owned()),
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    fn record_adaptive_tool_progress_result(
+        &self,
+        result: Result<(), WorkflowError>,
+    ) -> Result<bool, WorkflowError> {
+        let last_error = result
+            .as_ref()
+            .err()
+            .map(|error| format!("{:?}", error.code));
+        *self
+            .adaptive_tool_progress_error
+            .lock()
+            .map_err(|_| workflow_unavailable())? = last_error;
+        result.map(|()| true)
+    }
+
     pub fn reconcile_pending_until(&self, should_stop: impl Fn() -> bool) {
         if !self.enabled {
             return;
@@ -5304,6 +5432,14 @@ impl WorkflowApi {
         let projects = self.store.company_projects().inspect_err(|_| {
             log_reconciliation_failure("project_scan", "project ledger unavailable");
         })?;
+        #[cfg(feature = "llm")]
+        self.refresh_existing_adaptive_tool_hints(&projects)
+            .inspect_err(|_| {
+                log_reconciliation_failure("adaptive_tool_hints", "scope discovery failed");
+            })?;
+        if should_stop() {
+            return Ok(());
+        }
         for project in projects {
             #[cfg(feature = "llm")]
             if self
@@ -5679,7 +5815,9 @@ impl WorkflowApi {
         // Sample both fields together after durable checks, outside their expensive work.
         let reconciliation_status = self.reconciliation_status_snapshot();
         #[cfg(feature = "llm")]
-        let last_error = durable_error.or(reconciliation_status.last_error);
+        let last_error = durable_error
+            .or(reconciliation_status.last_error)
+            .or_else(|| self.adaptive_tool_progress_health_error());
         #[cfg(not(feature = "llm"))]
         let last_error = reconciliation_status.last_error;
         let ready = self.enabled
@@ -5883,24 +6021,16 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         let Some(binding) = binding else {
             return Ok(Some(unbound()));
         };
-        let (adaptive, reconciled_tools) =
-            self.adaptive_provider_authority_from_binding(binding.clone(), true)?;
+        // Existing tool effects drain on their independently owned worker, not
+        // while the bridge serially selects provider candidates for other agents.
+        let (adaptive, _) =
+            self.adaptive_provider_authority_from_binding(binding.clone(), false)?;
         if let Some(authority) = adaptive {
             return Ok(Some(PreparedProviderCandidate {
                 authority: Some(ProviderExecutionAuthority::Adaptive(Box::new(authority))),
                 prepared_context: None,
             }));
         }
-        // Tool reconciliation may change the selected head or finish its project.
-        // Only that path needs another selection before considering other work.
-        let binding = if reconciled_tools {
-            let Some(current) = self.provider_usage_binding_for_agent(agent_id)? else {
-                return Ok(Some(unbound()));
-            };
-            current
-        } else {
-            binding
-        };
         if binding
             .subscription_grant
             .as_ref()
