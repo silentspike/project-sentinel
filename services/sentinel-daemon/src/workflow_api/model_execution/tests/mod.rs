@@ -5,6 +5,7 @@ use sentinel_workflow::CustomerRequestStateV1;
 
 mod durable_health;
 mod fresh_observation;
+pub(super) mod read_cohorts;
 
 thread_local! {
     static PROVIDER_PREPARATION_COUNTS: std::cell::Cell<(usize, usize)> = const {
@@ -441,10 +442,21 @@ fn exact_adaptive_read_sources_do_not_reenter_fresh_mutating_acquisitions() {
         .split("fn evaluate_adaptive_provider_binding(")
         .next()
         .unwrap();
-    assert!(normal.contains(".company_project("));
-    assert!(normal.contains(".snapshot_for_admission("));
-    assert!(normal.contains(".adaptive_session_for_authority("));
-    assert!(!normal.contains(".adaptive_project_snapshot("));
+    assert_eq!(normal.matches(".adaptive_project_snapshot(").count(), 1);
+    assert_eq!(
+        normal.matches(".snapshot_from_validated_project(").count(),
+        1
+    );
+    assert_eq!(normal.matches(".session_for_authority(").count(), 1);
+    assert!(!normal.contains(".company_project("));
+    assert!(!normal.contains(".snapshot_for_admission("));
+    assert!(!normal.contains(".adaptive_session_for_authority("));
+    assert!(
+        normal.find("drop(snapshot)").unwrap()
+            < normal
+                .find("self.evaluate_adaptive_provider_binding(")
+                .unwrap()
+    );
 }
 
 pub(crate) fn record_provider_selection() {

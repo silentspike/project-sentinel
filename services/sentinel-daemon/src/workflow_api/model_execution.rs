@@ -1010,7 +1010,18 @@ impl WorkflowApi {
         let Some(authority) = self.authority.as_ref() else {
             return Ok(false);
         };
-        let Ok(current) = authority.snapshot_for_admission(
+        #[cfg(test)]
+        tests::read_cohorts::record_acquisition("first_rejection");
+        let Ok(Some(snapshot)) = self.store.adaptive_project_snapshot(
+            &project.tenant_id,
+            &project.project_id,
+            &allowance.grant.work_item_id,
+            allowance.grant.agent_id,
+        ) else {
+            return Ok(false);
+        };
+        let Ok(current) = authority.snapshot_from_validated_project(
+            snapshot.project(),
             &project.tenant_id,
             &project.project_id,
             &allowance.grant.work_item_id,
@@ -1019,12 +1030,13 @@ impl WorkflowApi {
         ) else {
             return Ok(false);
         };
-        let session = match self.store.adaptive_session_for_authority(&current) {
+        let session = match snapshot.session_for_authority(&current) {
             Ok(Some(session)) => session,
             Ok(None) => return Ok(false),
             Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => return Ok(false),
             Err(_) => return Err("adaptive recovery session unavailable"),
         };
+        drop(snapshot);
         if session.active_work_funding().is_some() {
             return Ok(false);
         }
@@ -1198,20 +1210,32 @@ impl WorkflowApi {
             .authority
             .as_ref()
             .ok_or("adaptive runtime authority unavailable")?;
+        let tenant = TenantId::parse(&binding.tenant_id).map_err(|_| "invalid adaptive tenant")?;
+        let project_id =
+            ProjectId::parse(&binding.project_id).map_err(|_| "invalid adaptive project")?;
+        let work_item_id =
+            WorkItemId::parse(&binding.work_item_id).map_err(|_| "invalid adaptive work item")?;
+        #[cfg(test)]
+        tests::read_cohorts::record_acquisition("continuation");
+        let snapshot = self
+            .store
+            .adaptive_project_snapshot(&tenant, &project_id, &work_item_id, binding.agent_id)
+            .map_err(|_| "adaptive runtime authority unavailable")?
+            .ok_or("adaptive runtime authority unavailable")?;
         let current = authority
-            .snapshot_for_admission(
-                &TenantId::parse(&binding.tenant_id).map_err(|_| "invalid adaptive tenant")?,
-                &ProjectId::parse(&binding.project_id).map_err(|_| "invalid adaptive project")?,
-                &WorkItemId::parse(&binding.work_item_id)
-                    .map_err(|_| "invalid adaptive work item")?,
+            .snapshot_from_validated_project(
+                snapshot.project(),
+                &tenant,
+                &project_id,
+                &work_item_id,
                 binding.agent_id,
                 false,
             )
             .map_err(|_| "adaptive runtime authority unavailable")?;
-        let session = self
-            .store
-            .adaptive_session_for_authority(&current)
+        let session = snapshot
+            .session_for_authority(&current)
             .map_err(|_| "adaptive continuation head unavailable")?;
+        drop(snapshot);
         if session.as_ref().is_some_and(|session| {
             session.continuation.is_some()
                 && session.active_provider_allowance_id() != binding.reservation_id
@@ -1238,21 +1262,33 @@ impl WorkflowApi {
             .authority
             .as_ref()
             .ok_or("adaptive authority unavailable")?;
+        let tenant = TenantId::parse(&binding.tenant_id).map_err(|_| "invalid adaptive tenant")?;
+        let project_id =
+            ProjectId::parse(&binding.project_id).map_err(|_| "invalid adaptive project")?;
+        let work_item_id =
+            WorkItemId::parse(&binding.work_item_id).map_err(|_| "invalid adaptive work item")?;
+        #[cfg(test)]
+        tests::read_cohorts::record_acquisition("queue");
+        let snapshot = self
+            .store
+            .adaptive_project_snapshot(&tenant, &project_id, &work_item_id, binding.agent_id)
+            .map_err(|_| "adaptive runtime authority unavailable")?
+            .ok_or("adaptive runtime authority unavailable")?;
         let current = authority
-            .snapshot_for_admission(
-                &TenantId::parse(&binding.tenant_id).map_err(|_| "invalid adaptive tenant")?,
-                &ProjectId::parse(&binding.project_id).map_err(|_| "invalid adaptive project")?,
-                &WorkItemId::parse(&binding.work_item_id)
-                    .map_err(|_| "invalid adaptive work item")?,
+            .snapshot_from_validated_project(
+                snapshot.project(),
+                &tenant,
+                &project_id,
+                &work_item_id,
                 binding.agent_id,
                 false,
             )
             .map_err(|_| "adaptive runtime authority unavailable")?;
-        let Some(session) = self
-            .store
-            .adaptive_session_for_authority(&current)
-            .map_err(|_| "adaptive queue session unavailable")?
-        else {
+        let session = snapshot
+            .session_for_authority(&current)
+            .map_err(|_| "adaptive queue session unavailable")?;
+        drop(snapshot);
+        let Some(session) = session else {
             return Ok(Some((2, 0)));
         };
         if session.continuation.is_some()
@@ -1589,11 +1625,14 @@ impl WorkflowApi {
             ProjectId::parse(&binding.project_id).map_err(|_| "invalid adaptive project")?;
         let work_item_id =
             WorkItemId::parse(&binding.work_item_id).map_err(|_| "invalid adaptive work item")?;
-        let project = self
+        #[cfg(test)]
+        tests::read_cohorts::record_acquisition("binding");
+        let snapshot = self
             .store
-            .company_project(&tenant, &project_id)
+            .adaptive_project_snapshot(&tenant, &project_id, &work_item_id, agent_id)
             .map_err(|_| "adaptive project unavailable")?
             .ok_or("adaptive project missing")?;
+        let project = snapshot.project();
         let allowance = project
             .subscription_call
             .as_ref()
@@ -1603,12 +1642,20 @@ impl WorkflowApi {
             return Err("adaptive allowance is already consumed or changed");
         }
         let current = authority
-            .snapshot_for_admission(&tenant, &project_id, &work_item_id, agent_id, false)
+            .snapshot_from_validated_project(
+                project,
+                &tenant,
+                &project_id,
+                &work_item_id,
+                agent_id,
+                false,
+            )
             .map_err(|_| "adaptive runtime authority unavailable")?;
-        let existing = self
-            .store
-            .adaptive_session_for_authority(&current)
+        let existing = snapshot
+            .session_for_authority(&current)
             .map_err(|_| "adaptive continuation head unavailable")?;
+        let project = project.clone();
+        drop(snapshot);
         self.evaluate_adaptive_provider_binding(
             binding,
             &project,

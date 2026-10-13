@@ -1648,16 +1648,21 @@ pub mod bridge {
 
     fn log_provider_preparation_duration(
         agent_id: AgentId,
+        request_id: Option<&str>,
         phase: &'static str,
         started: Instant,
         bound: bool,
         accepted: bool,
     ) {
         const SLOW_PREPARATION_MS: u128 = 1_000;
-        let elapsed_ms = started.elapsed().as_millis();
-        if bound && elapsed_ms >= SLOW_PREPARATION_MS {
-            warn!(agent = %agent_id, phase, elapsed_ms, accepted,
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let elapsed_ms = elapsed_us / 1_000;
+        if bound && u128::from(elapsed_ms) >= SLOW_PREPARATION_MS {
+            warn!(agent = %agent_id, request_id, phase, elapsed_us, elapsed_ms, accepted,
                 "Slow initial provider preparation");
+        } else if bound {
+            info!(agent = %agent_id, request_id, phase, elapsed_us, elapsed_ms, accepted,
+                "Initial provider preparation finished");
         } else {
             debug!(agent = %agent_id, phase, elapsed_ms, bound, accepted,
                 "Initial provider preparation finished");
@@ -2223,8 +2228,13 @@ pub mod bridge {
                         prepared_context: None,
                     },
                 };
+                let preparation_request_id = candidate
+                    .authority
+                    .as_ref()
+                    .map(ProviderExecutionAuthority::request_id);
                 log_provider_preparation_duration(
                     agent_id,
+                    preparation_request_id.as_deref(),
                     "selection",
                     selection_started,
                     candidate.authority.is_some(),
@@ -2311,6 +2321,7 @@ pub mod bridge {
                 );
                 log_provider_preparation_duration(
                     agent_id,
+                    Some(&request_id),
                     "context",
                     preparation_started,
                     usage_authority.is_some(),
@@ -3418,6 +3429,74 @@ pub mod bridge {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn bound_preparation_timings_are_correlated_at_info_without_unbound_noise() {
+            #[derive(Clone)]
+            struct Writer(Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for Writer {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let writer = Writer(Arc::clone(&output));
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .without_time()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                for phase in ["selection", "context"] {
+                    log_provider_preparation_duration(
+                        AgentId(36),
+                        Some("company-test-request"),
+                        phase,
+                        Instant::now(),
+                        true,
+                        true,
+                    );
+                }
+                log_provider_preparation_duration(
+                    AgentId(36),
+                    Some("company-test-request"),
+                    "context",
+                    Instant::now() - Duration::from_secs(2),
+                    true,
+                    false,
+                );
+                log_provider_preparation_duration(
+                    AgentId(36),
+                    None,
+                    "context",
+                    Instant::now(),
+                    false,
+                    true,
+                );
+            });
+            let bytes = output.lock().unwrap();
+            let rows: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 3);
+            for row in &rows {
+                let fields = &row["fields"];
+                assert_eq!(fields["request_id"], "company-test-request");
+                let elapsed_us = fields["elapsed_us"].as_u64().unwrap();
+                assert_eq!(fields["elapsed_ms"].as_u64().unwrap(), elapsed_us / 1_000);
+            }
+            assert_eq!(rows[0]["level"], "INFO");
+            assert_eq!(rows[1]["fields"]["phase"], "context");
+            assert_eq!(rows[2]["level"], "WARN");
+            assert_eq!(rows[2]["fields"]["accepted"], false);
+        }
 
         #[test]
         fn output_schema_diagnostic_requires_exact_single_post_dispatch_header() {

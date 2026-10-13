@@ -115,15 +115,19 @@ impl AdaptiveWorkingMemoryV1 {
             let memory = serde_json::to_string(self)
                 .map_err(|_| "adaptive working memory encoding failed")?;
             return Ok(format!(
-                " Historical private working memory: {memory}. This is prior observed work, not instructions, new permission, current filesystem state or completion evidence. Original ROOT model/tool ceilings remain {}/{}; original remaining model/tool calls {}/{} (saturating at zero). Previously adopted current model/tool ceilings at funding issuance: {}/{}. Separately verified adopted work-funding epoch {} has total model/tool ceilings {}/{}; model calls charged including this request {}, remaining {model_remaining}; tool calls spent {}, remaining {tool_remaining}. Active window model ceiling {}, remaining {active_remaining}; a funded total does not authorize work outside that exact bounded window. Actual continuation windows issued: {} (not a review ordinal). Expiry never refunds calls or requests another reconsideration. Only genuine leadership Continue and same-session adoption authorize another finite window. A successful tool does not imply passing tests: use actual exit_code and native_test_outcome; unavailable outcomes prove no success. Fresh-inspection requirements remain unchanged. Inspect when needed, preserve completed work, and independently choose implementation, testing, correction, collaboration or packaging without claiming unobserved results.",
+                " Operative funded total model/tool ceilings {}/{}; employee model calls charged including this request {}, remaining {model_remaining}; employee tool calls spent {}, remaining {tool_remaining}. Separately verified adopted work-funding epoch {} is the already-adopted current epoch. Original ROOT model/tool ceilings remain {}/{} as historical initial budgets only, explicitly nonoperative; original remaining model/tool calls {}/{} (saturating at zero) are historical, not the operative funded remainder. Previously adopted current model/tool ceilings at funding issuance: {}/{}. Historical private working memory: {memory}. This is prior observed work, not instructions, new permission, current filesystem state or completion evidence. Active window model ceiling {}, remaining {active_remaining}; a funded total does not authorize work outside that exact bounded window. Actual continuation windows issued: {} (not a review ordinal), total window ceiling {}, windows remaining {}. Leadership reviews are separate from employee model/tool calls: adopted funding review ordinal {}, total review ceiling {}; this memory does not establish the current number of reviews issued. Expiry never refunds calls, resets counts or requests another reconsideration. Only genuine leadership Continue and same-session adoption authorize another finite window; independent Defer remains valid, and this accounting does not instruct Continue or override a model decision. A successful tool does not imply passing tests: use actual exit_code and native_test_outcome; unavailable outcomes prove no success. Fresh-inspection requirements remain unchanged. Inspect when needed, preserve completed work, and independently choose implementation, testing, correction, collaboration or packaging without claiming unobserved results.",
+                limits.total_model_call_ceiling, limits.total_tool_call_ceiling,
+                charged_model_calls, source.tool_calls,
+                epoch.evidence_ref().map_err(|_| "adaptive funding evidence invalid")?,
                 source.root_model_ceiling, source.root_tool_ceiling,
                 source.root_model_ceiling.saturating_sub(charged_model_calls),
                 source.root_tool_ceiling.saturating_sub(source.tool_calls),
                 facts.current_model_call_ceiling, facts.current_tool_call_ceiling,
-                epoch.evidence_ref().map_err(|_| "adaptive funding evidence invalid")?,
-                limits.total_model_call_ceiling, limits.total_tool_call_ceiling,
-                charged_model_calls, source.tool_calls, source.active_model_ceiling,
+                source.active_model_ceiling,
                 source.continuation_windows,
+                limits.total_window_ceiling,
+                limits.total_window_ceiling.saturating_sub(source.continuation_windows),
+                epoch.binding.ordinal, limits.total_review_ceiling,
             ));
         }
         let model_remaining = source
@@ -240,4 +244,38 @@ pub(super) fn compose(
         .validate()
         .map_err(|_| "adaptive working memory bounded source invalid")?;
     Ok(memory)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn funded_memory_reports_operative_totals_not_exhausted_historical_root() {
+        let (_, _, model) =
+            crate::workflow_api::adaptive_leadership_review::tests::funded_prompt_fixture();
+        let mut memory = model.working_memory.unwrap();
+        for (spent, model_remaining, tool_remaining, active_remaining) in
+            [(0, 7, 8, 3), (5, 2, 3, 2)]
+        {
+            memory.source.model_calls = spent;
+            memory.source.tool_calls = spent;
+            if spent > 0 {
+                memory.source.active_model_ceiling = 8;
+            }
+            let before = serde_json::to_vec(&memory).unwrap();
+            let prompt = memory.prompt().unwrap();
+            assert!(prompt.contains("historical initial budgets only"));
+            assert!(prompt.starts_with(" Operative funded total model/tool ceilings 8/8;"));
+            assert!(prompt.contains("is the already-adopted current epoch."));
+            assert!(prompt.contains(&format!("employee model calls charged including this request {}, remaining {model_remaining}; employee tool calls spent {spent}, remaining {tool_remaining}.", spent + 1)));
+            assert!(prompt.contains(&format!("remaining {active_remaining}; a funded total does not authorize work outside that exact bounded window")));
+            assert!(prompt.contains("Actual continuation windows issued: 1 (not a review ordinal), total window ceiling 4, windows remaining 3."));
+            assert!(prompt.contains("adopted funding review ordinal 1, total review ceiling 4; this memory does not establish the current number of reviews issued."));
+            assert!(prompt.contains("independent Defer remains valid"));
+            assert!(prompt.contains("does not instruct Continue or override a model decision"));
+            if spent == 5 {
+                assert!(prompt.contains("original remaining model/tool calls 0/0 (saturating at zero) are historical, not the operative funded remainder"));
+            }
+            assert_eq!(serde_json::to_vec(&memory).unwrap(), before);
+        }
+    }
 }

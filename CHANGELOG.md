@@ -1,5 +1,15 @@
 # Changelog
 
+- Acquire project and adaptive head facts together for continuation detection,
+  queue ordering, binding preparation and rejected-model recovery. Preserve
+  per-operation fresh authority, deferred head errors and all external-effect
+  boundaries. Record content-free, request-correlated preparation timings for
+  bound provider work, including fast phases at microsecond resolution (#856).
+  Renew bounded review/window capacity from an exact adopted funding predecessor
+  without increasing already funded call ceilings or refunding usage. Explain
+  operative funded budgets separately from historical initial limits and retain
+  independent leadership decisions.
+
 - Bind exact employee preparation to one validated project/head read per
   boundary; retain fresh runtime authority and full competing-head checks.
   Batch bounded funding provenance and immutable artifact reads while retaining
