@@ -181,6 +181,343 @@ fn snapshot(store: &WorkflowStore) -> Vec<u8> {
     serde_json::to_vec(&(operations, heads, changes)).unwrap()
 }
 
+// Keep the pre-fusion prefix reader as a byte oracle, including both trimming steps.
+fn legacy_source(
+    fixture: &Fixture,
+    provider_version: u64,
+    effect_id: Uuid,
+) -> AdaptiveWorkingMemorySourceV1 {
+    let connection = fixture.store.lock().unwrap();
+    let scope = crate::domain_store::validation_scope::enter(&connection).unwrap();
+    let (head, _) = load(&connection, fixture.session.grant.session_id)
+        .unwrap()
+        .unwrap();
+    authorize(&head.grant, &fixture.session.grant.authority).unwrap();
+    require_head(&connection, &head).unwrap();
+    let (head_entry_digest, prefix) = evidence_entry(
+        &connection,
+        &namespace(head.grant.session_id),
+        provider_version,
+    )
+    .unwrap();
+    let session = prefix.session;
+    assert_eq!(session.grant, head.grant);
+    let mut rows = working_memory_rows(&connection, &session).unwrap();
+    let completed_tool_count = u16::try_from(rows.len()).unwrap();
+    let latest_test = rows
+        .iter()
+        .rfind(|row| row.tool_kind == AdaptiveWorkingMemoryToolKindV1::RunTests)
+        .cloned();
+    if rows.len() > ADAPTIVE_WORKING_MEMORY_MAX_ROWS {
+        rows = rows.split_off(rows.len() - ADAPTIVE_WORKING_MEMORY_MAX_ROWS);
+        if let Some(test) = &latest_test {
+            if !rows
+                .iter()
+                .any(|row| row.session_version == test.session_version)
+            {
+                rows.remove(0);
+                rows.insert(0, test.clone());
+            }
+        }
+    }
+    let mut source = AdaptiveWorkingMemorySourceV1 {
+        schema_version: 1,
+        session_id: session.grant.session_id,
+        authority: session.grant.authority.clone(),
+        provider_version,
+        effect_id,
+        head_version: session.version,
+        head_entry_digest,
+        last_observation: session.last_observation.clone(),
+        model_calls: session.model_calls,
+        tool_calls: session.tool_calls,
+        root_model_ceiling: session.grant.max_model_calls,
+        root_tool_ceiling: session.grant.max_tool_calls,
+        active_model_ceiling: session.active_model_ceiling(),
+        continuation_windows: u16::try_from(
+            session
+                .continuation
+                .as_ref()
+                .map_or(0, |state| state.authorizations.len()),
+        )
+        .unwrap(),
+        completed_tool_count,
+        omitted_count: completed_tool_count - rows.len() as u16,
+        rows,
+        work_funding: session.active_work_funding().cloned().map(Box::new),
+    };
+    while serde_json::to_vec(&source).unwrap().len() > ADAPTIVE_WORKING_MEMORY_MAX_BYTES {
+        let index = source
+            .rows
+            .iter()
+            .position(|row| {
+                source
+                    .rows
+                    .last()
+                    .is_some_and(|last| last.session_version != row.session_version)
+                    && latest_test
+                        .as_ref()
+                        .is_none_or(|test| test.session_version != row.session_version)
+            })
+            .unwrap();
+        source.rows.remove(index);
+        source.omitted_count += 1;
+    }
+    source.validate().unwrap();
+    scope.finish().unwrap();
+    source
+}
+
+fn assert_legacy_bytes(fixture: &Fixture, source: &AdaptiveWorkingMemorySourceV1) {
+    assert_eq!(
+        serde_json::to_vec(source).unwrap(),
+        serde_json::to_vec(&legacy_source(
+            fixture,
+            source.provider_version,
+            source.effect_id
+        ))
+        .unwrap(),
+    );
+}
+
+#[test]
+fn replay_collector_ready_pending_unknown_match_legacy_bytes_without_prefix_scans() {
+    let mut fixture = Fixture::new();
+    let empty = fixture.ready_source();
+    assert_legacy_bytes(&fixture, &empty);
+    fixture.complete(inspect(1));
+    fixture.complete(test_tool());
+    for state in 0..3 {
+        let (version, effect_id) = match state {
+            0 => (
+                fixture.session.version,
+                working_memory_model_effect_id(
+                    fixture.session.grant.session_id,
+                    fixture.session.version,
+                ),
+            ),
+            1 => {
+                let version = fixture.session.version;
+                (version, fixture.claim_model().id)
+            }
+            _ => {
+                let AdaptiveCursorV1::ModelPending { effect } = &fixture.session.cursor else {
+                    panic!("expected pending model");
+                };
+                let effect = effect.clone();
+                let version = fixture.session.version;
+                fixture.advance(AdaptiveTransitionV1::MarkUnknown {
+                    effect: effect.clone(),
+                });
+                (version, effect.id)
+            }
+        };
+        let before = snapshot(&fixture.store);
+        WORKING_MEMORY_READS.with(|reads| reads.set((0, 0, 0, 0)));
+        let source = fixture.source(version, effect_id).unwrap().unwrap();
+        assert_eq!(
+            WORKING_MEMORY_READS.with(|reads| reads.get()),
+            (1, fixture.session.version as usize, 0, 0),
+            "one full replay, no prefix lookup or second scan for state {state}",
+        );
+        assert_legacy_bytes(&fixture, &source);
+        assert_eq!(snapshot(&fixture.store), before);
+        WORKING_MEMORY_READS.with(|reads| reads.set((0, 0, 0, 0)));
+        assert_eq!(fixture.source(version, effect_id).unwrap(), Some(source));
+        assert_eq!(WORKING_MEMORY_READS.with(|reads| reads.get()), (0, 0, 0, 0));
+    }
+}
+
+#[test]
+fn replay_collector_keeps_normal_journal_proof_and_cached_proof_fallback() {
+    let mut fixture = Fixture::new();
+    fixture.complete(inspect(1));
+    let connection = fixture.store.lock().unwrap();
+    let scope = crate::domain_store::validation_scope::enter(&connection).unwrap();
+    let mut collected = None;
+    let loaded = load_with_working_memory(
+        &connection,
+        fixture.session.grant.session_id,
+        fixture.session.version,
+        &mut collected,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(collected.is_some());
+    WORKING_MEMORY_READS.with(|reads| reads.set((0, 0, 0, 0)));
+    assert_eq!(
+        load_with_feedback(&connection, fixture.session.grant.session_id).unwrap(),
+        Some(loaded.clone()),
+    );
+    let mut repeated = None;
+    assert_eq!(
+        load_with_working_memory(
+            &connection,
+            fixture.session.grant.session_id,
+            fixture.session.version - 1,
+            &mut repeated,
+        )
+        .unwrap(),
+        Some(loaded),
+    );
+    assert!(
+        repeated.is_none(),
+        "normal cached proof carries no projection"
+    );
+    assert_eq!(WORKING_MEMORY_READS.with(|reads| reads.get()), (0, 0, 0, 0));
+    scope.finish().unwrap();
+}
+
+#[test]
+fn replay_collector_corrupt_suffix_preempts_authority_and_effect_rejection() {
+    for corruption in 0..4 {
+        let mut fixture = Fixture::new();
+        fixture.complete(inspect(1));
+        let provider_version = fixture.session.version;
+        let model = fixture.claim_model();
+        let source = fixture.source(provider_version, model.id).unwrap().unwrap();
+        {
+            let connection = fixture.store.lock().unwrap();
+            let ns = namespace(fixture.session.grant.session_id);
+            let key = format!("{:020}", fixture.session.version);
+            match corruption {
+                0 => {
+                    connection.execute(
+                        "UPDATE workflow_operations SET request_digest=?1 WHERE operation_namespace=?2 AND operation_id=?3",
+                        params!["f".repeat(64), ns, key],
+                    ).unwrap();
+                }
+                1 => {
+                    let (_, mut entry) =
+                        evidence_entry(&connection, &ns, fixture.session.version).unwrap();
+                    entry.session.model_calls += 1;
+                    let digest =
+                        canonical_sha256("sentinel.workflow.adaptive-entry.v1", &entry).unwrap();
+                    connection.execute(
+                        "UPDATE workflow_operations SET request_digest=?1,response=?2 WHERE operation_namespace=?3 AND operation_id=?4",
+                        params![digest, encode(&entry).unwrap(), ns, key],
+                    ).unwrap();
+                }
+                2 => {
+                    connection.execute(
+                        "UPDATE workflow_operations SET response=?1 WHERE operation_namespace=?2 AND operation_id=?3",
+                        params![b"{}".as_slice(), ns, key],
+                    ).unwrap();
+                }
+                _ => {
+                    connection.execute(
+                        "UPDATE workflow_operations SET created_at_ms=created_at_ms+1 WHERE operation_namespace=?1 AND operation_id=?2",
+                        params![ns, key],
+                    ).unwrap();
+                }
+            }
+        }
+        let before = snapshot(&fixture.store);
+        let normal_error = load_with_feedback(
+            &fixture.store.lock().unwrap(),
+            fixture.session.grant.session_id,
+        )
+        .unwrap_err();
+        let mut foreign = source.authority.clone();
+        foreign.assignment_version += 1;
+        for (effect_id, authority) in [
+            (model.id, &source.authority),
+            (Uuid::from_u128(19), &source.authority),
+            (model.id, &foreign),
+        ] {
+            WORKING_MEMORY_READS.with(|reads| reads.set((0, 0, 0, 0)));
+            let error = fixture
+                .store
+                .adaptive_working_memory_source(
+                    source.session_id,
+                    provider_version,
+                    effect_id,
+                    authority,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, normal_error.code);
+            let (replays, _, scans, prefixes) = WORKING_MEMORY_READS.with(|reads| reads.get());
+            assert_eq!((replays, scans, prefixes), (1, 0, 0));
+        }
+        assert_eq!(snapshot(&fixture.store), before);
+    }
+}
+
+#[test]
+fn replay_collector_rejects_authority_and_effect_before_consuming_the_prefix() {
+    let mut fixture = Fixture::new();
+    fixture.complete(inspect(1));
+    let source = fixture.ready_source();
+    let mut foreign = source.authority.clone();
+    foreign.assignment_version += 1;
+    let before = snapshot(&fixture.store);
+    for (version, effect_id, authority) in [
+        (
+            source.provider_version,
+            Uuid::from_u128(19),
+            &source.authority,
+        ),
+        (
+            source.provider_version + 1,
+            source.effect_id,
+            &source.authority,
+        ),
+        (source.provider_version, source.effect_id, &foreign),
+    ] {
+        WORKING_MEMORY_READS.with(|reads| reads.set((0, 0, 0, 0)));
+        let error = fixture
+            .store
+            .adaptive_working_memory_source(source.session_id, version, effect_id, authority)
+            .unwrap_err();
+        assert_eq!(error.code, WorkflowErrorCode::AuthorityConflict);
+        assert_eq!(
+            WORKING_MEMORY_READS.with(|reads| reads.get()),
+            (1, fixture.session.version as usize, 0, 0),
+        );
+    }
+    assert_eq!(fixture.ready_source(), source);
+    assert_eq!(snapshot(&fixture.store), before);
+}
+
+#[test]
+fn replay_collector_bounded_window_and_latest_test_match_legacy_trimming() {
+    for padding in [0, 80] {
+        let mut fixture = Fixture::with_capability_padding(padding);
+        fixture.complete(test_tool());
+        for index in 1..20 {
+            fixture.complete(inspect(index));
+        }
+        let source = fixture.ready_source();
+        assert_legacy_bytes(&fixture, &source);
+        assert_eq!(source.completed_tool_count, 20);
+        assert_eq!(usize::from(source.omitted_count), 20 - source.rows.len());
+        assert_eq!(source.rows[0].session_version, 5);
+        fixture.complete(test_tool());
+        fixture.complete(inspect(20));
+        let source = fixture.ready_source();
+        assert_legacy_bytes(&fixture, &source);
+        assert_eq!(source.completed_tool_count, 22);
+        assert_eq!(usize::from(source.omitted_count), 22 - source.rows.len());
+        assert_eq!(
+            source.rows[source.rows.len() - 2].tool_kind,
+            AdaptiveWorkingMemoryToolKindV1::RunTests,
+        );
+        let connection = fixture.store.lock().unwrap();
+        let scope = crate::domain_store::validation_scope::enter(&connection).unwrap();
+        let mut collector = WorkingMemoryReplayCollector::new(fixture.session.version);
+        replay_with_working_memory(
+            &connection,
+            fixture.session.grant.session_id,
+            Some(&mut collector),
+        )
+        .unwrap();
+        assert_eq!(collector.rows.len(), ADAPTIVE_WORKING_MEMORY_MAX_ROWS);
+        assert_eq!(collector.completed_tool_count, 22);
+        assert!(collector.latest_test.is_some());
+        scope.finish().unwrap();
+    }
+}
+
 #[test]
 fn ready_and_claimed_sources_are_byte_identical_and_reads_do_not_write() {
     let mut fixture = Fixture::new();
@@ -408,6 +745,7 @@ fn all_tool_variants_are_projected_without_content_arguments_or_package_paths() 
     }
     let source = fixture.ready_source();
     let encoded = serde_json::to_string(&source).unwrap();
+    assert_legacy_bytes(&fixture, &source);
     assert!(!encoded.contains("PRIVATE_"));
     assert!(!encoded.contains("stdout"));
     assert!(!encoded.contains("content"));
@@ -439,6 +777,7 @@ fn labels_are_utf8_byte_bounded_and_never_misleadingly_truncated() {
     }
     let source = fixture.ready_source();
     assert_eq!(source.rows[0].target.as_deref(), Some(exact.as_str()));
+    assert_legacy_bytes(&fixture, &source);
     assert!(!source.rows[0].labels_omitted);
     for row in &source.rows[1..] {
         assert!(row.target.is_none());
@@ -921,46 +1260,122 @@ fn working_memory_cache_rechecks_outer_transaction_and_recovers_after_rollback()
 
 #[test]
 fn working_memory_cache_rejects_index_only_damage_with_unchanged_rows() {
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
 
-    let mut fixture = Fixture::new();
-    fixture.complete(inspect(1));
-    fixture.store.lock().unwrap().execute_batch(
-        "CREATE INDEX memory_payload_index ON workflow_operations(created_at_ms); PRAGMA wal_checkpoint(TRUNCATE)",
-    ).unwrap();
-    let source = fixture.ready_source();
-    assert_eq!(fixture.ready_source(), source);
-    let before = snapshot(&fixture.store);
-    {
-        let connection = fixture.store.lock().unwrap();
-        let page_size: u32 = connection
-            .query_row("PRAGMA page_size", [], |row| row.get(0))
-            .unwrap();
-        let root: u32 = connection
-            .query_row(
-                "SELECT rootpage FROM sqlite_schema WHERE name='memory_payload_index'",
-                [],
-                |row| row.get(0),
+    for case in ["cached", "uncached", "authority-rejected"] {
+        let mut fixture = Fixture::new();
+        fixture.complete(inspect(1));
+        fixture.store.lock().unwrap().execute_batch(
+            "CREATE INDEX memory_payload_index ON workflow_operations(created_at_ms); PRAGMA wal_checkpoint(TRUNCATE)",
+        ).unwrap();
+        let source = legacy_source(
+            &fixture,
+            fixture.session.version,
+            working_memory_model_effect_id(
+                fixture.session.grant.session_id,
+                fixture.session.version,
+            ),
+        );
+        let mut foreign = source.authority.clone();
+        foreign.assignment_version += 1;
+        let requested_authority = if case == "authority-rejected" {
+            assert_eq!(
+                fixture
+                    .store
+                    .adaptive_working_memory_source(
+                        source.session_id,
+                        source.provider_version,
+                        source.effect_id,
+                        &foreign,
+                    )
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::AuthorityConflict,
+            );
+            &foreign
+        } else {
+            &source.authority
+        };
+        if case == "uncached" {
+            // Warm exact SQL inputs through another public view, not this source key.
+            assert!(fixture.store.company_projects().unwrap().is_empty());
+            assert!(fixture.store.company_projects().unwrap().is_empty());
+        } else {
+            assert_eq!(fixture.ready_source(), source);
+            assert_eq!(fixture.ready_source(), source);
+        }
+        let before = snapshot(&fixture.store);
+        let (offset, original_page) = {
+            let connection = fixture.store.lock().unwrap();
+            let page_size: u32 = connection
+                .query_row("PRAGMA page_size", [], |row| row.get(0))
+                .unwrap();
+            let root: u32 = connection
+                .query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE name='memory_payload_index'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection.execute_batch("PRAGMA shrink_memory").unwrap();
+            let offset = u64::from(root - 1) * u64::from(page_size);
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(fixture.root.path().join("memory.sqlite"))
+                .unwrap();
+            let mut original_page = vec![0; page_size as usize];
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.read_exact(&mut original_page).unwrap();
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&vec![0; page_size as usize]).unwrap();
+            file.sync_all().unwrap();
+            (offset, original_page)
+        };
+        assert_eq!(snapshot(&fixture.store), before);
+        WORKING_MEMORY_READS.with(|reads| reads.set((0, 0, 0, 0)));
+        let error = fixture
+            .store
+            .adaptive_working_memory_source(
+                source.session_id,
+                source.provider_version,
+                source.effect_id,
+                requested_authority,
             )
-            .unwrap();
-        connection.execute_batch("PRAGMA shrink_memory").unwrap();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(fixture.root.path().join("memory.sqlite"))
-            .unwrap();
-        file.seek(SeekFrom::Start(u64::from(root - 1) * u64::from(page_size)))
-            .unwrap();
-        file.write_all(&vec![0; page_size as usize]).unwrap();
-        file.sync_all().unwrap();
+            .unwrap_err();
+        assert_eq!(error.code, WorkflowErrorCode::CorruptStore, "{case}");
+        assert_eq!(
+            WORKING_MEMORY_READS.with(|reads| reads.get().0),
+            usize::from(case != "cached"),
+            "warm misses must run the public source validator: {case}",
+        );
+        assert_eq!(snapshot(&fixture.store), before);
+        assert!(fixture.store.lock().unwrap().is_autocommit());
+        {
+            let connection = fixture.store.lock().unwrap();
+            connection.execute_batch("PRAGMA shrink_memory").unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture.root.path().join("memory.sqlite"))
+                .unwrap();
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&original_page).unwrap();
+            file.sync_all().unwrap();
+            connection.execute_batch("PRAGMA shrink_memory").unwrap();
+        }
+        WORKING_MEMORY_READS.with(|reads| reads.set((0, 0, 0, 0)));
+        assert_eq!(fixture.ready_source(), source, "repaired source: {case}");
+        assert_eq!(
+            WORKING_MEMORY_READS.with(|reads| reads.get()),
+            (1, fixture.session.version as usize, 0, 0),
+            "failed read must clear proofs before repair: {case}",
+        );
+        assert_eq!(snapshot(&fixture.store), before);
+        assert!(fixture.store.lock().unwrap().is_autocommit());
+        WORKING_MEMORY_READS.with(|reads| reads.set((0, 0, 0, 0)));
+        assert_eq!(fixture.ready_source(), source);
+        assert_eq!(WORKING_MEMORY_READS.with(|reads| reads.get()), (0, 0, 0, 0));
     }
-    assert_eq!(snapshot(&fixture.store), before);
-    assert!(fixture
-        .source(source.provider_version, source.effect_id)
-        .is_err());
-    assert!(fixture
-        .source(source.provider_version, source.effect_id)
-        .is_err());
-    assert_eq!(snapshot(&fixture.store), before);
 }
 
 #[test]

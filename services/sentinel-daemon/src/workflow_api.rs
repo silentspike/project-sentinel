@@ -5734,14 +5734,11 @@ impl WorkflowApi {
 
         if let Some(call) = self.leadership_review_for_agent(agent_id)? {
             let binding = adaptive_leadership_review::LeadershipAuthority::from_call(&call);
-            let context = self.prepare_leadership_review(&binding)?;
             return Ok(Some(PreparedProviderCandidate {
                 authority: Some(ProviderExecutionAuthority::AdaptiveLeadershipReview(
                     Box::new(binding),
                 )),
-                prepared_context: Some(ModelExecutionContext::AdaptiveLeadershipReview(Box::new(
-                    context,
-                ))),
+                prepared_context: None,
             }));
         }
         if let Some(call) = self.fresh_request_sales_call(agent_id, now_unix_ms())? {
@@ -5802,6 +5799,41 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         }
         self.resolve_provider_usage_authority(expected.agent_id())
             .map(|current| current.as_ref() == Some(expected))
+    }
+
+    fn validate_prepared_provider_model_context(
+        &self,
+        expected: &model_execution::ProviderExecutionAuthority,
+        context: &model_execution::ModelExecutionContext,
+    ) -> Result<Option<()>, String> {
+        let model_execution::ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) =
+            expected
+        else {
+            return Ok(None);
+        };
+        let (call, current) = self
+            .leadership_review_for_authority_with_context(
+                expected.agent_id(),
+                binding.grant.review_id,
+            )
+            .map_err(|reason| format!("provider usage reauthorization failed: {reason}"))?;
+        if adaptive_leadership_review::LeadershipAuthority::from_call(&call) != **binding {
+            return Err("provider usage authority changed during provider I/O".to_owned());
+        }
+        // Each gate prepares afresh; expected-context expiry follows authority validation.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "model work clock is unavailable")?
+            .as_millis();
+        context
+            .validate_dispatch(u64::try_from(now_ms).map_err(|_| "model work clock overflow")?)
+            .map_err(str::to_owned)?;
+        if model_execution::ModelExecutionContext::AdaptiveLeadershipReview(Box::new(current))
+            != *context
+        {
+            return Err("model work authority changed during provider I/O".to_owned());
+        }
+        Ok(Some(()))
     }
 
     fn is_provider_usage_candidate(&self, agent_id: AgentId) -> Result<bool, &'static str> {

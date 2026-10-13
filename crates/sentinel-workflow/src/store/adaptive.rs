@@ -337,7 +337,10 @@ impl WorkflowStore {
             |tx| {
                 // Cache reuse still requires fresh exact SQL inputs and index integrity.
                 let scope = crate::domain_store::validation_scope::enter(tx)?;
-                let Some((current_session, _)) = load(tx, session_id)? else {
+                let mut collected = None;
+                let Some((current_session, _, _)) =
+                    load_with_working_memory(tx, session_id, provider_version, &mut collected)?
+                else {
                     scope.finish()?;
                     return Ok(None);
                 };
@@ -359,21 +362,34 @@ impl WorkflowStore {
                 if !effect_matches {
                     return Err(authority_conflict());
                 }
-                let (head_entry_digest, prefix) =
-                    evidence_entry(tx, &namespace(session_id), provider_version)?;
-                let session = prefix.session;
+                let (head_entry_digest, session, mut rows, completed_tool_count, latest_test) =
+                    match collected {
+                        Some(collected) => collected.finish(&current_session.grant)?,
+                        None => {
+                            // A pre-existing normal journal proof has no projection.
+                            let (digest, prefix) =
+                                evidence_entry(tx, &namespace(session_id), provider_version)?;
+                            if prefix.session.grant != current_session.grant {
+                                return Err(corrupt_store());
+                            }
+                            let rows = working_memory_rows(tx, &prefix.session)?;
+                            let count = u16::try_from(rows.len()).map_err(|_| corrupt_store())?;
+                            let latest_test = rows
+                                .iter()
+                                .rfind(|row| {
+                                    row.tool_kind == AdaptiveWorkingMemoryToolKindV1::RunTests
+                                })
+                                .cloned();
+                            (digest, prefix.session, rows, count, latest_test)
+                        }
+                    };
                 if session.grant != current_session.grant {
                     return Err(corrupt_store());
                 }
-                let mut rows = working_memory_rows(tx, &session)?;
-                let completed_tool_count =
-                    u16::try_from(rows.len()).map_err(|_| corrupt_store())?;
-                let latest_test = rows
-                    .iter()
-                    .rfind(|row| row.tool_kind == AdaptiveWorkingMemoryToolKindV1::RunTests)
-                    .cloned();
                 if rows.len() > ADAPTIVE_WORKING_MEMORY_MAX_ROWS {
                     rows = rows.split_off(rows.len() - ADAPTIVE_WORKING_MEMORY_MAX_ROWS);
+                }
+                if usize::from(completed_tool_count) > ADAPTIVE_WORKING_MEMORY_MAX_ROWS {
                     if let Some(test) = &latest_test {
                         if !rows
                             .iter()
@@ -1280,6 +1296,11 @@ fn evidence_entry(
     ns: &str,
     version: u64,
 ) -> Result<(String, Entry), WorkflowError> {
+    #[cfg(test)]
+    WORKING_MEMORY_READS.with(|reads| {
+        let (replays, entries, scans, prefixes) = reads.get();
+        reads.set((replays, entries, scans, prefixes + 1));
+    });
     let (digest, bytes, created) =
         read_operation(connection, ns, &format!("{version:020}"))?.ok_or_else(corrupt_store)?;
     let entry: Entry = decode(&bytes)?;
@@ -1372,10 +1393,113 @@ fn working_memory_row(
     row
 }
 
+struct WorkingMemoryReplayCollector {
+    provider_version: u64,
+    prefix: Option<(String, AdaptiveSessionV1)>,
+    completed_tool_count: usize,
+    rows: Vec<AdaptiveWorkingMemoryCompletedRowV1>,
+    latest_test: Option<AdaptiveWorkingMemoryCompletedRowV1>,
+    invalid: bool,
+}
+
+type CollectedWorkingMemory = (
+    String,
+    AdaptiveSessionV1,
+    Vec<AdaptiveWorkingMemoryCompletedRowV1>,
+    u16,
+    Option<AdaptiveWorkingMemoryCompletedRowV1>,
+);
+
+impl WorkingMemoryReplayCollector {
+    fn new(provider_version: u64) -> Self {
+        Self {
+            provider_version,
+            prefix: None,
+            completed_tool_count: 0,
+            rows: Vec::new(),
+            latest_test: None,
+            invalid: false,
+        }
+    }
+
+    fn observe(&mut self, entry: &Entry, digest: &str, prior: Option<&AdaptiveSessionV1>) {
+        if entry.session.version > self.provider_version {
+            return;
+        }
+        if entry.session.version == self.provider_version {
+            self.prefix = Some((digest.to_owned(), entry.session.clone()));
+        }
+        let Some(AdaptiveTransitionV1::ObserveTool { observation }) = &entry.command else {
+            return;
+        };
+        let Some(prior) = prior else {
+            self.invalid = true;
+            return;
+        };
+        let (effect, tool, tool_digest) = match &prior.cursor {
+            crate::AdaptiveCursorV1::ToolPending {
+                effect,
+                tool,
+                tool_digest,
+            }
+            | crate::AdaptiveCursorV1::ToolUnknown {
+                effect,
+                tool,
+                tool_digest,
+            } => (effect, tool, tool_digest),
+            _ => {
+                self.invalid = true;
+                return;
+            }
+        };
+        if effect != &observation.effect {
+            self.invalid = true;
+            return;
+        }
+        let row = working_memory_row(entry, digest.to_owned(), tool, tool_digest, observation);
+        self.completed_tool_count += 1;
+        if row.tool_kind == AdaptiveWorkingMemoryToolKindV1::RunTests {
+            self.latest_test = Some(row.clone());
+        }
+        if self.rows.len() == ADAPTIVE_WORKING_MEMORY_MAX_ROWS {
+            self.rows.remove(0);
+        }
+        self.rows.push(row);
+    }
+
+    fn finish(
+        self,
+        current_grant: &AdaptiveSessionGrantV1,
+    ) -> Result<CollectedWorkingMemory, WorkflowError> {
+        let (digest, session) = self.prefix.ok_or_else(corrupt_store)?;
+        if &session.grant != current_grant {
+            return Err(corrupt_store());
+        }
+        // Projection errors never preempt full replay or the caller's authority checks.
+        if self.invalid {
+            return Err(corrupt_store());
+        }
+        let count = u16::try_from(self.completed_tool_count).map_err(|_| corrupt_store())?;
+        Ok((digest, session, self.rows, count, self.latest_test))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static WORKING_MEMORY_READS: std::cell::Cell<(usize, usize, usize, usize)> = const {
+        std::cell::Cell::new((0, 0, 0, 0))
+    };
+}
+
 fn working_memory_rows(
     connection: &Connection,
     session: &AdaptiveSessionV1,
 ) -> Result<Vec<AdaptiveWorkingMemoryCompletedRowV1>, WorkflowError> {
+    #[cfg(test)]
+    WORKING_MEMORY_READS.with(|reads| {
+        let (replays, entries, scans, prefixes) = reads.get();
+        reads.set((replays, entries, scans + 1, prefixes));
+    });
     // load() already replayed these immutable rows in this same read transaction.
     let mut statement = connection.prepare(
         "SELECT request_digest,response FROM workflow_operations WHERE operation_namespace=?1 AND operation_id<=?2 ORDER BY operation_id LIMIT ?3",
@@ -2999,6 +3123,33 @@ fn load_with_feedback_uncached(
     connection: &Connection,
     id: Uuid,
 ) -> Result<Option<LoadedSession>, WorkflowError> {
+    replay_with_working_memory(connection, id, None)
+}
+
+fn load_with_working_memory(
+    connection: &Connection,
+    id: Uuid,
+    provider_version: u64,
+    collected: &mut Option<WorkingMemoryReplayCollector>,
+) -> Result<Option<LoadedSession>, WorkflowError> {
+    crate::domain_store::validation_scope::memoize(connection, "adaptive-journal", &id, || {
+        let mut collector = WorkingMemoryReplayCollector::new(provider_version);
+        let loaded = replay_with_working_memory(connection, id, Some(&mut collector))?;
+        *collected = Some(collector);
+        Ok(loaded)
+    })
+}
+
+fn replay_with_working_memory(
+    connection: &Connection,
+    id: Uuid,
+    mut collector: Option<&mut WorkingMemoryReplayCollector>,
+) -> Result<Option<LoadedSession>, WorkflowError> {
+    #[cfg(test)]
+    WORKING_MEMORY_READS.with(|reads| {
+        let (replays, entries, scans, prefixes) = reads.get();
+        reads.set((replays + 1, entries, scans, prefixes));
+    });
     let mut statement = connection.prepare(
         "SELECT operation_id, request_digest, response, created_at_ms FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2"
     ).map_err(map_sqlite_error)?;
@@ -3016,6 +3167,11 @@ fn load_with_feedback_uncached(
         crate::domain_store::validation_scope::charge_bytes(connection, bytes.len())?;
         let created: i64 = row.get(3).map_err(map_sqlite_error)?;
         let entry: Entry = decode(&bytes)?;
+        #[cfg(test)]
+        WORKING_MEMORY_READS.with(|reads| {
+            let (replays, entries, scans, prefixes) = reads.get();
+            reads.set((replays, entries + 1, scans, prefixes));
+        });
         let recomputed = canonical_sha256("sentinel.workflow.adaptive-entry.v1", &entry)?;
         if count > MAX_JOURNAL_ENTRIES
             || entry.session.grant.session_id != id
@@ -3089,6 +3245,13 @@ fn load_with_feedback_uncached(
         .map_err(|_| corrupt_store())?;
         if expected != entry.session {
             return Err(corrupt_store());
+        }
+        if let Some(collector) = collector.as_deref_mut() {
+            collector.observe(
+                &entry,
+                &digest,
+                previous.as_ref().map(|(session, _)| session),
+            );
         }
         previous = Some((entry.session, digest));
     }
