@@ -194,8 +194,16 @@ fn existing_tool_progress_pass_recovers_expired_started_receipts_without_process
             });
             assert_eq!(adopted, expected);
             assert!(adopted.updated_at_ms > before.active_deadline_ms());
+            assert_eq!(
+                fixture.tool_progress_hint_keys(),
+                vec![fixture.tool_progress_scope_key()]
+            );
             let journal = fixture.tool_progress_journal();
-            fixture.run_existing_tool_progress().unwrap();
+            fixture
+                .api
+                .reconcile_adaptive_tools_until(|| false)
+                .unwrap();
+            assert!(fixture.tool_progress_hint_keys().is_empty());
             assert_eq!(fixture.read(), expected);
             assert_eq!(fixture.tool_progress_journal(), journal);
         });
@@ -226,8 +234,11 @@ fn existing_tool_progress_pass_skips_missing_heads_without_creating_session() {
     );
     assert!(heads.is_empty());
     for _ in 0..3 {
+        let generation = api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire);
         let discovered = api.store.company_projects().unwrap();
-        api.refresh_existing_adaptive_tool_hints(&discovered)
+        api.refresh_existing_adaptive_tool_hints(&discovered, generation)
             .unwrap();
         api.reconcile_adaptive_tools_until(|| false).unwrap();
         assert_eq!(tool_progress_sql_rows(&path, query), before);
@@ -290,6 +301,674 @@ fn existing_tool_progress_pass_leaves_non_tool_heads_and_provider_rows_unchanged
             }
         });
     }
+}
+
+#[test]
+fn idle_tool_scope_is_not_rescanned_until_republished() {
+    let fixture = Fixture::productive_root();
+    let before = fixture.read();
+    let journal = fixture.tool_progress_journal();
+    let facts = fixture.tool_progress_non_model_facts();
+    fixture.refresh_tool_progress_hints();
+    assert_eq!(
+        fixture.tool_progress_hint_keys(),
+        vec![fixture.tool_progress_scope_key()]
+    );
+    fixture
+        .api
+        .reconcile_adaptive_tools_until(|| false)
+        .unwrap();
+    assert!(fixture.tool_progress_hint_keys().is_empty());
+    assert_eq!(fixture.read(), before);
+    assert_eq!(fixture.tool_progress_journal(), journal);
+    assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+
+    let connection =
+        rusqlite::Connection::open(fixture.temp.path().join("company.sqlite")).unwrap();
+    assert!(connection.execute(
+        "UPDATE workflow_operations SET request_digest='corrupt-idle-journal' WHERE operation_namespace=?1",
+        [format!("adaptive-session-v1:{}", before.grant.session_id)],
+    ).unwrap() > 0);
+    let corrupt_journal = fixture.tool_progress_journal();
+    let corrupt_facts = fixture.tool_progress_non_model_facts();
+    // An empty hint pass performs no scope proof. Republishing must acquire a fresh exact proof.
+    for _ in 0..3 {
+        fixture
+            .api
+            .reconcile_adaptive_tools_until(|| false)
+            .unwrap();
+    }
+    let authority = &before.grant.authority;
+    fixture
+        .api
+        .publish_existing_adaptive_tool_hint((
+            authority.tenant_id.clone(),
+            authority.project_id.clone(),
+            authority.work_item_id.clone(),
+            authority.agent_id,
+        ))
+        .unwrap();
+    assert!(fixture
+        .api
+        .reconcile_adaptive_tools_until(|| false)
+        .is_err());
+    assert_eq!(
+        fixture.tool_progress_hint_keys(),
+        vec![fixture.tool_progress_scope_key()]
+    );
+    assert!(fixture
+        .api
+        .adaptive_tool_progress_failures
+        .lock()
+        .unwrap()
+        .contains_key(&fixture.tool_progress_scope_key()));
+    assert_eq!(fixture.tool_progress_journal(), corrupt_journal);
+    assert_eq!(fixture.tool_progress_non_model_facts(), corrupt_facts);
+}
+
+#[test]
+fn same_scope_publication_and_refresh_fence_stale_idle_retirement() {
+    for refresh in [false, true] {
+        let fixture = Fixture::productive_root();
+        fixture.refresh_tool_progress_hints();
+        let captured = fixture
+            .api
+            .adaptive_tool_progress_hints
+            .lock()
+            .unwrap()
+            .clone();
+        let scope = captured[0].clone();
+        let checks = std::cell::Cell::new(0);
+        fixture
+            .api
+            .reconcile_adaptive_tools_until(|| {
+                let check = checks.get() + 1;
+                checks.set(check);
+                // Publish after the exact idle proof, before the old pass can retire its ID.
+                if check == 4 {
+                    if refresh {
+                        fixture.refresh_tool_progress_hints();
+                    } else {
+                        fixture
+                            .api
+                            .publish_existing_adaptive_tool_hint(scope.clone())
+                            .unwrap();
+                    }
+                }
+                false
+            })
+            .unwrap();
+        assert!(checks.get() >= 4);
+        let current = fixture
+            .api
+            .adaptive_tool_progress_hints
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(!Arc::ptr_eq(&captured, &current));
+        assert_eq!(current.as_ref(), captured.as_ref());
+        // A subsequent pass owning the new generation may retire the same verified-idle ID.
+        fixture
+            .api
+            .reconcile_adaptive_tools_until(|| false)
+            .unwrap();
+        assert!(fixture.tool_progress_hint_keys().is_empty());
+    }
+}
+
+#[test]
+fn durable_model_tool_commit_republishes_retired_scope_without_provider_dispatch() {
+    let mut fixture = Fixture::productive_root();
+    fixture.refresh_tool_progress_hints();
+    fixture
+        .api
+        .reconcile_adaptive_tools_until(|| false)
+        .unwrap();
+    assert!(fixture.tool_progress_hint_keys().is_empty());
+    let binding = fixture
+        .api
+        .adaptive_provider_authority_for_claim(fixture.session.grant.authority.agent_id)
+        .unwrap()
+        .unwrap();
+    let context =
+        fixture.with_workbench_store(|| fixture.api.prepare_adaptive_model(&binding).unwrap());
+    let request_id = binding.request_id();
+    let digest = "a".repeat(64);
+    let completion = ModelExecutionCompletion {
+        context: ModelExecutionContext::Adaptive(Box::new(context.clone())),
+        content: serde_json::json!({"schema_version": 1, "decision": {
+            "kind": "tool", "tool": {"tool": "inspect_file", "path": "src/main.rs", "max_bytes": 1024}
+        }}).to_string(),
+        admissible: true,
+    };
+    let before = fixture.read();
+    assert!(fixture
+        .api
+        .accept_adaptive_model(&completion, &context, &request_id, &digest)
+        .is_err());
+    assert_eq!(fixture.read(), before);
+    assert!(fixture.tool_progress_hint_keys().is_empty());
+    fixture.advance(
+        AdaptiveTransitionV1::ClaimModel {
+            effect: AdaptiveEffectV1 {
+                id: binding.effect_id,
+                request_digest: digest.clone(),
+            },
+            previous_observation_digest: binding
+                .previous_observation
+                .as_ref()
+                .map(|observation| observation.observation_digest.clone()),
+        },
+        now_unix_ms(),
+    );
+    assert!(fixture.tool_progress_hint_keys().is_empty());
+    let pending = fixture.read();
+    let mut rejected = completion.clone();
+    rejected.admissible = false;
+    assert!(fixture
+        .api
+        .accept_adaptive_model(&rejected, &context, &request_id, &digest)
+        .is_err());
+    assert_eq!(fixture.read(), pending);
+    assert!(fixture.tool_progress_hint_keys().is_empty());
+    fixture
+        .api
+        .accept_adaptive_model(&completion, &context, &request_id, &digest)
+        .unwrap();
+    fixture.session = fixture.read();
+    assert!(matches!(
+        fixture.session.cursor,
+        AdaptiveCursorV1::ReadyForTool { .. }
+    ));
+    assert_eq!(
+        fixture.tool_progress_hint_keys(),
+        vec![fixture.tool_progress_scope_key()]
+    );
+    assert_eq!(fixture.session.version, pending.version + 1);
+    assert_eq!(fixture.session.tool_calls, pending.tool_calls);
+    assert_eq!(
+        fixture
+            .tool_progress_transition_versions("claim_tool")
+            .len(),
+        0
+    );
+
+    let AdaptiveCursorV1::ReadyForTool { tool, tool_digest } = &fixture.session.cursor else {
+        panic!("expected a durably resolved tool");
+    };
+    let adapter = fixture.api.workbench.as_ref().unwrap();
+    let effect = adapter
+        .adaptive_tool_effect(&fixture.session, tool)
+        .unwrap();
+    let request = adapter
+        .build_adaptive_request(&fixture.session, &effect, tool)
+        .unwrap();
+    assert!(fixture
+        .tools
+        .load(&request.invocation_id)
+        .unwrap()
+        .is_none());
+    let tool_digest = tool_digest.clone();
+    let now = now_unix_ms();
+    fixture.advance(
+        AdaptiveTransitionV1::ClaimTool {
+            effect,
+            tool_digest,
+        },
+        now,
+    );
+    let observation = fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+    let facts = fixture.tool_progress_non_model_facts();
+    fixture.with_terminal_workbench_service(|| {
+        fixture
+            .api
+            .reconcile_adaptive_tools_until(|| false)
+            .unwrap();
+        assert_eq!(
+            fixture.read().last_observation.unwrap().observation_digest,
+            observation.digest()
+        );
+        // Attempted success is not an idle proof: pending work must never be retired by this path.
+        assert_eq!(
+            fixture.tool_progress_hint_keys(),
+            vec![fixture.tool_progress_scope_key()]
+        );
+        fixture
+            .api
+            .reconcile_adaptive_tools_until(|| false)
+            .unwrap();
+        assert!(fixture.tool_progress_hint_keys().is_empty());
+    });
+    assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+    assert_eq!(
+        fixture
+            .tool_progress_transition_versions("observe_tool")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn idle_retirement_and_cancellation_preserve_other_scope_failure() {
+    let mut fixture = Fixture::productive_root();
+    let now = now_unix_ms();
+    let request = fixture.claim_tool(now);
+    fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+    let failed = fixture.tool_progress_scope_key();
+    let idle = fixture.add_tool_progress_project(10_000, true);
+    fixture.api.workbench = None;
+    fixture.refresh_tool_progress_hints();
+    fixture.set_tool_progress_next_scope(&failed);
+    assert!(fixture.record_tool_progress_pass(true).0.is_err());
+    let failures = fixture
+        .api
+        .adaptive_tool_progress_failures
+        .lock()
+        .unwrap()
+        .clone();
+    let journal = fixture.tool_progress_journal();
+    let facts = fixture.tool_progress_non_model_facts();
+    fixture.set_tool_progress_next_scope(&idle);
+    let checks = std::cell::Cell::new(0);
+    assert!(fixture
+        .api
+        .reconcile_adaptive_tools_until(|| {
+            let check = checks.get() + 1;
+            checks.set(check);
+            check >= 4
+        })
+        .is_err());
+    assert!(checks.get() >= 4);
+    assert!(fixture.tool_progress_hint_keys().contains(&idle));
+    assert_eq!(
+        *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+        failures
+    );
+    fixture.set_tool_progress_next_scope(&idle);
+    assert!(fixture.record_tool_progress_pass(true).0.is_err());
+    assert!(!fixture.tool_progress_hint_keys().contains(&idle));
+    assert!(fixture.tool_progress_hint_keys().contains(&failed));
+    assert_eq!(
+        *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+        failures
+    );
+    assert!(!fixture.api.reconcile_adaptive_tools_until(|| true).unwrap());
+    assert_eq!(
+        *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+        failures
+    );
+    assert!(fixture.api.adaptive_tool_progress_health_error().is_some());
+    assert_eq!(fixture.tool_progress_journal(), journal);
+    assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+}
+
+#[test]
+fn stale_complete_inventory_preserves_new_model_tool_hint_and_scope_failures() {
+    let mut fixture = Fixture::productive_root();
+    fixture.refresh_tool_progress_hints();
+    let generation = fixture
+        .api
+        .adaptive_tool_progress_inventory_generation
+        .load(Ordering::Acquire);
+    let older_projects = fixture.api.store.company_projects().unwrap();
+    let new_scope = fixture.add_tool_progress_project(10_000, true);
+    assert!(!older_projects
+        .iter()
+        .any(|project| project.project_id == new_scope.1));
+    let project = fixture
+        .api
+        .store
+        .company_project(&new_scope.0, &new_scope.1)
+        .unwrap()
+        .unwrap();
+    let selected = select_provider_usage_binding(
+        std::slice::from_ref(&project),
+        AgentId(new_scope.3),
+        Some(&project.subscription_call.as_ref().unwrap().allowance_id),
+    )
+    .unwrap()
+    .unwrap();
+    let binding = fixture
+        .api
+        .adaptive_provider_authority_from_binding(selected, false)
+        .unwrap()
+        .0
+        .unwrap();
+    let context =
+        fixture.with_workbench_store(|| fixture.api.prepare_adaptive_model(&binding).unwrap());
+    let request_id = binding.request_id();
+    let digest = "a".repeat(64);
+    let completion = ModelExecutionCompletion {
+        context: ModelExecutionContext::Adaptive(Box::new(context.clone())),
+        content: serde_json::json!({"schema_version": 1, "decision": {
+            "kind": "tool", "tool": {"tool": "inspect_file", "path": "src/main.rs", "max_bytes": 1024}
+        }}).to_string(),
+        admissible: true,
+    };
+    fixture
+        .api
+        .core
+        .advance_adaptive_session(
+            binding.grant.session_id,
+            binding.session_version,
+            Uuid::new_v4(),
+            &AdaptiveTransitionV1::ClaimModel {
+                effect: AdaptiveEffectV1 {
+                    id: binding.effect_id,
+                    request_digest: digest.clone(),
+                },
+                previous_observation_digest: None,
+            },
+            &binding.grant.authority,
+            now_unix_ms(),
+        )
+        .unwrap();
+    fixture
+        .api
+        .accept_adaptive_model(&completion, &context, &request_id, &digest)
+        .unwrap();
+    let resolved = fixture
+        .api
+        .store
+        .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        resolved.cursor,
+        AdaptiveCursorV1::ReadyForTool { .. }
+    ));
+    assert_eq!(resolved.tool_calls, 0);
+    assert!(fixture.tool_progress_hint_keys().contains(&new_scope));
+    assert!(
+        fixture
+            .api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire)
+            > generation
+    );
+    let published = fixture
+        .api
+        .adaptive_tool_progress_hints
+        .lock()
+        .unwrap()
+        .clone();
+    fixture
+        .api
+        .refresh_existing_adaptive_tool_hints(&older_projects, generation)
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &published,
+        &fixture.api.adaptive_tool_progress_hints.lock().unwrap()
+    ));
+
+    // Both failures come from actual existing-tool passes, not injected failure entries.
+    let now = now_unix_ms();
+    let request = fixture.claim_tool(now);
+    fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+    let original_scope = fixture.tool_progress_scope_key();
+    fixture.api.workbench = None;
+    for scope in [&new_scope, &original_scope] {
+        fixture.set_tool_progress_next_scope(scope);
+        assert!(fixture.record_tool_progress_pass(true).0.is_err());
+    }
+    let failures = fixture
+        .api
+        .adaptive_tool_progress_failures
+        .lock()
+        .unwrap()
+        .clone();
+    assert_eq!(failures.len(), 2);
+    assert!(failures.contains_key(&new_scope));
+    let error = fixture.api.adaptive_tool_progress_health_error();
+    let hints = fixture
+        .api
+        .adaptive_tool_progress_hints
+        .lock()
+        .unwrap()
+        .clone();
+    let current_generation = fixture
+        .api
+        .adaptive_tool_progress_inventory_generation
+        .load(Ordering::Acquire);
+    let journal = fixture.tool_progress_journal();
+    let facts = fixture.tool_progress_non_model_facts();
+    fixture
+        .api
+        .refresh_existing_adaptive_tool_hints(&older_projects, generation)
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &hints,
+        &fixture.api.adaptive_tool_progress_hints.lock().unwrap()
+    ));
+    assert_eq!(
+        *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+        failures
+    );
+    assert_eq!(fixture.api.adaptive_tool_progress_health_error(), error);
+    assert_eq!(
+        fixture
+            .api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire),
+        current_generation
+    );
+    assert_eq!(fixture.tool_progress_journal(), journal);
+    assert_eq!(fixture.tool_progress_non_model_facts(), facts);
+
+    // A native unsent-call abandonment removes only the original allowance scope.
+    fixture.abandon_tool_progress_fixture_allowance();
+    let removed_journal = fixture.tool_progress_journal();
+    let removed_facts = fixture.tool_progress_non_model_facts();
+    fixture.refresh_tool_progress_hints();
+    let remaining = fixture
+        .api
+        .adaptive_tool_progress_failures
+        .lock()
+        .unwrap()
+        .clone();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining.get(&new_scope), failures.get(&new_scope));
+    assert_eq!(fixture.tool_progress_hint_keys(), vec![new_scope]);
+    assert_eq!(fixture.tool_progress_journal(), removed_journal);
+    assert_eq!(fixture.tool_progress_non_model_facts(), removed_facts);
+}
+
+#[test]
+fn tool_inventory_generation_tracks_failure_clear_and_ignores_unchanged_passes() {
+    let mut fixture = Fixture::productive_root();
+    let now = now_unix_ms();
+    let request = fixture.claim_tool(now);
+    fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+    fixture.refresh_tool_progress_hints();
+    let generation = fixture
+        .api
+        .adaptive_tool_progress_inventory_generation
+        .load(Ordering::Acquire);
+    let projects = fixture.api.store.company_projects().unwrap();
+    let adapter = fixture.api.workbench.take().unwrap();
+    assert!(fixture
+        .api
+        .reconcile_adaptive_tools_until(|| false)
+        .is_err());
+    assert_eq!(
+        fixture
+            .api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire),
+        generation + 1
+    );
+    let failed_generation = generation + 1;
+    let hints = fixture
+        .api
+        .adaptive_tool_progress_hints
+        .lock()
+        .unwrap()
+        .clone();
+    let failures = fixture
+        .api
+        .adaptive_tool_progress_failures
+        .lock()
+        .unwrap()
+        .clone();
+    let failed_projects = fixture.api.store.company_projects().unwrap();
+    for _ in 0..3 {
+        assert!(fixture
+            .api
+            .reconcile_adaptive_tools_until(|| false)
+            .is_err());
+        assert_eq!(
+            fixture
+                .api
+                .adaptive_tool_progress_inventory_generation
+                .load(Ordering::Acquire),
+            failed_generation
+        );
+    }
+    // An inventory read before the failure cannot replace even an identical ID inventory.
+    fixture
+        .api
+        .refresh_existing_adaptive_tool_hints(&projects, generation)
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &hints,
+        &fixture.api.adaptive_tool_progress_hints.lock().unwrap()
+    ));
+    assert_eq!(
+        *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+        failures
+    );
+    assert!(!fixture.api.reconcile_adaptive_tools_until(|| true).unwrap());
+    assert_eq!(
+        fixture
+            .api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire),
+        failed_generation
+    );
+    fixture.api.workbench = Some(adapter);
+    fixture.with_terminal_workbench_service(|| {
+        fixture
+            .api
+            .reconcile_adaptive_tools_until(|| false)
+            .unwrap();
+    });
+    assert!(fixture
+        .api
+        .adaptive_tool_progress_failures
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        fixture
+            .api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire),
+        failed_generation + 1
+    );
+    let cleared_generation = failed_generation + 1;
+    // Clearing the failure also fences inventories captured before that fresh success.
+    let current = fixture
+        .api
+        .adaptive_tool_progress_hints
+        .lock()
+        .unwrap()
+        .clone();
+    fixture
+        .api
+        .refresh_existing_adaptive_tool_hints(&failed_projects, failed_generation)
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &current,
+        &fixture.api.adaptive_tool_progress_hints.lock().unwrap()
+    ));
+    assert_eq!(
+        fixture
+            .api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire),
+        cleared_generation
+    );
+    fixture
+        .api
+        .reconcile_adaptive_tools_until(|| false)
+        .unwrap();
+    assert!(fixture.tool_progress_hint_keys().is_empty());
+    assert_eq!(
+        fixture
+            .api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire),
+        cleared_generation + 1
+    );
+    for _ in 0..3 {
+        fixture
+            .api
+            .reconcile_adaptive_tools_until(|| false)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .api
+                .adaptive_tool_progress_inventory_generation
+                .load(Ordering::Acquire),
+            cleared_generation + 1
+        );
+    }
+    assert_eq!(
+        fixture
+            .tool_progress_transition_versions("observe_tool")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn tool_inventory_generation_exhaustion_preserves_hints_without_wraparound() {
+    let fixture = Fixture::productive_root();
+    fixture.refresh_tool_progress_hints();
+    let hints = fixture
+        .api
+        .adaptive_tool_progress_hints
+        .lock()
+        .unwrap()
+        .clone();
+    let failures = fixture
+        .api
+        .adaptive_tool_progress_failures
+        .lock()
+        .unwrap()
+        .clone();
+    fixture
+        .api
+        .adaptive_tool_progress_inventory_generation
+        .store(u64::MAX, Ordering::Release);
+    let projects = fixture.api.store.company_projects().unwrap();
+    assert!(fixture
+        .api
+        .refresh_existing_adaptive_tool_hints(&projects, u64::MAX)
+        .is_err());
+    assert!(fixture
+        .api
+        .publish_existing_adaptive_tool_hint(hints[0].clone())
+        .is_err());
+    assert!(fixture
+        .api
+        .reconcile_adaptive_tools_until(|| false)
+        .is_err());
+    assert!(Arc::ptr_eq(
+        &hints,
+        &fixture.api.adaptive_tool_progress_hints.lock().unwrap()
+    ));
+    assert_eq!(
+        *fixture.api.adaptive_tool_progress_failures.lock().unwrap(),
+        failures
+    );
+    assert_eq!(
+        fixture
+            .api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire),
+        u64::MAX
+    );
 }
 
 #[test]
@@ -440,10 +1119,14 @@ fn existing_tool_progress_pass_rechecks_revocation_after_scope_snapshot() {
     let record = fixture.tools.load(&request.invocation_id).unwrap().unwrap();
     let journal = fixture.tool_progress_journal();
     let facts = fixture.tool_progress_non_model_facts();
+    let generation = fixture
+        .api
+        .adaptive_tool_progress_inventory_generation
+        .load(Ordering::Acquire);
     let projects = fixture.api.store.company_projects().unwrap();
     fixture
         .api
-        .refresh_existing_adaptive_tool_hints(&projects)
+        .refresh_existing_adaptive_tool_hints(&projects, generation)
         .unwrap();
     let checks = std::cell::Cell::new(0);
     let should_stop = || {
@@ -1755,9 +2438,13 @@ impl Fixture {
     }
 
     fn refresh_tool_progress_hints(&self) {
+        let generation = self
+            .api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire);
         let projects = self.api.store.company_projects().unwrap();
         self.api
-            .refresh_existing_adaptive_tool_hints(&projects)
+            .refresh_existing_adaptive_tool_hints(&projects, generation)
             .unwrap();
     }
 
@@ -1912,8 +2599,13 @@ impl Fixture {
     }
 
     fn run_existing_tool_progress(&self) -> Result<(), WorkflowError> {
+        let generation = self
+            .api
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire);
         let projects = self.api.store.company_projects().unwrap();
-        self.api.refresh_existing_adaptive_tool_hints(&projects)?;
+        self.api
+            .refresh_existing_adaptive_tool_hints(&projects, generation)?;
         self.api
             .reconcile_adaptive_tools_until(|| false)
             .map(|_| ())

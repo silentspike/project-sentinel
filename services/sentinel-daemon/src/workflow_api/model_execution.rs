@@ -18,6 +18,12 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) type AdaptiveToolProgressScope = (TenantId, ProjectId, WorkItemId, AgentId);
 type AdaptiveToolProgressFailureKey = (TenantId, ProjectId, WorkItemId, u16);
 
+#[derive(Clone, Copy)]
+enum AdaptiveToolProgressOutcome {
+    VerifiedIdle,
+    Progress,
+}
+
 fn adaptive_tool_progress_failure_key(
     scope: &AdaptiveToolProgressScope,
 ) -> AdaptiveToolProgressFailureKey {
@@ -1589,6 +1595,7 @@ impl WorkflowApi {
     pub(super) fn refresh_existing_adaptive_tool_hints(
         &self,
         projects: &[sentinel_workflow::ProjectV1],
+        expected_generation: u64,
     ) -> Result<(), WorkflowError> {
         // The caller supplies the complete freshly validated company-project inventory.
         // Eligibility filtering alone is not proof that a failed scope was removed.
@@ -1630,23 +1637,39 @@ impl WorkflowApi {
             .collect();
         scopes.sort_by(compare_adaptive_tool_progress_scopes);
         scopes.dedup();
-        prune_adaptive_tool_progress_failures(
-            &mut *self
-                .adaptive_tool_progress_failures
-                .lock()
-                .map_err(|_| workflow_unavailable())?,
-            &authoritative_scopes,
-        );
-        *self
+        let mut failures = self
+            .adaptive_tool_progress_failures
+            .lock()
+            .map_err(|_| workflow_unavailable())?;
+        let mut hints = self
             .adaptive_tool_progress_hints
             .lock()
-            .map_err(|_| workflow_unavailable())? = Arc::new(scopes);
+            .map_err(|_| workflow_unavailable())?;
+        if self
+            .adaptive_tool_progress_inventory_generation
+            .load(Ordering::Acquire)
+            != expected_generation
+        {
+            return Ok(());
+        }
+        self.advance_adaptive_tool_inventory_generation()?;
+        prune_adaptive_tool_progress_failures(&mut failures, &authoritative_scopes);
+        *hints = Arc::new(scopes);
         Ok(())
+    }
+
+    fn advance_adaptive_tool_inventory_generation(&self) -> Result<(), WorkflowError> {
+        self.adaptive_tool_progress_inventory_generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|_| ())
+            .map_err(|_| workflow_unavailable())
     }
 
     pub(super) fn reconcile_existing_adaptive_tool_hints(
         &self,
-        scopes: &[(TenantId, ProjectId, WorkItemId, AgentId)],
+        scopes: &Arc<Vec<AdaptiveToolProgressScope>>,
         should_stop: &impl Fn() -> bool,
     ) -> Result<(), WorkflowError> {
         if !self.model_work_enabled || should_stop() {
@@ -1666,6 +1689,7 @@ impl WorkflowApi {
             .map_err(|_| workflow_unavailable())?
             .clone();
         let start = adaptive_tool_progress_start(scopes, cursor.as_ref());
+        let mut idle = Vec::new();
         for scope in scopes[start..]
             .iter()
             .chain(scopes[..start].iter())
@@ -1680,14 +1704,29 @@ impl WorkflowApi {
                 .lock()
                 .map_err(|_| workflow_unavailable())? = Some(scope.clone());
             let result = self.reconcile_existing_adaptive_tool_scope(scope, should_stop);
-            record_adaptive_tool_progress_result(
-                &mut *self
+            if matches!(result, Ok(Some(AdaptiveToolProgressOutcome::VerifiedIdle))) {
+                idle.push(scope.clone());
+            }
+            {
+                let mut failures = self
                     .adaptive_tool_progress_failures
                     .lock()
-                    .map_err(|_| workflow_unavailable())?,
-                scope,
-                result,
-            );
+                    .map_err(|_| workflow_unavailable())?;
+                let key = adaptive_tool_progress_failure_key(scope);
+                let changed = match result {
+                    Err(reason) => failures.get(&key).map(String::as_str) != Some(reason),
+                    Ok(Some(_)) => failures.contains_key(&key),
+                    Ok(None) => false,
+                };
+                if changed {
+                    self.advance_adaptive_tool_inventory_generation()?;
+                    record_adaptive_tool_progress_result(
+                        &mut failures,
+                        scope,
+                        result.map(|outcome| outcome.map(|_| ())),
+                    );
+                }
+            }
             if let Err(reason) = result {
                 log_reconciliation_failure("adaptive_tool_progress", reason);
             }
@@ -1696,7 +1735,44 @@ impl WorkflowApi {
                 break;
             }
         }
+        if !idle.is_empty() {
+            let mut current = self
+                .adaptive_tool_progress_hints
+                .lock()
+                .map_err(|_| workflow_unavailable())?;
+            // A refresh or post-commit publication invalidates this pass's retirement rights.
+            if Arc::ptr_eq(&*current, scopes) {
+                self.advance_adaptive_tool_inventory_generation()?;
+                *current = Arc::new(
+                    scopes
+                        .iter()
+                        .filter(|scope| !idle.contains(scope))
+                        .cloned()
+                        .collect(),
+                );
+            }
+        }
         self.existing_adaptive_tool_progress_status()
+    }
+
+    pub(super) fn publish_existing_adaptive_tool_hint(
+        &self,
+        scope: AdaptiveToolProgressScope,
+    ) -> Result<(), &'static str> {
+        let mut current = self
+            .adaptive_tool_progress_hints
+            .lock()
+            .map_err(|_| "adaptive tool hints unavailable")?;
+        let mut scopes = current.as_ref().clone();
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+            scopes.sort_by(compare_adaptive_tool_progress_scopes);
+        }
+        // Even an existing ID needs a new generation to fence an older idle proof.
+        self.advance_adaptive_tool_inventory_generation()
+            .map_err(|_| "adaptive tool inventory generation exhausted")?;
+        *current = Arc::new(scopes);
+        Ok(())
     }
 
     fn existing_adaptive_tool_progress_status(&self) -> Result<(), WorkflowError> {
@@ -1715,7 +1791,7 @@ impl WorkflowApi {
         &self,
         scope: &AdaptiveToolProgressScope,
         should_stop: &impl Fn() -> bool,
-    ) -> Result<Option<()>, &'static str> {
+    ) -> Result<Option<AdaptiveToolProgressOutcome>, &'static str> {
         let (tenant, project_id, work_item_id, agent_id) = scope;
         let snapshot = self
             .store
@@ -1723,8 +1799,9 @@ impl WorkflowApi {
             .map_err(|_| "adaptive tool project unavailable")?
             .ok_or("adaptive tool project missing")?;
         let project = snapshot.project();
+        // Early binding exclusions have not consumed the deferred head proof.
         let Some(allowance) = project.subscription_call.as_ref() else {
-            return Ok(Some(()));
+            return Ok(Some(AdaptiveToolProgressOutcome::Progress));
         };
         let Some(binding) = select_provider_usage_binding(
             std::slice::from_ref(project),
@@ -1732,7 +1809,7 @@ impl WorkflowApi {
             Some(&allowance.allowance_id),
         )?
         else {
-            return Ok(Some(()));
+            return Ok(Some(AdaptiveToolProgressOutcome::Progress));
         };
         if binding.work_item_id != work_item_id.0 {
             return Err("adaptive tool work item changed");
@@ -1754,7 +1831,11 @@ impl WorkflowApi {
             .session_for_authority(&current)
             .map_err(|_| "adaptive continuation head unavailable")?
         else {
-            return Ok(Some(()));
+            drop(snapshot);
+            if should_stop() {
+                return Ok(None);
+            }
+            return Ok(Some(AdaptiveToolProgressOutcome::VerifiedIdle));
         };
         if !matches!(
             session.cursor,
@@ -1765,7 +1846,11 @@ impl WorkflowApi {
             && (session.tool_calls >= session.funded_tool_call_ceiling()
                 || now_unix_ms() >= session.active_deadline_ms()))
         {
-            return Ok(Some(()));
+            drop(snapshot);
+            if should_stop() {
+                return Ok(None);
+            }
+            return Ok(Some(AdaptiveToolProgressOutcome::VerifiedIdle));
         }
         let project = project.clone();
         drop(snapshot);
@@ -1781,7 +1866,7 @@ impl WorkflowApi {
             true,
             true,
         )?;
-        Ok(Some(()))
+        Ok(Some(AdaptiveToolProgressOutcome::Progress))
     }
 
     pub(super) fn adaptive_provider_authority(
@@ -2646,7 +2731,8 @@ impl WorkflowApi {
                 request_id,
                 session.version,
             );
-            self.core
+            let (_, resolved) = self
+                .core
                 .advance_adaptive_session(
                     session.grant.session_id,
                     session.version,
@@ -2660,6 +2746,15 @@ impl WorkflowApi {
                     now_unix_ms(),
                 )
                 .map_err(|_| "adaptive model result admission failed")?;
+            if matches!(resolved.cursor, AdaptiveCursorV1::ReadyForTool { .. }) {
+                let source = &resolved.grant.authority;
+                self.publish_existing_adaptive_tool_hint((
+                    source.tenant_id.clone(),
+                    source.project_id.clone(),
+                    source.work_item_id.clone(),
+                    source.agent_id,
+                ))?;
+            }
         }
         if let AdaptiveModelDecisionV1::Collaborate { action } = &decision {
             self.apply_adaptive_collaboration(context, action, request_id, request_digest)?;

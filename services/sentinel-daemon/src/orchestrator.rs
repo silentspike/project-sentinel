@@ -2290,21 +2290,24 @@ async fn run_owner_snapshot_reconciliation(
     }
 }
 
-fn join_workflow_reconciler(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while !handle.is_finished() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    handle.join().is_ok()
-}
-
 #[cfg(feature = "llm")]
 const LLM_ACTION_FORWARDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "llm")]
 const ECS_ACTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn finish_company_worker_shutdown(
+    company_result: std::result::Result<(), &'static str>,
+    tool_result: Option<std::result::Result<(), &'static str>>,
+    cleanup: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // Terminal worker errors must not bypass channel closure or ECS cleanup.
+    let cleanup_result = cleanup();
+    company_result.map_err(anyhow::Error::msg)?;
+    if let Some(result) = tool_result {
+        result.map_err(anyhow::Error::msg)?;
+    }
+    cleanup_result
+}
 
 #[cfg(feature = "llm")]
 async fn drain_llm_actions_before_ecs_shutdown(
@@ -3363,34 +3366,33 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let events_db_path = events_path.to_string_lossy().to_string();
     let ecs_platform_state = Arc::clone(&platform_state);
     let ecs_runtime_health = Arc::clone(&runtime_health);
-    let workflow_reconciler = Arc::clone(&workflow_api);
-    let workflow_shutdown = Arc::clone(&shutdown);
-    let workflow_reconcile_handle = std::thread::Builder::new()
-        .name("company-workflow-reconcile".into())
-        .spawn(move || {
-            while !workflow_shutdown.load(Ordering::SeqCst) {
-                workflow_reconciler
-                    .reconcile_pending_until(|| workflow_shutdown.load(Ordering::SeqCst));
-                std::thread::sleep(Duration::from_millis(250));
-            }
-        })
-        .context("start M0 company workflow reconciler")?;
+    // Reverse declaration order also joins company before tool progress on
+    // later startup returns; initialization must remain company first.
     #[cfg(feature = "llm")]
-    let mut workflow_tool_progress = {
-        match crate::workflow_api::AdaptiveToolProgressWorker::spawn(
+    #[allow(clippy::needless_late_init)]
+    let mut workflow_tool_progress;
+    let mut workflow_reconciler = crate::workflow_api::CompanyReconciliationWorker::spawn(
+        Arc::clone(&workflow_api),
+        Arc::clone(&shutdown),
+    )
+    .context("start M0 company workflow reconciler")?;
+    #[cfg(feature = "llm")]
+    {
+        workflow_tool_progress = match crate::workflow_api::AdaptiveToolProgressWorker::spawn(
             Arc::clone(&workflow_api),
             Arc::clone(&shutdown),
         ) {
             Ok(worker) => worker,
             Err(error) => {
                 shutdown.store(true, Ordering::SeqCst);
-                if !join_workflow_reconciler(workflow_reconcile_handle, Duration::from_secs(6)) {
-                    warn!("Company workflow worker did not finish after progress startup failed");
-                }
+                workflow_reconciler
+                    .stop_and_join()
+                    .map_err(anyhow::Error::msg)
+                    .context("stop company workflow worker after tool progress startup failed")?;
                 return Err(error).context("start existing company tool progress worker");
             }
-        }
-    };
+        };
+    }
     let ecs_llm_circuit_open = Arc::clone(&llm_circuit_open);
     let ecs_llm_activity_ticks = Arc::clone(&llm_activity_ticks);
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
@@ -3767,46 +3769,49 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     )
     .await;
     shutdown.store(true, Ordering::SeqCst);
-    // The reconciler's bounded Workbench response wait is five seconds. Give
-    // an in-flight batch one extra second after the LLM-to-ECS handoff has
-    // reached the persisted tick barrier.
-    if !join_workflow_reconciler(workflow_reconcile_handle, Duration::from_secs(6)) {
-        warn!("Company-Workflow-Reconciler konnte nicht sauber beendet werden");
-    }
+    // Both mutation workers must actually finish before their stores can close.
+    let workflow_reconcile_result = workflow_reconciler.stop_and_join();
     #[cfg(feature = "llm")]
-    workflow_tool_progress
-        .stop_and_join()
-        .map_err(anyhow::Error::msg)?;
-    // Action-Channel schliessen damit ECS-Thread aufwacht falls er blockt
-    drop(action_tx);
-    drop(operator_tx);
+    let workflow_tool_progress_result = Some(workflow_tool_progress.stop_and_join());
+    #[cfg(not(feature = "llm"))]
+    let workflow_tool_progress_result = None;
+    finish_company_worker_shutdown(
+        workflow_reconcile_result,
+        workflow_tool_progress_result,
+        || {
+            // Action-Channel schliessen damit ECS-Thread aufwacht falls er blockt
+            drop(action_tx);
+            drop(operator_tx);
 
-    // ECS-Thread mit 8s Timeout joinen (AC-3 #255)
-    let join_deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        if ecs_handle.is_finished() {
-            match ecs_handle.join() {
-                Ok(Ok(tick_count)) => {
-                    info!(total_ticks = tick_count, "ECS Thread sauber beendet");
+            // ECS-Thread mit 8s Timeout joinen (AC-3 #255)
+            let join_deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if ecs_handle.is_finished() {
+                    match ecs_handle.join() {
+                        Ok(Ok(tick_count)) => {
+                            info!(total_ticks = tick_count, "ECS Thread sauber beendet");
+                        }
+                        Ok(Err(e)) => {
+                            error!(error = %e, "ECS Thread mit Fehler beendet");
+                        }
+                        Err(_) => {
+                            error!("ECS Thread panicked");
+                        }
+                    }
+                    break;
                 }
-                Ok(Err(e)) => {
-                    error!(error = %e, "ECS Thread mit Fehler beendet");
+                if Instant::now() > join_deadline {
+                    warn!("ECS-Thread Shutdown-Timeout (8s) — erzwinge Beendigung");
+                    break; // Daemon exits, --die-with-parent kills agents
                 }
-                Err(_) => {
-                    error!("ECS Thread panicked");
-                }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            break;
-        }
-        if Instant::now() > join_deadline {
-            warn!("ECS-Thread Shutdown-Timeout (8s) — erzwinge Beendigung");
-            break; // Daemon exits, --die-with-parent kills agents
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 
-    #[cfg(feature = "llm")]
-    llm_drain_result?;
+            #[cfg(feature = "llm")]
+            llm_drain_result?;
+            Ok(())
+        },
+    )?;
 
     info!("Daemon heruntergefahren");
 
@@ -12926,22 +12931,93 @@ mod tests {
     }
 
     #[test]
-    fn workflow_reconciler_observes_shutdown_and_joins() {
+    fn company_reconciliation_worker_local_stop_does_not_set_global_shutdown() {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let stopped = Arc::new(AtomicBool::new(false));
-        let worker_shutdown = Arc::clone(&shutdown);
-        let worker_stopped = Arc::clone(&stopped);
-        let handle = std::thread::spawn(move || {
-            while !worker_shutdown.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            worker_stopped.store(true, Ordering::SeqCst);
-        });
+        let api = Arc::new(crate::workflow_api::WorkflowApi::disabled().unwrap());
+        let mut worker =
+            crate::workflow_api::CompanyReconciliationWorker::spawn(api, Arc::clone(&shutdown))
+                .unwrap();
+        assert_eq!(worker.stop_and_join(), Ok(()));
+        assert!(!shutdown.load(Ordering::SeqCst));
+    }
 
-        shutdown.store(true, Ordering::SeqCst);
+    #[test]
+    fn company_or_tool_worker_panic_finishes_ecs_cleanup_before_error() {
+        for company_panics in [true, false] {
+            let mut order = Vec::new();
+            let company = std::thread::spawn(move || {
+                assert!(!company_panics, "synthetic company worker panic");
+            });
+            let tool = std::thread::spawn(move || {
+                assert!(company_panics, "synthetic tool worker panic");
+            });
+            let (action_tx, action_rx) = mpsc::channel::<()>();
+            let (operator_tx, operator_rx) = mpsc::channel::<()>();
+            let ecs = std::thread::spawn(move || {
+                assert!(action_rx.recv().is_err());
+                assert!(operator_rx.recv().is_err());
+            });
+            let company_result = company.join().map_err(|_| "company_worker_panicked");
+            order.push("company_joined");
+            let tool_result = tool.join().map_err(|_| "tool_worker_panicked");
+            order.push("tool_joined");
+            let error = finish_company_worker_shutdown(company_result, Some(tool_result), || {
+                drop(action_tx);
+                drop(operator_tx);
+                order.push("channels_closed");
+                ecs.join().unwrap();
+                order.push("ecs_joined");
+                order.push("remaining_cleanup");
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                if company_panics {
+                    "company_worker_panicked"
+                } else {
+                    "tool_worker_panicked"
+                }
+            );
+            assert_eq!(
+                order,
+                [
+                    "company_joined",
+                    "tool_joined",
+                    "channels_closed",
+                    "ecs_joined",
+                    "remaining_cleanup",
+                ]
+            );
+        }
+    }
 
-        assert!(join_workflow_reconciler(handle, Duration::from_secs(1)));
-        assert!(stopped.load(Ordering::SeqCst));
+    #[test]
+    fn company_worker_shutdown_callsite_defers_errors_until_ecs_cleanup() {
+        let source = include_str!("orchestrator.rs");
+        let shutdown = source
+            .split_once(
+                "// Both mutation workers must actually finish before their stores can close.",
+            )
+            .unwrap()
+            .1
+            .split_once("info!(\"Daemon heruntergefahren\");")
+            .unwrap()
+            .0;
+        let company = shutdown
+            .find("workflow_reconciler.stop_and_join()")
+            .unwrap();
+        let tool = shutdown
+            .find("workflow_tool_progress.stop_and_join()")
+            .unwrap();
+        let cleanup = shutdown.find("finish_company_worker_shutdown(").unwrap();
+        let channels = shutdown.find("drop(action_tx);").unwrap();
+        let ecs = shutdown.find("ecs_handle.join()").unwrap();
+        let remaining = shutdown.find("llm_drain_result?;").unwrap();
+        assert!(company < tool && tool < cleanup && cleanup < channels);
+        assert!(channels < ecs && ecs < remaining);
+        assert!(!shutdown[..cleanup].contains(".map_err("));
+        assert!(!shutdown[..cleanup].contains('?'));
     }
 
     #[test]
