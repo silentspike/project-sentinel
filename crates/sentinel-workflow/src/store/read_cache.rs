@@ -305,6 +305,8 @@ pub(super) struct ReadCache {
     results: BTreeMap<(&'static str, TypeId, Vec<u8>), ResultProof>,
     result_bytes: usize,
     use_counter: u64,
+    #[cfg(test)]
+    integrity_checks: usize,
 }
 
 impl std::fmt::Debug for ReadCache {
@@ -417,16 +419,22 @@ impl ReadCache {
             .is_some_and(|inputs| inputs.matches(connection).unwrap_or(false));
         let key = (domain, TypeId::of::<T>(), query_key.to_vec());
         if same {
-            // Table equality alone cannot detect index-only damage. Preserve
-            // SQLite-visible corruption coverage before reusing a replay proof.
-            if !self.integrity_ok(connection)? {
-                return Err(super::corrupt_store());
-            }
-            let used = self.next_use();
-            if let Some(proof) = self.results.get_mut(&key) {
-                if let Some(value) = proof.value.downcast_ref::<T>() {
-                    proof.last_used = used;
-                    return Ok(value.clone());
+            if self
+                .results
+                .get(&key)
+                .is_some_and(|proof| proof.value.downcast_ref::<T>().is_some())
+            {
+                // Table equality cannot detect index-only damage. Hits check
+                // before return; misses use the post-validation check below.
+                if !self.integrity_ok(connection)? {
+                    return Err(super::corrupt_store());
+                }
+                let used = self.next_use();
+                if let Some(proof) = self.results.get_mut(&key) {
+                    if let Some(value) = proof.value.downcast_ref::<T>() {
+                        proof.last_used = used;
+                        return Ok(value.clone());
+                    }
                 }
             }
         } else {
@@ -441,6 +449,11 @@ impl ReadCache {
             Ok(value) => value,
             Err(error) => {
                 self.clear();
+                // Preserve corruption precedence on warm typed misses, even
+                // when the read-only validator rejects the requested view.
+                if same && !self.integrity_ok(connection)? {
+                    return Err(super::corrupt_store());
+                }
                 return Err(error);
             }
         };
@@ -486,6 +499,10 @@ impl ReadCache {
     }
 
     fn integrity_ok(&mut self, connection: &Connection) -> Result<bool, WorkflowError> {
+        #[cfg(test)]
+        {
+            self.integrity_checks += 1;
+        }
         match connection.query_row("PRAGMA main.integrity_check", [], |row| {
             row.get::<_, String>(0)
         }) {
@@ -553,6 +570,113 @@ mod tests {
         })?;
         snapshot.commit()?;
         Ok(result)
+    }
+
+    #[test]
+    fn exact_read_cache_checks_integrity_once_per_hit_or_successful_miss() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut cache = ReadCache::default();
+        let validations = Cell::new(0);
+        for (domain, key, miss) in [
+            ("fixture", b"first".as_slice(), true),
+            ("fixture", b"first".as_slice(), false),
+            ("fixture", b"second".as_slice(), true),
+            ("fixture", b"second".as_slice(), false),
+            ("other-view", b"second".as_slice(), true),
+        ] {
+            let checks = cache.integrity_checks;
+            let calls = validations.get();
+            let result = cache
+                .read_keyed(&snapshot, true, domain, key, || {
+                    assert!(miss, "typed hit must not validate again");
+                    validations.set(validations.get() + 1);
+                    value(&snapshot)
+                })
+                .unwrap();
+            assert_eq!(result, b"old");
+            assert_eq!(cache.integrity_checks, checks + 1);
+            assert_eq!(validations.get(), calls + usize::from(miss));
+        }
+        let checks = cache.integrity_checks;
+        let result: u64 = cache
+            .read_keyed(&snapshot, true, "fixture", b"first", || Ok(7))
+            .unwrap();
+        assert_eq!(result, 7);
+        assert_eq!(cache.integrity_checks, checks + 1);
+        let checks = cache.integrity_checks;
+        let result: u64 = cache
+            .read_keyed(&snapshot, true, "fixture", b"first", || {
+                panic!("typed hit must not validate again")
+            })
+            .unwrap();
+        assert_eq!(result, 7);
+        assert_eq!(cache.integrity_checks, checks + 1);
+        snapshot.commit().unwrap();
+    }
+
+    #[test]
+    fn exact_read_cache_warm_miss_failure_checks_integrity_and_clears_proofs() {
+        for code in [
+            crate::WorkflowErrorCode::AuthorityConflict,
+            crate::WorkflowErrorCode::NotFound,
+            crate::WorkflowErrorCode::InvalidTransition,
+        ] {
+            let mut connection = database(":memory:");
+            let mut cache = ReadCache::default();
+            let calls = Cell::new(0);
+            read(&mut connection, &mut cache, &calls).unwrap();
+            let checks = cache.integrity_checks;
+            {
+                let snapshot = connection.savepoint().unwrap();
+                let error = cache
+                    .read_keyed::<Vec<u8>>(&snapshot, true, "fixture", b"missing", || {
+                        calls.set(calls.get() + 1);
+                        Err(WorkflowError::new(code, false, "rejected view"))
+                    })
+                    .unwrap_err();
+                assert_eq!(error.code, code);
+                assert_eq!(error.message, "rejected view");
+                assert_eq!(cache.integrity_checks, checks + 1);
+                assert!(cache.inputs.is_none());
+                assert!(cache.results.is_empty());
+                assert_eq!(cache.result_bytes, 0);
+            }
+            assert_eq!(calls.get(), 2);
+            assert_eq!(value(&connection).unwrap(), b"old");
+            assert!(connection.is_autocommit());
+        }
+    }
+
+    #[test]
+    fn exact_read_cache_cold_or_changed_input_failure_skips_integrity() {
+        let mut connection = database(":memory:");
+        let mut cache = ReadCache::default();
+        let calls = Cell::new(0);
+        for warm in [false, true] {
+            if warm {
+                read(&mut connection, &mut cache, &calls).unwrap();
+                connection
+                    .execute("UPDATE workflow_work_items SET value=X'6e6577'", [])
+                    .unwrap();
+            }
+            let checks = cache.integrity_checks;
+            let snapshot = connection.savepoint().unwrap();
+            let error = cache
+                .read_keyed::<Vec<u8>>(&snapshot, true, "fixture", b"missing", || {
+                    Err(WorkflowError::new(
+                        crate::WorkflowErrorCode::NotFound,
+                        false,
+                        "rejected view",
+                    ))
+                })
+                .unwrap_err();
+            assert_eq!(error.code, crate::WorkflowErrorCode::NotFound);
+            assert_eq!(cache.integrity_checks, checks);
+            assert!(cache.inputs.is_none());
+            assert!(cache.results.is_empty());
+        }
+        assert!(connection.is_autocommit());
     }
 
     #[test]
@@ -707,16 +831,23 @@ mod tests {
                 .is_err());
             assert!(cache.inputs.is_none());
         }
+        read(&mut connection, &mut cache, &calls).unwrap();
+        let checks = cache.integrity_checks;
+        let writes = Cell::new(0);
         {
             let snapshot = connection.savepoint().unwrap();
             assert!(cache
                 .read(&snapshot, true, "write", || {
+                    writes.set(writes.get() + 1);
                     snapshot.execute("UPDATE workflow_work_items SET value=X'6e6577'", [])?;
                     Ok(7_u64)
                 })
                 .is_err());
             assert!(cache.inputs.is_none());
+            assert!(cache.results.is_empty());
+            assert_eq!(cache.integrity_checks, checks);
         }
+        assert_eq!(writes.get(), 1);
         assert_eq!(value(&connection).unwrap(), b"old");
         assert!(connection.is_autocommit());
     }
@@ -779,6 +910,26 @@ mod tests {
 
     #[test]
     fn exact_read_cache_rejects_index_only_damage_with_unchanged_table_inputs() {
+        assert_index_only_damage_rejected(false, None);
+    }
+
+    #[test]
+    fn exact_read_cache_new_key_miss_rejects_index_only_damage_after_validation() {
+        assert_index_only_damage_rejected(true, None);
+    }
+
+    #[test]
+    fn exact_read_cache_warm_miss_corruption_precedes_validator_failure() {
+        for code in [
+            crate::WorkflowErrorCode::AuthorityConflict,
+            crate::WorkflowErrorCode::NotFound,
+            crate::WorkflowErrorCode::InvalidTransition,
+        ] {
+            assert_index_only_damage_rejected(true, Some(code));
+        }
+    }
+
+    fn assert_index_only_damage_rejected(new_key: bool, failure: Option<crate::WorkflowErrorCode>) {
         use std::io::{Seek, SeekFrom, Write};
 
         let directory = tempfile::tempdir().unwrap();
@@ -789,6 +940,7 @@ mod tests {
         let mut cache = ReadCache::default();
         let calls = Cell::new(0);
         read(&mut connection, &mut cache, &calls).unwrap();
+        assert_eq!(cache.integrity_checks, 1);
         let table = cache.inputs.as_ref().unwrap().tables.last().unwrap();
         let (InputValue::Blob(first), InputValue::Blob(second)) =
             (&table.rows[0][1], &table.rows[1][1])
@@ -815,14 +967,37 @@ mod tests {
         {
             let snapshot = connection.savepoint().unwrap();
             assert!(cache.inputs.as_ref().unwrap().matches(&snapshot).unwrap());
-            assert!(cache
-                .read::<Vec<u8>>(&snapshot, true, "fixture", || panic!(
-                    "never certify damaged index"
-                ))
-                .is_err());
+            let expected_error: WorkflowError =
+                match snapshot.query_row("PRAGMA main.integrity_check", [], |row| {
+                    row.get::<_, String>(0)
+                }) {
+                    Ok(result) => {
+                        assert_ne!(result, "ok");
+                        super::super::corrupt_store()
+                    }
+                    Err(error) => error.into(),
+                };
+            let result = cache.read_keyed::<Vec<u8>>(
+                &snapshot,
+                true,
+                "fixture",
+                if new_key { b"uncached" } else { b"" },
+                || {
+                    assert!(new_key, "typed hit must reject before validation");
+                    calls.set(calls.get() + 1);
+                    if let Some(code) = failure {
+                        return Err(WorkflowError::new(code, false, "rejected view"));
+                    }
+                    value(&snapshot)
+                },
+            );
+            assert_eq!(result.unwrap_err(), expected_error);
+            assert_eq!(cache.integrity_checks, 2);
             assert!(cache.inputs.is_none());
+            assert!(cache.results.is_empty());
         }
-        assert_eq!(calls.get(), 1);
+        assert_eq!(calls.get(), if new_key { 2 } else { 1 });
+        assert!(connection.is_autocommit());
     }
 
     #[test]

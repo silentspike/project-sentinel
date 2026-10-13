@@ -1501,6 +1501,8 @@ impl WorkflowApi {
         &self,
         agent: AgentId,
     ) -> Result<Option<AdaptiveLeadershipReviewCallV1>, &'static str> {
+        #[cfg(test)]
+        tests::record_leadership_selection();
         if !self.has_registered_model_role(
             agent,
             None,
@@ -1586,8 +1588,8 @@ impl WorkflowApi {
         agent: AgentId,
         review_id: Uuid,
     ) -> Result<(AdaptiveLeadershipReviewCallV1, LeadershipContext), &'static str> {
-        let call = self.exact_registered_leadership_review(agent, review_id)?;
-        let context = self.prepare_leadership_review(&LeadershipAuthority::from_call(&call))?;
+        let (call, context) =
+            self.leadership_review_for_authority_with_context(agent, review_id)?;
         if call.dispatch.is_some() {
             return Err("leadership call is already dispatched");
         }
@@ -1599,9 +1601,18 @@ impl WorkflowApi {
         agent: AgentId,
         review_id: Uuid,
     ) -> Result<AdaptiveLeadershipReviewCallV1, &'static str> {
+        self.leadership_review_for_authority_with_context(agent, review_id)
+            .map(|(call, _)| call)
+    }
+
+    pub(super) fn leadership_review_for_authority_with_context(
+        &self,
+        agent: AgentId,
+        review_id: Uuid,
+    ) -> Result<(AdaptiveLeadershipReviewCallV1, LeadershipContext), &'static str> {
         let call = self.exact_registered_leadership_review(agent, review_id)?;
-        self.prepare_leadership_review(&LeadershipAuthority::from_call(&call))?;
-        Ok(call)
+        let context = self.prepare_leadership_review(&LeadershipAuthority::from_call(&call))?;
+        Ok((call, context))
     }
 
     fn exact_registered_leadership_review(
@@ -1664,6 +1675,8 @@ impl WorkflowApi {
         &self,
         binding: &LeadershipAuthority,
     ) -> Result<LeadershipContext, &'static str> {
+        #[cfg(test)]
+        tests::record_leadership_preparation();
         let call = self
             .store
             .adaptive_leadership_review_call(
@@ -2340,6 +2353,26 @@ impl WorkflowApi {
 pub(crate) mod tests {
     use super::*;
     use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
+
+    thread_local! {
+        static LEADERSHIP_READ_COUNTS: std::cell::Cell<(usize, usize)> = const {
+            std::cell::Cell::new((0, 0))
+        };
+    }
+
+    pub(super) fn record_leadership_selection() {
+        LEADERSHIP_READ_COUNTS.with(|counts| {
+            let (selection, preparation) = counts.get();
+            counts.set((selection + 1, preparation));
+        });
+    }
+
+    pub(super) fn record_leadership_preparation() {
+        LEADERSHIP_READ_COUNTS.with(|counts| {
+            let (selection, preparation) = counts.get();
+            counts.set((selection, preparation + 1));
+        });
+    }
 
     // Synthetic journal adoption only, never provider or customer acceptance evidence.
     pub(crate) fn funded_prompt_fixture() -> (
@@ -5320,6 +5353,15 @@ pub(crate) mod tests {
             assert_eq!(context.source, call.context);
             assert_eq!(context.context_digest, call.context_digest().unwrap());
             assert_eq!(api.validate_provider_usage_authority(&expected), Ok(true));
+            LEADERSHIP_READ_COUNTS.with(|counts| counts.set((0, 0)));
+            assert_eq!(
+                api.validate_prepared_provider_model_context(
+                    &expected,
+                    &ModelExecutionContext::AdaptiveLeadershipReview(Box::new(context)),
+                ),
+                Ok(Some(()))
+            );
+            assert_eq!(LEADERSHIP_READ_COUNTS.with(|counts| counts.get()), (0, 1));
         }
         assert_eq!(discovery_state(&path, &events), before);
 
@@ -5355,6 +5397,18 @@ pub(crate) mod tests {
             Ok(dispatched)
         );
         assert_eq!(api.validate_provider_usage_authority(&expected), Ok(true));
+        let retained_context = api
+            .prepare_leadership_review(&LeadershipAuthority::from_call(&original))
+            .unwrap();
+        LEADERSHIP_READ_COUNTS.with(|counts| counts.set((0, 0)));
+        assert_eq!(
+            api.validate_prepared_provider_model_context(
+                &expected,
+                &ModelExecutionContext::AdaptiveLeadershipReview(Box::new(retained_context)),
+            ),
+            Ok(Some(()))
+        );
+        assert_eq!(LEADERSHIP_READ_COUNTS.with(|counts| counts.get()), (0, 1));
         assert_eq!(
             api.leadership_review_for_dispatch(agent, original.grant.review_id),
             Err("leadership call is already dispatched")
@@ -5440,6 +5494,24 @@ pub(crate) mod tests {
             let expected = ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(binding));
             assert!(
                 api.validate_provider_usage_authority(&expected).is_err(),
+                "{change}"
+            );
+            let mut retained = context.clone();
+            let ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) = &expected else {
+                panic!("leadership fixture");
+            };
+            retained.binding = binding.as_ref().clone();
+            assert_eq!(
+                api.validate_prepared_provider_model_context(
+                    &expected,
+                    &ModelExecutionContext::AdaptiveLeadershipReview(Box::new(retained)),
+                )
+                .unwrap_err(),
+                format!(
+                    "provider usage reauthorization failed: {}",
+                    api.validate_provider_usage_authority(&expected)
+                        .unwrap_err()
+                ),
                 "{change}"
             );
             assert_eq!(discovery_state(&path, &events), before, "{change}");
@@ -5570,8 +5642,140 @@ pub(crate) mod tests {
                     "{state}"
                 );
             }
+            let mut retained = context.clone();
+            let ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) = &expected else {
+                panic!("leadership fixture");
+            };
+            retained.binding = binding.as_ref().clone();
+            let fused = api.validate_prepared_provider_model_context(
+                &expected,
+                &ModelExecutionContext::AdaptiveLeadershipReview(Box::new(retained)),
+            );
+            if state == "dispatched" {
+                assert_eq!(fused, Ok(Some(())));
+            } else {
+                assert_eq!(
+                    fused.unwrap_err(),
+                    format!(
+                        "provider usage reauthorization failed: {}",
+                        api.validate_provider_usage_authority(&expected)
+                            .unwrap_err()
+                    ),
+                    "{state}"
+                );
+            }
             assert_eq!(discovery_state(&path, &events), before, "{state}");
         }
+    }
+
+    #[test]
+    fn leadership_candidate_defers_context_and_each_exact_gate_prepares_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (mut api, context) = fixture(&path, &events);
+        let expected =
+            ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(context.binding.clone()));
+        let agent = expected.agent_id();
+        let model_context = ModelExecutionContext::AdaptiveLeadershipReview(Box::new(context));
+        let before = discovery_state(&path, &events);
+        LEADERSHIP_READ_COUNTS.with(|counts| counts.set((0, 0)));
+        let candidate = api
+            .prepare_provider_usage_candidate(agent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.authority, Some(expected.clone()));
+        assert!(candidate.prepared_context.is_none());
+        assert_eq!(LEADERSHIP_READ_COUNTS.with(|counts| counts.get()), (1, 0));
+
+        for preparations in 1..=2 {
+            assert_eq!(
+                api.validate_prepared_provider_model_context(&expected, &model_context),
+                Ok(Some(()))
+            );
+            assert_eq!(
+                LEADERSHIP_READ_COUNTS.with(|counts| counts.get()),
+                (1, preparations)
+            );
+        }
+        Arc::make_mut(api.authority.as_mut().unwrap()).workbench_profile_digest = "0".repeat(64);
+        assert_eq!(
+            api.validate_prepared_provider_model_context(&expected, &model_context),
+            Err(
+                "provider usage reauthorization failed: leadership assignee unavailable".to_owned()
+            )
+        );
+        assert_eq!(LEADERSHIP_READ_COUNTS.with(|counts| counts.get()), (1, 3));
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+
+    #[test]
+    fn leadership_fused_context_preserves_authority_then_expected_context_error_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, context) = fixture(&path, &events);
+        let expected =
+            ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(context.binding.clone()));
+        let before = discovery_state(&path, &events);
+        let mut changed = context.clone();
+        changed.context_digest = "0".repeat(64);
+        let changed = ModelExecutionContext::AdaptiveLeadershipReview(Box::new(changed));
+        changed.validate_dispatch(now_unix_ms()).unwrap();
+        assert_eq!(
+            api.validate_prepared_provider_model_context(&expected, &changed),
+            Err("model work authority changed during provider I/O".to_owned())
+        );
+
+        let mut invalid = context;
+        invalid.source.source_project.project_id = ProjectId::parse("wrong-project").unwrap();
+        let invalid = ModelExecutionContext::AdaptiveLeadershipReview(Box::new(invalid));
+        let reason = invalid.validate_dispatch(now_unix_ms()).unwrap_err();
+        assert_eq!(
+            api.validate_prepared_provider_model_context(&expected, &invalid),
+            Err(reason.to_owned())
+        );
+        let mut wrong = expected.clone();
+        let ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) = &mut wrong else {
+            panic!("leadership fixture");
+        };
+        binding.allowance_id = "wrong-allowance".into();
+        assert_eq!(
+            api.validate_prepared_provider_model_context(&wrong, &invalid),
+            Err("provider usage authority changed during provider I/O".to_owned())
+        );
+        let ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) = &mut wrong else {
+            panic!("leadership fixture");
+        };
+        binding.grant.review_id = Uuid::new_v4();
+        assert_eq!(
+            api.validate_prepared_provider_model_context(&wrong, &invalid),
+            Err("provider usage reauthorization failed: leadership call missing".to_owned())
+        );
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+
+    #[test]
+    fn non_leadership_fused_context_preserves_legacy_fallback_without_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, leadership) = fixture(&path, &events);
+        let context: ModelExecutionContext = super::super::model_work::test_context().into();
+        let expected = context.binding();
+        let before = discovery_state(&path, &events);
+        LEADERSHIP_READ_COUNTS.with(|counts| counts.set((0, 0)));
+        for context in [
+            context,
+            ModelExecutionContext::AdaptiveLeadershipReview(Box::new(leadership)),
+        ] {
+            assert_eq!(
+                api.validate_prepared_provider_model_context(&expected, &context),
+                Ok(None)
+            );
+        }
+        assert_eq!(LEADERSHIP_READ_COUNTS.with(|counts| counts.get()), (0, 0));
+        assert_eq!(discovery_state(&path, &events), before);
     }
 
     #[test]
@@ -5605,6 +5809,19 @@ pub(crate) mod tests {
             assert_eq!(
                 api.validate_provider_usage_authority(&expected),
                 Ok(false),
+                "{change}"
+            );
+            let mut changed = context.clone();
+            let ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) = &expected else {
+                panic!("leadership fixture");
+            };
+            changed.binding = binding.as_ref().clone();
+            assert_eq!(
+                api.validate_prepared_provider_model_context(
+                    &expected,
+                    &ModelExecutionContext::AdaptiveLeadershipReview(Box::new(changed)),
+                ),
+                Err("provider usage authority changed during provider I/O".to_owned()),
                 "{change}"
             );
         }
@@ -6371,6 +6588,19 @@ pub(crate) mod tests {
                 ));
                 assert!(
                     api.validate_provider_usage_authority(&expected).is_err(),
+                    "{change}"
+                );
+                assert_eq!(
+                    api.validate_prepared_provider_model_context(
+                        &expected,
+                        &ModelExecutionContext::AdaptiveLeadershipReview(Box::new(context.clone())),
+                    )
+                    .unwrap_err(),
+                    format!(
+                        "provider usage reauthorization failed: {}",
+                        api.validate_provider_usage_authority(&expected)
+                            .unwrap_err()
+                    ),
                     "{change}"
                 );
                 if let Some((completion, id, digest)) = dispatched {
