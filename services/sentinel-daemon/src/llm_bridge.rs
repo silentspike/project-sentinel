@@ -182,6 +182,15 @@ pub mod bridge {
             Ok(None)
         }
 
+        /// One fresh proof may certify both bindings within this gate, never across gates.
+        fn validate_prepared_provider_model_context(
+            &self,
+            _expected: &ProviderExecutionAuthority,
+            _context: &ModelWorkContext,
+        ) -> Result<Option<()>, String> {
+            Ok(None)
+        }
+
         /// Returns true only when durable workflow authority proves that the
         /// provider dispatch for this exact request was never committed.
         fn provider_dispatch_is_definitively_absent(
@@ -542,6 +551,39 @@ pub mod bridge {
     }
 
     type ActiveProviderRequests = Arc<Mutex<HashMap<String, usize>>>;
+
+    // Scheduling ownership is not provider execution and must not affect orphan recovery.
+    type PreparingProviderRequests = Arc<Mutex<HashMap<String, ()>>>;
+
+    struct ProviderPreparationGuard {
+        requests: PreparingProviderRequests,
+        request_id: String,
+    }
+
+    impl ProviderPreparationGuard {
+        fn try_acquire(requests: &PreparingProviderRequests, request_id: &str) -> Option<Self> {
+            let mut pending = requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.contains_key(request_id) {
+                return None;
+            }
+            pending.insert(request_id.to_owned(), ());
+            Some(Self {
+                requests: Arc::clone(requests),
+                request_id: request_id.to_owned(),
+            })
+        }
+    }
+
+    impl Drop for ProviderPreparationGuard {
+        fn drop(&mut self) {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.request_id);
+        }
+    }
 
     // Register before reserving, so the orphan watcher cannot race live dispatch.
     // Counts also protect the original task when a duplicate reservation is denied.
@@ -1566,6 +1608,18 @@ pub mod bridge {
         agent_id: AgentId,
         model_work: Option<&ModelWorkContext>,
     ) -> Result<(), String> {
+        if let (Some(resolver), Some(expected), Some(context)) = (resolver, expected, model_work) {
+            if expected.agent_id() != agent_id {
+                return Err("provider usage authority returned another agent".to_owned());
+            }
+            if context.binding() == *expected
+                && resolver
+                    .validate_prepared_provider_model_context(expected, context)?
+                    .is_some()
+            {
+                return Ok(());
+            }
+        }
         validate_current_provider_usage_authority(resolver, expected, agent_id)
             .and_then(|()| validate_model_work_context(resolver, model_work))
     }
@@ -2042,6 +2096,8 @@ pub mod bridge {
         let mut last_call_tick: HashMap<AgentId, u64> = HashMap::new();
         let mut provider_tasks = JoinSet::new();
         let active_provider_requests: ActiveProviderRequests = Arc::new(Mutex::new(HashMap::new()));
+        let preparing_provider_requests: PreparingProviderRequests =
+            Arc::new(Mutex::new(HashMap::new()));
         let mut provider_task_failed = false;
         // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent,
         // danach 60 Ticks Cooldown. Verhindert Semaphore-Starvation bei 300-Tick TTL.
@@ -2307,6 +2363,17 @@ pub mod bridge {
                         }
                     }
                 }
+                let preparation_guard = if usage_authority.is_some() {
+                    let Some(guard) = ProviderPreparationGuard::try_acquire(
+                        &preparing_provider_requests,
+                        &request_id,
+                    ) else {
+                        continue;
+                    };
+                    Some(guard)
+                } else {
+                    None
+                };
                 let mut request = build_gateway_request(
                     &perception,
                     &state_store,
@@ -2433,6 +2500,7 @@ pub mod bridge {
                     let sem = llm_semaphore.clone();
                     let mut task_shutdown_rx = shutdown_rx.clone();
                     provider_tasks.spawn(async move {
+                        let _preparation_guard = preparation_guard;
                         // Urgent Calls duerfen auf Semaphore und Gateway warten, aber nicht ewig.
                         let acquire_timeout = config.request_timeout;
                         let permit = tokio::select! {
@@ -2617,6 +2685,7 @@ pub mod bridge {
                         }
                     };
                     provider_tasks.spawn(async move {
+                        let _preparation_guard = preparation_guard;
                         if let Err(error) = validate_unreserved_provider_authority(
                             provider_usage_authority_resolver.as_deref(),
                             provider_usage_authority.as_ref(),
@@ -3429,6 +3498,71 @@ pub mod bridge {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[tokio::test]
+        async fn preparation_guard_suppresses_exact_queued_request_and_releases_on_abort() {
+            let requests: PreparingProviderRequests = Arc::new(Mutex::new(HashMap::new()));
+            let guard =
+                ProviderPreparationGuard::try_acquire(&requests, "agent36-effect-one").unwrap();
+            let semaphore = Arc::new(Semaphore::new(0));
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _guard = guard;
+                started_tx.send(()).unwrap();
+                let _permit = semaphore.acquire_owned().await.unwrap();
+            });
+            started_rx.await.unwrap();
+            assert!(
+                ProviderPreparationGuard::try_acquire(&requests, "agent36-effect-one").is_none()
+            );
+            let different = ProviderPreparationGuard::try_acquire(&requests, "agent36-effect-two")
+                .expect("a different effect of the same employee remains eligible");
+            drop(different);
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(requests.lock().unwrap().is_empty());
+            assert!(
+                ProviderPreparationGuard::try_acquire(&requests, "agent36-effect-one").is_some()
+            );
+        }
+
+        #[tokio::test]
+        async fn preparation_guard_releases_on_timeout_and_shutdown_before_reservation() {
+            let requests: PreparingProviderRequests = Arc::new(Mutex::new(HashMap::new()));
+            {
+                let _guard = ProviderPreparationGuard::try_acquire(&requests, "timeout").unwrap();
+                let semaphore = Arc::new(Semaphore::new(0));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(1), semaphore.acquire_owned())
+                        .await
+                        .is_err()
+                );
+            }
+            assert!(requests.lock().unwrap().is_empty());
+            let guard = ProviderPreparationGuard::try_acquire(&requests, "shutdown").unwrap();
+            let (tx, mut rx) = watch::channel(false);
+            let task = tokio::spawn(async move {
+                let _guard = guard;
+                rx.changed().await.unwrap();
+            });
+            tx.send(true).unwrap();
+            task.await.unwrap();
+            assert!(requests.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn preparation_guard_is_not_orphan_authority_and_releases_after_unwind() {
+            let requests: PreparingProviderRequests = Arc::new(Mutex::new(HashMap::new()));
+            let active: ActiveProviderRequests = Arc::new(Mutex::new(HashMap::new()));
+            let result = std::panic::catch_unwind(|| {
+                let _guard = ProviderPreparationGuard::try_acquire(&requests, "panic").unwrap();
+                assert!(active.lock().unwrap().is_empty());
+                panic!("synthetic preparation failure");
+            });
+            assert!(result.is_err());
+            assert!(requests.lock().unwrap().is_empty());
+            assert!(active.lock().unwrap().is_empty());
+        }
 
         #[test]
         fn bound_preparation_timings_are_correlated_at_info_without_unbound_noise() {
@@ -5393,6 +5527,122 @@ pub mod bridge {
             }
         }
 
+        struct PreparedGateResolver {
+            legacy: ExactValidationResolver,
+            result: Mutex<Result<Option<()>, String>>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl ProviderUsageAuthorityResolver for PreparedGateResolver {
+            fn resolve_provider_usage_authority(
+                &self,
+                agent: AgentId,
+            ) -> Result<Option<ProviderExecutionAuthority>, &'static str> {
+                self.legacy.resolve_provider_usage_authority(agent)
+            }
+
+            fn validate_provider_usage_authority(
+                &self,
+                expected: &ProviderExecutionAuthority,
+            ) -> Result<bool, &'static str> {
+                self.legacy.validate_provider_usage_authority(expected)
+            }
+
+            fn model_work_context(
+                &self,
+                expected: &ProviderExecutionAuthority,
+            ) -> Result<Option<ModelWorkContext>, &'static str> {
+                self.legacy.model_work_context(expected)
+            }
+
+            fn validate_prepared_provider_model_context(
+                &self,
+                _: &ProviderExecutionAuthority,
+                _: &ModelWorkContext,
+            ) -> Result<Option<()>, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.result.lock().unwrap().clone()
+            }
+        }
+
+        #[test]
+        fn prepared_context_hook_is_fresh_per_gate_and_releases_after_authority_change() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
+                &dir.path().join("company.sqlite"),
+                &dir.path().join("events.sqlite"),
+            );
+            let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review));
+            let expected = context.binding();
+            for handled in [Some(()), None] {
+                let resolver = PreparedGateResolver {
+                    legacy: ExactValidationResolver::new(context.clone()),
+                    result: Mutex::new(Ok(handled)),
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                };
+                validate_unreserved_provider_authority(
+                    Some(&resolver),
+                    Some(&expected),
+                    expected.agent_id(),
+                    Some(&context),
+                )
+                .unwrap();
+                assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    resolver.legacy.validation_calls.load(Ordering::SeqCst),
+                    usize::from(handled.is_none())
+                );
+                assert_eq!(
+                    resolver.legacy.context_calls.load(Ordering::SeqCst),
+                    usize::from(handled.is_none())
+                );
+                let store = EventStore::open(":memory:").unwrap();
+                let id = expected.request_id();
+                let digest = "a".repeat(64);
+                assert!(store
+                    .reserve_request(&id, &digest, &expected.agent_id().to_string())
+                    .unwrap());
+                validate_pre_dispatch_provider_authority(
+                    &store,
+                    Some(&resolver),
+                    Some(&expected),
+                    expected.agent_id(),
+                    &id,
+                    &digest,
+                    Some(&context),
+                )
+                .unwrap();
+                assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+                assert!(store.get_completion(&id).unwrap().is_some());
+                *resolver.result.lock().unwrap() = Err("fresh authority changed".into());
+                assert_eq!(
+                    validate_pre_dispatch_provider_authority(
+                        &store,
+                        Some(&resolver),
+                        Some(&expected),
+                        expected.agent_id(),
+                        &id,
+                        &digest,
+                        Some(&context),
+                    ),
+                    Err("fresh authority changed".into())
+                );
+                assert_eq!(resolver.calls.load(Ordering::SeqCst), 3);
+                assert!(store.get_completion(&id).unwrap().is_none());
+                assert_eq!(
+                    validate_unreserved_provider_authority(
+                        Some(&resolver),
+                        Some(&expected),
+                        expected.agent_id(),
+                        Some(&context),
+                    ),
+                    Err("fresh authority changed".into())
+                );
+                assert!(store.get_completion(&id).unwrap().is_none());
+                assert_eq!(resolver.legacy.selection_calls.load(Ordering::SeqCst), 0);
+            }
+        }
+
         struct CandidateProbeResolver {
             candidate: Result<bool, &'static str>,
             authority: Result<Option<ProviderExecutionAuthority>, &'static str>,
@@ -6334,6 +6584,24 @@ pub mod bridge {
             );
             assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 0);
             assert_eq!(store.reservation_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 1);
+            for tick in 56..=58 {
+                let selections = resolver.selection_calls.load(Ordering::SeqCst);
+                let mut duplicate = recovery_test_perception();
+                duplicate.agent_id = expected.agent_id();
+                duplicate.is_directly_addressed = true;
+                duplicate.tick = Tick(tick);
+                perception_tx.send(duplicate).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while resolver.selection_calls.load(Ordering::SeqCst) <= selections {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("duplicate queued perception was not evaluated");
+            }
+            assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(telemetry.calls_total.load(Ordering::SeqCst), 2);
             tokio::time::timeout(Duration::from_secs(3), async {
                 while unix_now_ms() < expires_at {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6345,13 +6613,26 @@ pub mod bridge {
             tokio::time::timeout(Duration::from_secs(2), resolver.checked.notified())
                 .await
                 .expect("queued review was not checked after capacity became available");
+            let mut retry = recovery_test_perception();
+            retry.agent_id = expected.agent_id();
+            retry.is_directly_addressed = true;
+            retry.tick = Tick(59);
+            perception_tx.send(retry).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while resolver.validation_calls.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("failed admission retained exact-request preparation ownership");
             shutdown_tx.send(true).unwrap();
             tokio::time::timeout(Duration::from_secs(2), bridge)
                 .await
                 .expect("bridge did not drain")
                 .unwrap()
                 .unwrap();
-            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 2);
             assert_eq!(store.reservation_calls.load(Ordering::SeqCst), 1);
             assert!(store
                 .get_completion(&expected.request_id())

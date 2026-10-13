@@ -1,5 +1,13 @@
 # Changelog
 
+- Avoid repeated preparation of the same bound provider request while its task
+  waits for admission; keep scheduling ownership separate from durable provider
+  and orphan authority, releasing it on every task exit. Defer leadership
+  context until recovery checks and reuse one fresh exact leadership proof per
+  authorization gate. Remove the redundant integrity check on a validated-read
+  cache miss, and collect working-memory journal prefix evidence during full
+  replay without omitting corrupt suffixes or changing bounded memory (#856).
+
 - Acquire project and adaptive head facts together for continuation detection,
   queue ordering, binding preparation and rejected-model recovery. Preserve
   per-operation fresh authority, deferred head errors and all external-effect
