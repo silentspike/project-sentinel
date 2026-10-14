@@ -11,7 +11,18 @@
 //! - Structured Logging mit Tracing Spans
 
 #[cfg(feature = "llm")]
+#[path = "llm_bridge/provider_blocking_lanes.rs"]
+mod provider_blocking_lanes;
+#[cfg(feature = "llm")]
+#[path = "llm_bridge/provider_preparation_controller.rs"]
+mod provider_preparation_controller;
+
+#[cfg(feature = "llm")]
 pub mod bridge {
+    use super::provider_blocking_lanes::{
+        BlockingExecutor, JobCancellation, JobError, Lane, OwnedBlockingLanes, SubmitError,
+    };
+    use super::provider_preparation_controller::ProviderPreparationController;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -269,20 +280,45 @@ pub mod bridge {
         last_failure: Option<Instant>,
         reset_duration: Duration,
         open_signal: Arc<AtomicBool>,
+        terminal: Arc<Mutex<bool>>,
     }
 
     impl CircuitBreaker {
+        #[cfg(test)]
         fn new(threshold: u32, reset_duration: Duration, open_signal: Arc<AtomicBool>) -> Self {
+            Self::with_terminal(
+                threshold,
+                reset_duration,
+                open_signal,
+                Arc::new(Mutex::new(false)),
+            )
+        }
+
+        fn with_terminal(
+            threshold: u32,
+            reset_duration: Duration,
+            open_signal: Arc<AtomicBool>,
+            terminal: Arc<Mutex<bool>>,
+        ) -> Self {
             Self {
                 failure_count: 0,
                 threshold,
                 last_failure: None,
                 reset_duration,
                 open_signal,
+                terminal,
             }
         }
 
         fn is_open(&self) -> bool {
+            let terminal = self
+                .terminal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *terminal {
+                self.open_signal.store(true, Ordering::Release);
+                return true;
+            }
             if self.failure_count >= self.threshold {
                 // Pruefen ob Reset-Zeit abgelaufen
                 if let Some(last) = self.last_failure {
@@ -297,9 +333,13 @@ pub mod bridge {
         }
 
         fn record_success(&mut self) {
+            let terminal = self
+                .terminal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.failure_count = 0;
             self.last_failure = None;
-            self.open_signal.store(false, Ordering::Relaxed);
+            self.open_signal.store(*terminal, Ordering::Release);
         }
 
         fn record_failure(&mut self) {
@@ -307,6 +347,18 @@ pub mod bridge {
             self.last_failure = Some(Instant::now());
             let _ = self.is_open();
         }
+
+        fn mark_terminal(&self) {
+            publish_terminal_unavailability(&self.open_signal, &self.terminal);
+        }
+    }
+
+    fn publish_terminal_unavailability(signal: &AtomicBool, terminal: &Mutex<bool>) {
+        let mut terminal = terminal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *terminal = true;
+        signal.store(true, Ordering::Release);
     }
 
     // -- Gateway Request/Response Types --
@@ -722,17 +774,18 @@ pub mod bridge {
         *open = false;
     }
 
-    fn reserve_provider_request<S: CompletionStore>(
+    fn reserve_provider_request_until<S: CompletionStore>(
         admission: &RwLock<bool>,
         store: &S,
         request_id: &str,
         request_digest: &str,
         agent_id: &str,
+        cancelled: &impl Fn() -> bool,
     ) -> anyhow::Result<Option<bool>> {
         let open = admission
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !*open {
+        if !*open || cancelled() {
             return Ok(None);
         }
         store
@@ -1624,6 +1677,7 @@ pub mod bridge {
             .and_then(|()| validate_model_work_context(resolver, model_work))
     }
 
+    #[cfg(test)]
     fn validate_pre_dispatch_provider_authority<S: CompletionStore>(
         store: &S,
         resolver: Option<&dyn ProviderUsageAuthorityResolver>,
@@ -1633,10 +1687,37 @@ pub mod bridge {
         request_digest: &str,
         model_work: Option<&ModelWorkContext>,
     ) -> Result<(), String> {
+        validate_pre_dispatch_provider_authority_until(
+            store,
+            resolver,
+            expected,
+            agent_id,
+            request_id,
+            request_digest,
+            model_work,
+            &|| false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_pre_dispatch_provider_authority_until<S: CompletionStore>(
+        store: &S,
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        expected: Option<&ProviderExecutionAuthority>,
+        agent_id: AgentId,
+        request_id: &str,
+        request_digest: &str,
+        model_work: Option<&ModelWorkContext>,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(), String> {
         let validation =
             validate_unreserved_provider_authority(resolver, expected, agent_id, model_work)
                 .and_then(|()| {
+                    if cancelled() {
+                        return Err("provider dispatch cancelled before binding".to_owned());
+                    }
                     if let Some(context) = model_work {
+                        context.validate_dispatch(unix_now_ms())?;
                         if let Some(reservation) =
                             model_reservation(context, request_id, request_digest)?
                         {
@@ -1679,6 +1760,7 @@ pub mod bridge {
             if current.as_ref() != Some(expected) {
                 return Err("model work authority changed during provider I/O".to_owned());
             }
+            expected.validate_dispatch(unix_now_ms())?;
         }
         Ok(())
     }
@@ -1973,6 +2055,12 @@ pub mod bridge {
         pub calls_skipped_rate_limit: AtomicU64,
         pub calls_skipped_circuit_open: AtomicU64,
         pub tokens_total: AtomicU64,
+        #[cfg(test)]
+        preparations_processed: AtomicU64,
+        #[cfg(test)]
+        providers_retired: AtomicU64,
+        #[cfg(test)]
+        perceptions_offered: AtomicU64,
     }
 
     impl Default for BridgeTelemetry {
@@ -1984,7 +2072,23 @@ pub mod bridge {
                 calls_skipped_rate_limit: AtomicU64::new(0),
                 calls_skipped_circuit_open: AtomicU64::new(0),
                 tokens_total: AtomicU64::new(0),
+                #[cfg(test)]
+                preparations_processed: AtomicU64::new(0),
+                #[cfg(test)]
+                providers_retired: AtomicU64::new(0),
+                #[cfg(test)]
+                perceptions_offered: AtomicU64::new(0),
             }
+        }
+    }
+
+    #[cfg(test)]
+    struct PreparationProcessed<'a>(&'a AtomicU64);
+
+    #[cfg(test)]
+    impl Drop for PreparationProcessed<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -2051,6 +2155,777 @@ pub mod bridge {
         .await
     }
 
+    struct ProviderPreparationDependencies<S: CompletionStore> {
+        config: LlmBridgeConfig,
+        state_store: Arc<StateStore>,
+        event_store: Arc<S>,
+        action_tx: mpsc::Sender<AgentAction>,
+        active_requests: ActiveProviderRequests,
+        preparing_requests: PreparingProviderRequests,
+        completion_max_attempts: u32,
+        executor: BlockingExecutor,
+        runtime: tokio::runtime::Handle,
+        last_call_tick: Arc<Mutex<HashMap<AgentId, u64>>>,
+        activity: SharedLlmActivityTicks,
+        telemetry: Arc<BridgeTelemetry>,
+    }
+
+    struct PreparationWindow {
+        enqueued_at: Instant,
+        tick: u64,
+        urgent: bool,
+        heard: bool,
+        retained_heard: Option<(u64, Instant)>,
+    }
+
+    impl PreparationWindow {
+        fn enqueued_at_for(&self, tick: u64) -> Instant {
+            if self.tick == tick {
+                return self.enqueued_at;
+            }
+            self.retained_heard
+                .filter(|(heard_tick, _)| *heard_tick == tick)
+                .map_or(self.enqueued_at, |(_, enqueued_at)| enqueued_at)
+        }
+
+        fn contains_tick(&self, tick: u64) -> bool {
+            self.tick == tick
+                || self
+                    .retained_heard
+                    .is_some_and(|(heard_tick, _)| heard_tick == tick)
+        }
+
+        fn urgent_for(&self, tick: u64) -> bool {
+            (self.tick == tick && self.urgent)
+                || self
+                    .retained_heard
+                    .is_some_and(|(heard_tick, _)| heard_tick == tick)
+        }
+    }
+
+    fn intake_preparation_window(
+        perception: &Perception,
+        previous: Option<&Arc<PreparationWindow>>,
+        impulse_acked: &mut HashMap<AgentId, u64>,
+        now: Instant,
+    ) -> Arc<PreparationWindow> {
+        let tick = perception.tick.0;
+        let heard = !perception.heard_text.is_empty();
+        let preserved_urgent = previous.is_some_and(|window| window.urgent_for(tick));
+        let mut urgent = preserved_urgent
+            || heard
+            || perception.is_directly_addressed
+            || perception.has_operator_impulse;
+        if !preserved_urgent
+            && perception.has_operator_impulse
+            && !heard
+            && !perception.is_directly_addressed
+        {
+            let last = impulse_acked
+                .get(&perception.agent_id)
+                .copied()
+                .unwrap_or(0);
+            if tick.saturating_sub(last) < 5 {
+                urgent = false;
+            } else {
+                impulse_acked.insert(perception.agent_id, tick);
+            }
+        }
+        let enqueued_at = previous
+            .filter(|window| window.contains_tick(tick))
+            .map_or(now, |window| window.enqueued_at_for(tick));
+        // Only the actually selected heard tick can use this bounded fallback.
+        let retained_heard = if heard {
+            None
+        } else {
+            previous.and_then(|window| {
+                if window.heard {
+                    Some((window.tick, window.enqueued_at))
+                } else {
+                    window.retained_heard
+                }
+            })
+        };
+        Arc::new(PreparationWindow {
+            enqueued_at,
+            tick,
+            urgent,
+            heard,
+            retained_heard,
+        })
+    }
+
+    struct PreparedProviderCall {
+        perception: Perception,
+        request_id: String,
+        request_digest: String,
+        request: GatewayRequest,
+        usage_authority: Option<ProviderExecutionAuthority>,
+        model_work: Option<ModelWorkContext>,
+        preparation_guard: Option<ProviderPreparationGuard>,
+        window: Arc<PreparationWindow>,
+        deadline: Option<Instant>,
+    }
+
+    struct ProviderPreparationOutcome {
+        perception: Perception,
+        attempt_started: bool,
+        call: Option<PreparedProviderCall>,
+        window: Arc<PreparationWindow>,
+        recovery_failure: Option<&'static str>,
+    }
+
+    fn prepare_provider_call<S: CompletionStore + 'static>(
+        dependencies: &ProviderPreparationDependencies<S>,
+        perception: Perception,
+        cancellation: &JobCancellation,
+        window: Arc<PreparationWindow>,
+    ) -> ProviderPreparationOutcome {
+        let mut outcome = ProviderPreparationOutcome {
+            perception,
+            attempt_started: false,
+            call: None,
+            window: Arc::clone(&window),
+            recovery_failure: None,
+        };
+        if cancellation.is_cancelled() {
+            return outcome;
+        }
+        let config = &dependencies.config;
+        let agent_id = outcome.perception.agent_id;
+        // Intake may precede a slow earlier preparation. Recheck before selecting
+        // any new work; recovery-only passes never record an attempt or extend this clock.
+        if !window.urgent_for(outcome.perception.tick.0)
+            && outcome.perception.heard_text.is_empty()
+            && !outcome.perception.is_directly_addressed
+            && dependencies
+                .last_call_tick
+                .lock()
+                .unwrap()
+                .get(&agent_id)
+                .is_some_and(|last| {
+                    outcome.perception.tick.0.saturating_sub(*last) < config.min_ticks_between_calls
+                })
+        {
+            dependencies
+                .telemetry
+                .calls_skipped_rate_limit
+                .fetch_add(1, Ordering::Relaxed);
+            return outcome;
+        }
+        let enqueued_at = window.enqueued_at_for(outcome.perception.tick.0);
+        let started = Instant::now();
+        let candidate = match config.provider_usage_authority.as_ref() {
+            Some(resolver) => match resolver.prepare_provider_usage_candidate(agent_id) {
+                Ok(Some(candidate)) => candidate,
+                Ok(None) => return outcome,
+                Err(reason) => {
+                    error!(agent = %agent_id, reason, "Provider candidate preparation failed closed");
+                    return outcome;
+                }
+            },
+            None => PreparedProviderCandidate {
+                authority: None,
+                prepared_context: None,
+            },
+        };
+        let request_id = candidate
+            .authority
+            .as_ref()
+            .map(ProviderExecutionAuthority::request_id);
+        log_provider_preparation_duration(
+            agent_id,
+            request_id.as_deref(),
+            "selection",
+            started,
+            candidate.authority.is_some(),
+            true,
+        );
+        if cancellation.is_cancelled() {
+            return outcome;
+        }
+        let usage_authority = candidate.authority;
+        if usage_authority
+            .as_ref()
+            .is_some_and(|authority| authority.agent_id() != agent_id)
+        {
+            error!(agent = %agent_id, "Provider usage authority returned another agent");
+            return outcome;
+        }
+        let unbound_allowed = config
+            .provider_usage_authority
+            .as_ref()
+            .is_none_or(|resolver| resolver.allows_unbound_provider_usage());
+        if usage_authority.is_none() && !unbound_allowed {
+            return outcome;
+        }
+        if let Err(reason) = validate_provider_usage_mode(
+            usage_authority.as_ref(),
+            config.usage_v2_enabled,
+            unbound_allowed,
+        ) {
+            error!(agent = %agent_id, reason, "Provider usage accounting is unavailable");
+            return outcome;
+        }
+        outcome.attempt_started = usage_authority.is_none();
+        if outcome.attempt_started {
+            record_provider_preparation_attempt(
+                &mut dependencies.last_call_tick.lock().unwrap(),
+                &dependencies.activity,
+                agent_id,
+                outcome.perception.tick.0,
+                config.min_ticks_between_calls,
+            );
+        }
+        let request_id = agent_runtime_request_id(&outcome.perception, usage_authority.as_ref());
+        if dependencies
+            .active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&request_id)
+        {
+            return outcome;
+        }
+        if let Some(authority) = usage_authority.as_ref() {
+            let store = Arc::clone(&dependencies.event_store);
+            let resolver = config.provider_usage_authority.clone();
+            let authority = authority.clone();
+            let action_tx = dependencies.action_tx.clone();
+            let attempts = dependencies.completion_max_attempts;
+            let timeout = config.request_timeout;
+            let recovery = recover_on_owned_lane(dependencies, move |_| {
+                recover_reserved_model_request(
+                    store.as_ref(),
+                    resolver.as_deref(),
+                    &authority,
+                    &action_tx,
+                    attempts,
+                    unix_now_ms(),
+                    timeout,
+                )
+            });
+            match recovery {
+                Ok(Ok(true)) => return outcome,
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => {
+                    error!(request_id, error = %error, "Reserved model recovery failed closed");
+                    return outcome;
+                }
+                Err(reason) => {
+                    outcome.recovery_failure = Some(reason);
+                    error!(
+                        request_id,
+                        reason, "Reserved model recovery lane failed closed"
+                    );
+                    return outcome;
+                }
+            }
+        }
+        if cancellation.is_cancelled() {
+            return outcome;
+        }
+        let preparation_guard = if usage_authority.is_some() {
+            let Some(guard) = ProviderPreparationGuard::try_acquire(
+                &dependencies.preparing_requests,
+                &request_id,
+            ) else {
+                return outcome;
+            };
+            outcome.attempt_started = true;
+            record_provider_preparation_attempt(
+                &mut dependencies.last_call_tick.lock().unwrap(),
+                &dependencies.activity,
+                agent_id,
+                outcome.perception.tick.0,
+                config.min_ticks_between_calls,
+            );
+            Some(guard)
+        } else {
+            None
+        };
+        let mut request = build_gateway_request(
+            &outcome.perception,
+            &dependencies.state_store,
+            &request_id,
+            usage_authority.as_ref(),
+        );
+        if cancellation.is_cancelled()
+            || (usage_authority.is_none() && enqueued_at.elapsed() >= UNBOUND_ADMISSION_MAX_AGE)
+        {
+            return outcome;
+        }
+        let started = Instant::now();
+        let preparation = initial_model_work_context(
+            config.provider_usage_authority.as_deref(),
+            usage_authority.as_ref(),
+            candidate.prepared_context,
+        );
+        log_provider_preparation_duration(
+            agent_id,
+            Some(&request_id),
+            "context",
+            started,
+            usage_authority.is_some(),
+            preparation.is_ok(),
+        );
+        let model_work = match preparation {
+            Ok(context) => context,
+            Err(reason) => {
+                warn!(agent = %agent_id, reason, "Model work context unavailable");
+                return outcome;
+            }
+        };
+        if let Some(context) = &model_work {
+            if let Err(reason) = bind_model_work_request(&mut request, context) {
+                warn!(agent = %agent_id, reason, "Model work request rejected");
+                return outcome;
+            }
+        }
+        let request_digest = match gateway_request_digest(&request) {
+            Ok(digest) => digest,
+            Err(error) => {
+                error!(agent = %agent_id, error = %error, "Gateway request digest failed");
+                return outcome;
+            }
+        };
+        match dependencies.event_store.get_completion(&request_id) {
+            Ok(Some(entry))
+                if entry.request_digest == request_digest
+                    && entry.status == "provider_in_flight" =>
+            {
+                let store = Arc::clone(&dependencies.event_store);
+                let resolver = config.provider_usage_authority.clone();
+                let authority = usage_authority.clone();
+                let timeout = config.request_timeout;
+                if let Err(reason) = recover_on_owned_lane(dependencies, move |_| {
+                    release_stale_undispatched_subscription(
+                        store.as_ref(),
+                        resolver.as_deref(),
+                        authority.as_ref(),
+                        &entry,
+                        unix_now_ms(),
+                        timeout,
+                    );
+                }) {
+                    outcome.recovery_failure = Some(reason);
+                    error!(
+                        request_id,
+                        reason, "Undispatched recovery lane failed closed"
+                    );
+                }
+                return outcome;
+            }
+            Ok(Some(entry)) if entry.request_digest == request_digest => {
+                let store = Arc::clone(&dependencies.event_store);
+                let resolver = config.provider_usage_authority.clone();
+                let action_tx = dependencies.action_tx.clone();
+                let attempts = dependencies.completion_max_attempts;
+                if let Err(reason) = recover_on_owned_lane(dependencies, move |_| {
+                    recover_completion(
+                        store.as_ref(),
+                        entry,
+                        &action_tx,
+                        attempts,
+                        resolver.as_deref(),
+                    );
+                }) {
+                    outcome.recovery_failure = Some(reason);
+                    error!(request_id, reason, "Completion recovery lane failed closed");
+                }
+                return outcome;
+            }
+            Ok(Some(_)) => {
+                error!(request_id = %request_id, "Stable LLM request ID reused with different request digest");
+                return outcome;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                error!(request_id = %request_id, error = %error, "LLM completion lookup failed closed");
+                return outcome;
+            }
+        }
+        match dependencies
+            .event_store
+            .has_operation(&format!("llm_usage_{request_id}"))
+        {
+            Ok(true) => return outcome,
+            Ok(false) => {}
+            Err(error) => {
+                error!(request_id = %request_id, error = %error, "LLM usage lookup failed closed");
+                return outcome;
+            }
+        }
+        if !cancellation.is_cancelled()
+            && model_work
+                .as_ref()
+                .is_none_or(|context| context.validate_dispatch(unix_now_ms()).is_ok())
+        {
+            let deadline = model_work
+                .as_ref()
+                .and_then(model_context_deadline)
+                .or_else(|| {
+                    usage_authority
+                        .is_none()
+                        .then(|| enqueued_at + UNBOUND_ADMISSION_MAX_AGE)
+                });
+            outcome.call = Some(PreparedProviderCall {
+                perception: outcome.perception.clone(),
+                request_id,
+                request_digest,
+                request,
+                usage_authority,
+                model_work,
+                preparation_guard,
+                window,
+                deadline,
+            });
+        }
+        outcome
+    }
+
+    // Only ambient calls use this scheduler age bound. HTTP retains config.request_timeout;
+    // bound work uses its original model context expiry, never this unrelated queue budget.
+    const UNBOUND_ADMISSION_MAX_AGE: Duration = Duration::from_secs(60);
+
+    fn model_context_deadline(context: &ModelWorkContext) -> Option<Instant> {
+        let deadline_ms = match context {
+            ModelWorkContext::Project(value) => value.deadline_unix_ms,
+            ModelWorkContext::Adaptive(value) => value.binding.grant.deadline_ms,
+            ModelWorkContext::AdaptiveLeadershipReview(value) => {
+                value.binding.grant.expires_at_unix_ms
+            }
+            ModelWorkContext::RequestSales(value) => value.binding.grant.expires_at_unix_ms,
+            ModelWorkContext::ProjectPlanning(value) => value.binding.grant.expires_at_unix_ms,
+        };
+        Instant::now().checked_add(Duration::from_millis(
+            deadline_ms.saturating_sub(unix_now_ms()),
+        ))
+    }
+
+    fn recover_on_owned_lane<S: CompletionStore + 'static, T: Send + 'static>(
+        dependencies: &ProviderPreparationDependencies<S>,
+        job: impl FnOnce(JobCancellation) -> T + Send + 'static,
+    ) -> Result<T, &'static str> {
+        let job = dependencies
+            .executor
+            .submit_required(Lane::Recovery, job)
+            .map_err(|error| match error {
+                SubmitError::Full => "llm_recovery_lane_full",
+                SubmitError::Closed => "llm_recovery_lane_closed",
+            })?;
+        dependencies
+            .runtime
+            .block_on(job.wait())
+            .map_err(|error| match error {
+                JobError::Panicked => "llm_recovery_job_panicked",
+                _ => "llm_recovery_job_failed",
+            })
+    }
+
+    fn log_owned_provider_phase(
+        agent_id: AgentId,
+        request_id: &str,
+        phase: &'static str,
+        elapsed: Duration,
+        accepted: bool,
+    ) {
+        let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let elapsed_ms = elapsed_us / 1_000;
+        info!(agent = %agent_id, request_id = %request_id, phase, elapsed_us, elapsed_ms, accepted,
+            "Owned provider phase finished");
+    }
+
+    struct BridgeInput<S: CompletionStore> {
+        config: LlmBridgeConfig,
+        perception_rx: mpsc::Receiver<Perception>,
+        action_tx: mpsc::Sender<AgentAction>,
+        telemetry: Arc<BridgeTelemetry>,
+        state_store: Arc<StateStore>,
+        event_store: Arc<S>,
+        llm_unavailable: Arc<AtomicBool>,
+        activity: SharedLlmActivityTicks,
+        shutdown_rx: watch::Receiver<bool>,
+        admission: Arc<RwLock<bool>>,
+        stopping: Arc<AtomicBool>,
+        terminal: Arc<Mutex<bool>>,
+    }
+
+    enum SupervisorMessage {
+        Receiver(std::thread::JoinHandle<()>),
+        Stop,
+    }
+
+    struct ProviderExecutionDependencies<S: CompletionStore> {
+        preparation: Arc<ProviderPreparationDependencies<S>>,
+        client: reqwest::Client,
+        semaphore: Arc<Semaphore>,
+        circuit: Arc<Mutex<CircuitBreaker>>,
+        telemetry: Arc<BridgeTelemetry>,
+        admission: Arc<RwLock<bool>>,
+        stopping: Arc<AtomicBool>,
+        retries: Arc<AsyncMutex<HashMap<AgentId, QueuedProviderRetry>>>,
+        retry_overflow: Arc<AtomicBool>,
+    }
+
+    struct QueuedProviderRetry {
+        perception: Perception,
+        window: Option<Arc<PreparationWindow>>,
+    }
+
+    struct ProviderLifetime<S: CompletionStore> {
+        outcome: Option<ProviderOutcomeGuard<S>>,
+        preparation: Option<ProviderPreparationGuard>,
+        agent: AgentId,
+        request_id: String,
+        started: Instant,
+        accepted: bool,
+    }
+
+    impl<S: CompletionStore> Drop for ProviderLifetime<S> {
+        fn drop(&mut self) {
+            let cleanup = Instant::now();
+            drop(self.outcome.take());
+            drop(self.preparation.take());
+            log_owned_provider_phase(
+                self.agent,
+                &self.request_id,
+                "cleanup",
+                cleanup.elapsed(),
+                true,
+            );
+            log_owned_provider_phase(
+                self.agent,
+                &self.request_id,
+                "total",
+                self.started.elapsed(),
+                self.accepted,
+            );
+        }
+    }
+
+    async fn await_owned_transport<F: std::future::Future>(
+        cancellation: &JobCancellation,
+        transport: F,
+        first_poll: &AtomicBool,
+    ) -> Option<F::Output> {
+        tokio::pin!(transport);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            result = std::future::poll_fn(|cx| {
+                first_poll.store(true, Ordering::Release);
+                std::future::Future::poll(transport.as_mut(), cx)
+            }) => Some(result),
+        }
+    }
+
+    fn classify_cancelled_transport<S: CompletionStore>(
+        guard: &mut ProviderOutcomeGuard<S>,
+        polled: bool,
+    ) {
+        if !polled {
+            if let Err(error) = guard
+                .store
+                .release_undispatched_request(&guard.request_id, &guard.request_digest)
+            {
+                warn!(request_id = %guard.request_id, error = %error, "Undispatched provider cancellation release failed closed");
+            }
+            guard.disarm_if_resolved();
+        }
+    }
+
+    fn execute_owned_provider<S: CompletionStore + 'static>(
+        dependencies: Arc<ProviderExecutionDependencies<S>>,
+        mut call: PreparedProviderCall,
+        cancellation: JobCancellation,
+        submitted_at: Instant,
+    ) {
+        let agent = call.perception.agent_id;
+        log_owned_provider_phase(
+            agent,
+            &call.request_id,
+            "enqueue_wait",
+            submitted_at.elapsed(),
+            true,
+        );
+        let mut lifetime = ProviderLifetime {
+            outcome: None,
+            preparation: call.preparation_guard.take(),
+            agent,
+            request_id: call.request_id.clone(),
+            started: call.window.enqueued_at_for(call.perception.tick.0),
+            accepted: false,
+        };
+        dependencies.preparation.runtime.block_on(async {
+            let cancelled = || cancellation.is_cancelled()
+                || dependencies.stopping.load(Ordering::Acquire)
+                || call.deadline.is_some_and(|deadline| Instant::now() >= deadline);
+            let started = Instant::now();
+            let urgent = call.window.urgent_for(call.perception.tick.0) || !call.perception.heard_text.is_empty()
+                || call.perception.is_directly_addressed;
+            let permit_deadline = Instant::now() + dependencies.preparation.config.request_timeout;
+            let permit_deadline = call.deadline.map_or(permit_deadline, |deadline| deadline.min(permit_deadline));
+            let permit = if urgent {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => None,
+                    result = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(permit_deadline),
+                        Arc::clone(&dependencies.semaphore).acquire_owned(),
+                    ) => result.ok().and_then(Result::ok),
+                }
+            } else {
+                Arc::clone(&dependencies.semaphore).try_acquire_owned().ok()
+            };
+            log_owned_provider_phase(agent, &call.request_id, "permit_wait", started.elapsed(), permit.is_some());
+            let Some(permit) = permit else {
+                if urgent && !cancelled()
+                    && !queue_bounded_retry(&dependencies.retries, call.perception.clone(),
+                        Some(Arc::clone(&call.window))).await {
+                    dependencies.retry_overflow.store(true, Ordering::Release);
+                    dependencies.circuit.lock().unwrap().mark_terminal();
+                }
+                return;
+            };
+            if cancelled() { return; }
+            let resolver = dependencies.preparation.config.provider_usage_authority.as_deref();
+            let started = Instant::now();
+            let authority = validate_unreserved_provider_authority(
+                resolver, call.usage_authority.as_ref(), agent, call.model_work.as_ref(),
+            );
+            let fresh = authority.is_ok() && !cancelled()
+                && call.model_work.as_ref().is_none_or(|context| context.validate_dispatch(unix_now_ms()).is_ok());
+            log_owned_provider_phase(agent, &call.request_id, "unreserved_authority", started.elapsed(), fresh);
+            if !fresh {
+                if let Err(error) = authority {
+                    warn!(request_id = %call.request_id, error, "Provider request reauthorization failed before reservation");
+                }
+                return;
+            }
+            lifetime.outcome = Some(ProviderOutcomeGuard::new(
+                Arc::clone(&dependencies.preparation.event_store),
+                Arc::clone(&dependencies.preparation.active_requests),
+                &call.request_id, &call.request_digest,
+            ));
+            let started = Instant::now();
+            let reservation = reserve_provider_request_until(
+                dependencies.admission.as_ref(), dependencies.preparation.event_store.as_ref(),
+                &call.request_id, &call.request_digest, &agent.to_string(), &cancelled,
+            );
+            let reserved = matches!(reservation, Ok(Some(true)));
+            log_owned_provider_phase(agent, &call.request_id, "reservation", started.elapsed(), reserved);
+            match reservation {
+                Ok(Some(true)) => lifetime.outcome.as_mut().unwrap().armed = true,
+                Ok(Some(false)) | Ok(None) => return,
+                Err(error) => {
+                    error!(request_id = %call.request_id, error = %error, "LLM provider reservation failed closed");
+                    return;
+                }
+            }
+            let started = Instant::now();
+            let validation = validate_pre_dispatch_provider_authority_until(
+                dependencies.preparation.event_store.as_ref(), resolver,
+                call.usage_authority.as_ref(), agent, &call.request_id, &call.request_digest,
+                call.model_work.as_ref(), &cancelled,
+            );
+            log_owned_provider_phase(agent, &call.request_id, "predispatch_authority", started.elapsed(), validation.is_ok());
+            if let Err(error) = validation {
+                warn!(request_id = %call.request_id, error, "Provider request reauthorization failed before dispatch");
+                lifetime.outcome.as_mut().unwrap().disarm_if_resolved();
+                return;
+            }
+            if cancelled() {
+                let _ = dependencies.preparation.event_store.release_undispatched_request(&call.request_id, &call.request_digest);
+                lifetime.outcome.as_mut().unwrap().disarm_if_resolved();
+                return;
+            }
+            let started = Instant::now();
+            let url = format!("{}/internal/agent-runtime", dependencies.preparation.config.gateway_url);
+            let first_poll = AtomicBool::new(false);
+            let response = await_owned_transport(&cancellation, agent_runtime_request(
+                    &dependencies.client, &url, &dependencies.preparation.config.credential,
+                    &call.request_id, &call.request_digest, &call.request,
+                ).send(), &first_poll).await;
+            let Some(response) = response else {
+                classify_cancelled_transport(lifetime.outcome.as_mut().unwrap(), first_poll.load(Ordering::Acquire));
+                log_owned_provider_phase(agent, &call.request_id, "http", started.elapsed(), false);
+                return;
+            };
+            log_owned_provider_phase(agent, &call.request_id, "http", started.elapsed(), response.as_ref().is_ok_and(|response| response.status().is_success()));
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    let released = release_connect_failed_request(
+                        dependencies.preparation.event_store.as_ref(),
+                        &call.request_id, &call.request_digest, &error,
+                    );
+                    if released { lifetime.outcome.as_mut().unwrap().armed = false; }
+                    warn!(agent = %agent, error = %error, reservation_released = released, "Gateway Request fehlgeschlagen");
+                    dependencies.telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                    dependencies.circuit.lock().unwrap().record_failure();
+                    return;
+                }
+            };
+            if !response.status().is_success() {
+                let resolved = handle_gateway_rejection(
+                    dependencies.preparation.event_store.as_ref(), call.model_work.as_ref(),
+                    &call.request_id, &call.request_digest, call.perception.tick.0,
+                    response.status(), response.headers(),
+                );
+                if resolved { lifetime.outcome.as_mut().unwrap().armed = false; }
+                dependencies.telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                dependencies.circuit.lock().unwrap().record_failure();
+                return;
+            }
+            let started = Instant::now();
+            let decoded = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    log_owned_provider_phase(agent, &call.request_id, "response_decode", started.elapsed(), false);
+                    return;
+                }
+                decoded = response.json::<GatewayResponse>() => decoded,
+            };
+            log_owned_provider_phase(agent, &call.request_id, "response_decode", started.elapsed(), decoded.is_ok());
+            let gateway_response = match decoded {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(agent = %agent, error = %error, "Gateway Response Parse-Fehler");
+                    dependencies.telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                    dependencies.circuit.lock().unwrap().record_failure();
+                    return;
+                }
+            };
+            drop(permit);
+            // A fully decoded response must be durably classified even after cancellation.
+            let started = Instant::now();
+            let persisted = store_gateway_completion(
+                dependencies.preparation.event_store.as_ref(), &dependencies.preparation.action_tx,
+                GatewayCompletionContext {
+                    request_id: &call.request_id, request_digest: &call.request_digest, agent_id: agent,
+                    tick: call.perception.tick.0, requested_model: &call.request.model,
+                    authority: call.usage_authority.as_ref(), authority_resolver: resolver,
+                    gateway_response: &gateway_response,
+                    usage_v2_enabled: dependencies.preparation.config.usage_v2_enabled,
+                    model_work: call.model_work.as_ref(),
+                }, dependencies.preparation.completion_max_attempts,
+            );
+            log_owned_provider_phase(agent, &call.request_id, "persistence", started.elapsed(), persisted.is_ok());
+            if let Err(error) = persisted {
+                warn!(agent = %agent, error = %error, "Completed gateway response rejected fail-closed");
+                lifetime.outcome.as_mut().unwrap().disarm_if_resolved();
+                dependencies.telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                dependencies.circuit.lock().unwrap().record_failure();
+                return;
+            }
+            lifetime.outcome.as_mut().unwrap().armed = false;
+            lifetime.accepted = true;
+            dependencies.telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
+            dependencies.telemetry.tokens_total.fetch_add(gateway_response.tokens_used.max(0) as u64, Ordering::Relaxed);
+            dependencies.circuit.lock().unwrap().record_success();
+        });
+    }
+
     async fn run_llm_bridge_with_store<S: CompletionStore + 'static>(
         config: LlmBridgeConfig,
         perception_rx: mpsc::Receiver<Perception>,
@@ -2059,846 +2934,567 @@ pub mod bridge {
         state_store: Arc<StateStore>,
         event_store: Arc<S>,
         llm_unavailable: Arc<AtomicBool>,
-        llm_activity_ticks: SharedLlmActivityTicks,
-        mut shutdown_rx: watch::Receiver<bool>,
-        provider_admission: Arc<RwLock<bool>>,
-    ) -> std::result::Result<(), &'static str> {
+        activity: SharedLlmActivityTicks,
+        shutdown_rx: watch::Receiver<bool>,
+        admission: Arc<RwLock<bool>>,
+    ) -> Result<(), &'static str> {
         info!(
             max_concurrent = config.max_concurrent,
             min_ticks = config.min_ticks_between_calls,
             timeout_secs = config.request_timeout.as_secs(),
             "LLM Bridge gestartet"
         );
+        let stopping = Arc::new(AtomicBool::new(false));
+        let terminal = Arc::new(Mutex::new(false));
+        let terminal_signal = Arc::clone(&llm_unavailable);
+        let owner_stopping = Arc::clone(&stopping);
+        let owner_admission = Arc::clone(&admission);
+        let workers = config.max_concurrent.max(1);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (owner_tx, owner_rx) = mpsc::channel();
+        // The lane owner never lives on a Tokio thread, including initialization failures/unwind.
+        let supervisor = tokio::task::spawn_blocking(move || {
+            let mut lanes = match OwnedBlockingLanes::spawn(workers, 32) {
+                Ok(lanes) => lanes,
+                Err(_) => {
+                    let _ = ready_tx.send(Err("llm_blocking_lanes_spawn_failed"));
+                    return Err("llm_blocking_lanes_spawn_failed");
+                }
+            };
+            let mut receiver = None;
+            if ready_tx.send(Ok(lanes.executor())).is_ok() {
+                while let Ok(message) = owner_rx.recv() {
+                    match message {
+                        SupervisorMessage::Receiver(handle) => receiver = Some(handle),
+                        SupervisorMessage::Stop => break,
+                    }
+                }
+            }
+            owner_stopping.store(true, Ordering::Release);
+            stop_provider_admission(owner_admission.as_ref());
+            let joined = lanes.stop_and_join();
+            if receiver.is_some_and(|receiver| receiver.join().is_err()) {
+                return Err("llm_receiver_thread_failed");
+            }
+            joined
+        });
+        let executor = match ready_rx.await {
+            Ok(Ok(executor)) => executor,
+            _ => {
+                publish_terminal_unavailability(&terminal_signal, &terminal);
+                drop(owner_tx);
+                let _ = supervisor.await;
+                return Err("llm_blocking_lanes_spawn_failed");
+            }
+        };
+        let loop_owner_tx = owner_tx.clone();
+        let body = tokio::spawn(run_llm_bridge_on_lanes(
+            BridgeInput {
+                config,
+                perception_rx,
+                action_tx,
+                telemetry,
+                state_store,
+                event_store,
+                llm_unavailable,
+                activity,
+                shutdown_rx,
+                admission,
+                stopping,
+                terminal: Arc::clone(&terminal),
+            },
+            executor,
+            loop_owner_tx,
+        ));
+        let result = body.await.unwrap_or(Err("llm_bridge_loop_failed"));
+        if result.is_err() {
+            publish_terminal_unavailability(&terminal_signal, &terminal);
+        }
+        let _ = owner_tx.send(SupervisorMessage::Stop);
+        drop(owner_tx);
+        let joined = supervisor
+            .await
+            .unwrap_or(Err("llm_blocking_supervisor_failed"));
+        if joined.is_err() {
+            publish_terminal_unavailability(&terminal_signal, &terminal);
+        }
+        joined?;
+        result
+    }
 
-        let client = match reqwest::Client::builder()
+    async fn run_llm_bridge_on_lanes<S: CompletionStore + 'static>(
+        input: BridgeInput<S>,
+        executor: BlockingExecutor,
+        owner_tx: mpsc::Sender<SupervisorMessage>,
+    ) -> Result<(), &'static str> {
+        let BridgeInput {
+            config,
+            perception_rx,
+            action_tx,
+            telemetry,
+            state_store,
+            event_store,
+            llm_unavailable,
+            activity,
+            mut shutdown_rx,
+            admission,
+            stopping,
+            terminal,
+        } = input;
+        let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .pool_max_idle_per_host(config.max_concurrent)
             .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                error!(error = %e, "HTTP Client erstellen fehlgeschlagen");
-                return Ok(());
-            }
-        };
-
-        // Ein geteiltes Semaphore fuer alle echten Gateway-Calls.
-        // Urgent Calls warten auf einen Slot, normale Calls droppen bei Ueberlast.
-        // Die Kapazitaet richtet sich an der realen Gateway-Forward-Kapazitaet aus.
-        let llm_semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
-        let circuit_breaker = Arc::new(std::sync::Mutex::new(CircuitBreaker::new(
+            .map_err(|_| "llm_http_client_failed")?;
+        let semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
+        let circuit = Arc::new(Mutex::new(CircuitBreaker::with_terminal(
             config.circuit_breaker_threshold,
             config.circuit_breaker_reset,
             Arc::clone(&llm_unavailable),
+            terminal,
         )));
         llm_unavailable.store(false, Ordering::Relaxed);
-        let pending_retries = Arc::new(AsyncMutex::new(HashMap::<AgentId, Perception>::new()));
-        let mut last_call_tick: HashMap<AgentId, u64> = HashMap::new();
-        let mut provider_tasks = JoinSet::new();
-        let active_provider_requests: ActiveProviderRequests = Arc::new(Mutex::new(HashMap::new()));
-        let preparing_provider_requests: PreparingProviderRequests =
-            Arc::new(Mutex::new(HashMap::new()));
-        let mut provider_task_failed = false;
-        // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent,
-        // danach 60 Ticks Cooldown. Verhindert Semaphore-Starvation bei 300-Tick TTL.
+        let pending_retries = Arc::new(AsyncMutex::new(HashMap::new()));
+        let retry_overflow = Arc::new(AtomicBool::new(false));
+        let last_call_tick = Arc::new(Mutex::new(HashMap::new()));
+        let preparation = Arc::new(ProviderPreparationDependencies {
+            config: config.clone(),
+            state_store,
+            event_store: Arc::clone(&event_store),
+            action_tx: action_tx.clone(),
+            active_requests: Arc::new(Mutex::new(HashMap::new())),
+            preparing_requests: Arc::new(Mutex::new(HashMap::new())),
+            completion_max_attempts: config.completion_max_attempts.max(1),
+            executor: executor.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            last_call_tick: Arc::clone(&last_call_tick),
+            activity,
+            telemetry: Arc::clone(&telemetry),
+        });
+        let execution = Arc::new(ProviderExecutionDependencies {
+            preparation: Arc::clone(&preparation),
+            client,
+            semaphore: Arc::clone(&semaphore),
+            circuit: Arc::clone(&circuit),
+            telemetry: Arc::clone(&telemetry),
+            admission: Arc::clone(&admission),
+            stopping: Arc::clone(&stopping),
+            retries: Arc::clone(&pending_retries),
+            retry_overflow: Arc::clone(&retry_overflow),
+        });
+        let receiver_stopping = Arc::clone(&stopping);
+        let (async_tx, mut async_rx) = tokio::sync::mpsc::channel::<Perception>(256);
+        let receiver = std::thread::Builder::new()
+            .name("llm-bridge-recv".into())
+            .spawn(move || {
+                while !receiver_stopping.load(Ordering::Acquire) {
+                    match perception_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(perception) => {
+                            if async_tx.blocking_send(perception).is_err() {
+                                break;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .map_err(|_| "llm_receiver_spawn_failed")?;
+        if let Err(error) = owner_tx.send(SupervisorMessage::Receiver(receiver)) {
+            stopping.store(true, Ordering::Release);
+            drop(async_rx);
+            if let SupervisorMessage::Receiver(receiver) = error.0 {
+                let _ = tokio::task::spawn_blocking(move || receiver.join()).await;
+            }
+            return Err("llm_supervisor_closed");
+        }
+        // This sender is not retained by the body; dropping the wrapper always wakes the supervisor.
+        drop(owner_tx);
+        let mut controller = ProviderPreparationController::new(32, 1, insert_prefer_heard);
+        let mut windows: HashMap<AgentId, Arc<PreparationWindow>> = HashMap::new();
         let mut impulse_acked: HashMap<AgentId, u64> = HashMap::new();
-
-        // Recover provider results committed by an earlier process before accepting
-        // new perceptions. The periodic worker has a bounded per-record attempt budget
-        // and is explicitly cancelled when the bridge receiver closes.
-        let completion_max_attempts = config.completion_max_attempts.max(1);
-        let completion_retry_interval = if config.completion_retry_interval.is_zero() {
+        let mut provider_tasks = JoinSet::new();
+        let mut provider_cancellations = HashMap::new();
+        let mut next_provider_id = 0_u64;
+        let mut recovery_tasks = JoinSet::new();
+        let mut startup_recovered = false;
+        let mut intake_closed = false;
+        let mut failed = None;
+        let retry_interval = if config.completion_retry_interval.is_zero() {
             Duration::from_secs(1)
         } else {
             config.completion_retry_interval
         };
-        classify_stale_provider_requests(
-            event_store.as_ref(),
-            &active_provider_requests,
-            unix_now_ms(),
-            config.request_timeout,
-        );
-        recover_completion_batch(
-            event_store.as_ref(),
-            &action_tx,
-            completion_max_attempts,
-            config.provider_usage_authority.as_deref(),
-        );
-        let (recovery_shutdown_tx, mut recovery_shutdown_rx) = tokio::sync::watch::channel(false);
-        let recovery_store = Arc::clone(&event_store);
-        let recovery_action_tx = action_tx.clone();
-        let recovery_interval = completion_retry_interval;
-        let recovery_max_attempts = completion_max_attempts;
-        let recovery_resolver = config.provider_usage_authority.clone();
-        let recovery_request_timeout = config.request_timeout;
-        let recovery_active = Arc::clone(&active_provider_requests);
-        let recovery_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(recovery_interval);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Startup recovery was performed synchronously above.
-            interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        classify_stale_provider_requests(
-                            recovery_store.as_ref(), &recovery_active,
-                            unix_now_ms(), recovery_request_timeout,
-                        );
-                        recover_completion_batch(
-                            recovery_store.as_ref(), &recovery_action_tx,
-                            recovery_max_attempts, recovery_resolver.as_deref(),
-                        );
-                    },
-                    changed = recovery_shutdown_rx.changed() => {
-                        if changed.is_err() || *recovery_shutdown_rx.borrow() {
+        let mut recovery_interval = tokio::time::interval(retry_interval);
+        recovery_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The explicit startup recovery owns the interval's initial tick.
+        recovery_interval.tick().await;
+        let mut retry_tick = tokio::time::interval(Duration::from_millis(50));
+        let schedule_recovery = |tasks: &mut JoinSet<Result<(), JobError>>| {
+            let dependencies = Arc::clone(&preparation);
+            match executor.submit_required(Lane::Recovery, move |_| {
+                classify_stale_provider_requests(
+                    dependencies.event_store.as_ref(),
+                    &dependencies.active_requests,
+                    unix_now_ms(),
+                    dependencies.config.request_timeout,
+                );
+                recover_completion_batch(
+                    dependencies.event_store.as_ref(),
+                    &dependencies.action_tx,
+                    dependencies.completion_max_attempts,
+                    dependencies.config.provider_usage_authority.as_deref(),
+                );
+            }) {
+                Ok(job) => {
+                    tasks.spawn(async move { job.wait().await });
+                    true
+                }
+                Err(_) => false,
+            }
+        };
+        if !schedule_recovery(&mut recovery_tasks) {
+            circuit.lock().unwrap().mark_terminal();
+            return Err("llm_recovery_admission_failed");
+        }
+        loop {
+            if failed.is_some() {
+                break;
+            }
+            if retry_overflow.load(Ordering::Acquire) {
+                failed = Some("llm_retry_capacity_exhausted");
+                break;
+            }
+            if stopping.load(Ordering::Acquire) || *shutdown_rx.borrow() {
+                break;
+            }
+            if intake_closed
+                && !controller.has_work()
+                && provider_tasks.is_empty()
+                && recovery_tasks.is_empty()
+            {
+                break;
+            }
+            if startup_recovered && controller.has_work() {
+                let snapshot = Arc::new(windows.clone());
+                let dependencies = Arc::clone(&preparation);
+                controller.pump(&executor, None, move |perception, cancellation| {
+                    let window = snapshot
+                        .get(&perception.agent_id)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            let now = Instant::now();
+                            Arc::new(PreparationWindow {
+                                enqueued_at: now,
+                                tick: perception.tick.0,
+                                urgent: should_retry_perception(&perception),
+                                heard: !perception.heard_text.is_empty(),
+                                retained_heard: None,
+                            })
+                        });
+                    let started = Instant::now();
+                    let queue_elapsed = started
+                        .saturating_duration_since(window.enqueued_at_for(perception.tick.0));
+                    let outcome =
+                        prepare_provider_call(&dependencies, perception, &cancellation, window);
+                    let request_id = outcome
+                        .call
+                        .as_ref()
+                        .map_or("", |call| call.request_id.as_str());
+                    log_owned_provider_phase(
+                        outcome.perception.agent_id,
+                        request_id,
+                        "enqueue_wait",
+                        queue_elapsed,
+                        outcome.call.is_some(),
+                    );
+                    outcome
+                });
+            }
+            let mut batch = HashMap::new();
+            let mut retry_windows = HashMap::new();
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() { break; }
+                }
+                result = controller.next_result(), if controller.inflight_count() > 0 => {
+                    match result {
+                        Some((agent, Ok(outcome))) => {
+                            #[cfg(test)]
+                            let _processed = PreparationProcessed(&telemetry.preparations_processed);
+                            if let Some(reason) = outcome.recovery_failure {
+                                failed = Some(reason);
+                                break;
+                            }
+                            debug!(agent = %agent, attempt_started = outcome.attempt_started,
+                                prepared = outcome.call.is_some(), "Provider preparation result received");
+                            if outcome.call.is_none()
+                                && windows.get(&agent).is_some_and(|current| Arc::ptr_eq(current, &outcome.window)) {
+                                windows.remove(&agent);
+                            }
+                            if let Some(call) = outcome.call {
+                                telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
+                                let urgent = call.window.urgent_for(call.perception.tick.0) || !call.perception.heard_text.is_empty()
+                                    || call.perception.is_directly_addressed;
+                                if !urgent && semaphore.available_permits() == 0 {
+                                    if windows.get(&agent).is_some_and(|current| Arc::ptr_eq(current, &call.window)) {
+                                        windows.remove(&agent);
+                                    }
+                                    continue;
+                                }
+                                let Some(id) = next_provider_id.checked_add(1) else {
+                                    failed = Some("llm_provider_identifier_exhausted"); break;
+                                };
+                                next_provider_id = id;
+                                let submitted_at = Instant::now();
+                                let deadline = call.deadline;
+                                let retry = urgent.then(|| call.perception.clone());
+                                let request_id = call.request_id.clone();
+                                let window = Arc::clone(&call.window);
+                                let dependencies = Arc::clone(&execution);
+                                match executor.submit(Lane::Provider, deadline, move |cancellation| {
+                                    execute_owned_provider(dependencies, call, cancellation, submitted_at);
+                                }) {
+                                    Ok(job) => {
+                                        provider_cancellations.insert(id, job.cancellation());
+                                        provider_tasks.spawn(async move {
+                                            (id, agent, request_id, window, submitted_at, job.wait().await)
+                                        });
+                                    }
+                                    Err(_) => {
+                                        // Only unarmed preparation data was captured by the rejected closure.
+                                        if let Some(perception) = retry {
+                                            if !queue_bounded_retry(&pending_retries, perception,
+                                                Some(Arc::clone(&window))).await {
+                                                failed = Some("llm_retry_capacity_exhausted");
+                                                break;
+                                            }
+                                        }
+                                        if windows.get(&agent).is_some_and(|current| Arc::ptr_eq(current, &window)) {
+                                            windows.remove(&agent);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some((agent, Err(JobError::Cancelled | JobError::DeadlineExceeded))) => {
+                            // No selected request or armed guard exists for a pre-start skip.
+                            if controller.pending_count() == 0 { windows.remove(&agent); }
+                        }
+                        Some((_, Err(JobError::Panicked | JobError::Stopped))) => {
+                            failed = Some("llm_preparation_job_failed"); break;
+                        }
+                        None => {}
+                    }
+                }
+                result = provider_tasks.join_next(), if !provider_tasks.is_empty() => {
+                    match result {
+                        Some(Ok((id, agent, request_id, window, queued, result))) => {
+                            #[cfg(test)]
+                            telemetry.providers_retired.fetch_add(1, Ordering::SeqCst);
+                            provider_cancellations.remove(&id);
+                            if windows.get(&agent).is_some_and(|current| Arc::ptr_eq(current, &window)) {
+                                windows.remove(&agent);
+                            }
+                            if let Err(error) = result {
+                                log_owned_provider_phase(agent, &request_id, "enqueue_wait", queued.elapsed(), false);
+                                if matches!(error, JobError::Panicked | JobError::Stopped) {
+                                    failed = Some("llm_provider_task_failed");
+                                    circuit.lock().unwrap().mark_terminal();
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Err(_)) => { failed = Some("llm_provider_adapter_failed"); break; }
+                        None => {}
+                    }
+                }
+                result = recovery_tasks.join_next(), if !recovery_tasks.is_empty() => {
+                    match result {
+                        Some(Ok(Ok(()))) => startup_recovered = true,
+                        _ => { failed = Some("llm_recovery_task_failed"); break; }
+                    }
+                }
+                _ = recovery_interval.tick(), if startup_recovered && recovery_tasks.is_empty() => {
+                    if !schedule_recovery(&mut recovery_tasks) {
+                        failed = Some("llm_recovery_admission_failed"); break;
+                    }
+                }
+                _ = retry_tick.tick() => {
+                    let retries = std::mem::take(&mut *pending_retries.lock().await);
+                    for (agent, retry) in retries {
+                        if let Some(window) = retry.window { retry_windows.insert(agent, window); }
+                        insert_prefer_heard(&mut batch, retry.perception);
+                    }
+                }
+                perception = async_rx.recv(), if !intake_closed => match perception {
+                    Some(perception) => insert_prefer_heard(&mut batch, perception),
+                    None => intake_closed = true,
+                }
+            }
+            for _ in 0..255 {
+                let Ok(perception) = async_rx.try_recv() else {
+                    break;
+                };
+                insert_prefer_heard(&mut batch, perception);
+            }
+            for perception in batch.into_values() {
+                let agent = perception.agent_id;
+                let tick = perception.tick.0;
+                let heard = !perception.heard_text.is_empty();
+                let previous = retry_windows.get(&agent).or_else(|| windows.get(&agent));
+                // Capture original age/normalized urgency before either backpressure path.
+                let window = intake_preparation_window(
+                    &perception,
+                    previous,
+                    &mut impulse_acked,
+                    Instant::now(),
+                );
+                let urgent = window.urgent_for(tick);
+                if !urgent
+                    && last_call_tick
+                        .lock()
+                        .unwrap()
+                        .get(&agent)
+                        .is_some_and(|last| {
+                            tick.saturating_sub(*last) < config.min_ticks_between_calls
+                        })
+                {
+                    telemetry
+                        .calls_skipped_rate_limit
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if circuit.lock().unwrap().is_open() {
+                    telemetry
+                        .calls_skipped_circuit_open
+                        .fetch_add(1, Ordering::Relaxed);
+                    if !queue_bounded_retry(&pending_retries, perception, Some(window)).await {
+                        failed = Some("llm_retry_capacity_exhausted");
+                        break;
+                    }
+                    continue;
+                }
+                if perception.impulse_text.is_empty() && perception.body_text.is_empty() && !heard {
+                    continue;
+                }
+                match controller.offer(perception) {
+                    Ok(()) => {
+                        windows.insert(agent, window);
+                        #[cfg(test)]
+                        telemetry.perceptions_offered.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(perception) => {
+                        if !queue_bounded_retry(&pending_retries, *perception, Some(window)).await {
+                            failed = Some("llm_retry_capacity_exhausted");
                             break;
                         }
                     }
                 }
             }
-        });
-
-        // Blocking receive in eigenem Thread, forward an async channel
-        let (async_tx, mut async_rx) = tokio::sync::mpsc::channel::<Perception>(256);
-        std::thread::Builder::new()
-            .name("llm-bridge-recv".into())
-            .spawn(move || {
-                while let Ok(perception) = perception_rx.recv() {
-                    if async_tx.blocking_send(perception).is_err() {
-                        break;
-                    }
-                }
-                debug!("LLM Bridge Receiver Thread beendet");
-            })
-            .expect("LLM Bridge Receiver Thread spawnen");
-
-        loop {
-            let first = tokio::select! {
-                biased;
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        stop_provider_admission(provider_admission.as_ref());
-                        break;
-                    }
-                    continue;
-                }
-                perception = async_rx.recv() => match perception {
-                    Some(perception) => perception,
-                    None => {
-                        stop_provider_admission(provider_admission.as_ref());
-                        break;
-                    }
-                },
-            };
-            // Drain: Alle sofort verfuegbaren Perceptions lesen.
-            // Pro Agent: neueste behalten, heard_text bevorzugen.
-            let mut batch: HashMap<AgentId, Perception> = {
-                let mut pending = pending_retries.lock().await;
-                std::mem::take(&mut *pending)
-            };
-            insert_prefer_heard(&mut batch, first);
-            while let Ok(p) = async_rx.try_recv() {
-                insert_prefer_heard(&mut batch, p);
-            }
-
-            // Batch verarbeiten — jede Perception durch Rate-Limit/Filter/Call
-            for perception in batch.into_values() {
-                let agent_id = perception.agent_id;
-                let current_tick = perception.tick.0;
-
-                // heard_text oder direkt angesprochen → Rate-Limit bypass
-                let has_heard = !perception.heard_text.is_empty();
-                let mut is_urgent = perception.is_directly_addressed
-                    || has_heard
-                    || perception.has_operator_impulse;
-
-                // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent.
-                // IM:1 bleibt im Fingerprint → Synthesis bypassed im Gateway.
-                // Aber nur 1 urgent Call pro 60 Ticks pro Agent.
-                // Debounce: Operator-Impulse max 1x pro 5 Ticks pro Agent.
-                // 60 Ticks war zu aggressiv — bei Gateway-Fehler kein Retry fuer 1 Minute.
-                // 5 Ticks gibt dem LLM-Call genug Zeit (12-20s) und verhindert trotzdem Spam.
-                if is_urgent
-                    && perception.has_operator_impulse
-                    && !has_heard
-                    && !perception.is_directly_addressed
-                {
-                    let last_ack = impulse_acked.get(&agent_id).copied().unwrap_or(0);
-                    if current_tick.saturating_sub(last_ack) < 5 {
-                        is_urgent = false;
-                    } else {
-                        impulse_acked.insert(agent_id, current_tick);
-                    }
-                }
-
-                // Rate Limiting pro Agent (urgent bypass)
-                if !is_urgent {
-                    if let Some(&last_tick) = last_call_tick.get(&agent_id) {
-                        if current_tick.saturating_sub(last_tick) < config.min_ticks_between_calls {
-                            telemetry
-                                .calls_skipped_rate_limit
-                                .fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                }
-
-                // Circuit Breaker
-                if circuit_breaker.lock().unwrap().is_open() {
-                    telemetry
-                        .calls_skipped_circuit_open
-                        .fetch_add(1, Ordering::Relaxed);
-                    if should_retry_perception(&perception) {
-                        queue_retry(&pending_retries, perception).await;
-                    }
-                    continue;
-                }
-
-                // Nur Calls mit nicht-leerem Inhalt
-                if perception.impulse_text.is_empty()
-                    && perception.body_text.is_empty()
-                    && perception.heard_text.is_empty()
-                {
-                    continue;
-                }
-
-                let selection_started = Instant::now();
-                let candidate = match config.provider_usage_authority.as_ref() {
-                    Some(resolver) => match resolver.prepare_provider_usage_candidate(agent_id) {
-                        Ok(Some(candidate)) => candidate,
-                        Ok(None) => {
-                            debug!(agent = %agent_id,
-                                elapsed_ms = selection_started.elapsed().as_millis(),
-                                outcome = "skipped", "Provider candidate selection finished");
-                            continue;
-                        }
-                        Err(reason) => {
-                            error!(agent = %agent_id, reason,
-                                elapsed_ms = selection_started.elapsed().as_millis(),
-                                "Provider candidate preparation failed closed");
-                            continue;
-                        }
-                    },
-                    None => PreparedProviderCandidate {
-                        authority: None,
-                        prepared_context: None,
-                    },
-                };
-                let preparation_request_id = candidate
-                    .authority
-                    .as_ref()
-                    .map(ProviderExecutionAuthority::request_id);
-                log_provider_preparation_duration(
-                    agent_id,
-                    preparation_request_id.as_deref(),
-                    "selection",
-                    selection_started,
-                    candidate.authority.is_some(),
-                    true,
-                );
-                let usage_authority = candidate.authority;
-                if usage_authority
-                    .as_ref()
-                    .is_some_and(|authority| authority.agent_id() != agent_id)
-                {
-                    error!(agent = %agent_id, "Provider usage authority returned another agent");
-                    continue;
-                }
-                let unbound_allowed = config
-                    .provider_usage_authority
-                    .as_ref()
-                    .is_none_or(|resolver| resolver.allows_unbound_provider_usage());
-                if usage_authority.is_none() && !unbound_allowed {
-                    continue;
-                }
-                if let Err(reason) = validate_provider_usage_mode(
-                    usage_authority.as_ref(),
-                    config.usage_v2_enabled,
-                    unbound_allowed,
-                ) {
-                    error!(agent = %agent_id, reason, "Provider usage accounting is unavailable");
-                    continue;
-                }
-
-                if usage_authority.is_none() {
-                    record_provider_preparation_attempt(
-                        &mut last_call_tick,
-                        &llm_activity_ticks,
-                        agent_id,
-                        current_tick,
-                        config.min_ticks_between_calls,
-                    );
-                }
-
-                let request_id = agent_runtime_request_id(&perception, usage_authority.as_ref());
-                if active_provider_requests
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains_key(&request_id)
-                {
-                    continue;
-                }
-                if let Some(authority) = usage_authority.as_ref() {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX);
-                    match recover_reserved_model_request(
-                        event_store.as_ref(),
-                        config.provider_usage_authority.as_deref(),
-                        authority,
-                        &action_tx,
-                        completion_max_attempts,
-                        now_ms,
-                        config.request_timeout,
-                    ) {
-                        Ok(true) => continue,
-                        Ok(false) => {}
-                        Err(error) => {
-                            error!(request_id, error = %error, "Reserved model recovery failed closed");
-                            continue;
-                        }
-                    }
-                }
-                let preparation_guard = if usage_authority.is_some() {
-                    let Some(guard) = ProviderPreparationGuard::try_acquire(
-                        &preparing_provider_requests,
-                        &request_id,
-                    ) else {
-                        continue;
-                    };
-                    Some(guard)
-                } else {
-                    None
-                };
-                if preparation_guard.is_some() {
-                    // Exact duplicates and recovery do not start a new attempt.
-                    // Owned preparation failures and capacity misses still back off.
-                    record_provider_preparation_attempt(
-                        &mut last_call_tick,
-                        &llm_activity_ticks,
-                        agent_id,
-                        current_tick,
-                        config.min_ticks_between_calls,
-                    );
-                }
-                let mut request = build_gateway_request(
-                    &perception,
-                    &state_store,
-                    &request_id,
-                    usage_authority.as_ref(),
-                );
-                let preparation_started = Instant::now();
-                let preparation = initial_model_work_context(
-                    config.provider_usage_authority.as_deref(),
-                    usage_authority.as_ref(),
-                    candidate.prepared_context,
-                );
-                log_provider_preparation_duration(
-                    agent_id,
-                    Some(&request_id),
-                    "context",
-                    preparation_started,
-                    usage_authority.is_some(),
-                    preparation.is_ok(),
-                );
-                let model_work = match preparation {
-                    Ok(context) => context,
-                    Err(reason) => {
-                        warn!(agent = %agent_id, reason, "Model work context unavailable");
-                        continue;
-                    }
-                };
-                if let Some(context) = &model_work {
-                    if let Err(reason) = bind_model_work_request(&mut request, context) {
-                        warn!(agent = %agent_id, reason, "Model work request rejected");
-                        continue;
-                    }
-                }
-                let request_digest = match gateway_request_digest(&request) {
-                    Ok(digest) => digest,
-                    Err(error) => {
-                        error!(agent = %agent_id, error = %error, "Gateway request digest failed");
-                        continue;
-                    }
-                };
-                match event_store.get_completion(&request_id) {
-                    Ok(Some(entry))
-                        if entry.request_digest == request_digest
-                            && entry.status == "provider_in_flight" =>
-                    {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX);
-                        if release_stale_undispatched_subscription(
-                            event_store.as_ref(),
-                            config.provider_usage_authority.as_deref(),
-                            usage_authority.as_ref(),
-                            &entry,
-                            now_ms,
-                            config.request_timeout,
-                        ) {
-                            info!(request_id = %request_id, "Definitively undispatched provider reservation released for retry");
-                            continue;
-                        }
-                        warn!(request_id = %request_id, "Ambiguous prior provider execution remains fail-closed");
-                        continue;
-                    }
-                    Ok(Some(entry)) if entry.request_digest == request_digest => {
-                        recover_completion(
-                            event_store.as_ref(),
-                            entry,
-                            &action_tx,
-                            completion_max_attempts,
-                            config.provider_usage_authority.as_deref(),
-                        );
-                        continue;
-                    }
-                    Ok(Some(_)) => {
-                        error!(request_id = %request_id, "Stable LLM request ID reused with different request digest");
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        error!(request_id = %request_id, error = %error, "LLM completion lookup failed closed");
-                        continue;
-                    }
-                }
-                let operation_id = format!("llm_usage_{request_id}");
-                match event_store.has_operation(&operation_id) {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(error) => {
-                        error!(request_id = %request_id, error = %error, "LLM usage lookup failed closed");
-                        continue;
-                    }
-                }
-
-                info!(agent = %agent_id,
-                    priority = if perception.is_directly_addressed { "P1" } else { "normal" },
-                    has_heard = !perception.heard_text.is_empty(),
-                    "LLM call triggered");
-
-                let client = client.clone();
-                let url = format!("{}/internal/agent-runtime", config.gateway_url);
-                let action_tx = action_tx.clone();
-                let telemetry = Arc::clone(&telemetry);
-                let cb = Arc::clone(&circuit_breaker);
-                let retry_queue = Arc::clone(&pending_retries);
-                let retry_perception = perception.clone();
-                let bridge_event_store = Arc::clone(&event_store);
-                let credential = config.credential.clone();
-                let usage_v2_enabled = config.usage_v2_enabled;
-                let request_completion_max_attempts = completion_max_attempts;
-                let task_provider_admission = Arc::clone(&provider_admission);
-                let task_active = Arc::clone(&active_provider_requests);
-                let provider_usage_authority = usage_authority.clone();
-                let provider_usage_authority_resolver =
-                    config.provider_usage_authority.as_ref().map(Arc::clone);
-
-                telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
-
-                if is_urgent {
-                    // Urgent (heard_text/P1): acquire_owned().await INNERHALB tokio::spawn.
-                    // Wartet auf Permit im eigenen Task — Drain-Loop blockiert NICHT,
-                    // urgent Calls werden NIEMALS gedroppt.
-                    let sem = llm_semaphore.clone();
-                    let mut task_shutdown_rx = shutdown_rx.clone();
-                    provider_tasks.spawn(async move {
-                        let _preparation_guard = preparation_guard;
-                        // Urgent Calls duerfen auf Semaphore und Gateway warten, aber nicht ewig.
-                        let acquire_timeout = config.request_timeout;
-                        let permit = tokio::select! {
-                            biased;
-                            _ = task_shutdown_rx.changed() => {
-                                debug!(agent = %agent_id, "URGENT call cancelled before reservation during shutdown");
-                                return;
-                            }
-                            result = tokio::time::timeout(acquire_timeout, sem.acquire_owned()) => {
-                                match result {
-                                    Ok(Ok(permit)) => permit,
-                                    Ok(Err(_)) => {
-                                        warn!(agent = %agent_id, "URGENT Semaphore closed");
-                                        queue_retry(&retry_queue, retry_perception.clone()).await;
-                                        return;
-                                    }
-                                    Err(_) => {
-                                        warn!(
-                                            agent = %agent_id,
-                                            timeout_ms = acquire_timeout.as_millis(),
-                                            "URGENT Semaphore timeout"
-                                        );
-                                        queue_retry(&retry_queue, retry_perception.clone()).await;
-                                        return;
-                                    }
-                                }
-                            }
-                        };
-                        if let Err(error) = validate_unreserved_provider_authority(
-                            provider_usage_authority_resolver.as_deref(),
-                            provider_usage_authority.as_ref(),
-                            agent_id,
-                            model_work.as_ref(),
-                        ) {
-                            warn!(request_id = %request_id, error, "Provider request reauthorization failed before reservation");
-                            return;
-                        }
-                        let call_start = Instant::now();
-                        let mut outcome_guard = ProviderOutcomeGuard::new(
-                            Arc::clone(&bridge_event_store), task_active, &request_id, &request_digest,
-                        );
-                        match reserve_provider_request(
-                            task_provider_admission.as_ref(),
-                            bridge_event_store.as_ref(),
-                            &request_id,
-                            &request_digest,
-                            &agent_id.to_string(),
-                        ) {
-                            Ok(Some(true)) => outcome_guard.armed = true,
-                            Ok(Some(false)) => {
-                                warn!(request_id = %request_id, "LLM provider request already reserved");
-                                return;
-                            }
-                            Ok(None) => {
-                                debug!(request_id = %request_id, "LLM call cancelled before reservation during shutdown");
-                                return;
-                            }
-                            Err(error) => {
-                                error!(request_id = %request_id, error = %error, "LLM provider reservation failed closed");
-                                return;
-                            }
-                        }
-                        if let Err(error) = validate_pre_dispatch_provider_authority(
-                            bridge_event_store.as_ref(),
-                            provider_usage_authority_resolver.as_deref(),
-                            provider_usage_authority.as_ref(),
-                            agent_id,
-                            &request_id,
-                            &request_digest,
-                            model_work.as_ref(),
-                        ) {
-                            warn!(request_id = %request_id, error, "Provider request reauthorization failed before dispatch");
-                            outcome_guard.disarm_if_resolved();
-                            return;
-                        }
-                        match agent_runtime_request(
-                            &client,
-                            &url,
-                            &credential,
-                            &request_id,
-                            &request_digest,
-                            &request,
-                        )
-                        .send()
-                        .await
-                        {
-                            Ok(response) => {
-                                let status = response.status();
-                                if status.is_success() {
-                                    match response.json::<GatewayResponse>().await {
-                                        Ok(gateway_resp) => {
-                                            // Provider execution is complete. Release scarce
-                                            // capacity before local durable recovery.
-                                            drop(permit);
-                                            if let Err(e) = store_gateway_completion(
-                                                bridge_event_store.as_ref(),
-                                                &action_tx,
-                                                GatewayCompletionContext {
-                                                    request_id: &request_id,
-                                                    request_digest: &request_digest,
-                                                    agent_id,
-                                                    tick: current_tick,
-                                                    requested_model: &request.model,
-                                                    authority: provider_usage_authority.as_ref(),
-                                                    authority_resolver: provider_usage_authority_resolver
-                                                        .as_deref(),
-                                                    gateway_response: &gateway_resp,
-                                                    usage_v2_enabled,
-                                                    model_work: model_work.as_ref(),
-                                                },
-                                                request_completion_max_attempts,
-                                            ) {
-                                                warn!(agent = %agent_id, error = %e, "Completed gateway response rejected fail-closed");
-                                                outcome_guard.disarm_if_resolved();
-                                                telemetry
-                                                    .calls_failed
-                                                    .fetch_add(1, Ordering::Relaxed);
-                                                cb.lock().unwrap().record_failure();
-                                                return;
-                                            }
-                                            let latency_ms = call_start.elapsed().as_millis();
-                                            outcome_guard.armed = false;
-                                            telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
-                                            telemetry.tokens_total.fetch_add(
-                                                gateway_resp.tokens_used.max(0) as u64,
-                                                Ordering::Relaxed,
-                                            );
-                                            cb.lock().unwrap().record_success();
-
-                                            info!(
-                                                agent = %agent_id,
-                                                request_id = %gateway_resp.request_id,
-                                                tokens = gateway_resp.tokens_used,
-                                                actions = gateway_resp.actions.len(),
-                                                latency_ms = latency_ms,
-                                                "URGENT LLM Response erhalten"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
-                                            telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                                            cb.lock().unwrap().record_failure();
-                                        }
-                                    }
-                                } else {
-                                    let rejection_resolved = handle_gateway_rejection(
-                                        bridge_event_store.as_ref(), model_work.as_ref(),
-                                        &request_id, &request_digest, current_tick, status, response.headers(),
-                                    );
-                                    warn!(agent = %agent_id, status = status.as_u16(), rejection_resolved, "Gateway HTTP Fehler");
-                                    if rejection_resolved {
-                                        outcome_guard.armed = false;
-                                    }
-                                    telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                                    cb.lock().unwrap().record_failure();
-                                }
-                            }
-                            Err(e) => {
-                                let is_timeout = e.is_timeout();
-                                let reservation_released = release_connect_failed_request(
-                                    bridge_event_store.as_ref(),
-                                    &request_id,
-                                    &request_digest,
-                                    &e,
-                                );
-                                warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, reservation_released, "Gateway Request fehlgeschlagen");
-                                if reservation_released {
-                                    outcome_guard.armed = false;
-                                }
-                                telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                                cb.lock().unwrap().record_failure();
-                            }
-                        }
-                    });
-                } else {
-                    // Normal (Heartbeats): try_acquire — droppen OK, Heartbeats sind nicht kritisch.
-                    let permit = match llm_semaphore.clone().try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            debug!(agent = %agent_id, "Heartbeat LLM Call uebersprungen: max concurrent erreicht");
-                            continue;
-                        }
-                    };
-                    provider_tasks.spawn(async move {
-                        let _preparation_guard = preparation_guard;
-                        if let Err(error) = validate_unreserved_provider_authority(
-                            provider_usage_authority_resolver.as_deref(),
-                            provider_usage_authority.as_ref(),
-                            agent_id,
-                            model_work.as_ref(),
-                        ) {
-                            warn!(request_id = %request_id, error, "Provider request reauthorization failed before reservation");
-                            return;
-                        }
-                        let call_start = Instant::now();
-                        let mut outcome_guard = ProviderOutcomeGuard::new(
-                            Arc::clone(&bridge_event_store), task_active, &request_id, &request_digest,
-                        );
-                        match reserve_provider_request(
-                            task_provider_admission.as_ref(),
-                            bridge_event_store.as_ref(),
-                            &request_id,
-                            &request_digest,
-                            &agent_id.to_string(),
-                        ) {
-                            Ok(Some(true)) => outcome_guard.armed = true,
-                            Ok(Some(false)) => {
-                                warn!(request_id = %request_id, "LLM provider request already reserved");
-                                return;
-                            }
-                            Ok(None) => {
-                                debug!(request_id = %request_id, "LLM call cancelled before reservation during shutdown");
-                                return;
-                            }
-                            Err(error) => {
-                                error!(request_id = %request_id, error = %error, "LLM provider reservation failed closed");
-                                return;
-                            }
-                        }
-                        if let Err(error) = validate_pre_dispatch_provider_authority(
-                            bridge_event_store.as_ref(),
-                            provider_usage_authority_resolver.as_deref(),
-                            provider_usage_authority.as_ref(),
-                            agent_id,
-                            &request_id,
-                            &request_digest,
-                            model_work.as_ref(),
-                        ) {
-                            warn!(request_id = %request_id, error, "Provider request reauthorization failed before dispatch");
-                            outcome_guard.disarm_if_resolved();
-                            return;
-                        }
-                        match agent_runtime_request(
-                            &client,
-                            &url,
-                            &credential,
-                            &request_id,
-                            &request_digest,
-                            &request,
-                        )
-                        .send()
-                        .await
-                        {
-                            Ok(response) => {
-                                let status = response.status();
-                                if status.is_success() {
-                                    match response.json::<GatewayResponse>().await {
-                                        Ok(gateway_resp) => {
-                                            drop(permit);
-                                            if let Err(e) = store_gateway_completion(
-                                                bridge_event_store.as_ref(),
-                                                &action_tx,
-                                                GatewayCompletionContext {
-                                                    request_id: &request_id,
-                                                    request_digest: &request_digest,
-                                                    agent_id,
-                                                    tick: current_tick,
-                                                    requested_model: &request.model,
-                                                    authority: provider_usage_authority.as_ref(),
-                                                    authority_resolver: provider_usage_authority_resolver
-                                                        .as_deref(),
-                                                    gateway_response: &gateway_resp,
-                                                    usage_v2_enabled,
-                                                    model_work: model_work.as_ref(),
-                                                },
-                                                request_completion_max_attempts,
-                                            ) {
-                                                warn!(agent = %agent_id, error = %e, "Completed gateway response rejected fail-closed");
-                                                outcome_guard.disarm_if_resolved();
-                                                telemetry
-                                                    .calls_failed
-                                                    .fetch_add(1, Ordering::Relaxed);
-                                                cb.lock().unwrap().record_failure();
-                                                return;
-                                            }
-                                            let latency_ms = call_start.elapsed().as_millis();
-                                            outcome_guard.armed = false;
-                                            telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
-                                            telemetry.tokens_total.fetch_add(
-                                                gateway_resp.tokens_used.max(0) as u64,
-                                                Ordering::Relaxed,
-                                            );
-                                            cb.lock().unwrap().record_success();
-
-                                            info!(
-                                                agent = %agent_id,
-                                                request_id = %gateway_resp.request_id,
-                                                tokens = gateway_resp.tokens_used,
-                                                actions = gateway_resp.actions.len(),
-                                                latency_ms = latency_ms,
-                                                "LLM Response erhalten"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
-                                            telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                                            cb.lock().unwrap().record_failure();
-                                        }
-                                    }
-                                } else {
-                                    let rejection_resolved = handle_gateway_rejection(
-                                        bridge_event_store.as_ref(), model_work.as_ref(),
-                                        &request_id, &request_digest, current_tick, status, response.headers(),
-                                    );
-                                    warn!(agent = %agent_id, status = status.as_u16(), rejection_resolved, "Gateway HTTP Fehler");
-                                    if rejection_resolved {
-                                        outcome_guard.armed = false;
-                                    }
-                                    telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                                    cb.lock().unwrap().record_failure();
-                                }
-                            }
-                            Err(e) => {
-                                let is_timeout = e.is_timeout();
-                                let reservation_released = release_connect_failed_request(
-                                    bridge_event_store.as_ref(),
-                                    &request_id,
-                                    &request_digest,
-                                    &e,
-                                );
-                                warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, reservation_released, "Gateway Request fehlgeschlagen");
-                                if reservation_released {
-                                    outcome_guard.armed = false;
-                                }
-                                telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                                cb.lock().unwrap().record_failure();
-                            }
-                        }
-                    });
-                }
-            }
-            while let Some(result) = provider_tasks.try_join_next() {
-                if let Err(join_error) = result {
-                    provider_task_failed = true;
-                    error!(error = %join_error, "LLM provider task failed");
-                }
-            }
         }
-
-        let drain_result = tokio::time::timeout(config.shutdown_drain_timeout, async {
-            while let Some(result) = provider_tasks.join_next().await {
-                if let Err(join_error) = result {
-                    provider_task_failed = true;
-                    error!(error = %join_error, "LLM provider task failed during shutdown");
+        if failed.is_some() {
+            circuit.lock().unwrap().mark_terminal();
+        }
+        controller.stop_intake();
+        controller.cancel_pending();
+        controller.cancel_inflight();
+        stopping.store(true, Ordering::Release);
+        async_rx.close();
+        let drained = tokio::time::timeout(config.shutdown_drain_timeout, async {
+            close_provider_admission_async(&admission).await;
+            while !provider_tasks.is_empty() {
+                if !matches!(
+                    provider_tasks.join_next().await,
+                    Some(Ok((
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        Ok(()) | Err(JobError::Cancelled | JobError::DeadlineExceeded)
+                    )))
+                ) {
+                    failed.get_or_insert("llm_provider_task_failed");
+                    circuit.lock().unwrap().mark_terminal();
+                }
+            }
+            while controller.inflight_count() > 0 {
+                match controller.next_result().await {
+                    Some((_, Ok(outcome))) => {
+                        if let Some(reason) = outcome.recovery_failure {
+                            failed.get_or_insert(reason);
+                            circuit.lock().unwrap().mark_terminal();
+                        }
+                    }
+                    Some((_, Err(JobError::Panicked | JobError::Stopped))) => {
+                        failed.get_or_insert("llm_preparation_job_failed");
+                        circuit.lock().unwrap().mark_terminal();
+                    }
+                    _ => {}
+                }
+            }
+            while !recovery_tasks.is_empty() {
+                if !matches!(recovery_tasks.join_next().await, Some(Ok(Ok(())))) {
+                    failed.get_or_insert("llm_recovery_task_failed");
+                    circuit.lock().unwrap().mark_terminal();
                 }
             }
         })
         .await;
-        if drain_result.is_err() {
-            provider_tasks.abort_all();
+        if drained.is_err() {
+            circuit.lock().unwrap().mark_terminal();
+            for cancellation in provider_cancellations.values() {
+                cancellation.cancel();
+            }
+            controller.cancel_inflight();
+            close_provider_admission_async(&admission).await;
+            // Cancellation interrupts transport, not synchronous response persistence or guard cleanup.
             while provider_tasks.join_next().await.is_some() {}
-            let _ = recovery_shutdown_tx.send(true);
-            let _ = recovery_task.await;
-            error!(
-                timeout_ms = config.shutdown_drain_timeout.as_millis(),
-                "LLM provider drain timed out"
-            );
+            while controller.inflight_count() > 0 {
+                let _ = controller.next_result().await;
+            }
+            while recovery_tasks.join_next().await.is_some() {}
             return Err("llm_provider_drain_timeout");
         }
-        let _ = recovery_shutdown_tx.send(true);
-        if let Err(error) = recovery_task.await {
-            error!(error = %error, "LLM completion recovery task failed");
-            return Err("llm_recovery_task_failed");
+        failed.map_or(Ok(()), Err)
+    }
+
+    async fn close_provider_admission_async(admission: &RwLock<bool>) {
+        loop {
+            match admission.try_write() {
+                Ok(mut open) => {
+                    *open = false;
+                    return;
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    *error.into_inner() = false;
+                    return;
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        if provider_task_failed {
-            return Err("llm_provider_task_failed");
-        }
-        info!("LLM Bridge beendet");
-        Ok(())
     }
 
     /// Fuegt Perception in Batch ein. Bevorzugt Versionen MIT heard_text.
     /// #295 Fix: Bewahrt has_operator_impulse (IM-Flag) beim Merge,
     /// damit Gaia/Broadcast-Bypass nicht verloren geht wenn heard_text-Version gewinnt.
-    fn insert_prefer_heard(batch: &mut HashMap<AgentId, Perception>, p: Perception) {
+    pub(super) fn insert_prefer_heard(batch: &mut HashMap<AgentId, Perception>, p: Perception) {
         batch
             .entry(p.agent_id)
             .and_modify(|existing| {
+                let preserve_impulse = existing.has_operator_impulse || p.has_operator_impulse;
                 // Behalte Version MIT heard_text, sonst neueste
                 if !p.heard_text.is_empty() || existing.heard_text.is_empty() {
-                    let preserve_impulse = existing.has_operator_impulse;
                     *existing = p.clone();
-                    // IM-Flag aus alter Perception bewahren (Gaia/Broadcast darf nicht verloren gehen)
-                    if preserve_impulse && !existing.has_operator_impulse {
-                        existing.has_operator_impulse = true;
-                        existing.synth_fingerprint =
-                            existing.synth_fingerprint.replace("|IM:0", "|IM:1");
-                    }
+                }
+                // Either input may carry Gaia/Broadcast, even when heard text retains the older frame.
+                if preserve_impulse && !existing.has_operator_impulse {
+                    existing.has_operator_impulse = true;
+                    existing.synth_fingerprint =
+                        existing.synth_fingerprint.replace("|IM:0", "|IM:1");
                 }
             })
             .or_insert(p);
@@ -2924,16 +3520,43 @@ pub mod bridge {
             || perception.has_operator_impulse
     }
 
-    async fn queue_retry(
-        queue: &Arc<AsyncMutex<HashMap<AgentId, Perception>>>,
+    async fn queue_bounded_retry(
+        queue: &Arc<AsyncMutex<HashMap<AgentId, QueuedProviderRetry>>>,
         perception: Perception,
-    ) {
+        window: Option<Arc<PreparationWindow>>,
+    ) -> bool {
         if !should_retry_perception(&perception) {
-            return;
+            return true;
         }
 
+        let window = window.or_else(|| {
+            Some(Arc::new(PreparationWindow {
+                enqueued_at: Instant::now(),
+                tick: perception.tick.0,
+                urgent: should_retry_perception(&perception),
+                heard: !perception.heard_text.is_empty(),
+                retained_heard: None,
+            }))
+        });
+
         let mut pending = queue.lock().await;
-        insert_prefer_heard(&mut pending, perception);
+        if pending.len() >= 256 && !pending.contains_key(&perception.agent_id) {
+            return false;
+        }
+        let agent = perception.agent_id;
+        let previous = pending.remove(&agent);
+        let mut merged = HashMap::new();
+        if let Some(previous) = &previous {
+            insert_prefer_heard(&mut merged, previous.perception.clone());
+        }
+        insert_prefer_heard(&mut merged, perception);
+        let perception = merged.remove(&agent).unwrap();
+        let window = previous
+            .and_then(|previous| previous.window)
+            .filter(|previous| previous.contains_tick(perception.tick.0))
+            .or_else(|| window.filter(|window| window.contains_tick(perception.tick.0)));
+        pending.insert(agent, QueuedProviderRetry { perception, window });
+        true
     }
 
     /// Baut den Gateway-Request aus einer Perception + Evolution-Daten aus redb.
@@ -3522,6 +4145,346 @@ pub mod bridge {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        include!("llm_bridge/tests/owned_pipeline.rs");
+
+        #[test]
+        fn coalesced_queue_age_uses_actual_selected_tick_not_inflight_history() {
+            let heard_age = Instant::now();
+            let fresh_age = heard_age + Duration::from_secs(1);
+            let window = PreparationWindow {
+                enqueued_at: fresh_age,
+                tick: 56,
+                urgent: false,
+                heard: false,
+                retained_heard: Some((55, heard_age)),
+            };
+            assert_eq!(window.enqueued_at_for(55), heard_age);
+            assert_eq!(window.enqueued_at_for(56), fresh_age);
+            assert!(window.contains_tick(55));
+            assert!(window.contains_tick(56));
+            assert!(!window.contains_tick(57));
+        }
+
+        #[tokio::test]
+        async fn unreserved_retry_coalesces_heard_and_preserves_original_queue_age() {
+            let queue = Arc::new(AsyncMutex::new(HashMap::new()));
+            let mut heard = recovery_test_perception();
+            heard.heard_text = "original heard intent".into();
+            let original = Arc::new(PreparationWindow {
+                enqueued_at: Instant::now(),
+                tick: heard.tick.0,
+                urgent: true,
+                heard: true,
+                retained_heard: None,
+            });
+            assert!(queue_bounded_retry(&queue, heard.clone(), Some(Arc::clone(&original))).await);
+            let mut newer = heard.clone();
+            newer.tick = Tick(56);
+            newer.heard_text.clear();
+            newer.has_operator_impulse = true;
+            let newer_window = Arc::new(PreparationWindow {
+                enqueued_at: Instant::now(),
+                tick: 56,
+                urgent: true,
+                heard: false,
+                retained_heard: None,
+            });
+            assert!(queue_bounded_retry(&queue, newer, Some(newer_window)).await);
+            {
+                let pending = queue.lock().await;
+                assert_eq!(pending.len(), 1);
+                let retained = pending.get(&heard.agent_id).unwrap();
+                assert_eq!(retained.perception.tick, heard.tick);
+                assert_eq!(retained.perception.heard_text, heard.heard_text);
+                assert!(retained.perception.has_operator_impulse);
+                assert!(Arc::ptr_eq(retained.window.as_ref().unwrap(), &original));
+            }
+            let mut distinct = heard.clone();
+            distinct.tick = Tick(57);
+            distinct.heard_text = "distinct heard intent".into();
+            let distinct_window = Arc::new(PreparationWindow {
+                enqueued_at: Instant::now(),
+                tick: 57,
+                urgent: true,
+                heard: true,
+                retained_heard: None,
+            });
+            assert!(
+                queue_bounded_retry(&queue, distinct, Some(Arc::clone(&distinct_window))).await
+            );
+            let pending = queue.lock().await;
+            let retained = pending.get(&heard.agent_id).unwrap();
+            assert_eq!(retained.perception.tick, Tick(57));
+            assert!(Arc::ptr_eq(
+                retained.window.as_ref().unwrap(),
+                &distinct_window
+            ));
+        }
+
+        #[tokio::test]
+        async fn bounded_unreserved_retry_overflow_preserves_pending_intents() {
+            let queue = Arc::new(AsyncMutex::new(HashMap::new()));
+            for agent in 0..256 {
+                let mut perception = recovery_test_perception();
+                perception.agent_id = AgentId(agent);
+                perception.is_directly_addressed = true;
+                assert!(queue_bounded_retry(&queue, perception, None).await);
+            }
+            let mut overflow = recovery_test_perception();
+            overflow.agent_id = AgentId(256);
+            overflow.is_directly_addressed = true;
+            assert!(!queue_bounded_retry(&queue, overflow, None).await);
+            let mut duplicate = recovery_test_perception();
+            duplicate.is_directly_addressed = true;
+            duplicate.heard_text = "retained exact urgent intent".into();
+            assert!(queue_bounded_retry(&queue, duplicate.clone(), None).await);
+            let pending = queue.lock().await;
+            assert_eq!(pending.len(), 256);
+            assert!(!pending.contains_key(&AgentId(256)));
+            assert_eq!(
+                pending
+                    .get(&duplicate.agent_id)
+                    .unwrap()
+                    .perception
+                    .heard_text,
+                duplicate.heard_text
+            );
+        }
+
+        fn recovery_lane_test_dependencies(
+            directory: &std::path::Path,
+            runtime: &tokio::runtime::Runtime,
+            executor: BlockingExecutor,
+        ) -> ProviderPreparationDependencies<EventStore> {
+            let (action_tx, _) = mpsc::channel();
+            ProviderPreparationDependencies {
+                config: LlmBridgeConfig::default(),
+                state_store: Arc::new(
+                    StateStore::open(directory.join("state.redb").to_str().unwrap()).unwrap(),
+                ),
+                event_store: Arc::new(EventStore::open(":memory:").unwrap()),
+                action_tx,
+                active_requests: Arc::new(Mutex::new(HashMap::new())),
+                preparing_requests: Arc::new(Mutex::new(HashMap::new())),
+                completion_max_attempts: 3,
+                executor,
+                runtime: runtime.handle().clone(),
+                last_call_tick: Arc::new(Mutex::new(HashMap::new())),
+                activity: Arc::new(Mutex::new(HashMap::new())),
+                telemetry: Arc::new(BridgeTelemetry::default()),
+            }
+        }
+
+        fn assert_owned_transport_cancel_boundary(cancel_before_poll: bool) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut lanes = OwnedBlockingLanes::spawn(1, 32).unwrap();
+            let store = Arc::new(EventStore::open(":memory:").unwrap());
+            let worker_store = Arc::clone(&store);
+            let active = Arc::new(Mutex::new(HashMap::new()));
+            let worker_active = Arc::clone(&active);
+            let polls = Arc::new(AtomicU64::new(0));
+            let worker_polls = Arc::clone(&polls);
+            let handle = runtime.handle().clone();
+            let (reserved_tx, reserved_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (polled_tx, polled_rx) = mpsc::channel();
+            let digest = "a".repeat(64);
+            let worker_digest = digest.clone();
+            let job = lanes
+                .executor()
+                .submit(Lane::Provider, None, move |cancellation| {
+                    // Guard creation, classification, and Drop all belong to this accepted worker.
+                    let mut guard = ProviderOutcomeGuard::new(
+                        worker_store,
+                        worker_active,
+                        "owned-first-poll",
+                        &worker_digest,
+                    );
+                    assert_eq!(
+                        reserve_provider_request_until(
+                            &RwLock::new(true),
+                            guard.store.as_ref(),
+                            &guard.request_id,
+                            &guard.request_digest,
+                            &AgentId(7).to_string(),
+                            &|| false
+                        )
+                        .unwrap(),
+                        Some(true)
+                    );
+                    guard.armed = true;
+                    reserved_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(8));
+                    let first_poll = AtomicBool::new(false);
+                    let transport = std::future::poll_fn(|_| {
+                        if worker_polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            polled_tx.send(()).unwrap();
+                        }
+                        std::task::Poll::<()>::Pending
+                    });
+                    assert!(handle
+                        .block_on(await_owned_transport(&cancellation, transport, &first_poll))
+                        .is_none());
+                    let polled = first_poll.load(Ordering::Acquire);
+                    classify_cancelled_transport(&mut guard, polled);
+                    drop(guard);
+                    polled
+                })
+                .unwrap();
+            reserved_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let cancellation = job.cancellation();
+            if cancel_before_poll {
+                cancellation.cancel();
+            }
+            release_tx.send(()).unwrap();
+            if !cancel_before_poll {
+                polled_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                cancellation.cancel();
+            }
+            assert_eq!(runtime.block_on(job.wait()).unwrap(), !cancel_before_poll);
+            lanes.stop_and_join().unwrap();
+            assert!(active.lock().unwrap().is_empty());
+            if cancel_before_poll {
+                assert_eq!(polls.load(Ordering::SeqCst), 0);
+                assert!(store.get_completion("owned-first-poll").unwrap().is_none());
+                assert!(store
+                    .reserve_request("owned-first-poll", &digest, &AgentId(7).to_string())
+                    .unwrap());
+            } else {
+                assert!(polls.load(Ordering::SeqCst) >= 1);
+                let unknown = store.get_completion("owned-first-poll").unwrap().unwrap();
+                assert_eq!(unknown.status, "failed");
+                assert_eq!(
+                    unknown.last_error.as_deref(),
+                    Some("UnknownOutcome: bridge_task_ended_without_durable_response")
+                );
+                assert!(!store
+                    .reserve_request("owned-first-poll", &digest, &AgentId(7).to_string())
+                    .unwrap());
+            }
+            assert!(store.get_all_events().unwrap().is_empty());
+        }
+
+        #[test]
+        fn owned_transport_cancel_before_first_poll_releases_undispatched_reservation() {
+            assert_owned_transport_cancel_boundary(true);
+        }
+
+        #[test]
+        fn owned_transport_cancel_after_first_poll_preserves_unknown_outcome() {
+            assert_owned_transport_cancel_boundary(false);
+        }
+
+        #[test]
+        fn terminal_unavailability_survives_circuit_success_and_reset() {
+            let unavailable = Arc::new(AtomicBool::new(false));
+            let mut circuit = CircuitBreaker::new(2, Duration::ZERO, Arc::clone(&unavailable));
+            circuit.mark_terminal();
+            circuit.record_success();
+            assert!(unavailable.load(Ordering::Acquire));
+            assert!(circuit.is_open());
+            circuit.record_failure();
+            circuit.record_success();
+            assert!(circuit.is_open());
+            assert!(unavailable.load(Ordering::Acquire));
+        }
+
+        #[test]
+        fn required_recovery_lane_full_fails_closed_without_running_callback() {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            // This synchronous test owns and joins lanes outside Tokio, as production does.
+            let mut lanes = OwnedBlockingLanes::spawn(1, 32).unwrap();
+            let executor = lanes.executor();
+            let dependencies =
+                recovery_lane_test_dependencies(directory.path(), &runtime, executor.clone());
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let running = executor
+                .submit_required(Lane::Recovery, move |_| {
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(8));
+                })
+                .unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let queued: Vec<_> = (0..8)
+                .map(|_| executor.submit_required(Lane::Recovery, |_| {}).unwrap())
+                .collect();
+            let called = Arc::new(AtomicBool::new(false));
+            let callback_called = Arc::clone(&called);
+            assert_eq!(
+                recover_on_owned_lane(&dependencies, move |_| {
+                    callback_called.store(true, Ordering::SeqCst);
+                }),
+                Err("llm_recovery_lane_full")
+            );
+            assert!(!called.load(Ordering::SeqCst));
+            drop(release_tx);
+            drop(queued);
+            drop(running);
+            lanes.stop_and_join().unwrap();
+            assert!(dependencies
+                .event_store
+                .get_all_events()
+                .unwrap()
+                .is_empty());
+        }
+
+        #[test]
+        fn required_recovery_lane_closed_fails_closed_without_running_callback() {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut lanes = OwnedBlockingLanes::spawn(1, 32).unwrap();
+            let dependencies =
+                recovery_lane_test_dependencies(directory.path(), &runtime, lanes.executor());
+            lanes.stop_and_join().unwrap();
+            let called = Arc::new(AtomicBool::new(false));
+            let callback_called = Arc::clone(&called);
+            assert_eq!(
+                recover_on_owned_lane(&dependencies, move |_| {
+                    callback_called.store(true, Ordering::SeqCst);
+                }),
+                Err("llm_recovery_lane_closed")
+            );
+            assert!(!called.load(Ordering::SeqCst));
+            assert!(dependencies
+                .event_store
+                .get_all_events()
+                .unwrap()
+                .is_empty());
+        }
+
+        #[test]
+        fn required_recovery_lane_panic_is_propagated() {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut lanes = OwnedBlockingLanes::spawn(1, 32).unwrap();
+            let dependencies =
+                recovery_lane_test_dependencies(directory.path(), &runtime, lanes.executor());
+            let recovery: Result<(), _> = recover_on_owned_lane(&dependencies, |_| {
+                panic!("synthetic recovery callback panic");
+            });
+            assert_eq!(recovery, Err("llm_recovery_job_panicked"));
+            lanes.stop_and_join().unwrap();
+            assert!(dependencies
+                .event_store
+                .get_all_events()
+                .unwrap()
+                .is_empty());
+        }
 
         #[tokio::test]
         async fn preparation_guard_suppresses_exact_queued_request_and_releases_on_abort() {
@@ -6459,6 +7422,7 @@ pub mod bridge {
             legacy: ExactValidationResolver,
             selections: Mutex<HashMap<AgentId, usize>>,
             fail_context: bool,
+            selection_barrier: Option<Arc<OwnedPipelineBarrier>>,
         }
 
         impl ProviderUsageAuthorityResolver for CooldownTestResolver {
@@ -6477,7 +7441,17 @@ pub mod bridge {
                 &self,
                 agent_id: AgentId,
             ) -> Result<Option<PreparedProviderCandidate>, &'static str> {
-                *self.selections.lock().unwrap().entry(agent_id).or_default() += 1;
+                let first = {
+                    let mut selections = self.selections.lock().unwrap();
+                    let count = selections.entry(agent_id).or_default();
+                    *count += 1;
+                    *count == 1
+                };
+                if first && agent_id == self.legacy.context.binding().agent_id() {
+                    if let Some(barrier) = &self.selection_barrier {
+                        barrier.wait();
+                    }
+                }
                 Ok(Some(PreparedProviderCandidate {
                     authority: self.legacy.resolve_provider_usage_authority(agent_id)?,
                     prepared_context: None,
@@ -6504,11 +7478,13 @@ pub mod bridge {
         }
 
         struct CooldownBridgeFixture {
+            _release_on_drop: ReleaseOnDrop,
             _directory: tempfile::TempDir,
             resolver: Arc<CooldownTestResolver>,
             store: Arc<EventStore>,
             telemetry: Arc<BridgeTelemetry>,
             activity: SharedLlmActivityTicks,
+            llm_unavailable: Arc<AtomicBool>,
             provider_calls: Arc<std::sync::atomic::AtomicUsize>,
             release_response: Arc<tokio::sync::Notify>,
             perception_tx: mpsc::Sender<Perception>,
@@ -6519,6 +7495,14 @@ pub mod bridge {
 
         impl CooldownBridgeFixture {
             async fn start(fail_context: bool, reserved: bool) -> Self {
+                Self::start_with_selection_barrier(fail_context, reserved, None).await
+            }
+
+            async fn start_with_selection_barrier(
+                fail_context: bool,
+                reserved: bool,
+                selection_barrier: Option<Arc<OwnedPipelineBarrier>>,
+            ) -> Self {
                 let directory = tempfile::tempdir().unwrap();
                 let context: ModelWorkContext =
                     crate::workflow_api::model_work::test_context().into();
@@ -6526,6 +7510,7 @@ pub mod bridge {
                     legacy: ExactValidationResolver::new(context),
                     selections: Mutex::new(HashMap::new()),
                     fail_context,
+                    selection_barrier,
                 });
                 let store = Arc::new(EventStore::open(":memory:").unwrap());
                 if reserved {
@@ -6567,6 +7552,7 @@ pub mod bridge {
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let telemetry = Arc::new(BridgeTelemetry::default());
                 let activity = Arc::new(Mutex::new(HashMap::new()));
+                let llm_unavailable = Arc::new(AtomicBool::new(false));
                 let bridge = tokio::spawn(run_llm_bridge_with_store(
                     config,
                     perception_rx,
@@ -6574,17 +7560,19 @@ pub mod bridge {
                     Arc::clone(&telemetry),
                     state,
                     Arc::clone(&store),
-                    Arc::new(AtomicBool::new(false)),
+                    Arc::clone(&llm_unavailable),
                     Arc::clone(&activity),
                     shutdown_rx,
                     Arc::new(RwLock::new(true)),
                 ));
                 Self {
+                    _release_on_drop: ReleaseOnDrop(Arc::clone(&release_response)),
                     _directory: directory,
                     resolver,
                     store,
                     telemetry,
                     activity,
+                    llm_unavailable,
                     provider_calls,
                     release_response,
                     perception_tx,
@@ -6618,14 +7606,17 @@ pub mod bridge {
             async fn send_selected(&self, perception: Perception) {
                 let agent_id = perception.agent_id;
                 let before = self.selection_count(agent_id);
+                let processed = self.telemetry.preparations_processed.load(Ordering::SeqCst);
                 self.perception_tx.send(perception).unwrap();
                 tokio::time::timeout(Duration::from_secs(2), async {
-                    while self.selection_count(agent_id) == before {
+                    while self.selection_count(agent_id) == before
+                        || self.telemetry.preparations_processed.load(Ordering::SeqCst) == processed
+                    {
                         tokio::task::yield_now().await;
                     }
                 })
                 .await
-                .expect("eligible perception did not reach fresh selection");
+                .expect("eligible perception did not finish owned preparation");
             }
 
             async fn send_rate_limited(&self, perception: Perception) {
@@ -6672,6 +7663,356 @@ pub mod bridge {
                     .unwrap();
                 self.provider_task.abort();
             }
+        }
+
+        struct ReleaseOnDrop(Arc<tokio::sync::Notify>);
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_waiters();
+                self.0.notify_one();
+            }
+        }
+
+        async fn assert_queued_preparation_cooldown(urgent: bool) {
+            let (release_tx, release_rx) = mpsc::channel();
+            let barrier = Arc::new(OwnedPipelineBarrier {
+                entered: tokio::sync::Notify::new(),
+                release: Mutex::new(release_rx),
+                exited: AtomicBool::new(false),
+            });
+            let f = CooldownBridgeFixture::start_with_selection_barrier(
+                true,
+                false,
+                Some(Arc::clone(&barrier)),
+            )
+            .await;
+            f.perception_tx.send(f.perception(55)).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified())
+                .await
+                .unwrap();
+            let mut queued = f.perception(56);
+            queued.is_directly_addressed = urgent;
+            f.perception_tx.send(queued).unwrap();
+            owned_pipeline_wait(|| f.telemetry.perceptions_offered.load(Ordering::SeqCst) == 2)
+                .await;
+            assert!(!f.activity.lock().unwrap().contains_key(&f.bound_agent()));
+            release_tx.send(()).unwrap();
+            owned_pipeline_wait(|| f.telemetry.preparations_processed.load(Ordering::SeqCst) == 2)
+                .await;
+            assert_eq!(
+                f.selection_count(f.bound_agent()),
+                if urgent { 2 } else { 1 }
+            );
+            assert_eq!(
+                f.resolver.legacy.context_calls.load(Ordering::SeqCst),
+                if urgent { 2 } else { 1 }
+            );
+            let expected_tick = if urgent { 56 } else { 55 };
+            assert_eq!(
+                f.activity.lock().unwrap().get(&f.bound_agent()),
+                Some(&expected_tick)
+            );
+            assert_eq!(
+                f.telemetry.calls_skipped_rate_limit.load(Ordering::SeqCst),
+                if urgent { 0 } else { 1 }
+            );
+            assert_eq!(f.provider_calls.load(Ordering::SeqCst), 0);
+            assert!(f.store.get_all_events().unwrap().is_empty());
+            assert!(f
+                .store
+                .get_completion(&f.resolver.legacy.context.binding().request_id())
+                .unwrap()
+                .is_none());
+            f.stop().await;
+        }
+
+        #[tokio::test]
+        async fn queued_normal_rechecks_cooldown_after_slow_selection_context_failure() {
+            assert_queued_preparation_cooldown(false).await;
+        }
+
+        #[tokio::test]
+        async fn queued_urgent_preserves_bypass_after_slow_selection_context_failure() {
+            assert_queued_preparation_cooldown(true).await;
+        }
+
+        #[tokio::test]
+        async fn preparation_panic_publishes_terminal_unavailable_before_inflight_success() {
+            let (release_tx, release_rx) = mpsc::channel();
+            let barrier = Arc::new(OwnedPipelineBarrier {
+                entered: tokio::sync::Notify::new(),
+                release: Mutex::new(release_rx),
+                exited: AtomicBool::new(false),
+            });
+            let f = CooldownBridgeFixture::start_with_selection_barrier(
+                false,
+                false,
+                Some(Arc::clone(&barrier)),
+            )
+            .await;
+            let other = recovery_test_perception();
+            assert_ne!(other.agent_id, f.bound_agent());
+            f.send_selected(other).await;
+            f.wait_provider_calls(1).await;
+            f.perception_tx.send(f.perception(55)).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified())
+                .await
+                .unwrap();
+            // Closing the fixture callback channel injects a native preparation panic.
+            drop(release_tx);
+            owned_pipeline_wait(|| f.llm_unavailable.load(Ordering::Acquire)).await;
+            assert!(!*f.shutdown_tx.borrow(), "no daemon shutdown requested");
+            assert!(
+                !f.bridge.is_finished(),
+                "in-flight response still belongs to the bridge"
+            );
+            f.release_response.notify_one();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(3), f.bridge)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err("llm_preparation_job_failed")
+            );
+            assert_eq!(f.telemetry.calls_success.load(Ordering::SeqCst), 1);
+            assert_eq!(f.provider_calls.load(Ordering::SeqCst), 1);
+            assert!(
+                f.llm_unavailable.load(Ordering::Acquire),
+                "in-flight circuit success must not revive a stopped bridge"
+            );
+            assert!(!*f.shutdown_tx.borrow());
+            f.provider_task.abort();
+        }
+
+        #[test]
+        fn rejected_operator_impulse_retry_preserves_admitted_urgency_not_new_frames() {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut lanes = OwnedBlockingLanes::spawn(1, 32).unwrap();
+            let mut dependencies =
+                recovery_lane_test_dependencies(directory.path(), &runtime, lanes.executor());
+            let resolver = Arc::new(CooldownTestResolver {
+                legacy: ExactValidationResolver::new(
+                    crate::workflow_api::model_work::test_context().into(),
+                ),
+                selections: Mutex::new(HashMap::new()),
+                fail_context: true,
+                selection_barrier: None,
+            });
+            dependencies.config.min_ticks_between_calls = 5;
+            dependencies.config.usage_v2_enabled = true;
+            dependencies.config.provider_usage_authority = Some(resolver.clone());
+            let dependencies = Arc::new(dependencies);
+            let mut perception = recovery_test_perception();
+            perception.agent_id = resolver.legacy.context.binding().agent_id();
+            let mut acked = HashMap::new();
+            let window = intake_preparation_window(&perception, None, &mut acked, Instant::now());
+            let first_dependencies = Arc::clone(&dependencies);
+            let first_perception = perception.clone();
+            let first_window = Arc::clone(&window);
+            let first = lanes
+                .executor()
+                .submit(Lane::Preparation, None, move |cancellation| {
+                    prepare_provider_call(
+                        &first_dependencies,
+                        first_perception,
+                        &cancellation,
+                        first_window,
+                    )
+                })
+                .unwrap();
+            let outcome = runtime.block_on(first.wait()).unwrap();
+            assert!(outcome.attempt_started);
+            assert!(outcome.call.is_none());
+            assert_eq!(
+                dependencies
+                    .activity
+                    .lock()
+                    .unwrap()
+                    .get(&perception.agent_id),
+                Some(&55)
+            );
+            perception.has_operator_impulse = true;
+            let admitted =
+                intake_preparation_window(&perception, Some(&window), &mut acked, Instant::now());
+            assert!(admitted.urgent_for(55));
+            let mut rejected = ProviderPreparationController::<ProviderPreparationOutcome>::new(
+                0,
+                1,
+                insert_prefer_heard,
+            );
+            let perception = rejected.offer(perception).unwrap_err();
+            let retries = Arc::new(AsyncMutex::new(HashMap::new()));
+            assert!(runtime.block_on(queue_bounded_retry(
+                &retries,
+                *perception,
+                Some(Arc::clone(&admitted))
+            )));
+            let retry = runtime.block_on(async {
+                retries
+                    .lock()
+                    .await
+                    .remove(&resolver.legacy.context.binding().agent_id())
+                    .unwrap()
+            });
+            let retry_window = intake_preparation_window(
+                &retry.perception,
+                retry.window.as_ref(),
+                &mut acked,
+                Instant::now(),
+            );
+            assert!(retry_window.urgent_for(55));
+            assert_eq!(
+                retry_window.enqueued_at_for(55),
+                admitted.enqueued_at_for(55)
+            );
+            assert_eq!(acked.get(&retry.perception.agent_id), Some(&55));
+            let mut new_frame = retry.perception.clone();
+            new_frame.tick = Tick(56);
+            assert!(!intake_preparation_window(
+                &new_frame,
+                Some(&retry_window),
+                &mut acked,
+                Instant::now()
+            )
+            .urgent_for(56));
+            let mut accepted = ProviderPreparationController::new(1, 1, insert_prefer_heard);
+            accepted.offer(retry.perception).unwrap();
+            let worker_dependencies = Arc::clone(&dependencies);
+            let (_, result) = runtime.block_on(async {
+                assert_eq!(
+                    accepted.pump(&lanes.executor(), None, move |perception, cancellation| {
+                        prepare_provider_call(
+                            &worker_dependencies,
+                            perception,
+                            &cancellation,
+                            Arc::clone(&retry_window),
+                        )
+                    }),
+                    1
+                );
+                accepted.next_result().await.unwrap()
+            });
+            let outcome = result.unwrap();
+            assert!(outcome.attempt_started);
+            assert!(outcome.call.is_none());
+            assert_eq!(
+                resolver.selections.lock().unwrap().get(&new_frame.agent_id),
+                Some(&2)
+            );
+            assert_eq!(resolver.legacy.context_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                dependencies
+                    .activity
+                    .lock()
+                    .unwrap()
+                    .get(&new_frame.agent_id),
+                Some(&55)
+            );
+            assert!(dependencies
+                .event_store
+                .get_all_events()
+                .unwrap()
+                .is_empty());
+            lanes.stop_and_join().unwrap();
+        }
+
+        fn assert_backpressure_preserves_first_intake_age(circuit_open: bool) {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut lanes = OwnedBlockingLanes::spawn(1, 32).unwrap();
+            let dependencies = Arc::new(recovery_lane_test_dependencies(
+                directory.path(),
+                &runtime,
+                lanes.executor(),
+            ));
+            let mut perception = recovery_test_perception();
+            perception.is_directly_addressed = true;
+            let mut acked = HashMap::new();
+            // Controlled scheduler age, not a fabricated model/grant deadline or speed claim.
+            let original_age =
+                Instant::now() - (UNBOUND_ADMISSION_MAX_AGE + Duration::from_secs(1));
+            let original = intake_preparation_window(&perception, None, &mut acked, original_age);
+            let retries = Arc::new(AsyncMutex::new(HashMap::new()));
+            if circuit_open {
+                let mut circuit = CircuitBreaker::new(
+                    1,
+                    Duration::from_secs(60),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                circuit.record_failure();
+                assert!(circuit.is_open());
+            } else {
+                let mut controller =
+                    ProviderPreparationController::<ProviderPreparationOutcome>::new(
+                        0,
+                        1,
+                        insert_prefer_heard,
+                    );
+                assert!(controller.offer(perception.clone()).is_err());
+            }
+            assert!(runtime.block_on(queue_bounded_retry(
+                &retries,
+                perception.clone(),
+                Some(original)
+            )));
+            let retry = runtime
+                .block_on(async { retries.lock().await.remove(&perception.agent_id).unwrap() });
+            let window = intake_preparation_window(
+                &retry.perception,
+                retry.window.as_ref(),
+                &mut acked,
+                Instant::now(),
+            );
+            assert_eq!(window.enqueued_at_for(perception.tick.0), original_age);
+            assert!(
+                window.enqueued_at_for(perception.tick.0).elapsed() > UNBOUND_ADMISSION_MAX_AGE
+            );
+            let worker_dependencies = Arc::clone(&dependencies);
+            let job = lanes
+                .executor()
+                .submit(Lane::Preparation, None, move |cancellation| {
+                    prepare_provider_call(
+                        &worker_dependencies,
+                        retry.perception,
+                        &cancellation,
+                        window,
+                    )
+                })
+                .unwrap();
+            let outcome = runtime.block_on(job.wait()).unwrap();
+            assert!(
+                outcome.call.is_none(),
+                "acceptance must not create a fresh ambient admission age"
+            );
+            assert!(dependencies
+                .event_store
+                .get_completion(&agent_runtime_request_id(&perception, None))
+                .unwrap()
+                .is_none());
+            assert!(dependencies
+                .event_store
+                .get_all_events()
+                .unwrap()
+                .is_empty());
+            lanes.stop_and_join().unwrap();
+        }
+
+        #[test]
+        fn circuit_retry_preserves_first_intake_age_before_acceptance() {
+            assert_backpressure_preserves_first_intake_age(true);
+        }
+
+        #[test]
+        fn preparation_overflow_retry_preserves_first_intake_age_before_acceptance() {
+            assert_backpressure_preserves_first_intake_age(false);
         }
 
         #[tokio::test]
@@ -6892,6 +8233,7 @@ pub mod bridge {
             let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let observed = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Notify::new());
+            let _release_on_drop = ReleaseOnDrop(Arc::clone(&release));
             let (gateway_url, provider_task) = start_mock_agent_provider(
                 Arc::clone(&provider_calls),
                 Some(Arc::clone(&observed)),
@@ -6957,13 +8299,16 @@ pub mod bridge {
             assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 1);
             for tick in 56..=58 {
                 let selections = resolver.selection_calls.load(Ordering::SeqCst);
+                let processed = telemetry.preparations_processed.load(Ordering::SeqCst);
                 let mut duplicate = recovery_test_perception();
                 duplicate.agent_id = expected.agent_id();
                 duplicate.is_directly_addressed = true;
                 duplicate.tick = Tick(tick);
                 perception_tx.send(duplicate).unwrap();
                 tokio::time::timeout(Duration::from_secs(2), async {
-                    while resolver.selection_calls.load(Ordering::SeqCst) <= selections {
+                    while resolver.selection_calls.load(Ordering::SeqCst) <= selections
+                        || telemetry.preparations_processed.load(Ordering::SeqCst) == processed
+                    {
                         tokio::task::yield_now().await;
                     }
                 })
@@ -6984,15 +8329,21 @@ pub mod bridge {
             .await
             .expect("review did not expire within its bound");
             release.notify_one();
-            tokio::time::timeout(Duration::from_secs(2), resolver.checked.notified())
-                .await
-                .expect("queued review was not checked after capacity became available");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while telemetry.providers_retired.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("expired queued provider job did not actually retire");
+            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 0);
+            let processed = telemetry.preparations_processed.load(Ordering::SeqCst);
             let mut retry = recovery_test_perception();
             retry.agent_id = expected.agent_id();
             retry.tick = Tick(60);
             perception_tx.send(retry).unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
-                while resolver.validation_calls.load(Ordering::SeqCst) < 2 {
+                while telemetry.preparations_processed.load(Ordering::SeqCst) == processed {
                     tokio::task::yield_now().await;
                 }
             })
@@ -7004,7 +8355,7 @@ pub mod bridge {
                 .expect("bridge did not drain")
                 .unwrap()
                 .unwrap();
-            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 0);
             assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 2);
             assert_eq!(
                 activity.lock().unwrap().get(&expected.agent_id()),
@@ -7070,10 +8421,22 @@ pub mod bridge {
                 .await
                 .expect("first usage append was not attempted");
             assert!(action_rx.try_recv().is_err());
-            let pending = first_store
-                .get_completion("agent-runtime-07-55")
-                .unwrap()
-                .unwrap();
+            // Notification occurs inside append; the owned worker still has to
+            // durably record that failure before this checkpoint is observable.
+            let pending = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let pending = first_store
+                        .get_completion("agent-runtime-07-55")
+                        .unwrap()
+                        .unwrap();
+                    if pending.attempt_count >= 1 {
+                        break pending;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first usage append failure was not durably recorded");
             assert_eq!(pending.status, "pending_usage");
             assert_eq!(pending.attempt_count, 1);
 
@@ -7171,11 +8534,12 @@ pub mod bridge {
             let (action_tx, _action_rx) = mpsc::channel();
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let activity_ticks = Arc::new(Mutex::new(HashMap::new()));
+            let telemetry = Arc::new(BridgeTelemetry::default());
             let bridge = tokio::spawn(run_llm_bridge_with_store(
                 config,
                 perception_rx,
                 action_tx,
-                Arc::new(BridgeTelemetry::default()),
+                Arc::clone(&telemetry),
                 state_store,
                 Arc::clone(&event_store),
                 Arc::new(AtomicBool::new(false)),
@@ -7201,7 +8565,7 @@ pub mod bridge {
             second.impulse_text = "continue".to_owned();
             perception_tx.send(second).unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
-                while activity_ticks.lock().unwrap().get(&AgentId(7)) != Some(&56) {
+                while telemetry.preparations_processed.load(Ordering::SeqCst) < 2 {
                     tokio::task::yield_now().await;
                 }
             })
@@ -7214,7 +8578,15 @@ pub mod bridge {
                 .expect("bridge did not shut down")
                 .unwrap()
                 .unwrap();
+            assert_eq!(telemetry.preparations_processed.load(Ordering::SeqCst), 2);
             assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+            let usage_count = event_store
+                .get_all_events()
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.event_type == "agent_llm_usage")
+                .count();
+            assert_eq!(usage_count, 1);
             let usage = event_store
                 .event_by_operation_id("llm_usage_company-provider-reservation-m0")
                 .unwrap()
@@ -7291,6 +8663,7 @@ pub mod bridge {
             let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let request_observed = Arc::new(tokio::sync::Notify::new());
             let release_response = Arc::new(tokio::sync::Notify::new());
+            let _release_on_drop = ReleaseOnDrop(Arc::clone(&release_response));
             let (gateway_url, provider_task) = start_mock_agent_provider(
                 Arc::clone(&provider_calls),
                 Some(Arc::clone(&request_observed)),
@@ -7377,6 +8750,7 @@ pub mod bridge {
             let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let request_observed = Arc::new(tokio::sync::Notify::new());
             let release_response = Arc::new(tokio::sync::Notify::new());
+            let _release_on_drop = ReleaseOnDrop(Arc::clone(&release_response));
             let (gateway_url, provider_task) = start_mock_agent_provider(
                 Arc::clone(&provider_calls),
                 Some(Arc::clone(&request_observed)),
@@ -7573,6 +8947,27 @@ pub mod bridge {
                 "Fingerprint IM-Flag muss auf 1 korrigiert werden, got: {}",
                 merged.synth_fingerprint
             );
+        }
+
+        #[test]
+        fn insert_prefer_heard_preserves_incoming_im_when_retaining_older_heard_frame() {
+            let mut batch = HashMap::new();
+            let chat = make_perception(16, "Thomas sagte: Hallo", false);
+            let original_tick = chat.tick;
+            let original_body = chat.body_text.clone();
+            insert_prefer_heard(&mut batch, chat);
+
+            let mut gaia = make_perception(16, "", true);
+            gaia.tick = Tick(original_tick.0 + 1);
+            insert_prefer_heard(&mut batch, gaia);
+
+            let merged = batch.get(&AgentId(16)).unwrap();
+            assert_eq!(merged.heard_text, "Thomas sagte: Hallo");
+            assert_eq!(merged.tick, original_tick);
+            assert_eq!(merged.body_text, original_body);
+            assert!(merged.has_operator_impulse);
+            assert!(merged.synth_fingerprint.contains("|IM:1"));
+            assert!(merged.synth_fingerprint.contains("|HR:1"));
         }
 
         #[test]

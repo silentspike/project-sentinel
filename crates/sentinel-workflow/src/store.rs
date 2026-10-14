@@ -200,6 +200,13 @@ struct GateRow {
 }
 
 impl WorkflowStore {
+    /// Drain at most 64 process-wide, payload-free read-cache diagnostic records.
+    /// Requires opt-in at process startup; unavailable/contended observation is empty.
+    /// Consumers perform output after this method returns, outside store locks.
+    pub fn take_read_cache_diagnostics(&self) -> Vec<String> {
+        read_cache::take_diagnostics()
+    }
+
     pub(crate) fn validated_read_snapshot<T: Clone + Serialize + Send + 'static>(
         &self,
         connection: &mut Connection,

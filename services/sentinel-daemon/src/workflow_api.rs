@@ -3331,6 +3331,8 @@ pub struct WorkflowHealthSnapshot {
     pub delivery_publication_pending: usize,
     pub collaboration_publication_pending: usize,
     pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub read_cache_diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5927,6 +5929,7 @@ impl WorkflowApi {
                 .unwrap_or(MAX_RECONCILE_BATCH),
             collaboration_publication_pending,
             last_error,
+            read_cache_diagnostics: self.store.take_read_cache_diagnostics(),
         }
     }
 }
@@ -8345,6 +8348,26 @@ mod tests {
         assert_eq!(response.status, 503);
         assert!(!api.health().ready);
         assert_eq!(api.health().status, "disabled");
+    }
+
+    #[test]
+    fn health_cache_diagnostics_are_optional_and_do_not_grant_readiness() {
+        let api = WorkflowApi::disabled().unwrap();
+        let mut health = api.health();
+        health.read_cache_diagnostics.clear();
+        let empty = serde_json::to_value(&health).unwrap();
+        assert!(empty.get("read_cache_diagnostics").is_none());
+        assert!(!health.ready);
+        health
+            .read_cache_diagnostics
+            .push("workflow_read_cache domain=fixture category=hit succeeded=true".to_owned());
+        let observed = serde_json::to_value(&health).unwrap();
+        assert_eq!(
+            observed["read_cache_diagnostics"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(observed["ready"], false);
+        assert_eq!(observed["status"], "disabled");
     }
 
     #[test]

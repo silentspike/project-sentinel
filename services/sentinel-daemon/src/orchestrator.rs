@@ -2319,6 +2319,7 @@ async fn drain_llm_actions_before_ecs_shutdown(
     bridge_timeout: Duration,
     action_forwarder_timeout: Duration,
     action_timeout: Duration,
+    shutdown_notification: Result<()>,
 ) -> Result<()> {
     // Quiesce the synchronous ECS thread as soon as shutdown starts. Until the
     // ordered barrier is armed below, it keeps running only Input-to-Persist
@@ -2326,23 +2327,38 @@ async fn drain_llm_actions_before_ecs_shutdown(
     // expensive post-schedule phase.
     shutdown.store(true, Ordering::SeqCst);
 
-    match tokio::time::timeout(bridge_timeout, &mut bridge_handle).await {
-        Ok(Ok(Ok(()))) => info!("LLM Bridge provider tasks drained"),
-        Ok(Ok(Err(reason))) => return Err(anyhow!("LLM Bridge shutdown failed: {reason}")),
-        Ok(Err(error)) => return Err(anyhow!("LLM Bridge task failed: {error}")),
-        Err(_) => {
-            bridge_handle.abort();
-            return Err(anyhow!("LLM Bridge shutdown join timed out"));
+    let bridge_error = match tokio::time::timeout(bridge_timeout, &mut bridge_handle).await {
+        Ok(Ok(Ok(()))) => {
+            info!("LLM Bridge provider tasks drained");
+            None
         }
-    }
+        Ok(Ok(Err(reason))) => Some(anyhow!("LLM Bridge shutdown failed: {reason}")),
+        Ok(Err(error)) => Some(anyhow!("LLM Bridge task failed: {error}")),
+        Err(_) => {
+            // Cancellation cannot retire synchronous store work. The bridge owns
+            // its cancellation/drain policy and returns only after actual joins.
+            error!("LLM Bridge shutdown join timed out; retaining worker ownership");
+            let result = bridge_handle.await;
+            if !matches!(result, Ok(Ok(()))) {
+                error!("LLM Bridge reported failure after its shutdown deadline");
+            }
+            Some(anyhow!("LLM Bridge shutdown join timed out"))
+        }
+    };
+    let mut terminal_error = bridge_error.or_else(|| shutdown_notification.err());
 
     match tokio::time::timeout(action_forwarder_timeout, &mut action_forwarder_handle).await {
         Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(error))) => return Err(error.context("LLM action forwarding failed")),
-        Ok(Err(error)) => return Err(anyhow!("LLM action forwarder failed: {error}")),
+        Ok(Ok(Err(error))) => {
+            terminal_error.get_or_insert(error.context("LLM action forwarding failed"));
+        }
+        Ok(Err(error)) => {
+            terminal_error.get_or_insert(anyhow!("LLM action forwarder failed: {error}"));
+        }
         Err(_) => {
-            action_forwarder_handle.abort();
-            return Err(anyhow!("LLM action forwarder drain timed out"));
+            error!("LLM action forwarder drain timed out; retaining worker ownership");
+            let _ = action_forwarder_handle.await;
+            terminal_error.get_or_insert(anyhow!("LLM action forwarder drain timed out"));
         }
     }
 
@@ -2358,7 +2374,7 @@ async fn drain_llm_actions_before_ecs_shutdown(
         .context("join ECS action-drain acknowledgement")?;
     drain_result.map_err(|error| anyhow!("ECS action drain was not acknowledged: {error}"))?;
     info!("LLM actions applied and persisted by ECS before shutdown");
-    Ok(())
+    terminal_error.map_or(Ok(()), Err)
 }
 
 fn collect_action_drain_requests(
@@ -3741,11 +3757,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- Graceful Shutdown --
     info!("Shutdown eingeleitet...");
     #[cfg(feature = "llm")]
-    crate::llm_bridge::bridge::stop_provider_admission(llm_provider_admission.as_ref());
-    #[cfg(feature = "llm")]
-    llm_bridge_shutdown_tx
+    let llm_shutdown_notification = llm_bridge_shutdown_tx
         .send(true)
-        .map_err(|_| anyhow!("LLM Bridge shutdown channel closed before shutdown"))?;
+        .map_err(|_| anyhow!("LLM Bridge shutdown channel closed before shutdown"));
     if let Some(handle) = operator_api_handle {
         handle.abort();
     }
@@ -3766,6 +3780,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         // Keep a bounded failure ceiling without budgeting for episode or
         // snapshot work that shutdown is required to skip.
         ECS_ACTION_DRAIN_TIMEOUT,
+        llm_shutdown_notification,
     )
     .await;
     shutdown.store(true, Ordering::SeqCst);
@@ -12467,6 +12482,121 @@ mod tests {
 
     #[cfg(feature = "llm")]
     #[tokio::test]
+    async fn llm_shutdown_timeout_retains_owner_and_persists_late_actions() {
+        failed_bridge_drain_fixture(true, false).await;
+    }
+
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn llm_shutdown_bridge_failure_still_persists_committed_actions() {
+        failed_bridge_drain_fixture(false, false).await;
+    }
+
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn llm_closed_shutdown_receiver_still_drains_committed_actions() {
+        failed_bridge_drain_fixture(false, true).await;
+    }
+
+    #[cfg(feature = "llm")]
+    async fn failed_bridge_drain_fixture(after_deadline: bool, notification_closed: bool) {
+        let (guarded_tx, guarded_rx) = mpsc::channel::<u8>();
+        let (ecs_tx, ecs_rx) = mpsc::channel::<u8>();
+        let forwarder = tokio::task::spawn_blocking(move || -> Result<()> {
+            while let Ok(value) = guarded_rx.recv() {
+                ecs_tx
+                    .send(value)
+                    .map_err(|_| anyhow!("test ECS receiver closed"))?;
+            }
+            Ok(())
+        });
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut release_tx = Some(release_tx);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let exited = Arc::new(AtomicBool::new(false));
+        let bridge_exited = Arc::clone(&exited);
+        let bridge = tokio::spawn(async move {
+            let _shutdown_receiver = shutdown_rx;
+            let _ = release_rx.await;
+            guarded_tx.send(7).unwrap();
+            bridge_exited.store(true, Ordering::SeqCst);
+            if after_deadline || notification_closed {
+                Ok(())
+            } else {
+                Err("injected bridge failure")
+            }
+        });
+        if notification_closed {
+            release_tx.take().unwrap().send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !bridge.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let notification = shutdown_tx
+            .send(true)
+            .map_err(|_| anyhow!("LLM Bridge shutdown channel closed before shutdown"));
+        assert_eq!(notification.is_err(), notification_closed);
+        let (drain_tx, drain_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let persisted = Arc::new(AtomicBool::new(false));
+        let ecs_persisted = Arc::clone(&persisted);
+        let ecs = std::thread::spawn(move || {
+            let acknowledgement = drain_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(ecs_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 7);
+            ecs_persisted.store(true, Ordering::SeqCst);
+            acknowledgement.send(()).unwrap();
+        });
+        let drain = tokio::spawn(async move {
+            drain_llm_actions_before_ecs_shutdown(
+                bridge,
+                forwarder,
+                &drain_tx,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                if after_deadline {
+                    Duration::from_millis(1)
+                } else {
+                    Duration::from_secs(1)
+                },
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                notification,
+            )
+            .await
+        });
+        if after_deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let premature_retirement =
+            after_deadline && (drain.is_finished() || exited.load(Ordering::SeqCst));
+        // Dropping the sender also wakes the fixture, including assertion failure paths.
+        if let Some(release_tx) = release_tx {
+            let _ = release_tx.send(());
+        }
+        let error = tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        ecs.join().unwrap();
+        assert!(!premature_retirement);
+        assert!(exited.load(Ordering::SeqCst));
+        assert!(persisted.load(Ordering::SeqCst));
+        let expected = if after_deadline {
+            "shutdown join timed out"
+        } else if notification_closed {
+            "shutdown channel closed before shutdown"
+        } else {
+            "shutdown failed: injected bridge failure"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[cfg(feature = "llm")]
+    #[tokio::test]
     async fn llm_shutdown_waits_for_forwarding_and_ecs_persist_barrier() {
         let (guarded_tx, guarded_rx) = mpsc::channel::<u8>();
         let (ecs_tx, ecs_rx) = mpsc::channel::<u8>();
@@ -12510,6 +12640,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
+            Ok(()),
         )
         .await
         .unwrap();
