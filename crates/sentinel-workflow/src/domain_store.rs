@@ -789,8 +789,12 @@ impl WorkflowStore {
         tenant_id.validate()?;
         validate_identifier(customer_id)?;
         let connection = self.connection.lock().map_err(|_| persistence())?;
-        Ok(read_sources::customer_projects_in_snapshot(&connection, tenant_id, customer_id)?
-            .into_iter().map(|value| value.project).collect())
+        Ok(
+            read_sources::customer_projects_in_snapshot(&connection, tenant_id, customer_id)?
+                .into_iter()
+                .map(|value| value.project)
+                .collect(),
+        )
     }
 
     pub fn collaboration_capacity_snapshot(

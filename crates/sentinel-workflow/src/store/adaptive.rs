@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 mod company_claim_tests;
 #[cfg(test)]
 mod health_inventory_tests;
-mod recovery_lineage;
 mod read_sources;
+mod recovery_lineage;
 pub use read_sources::AdaptiveModelPreparationReadSnapshot;
 #[cfg(test)]
 mod rejected_model_tests;
@@ -349,7 +349,11 @@ impl WorkflowStore {
                 authorize(&current_session.grant, current)?;
                 require_head(tx, &current_session)?;
                 let source = read_sources::working_memory_source_from_loaded(
-                    tx, &current_session, provider_version, effect_id, collected,
+                    tx,
+                    &current_session,
+                    provider_version,
+                    effect_id,
+                    collected,
                 )?;
                 scope.finish()?;
                 Ok(Some(source))
@@ -585,7 +589,9 @@ impl WorkflowStore {
             load_with_feedback(&tx, head.session_id)?.ok_or_else(corrupt_store)?;
         authorize(&session.grant, current)?;
         validate_head(&head, &session)?;
-        Ok(read_sources::recovery_feedback_from_loaded(&session, feedback))
+        Ok(read_sources::recovery_feedback_from_loaded(
+            &session, feedback,
+        ))
     }
 
     /// Reads exact durable adoption evidence; does not authorize or dispatch an effect.

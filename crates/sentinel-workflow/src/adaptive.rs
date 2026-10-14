@@ -242,7 +242,9 @@ impl ModelAdmissionReadFacts {
             return AdaptiveModelAdmissionV1::DeadlineExpired;
         }
         if let Some(margin) = self.dispatch_margin_ms {
-            if self.call_duration_ms.checked_add(margin)
+            if self
+                .call_duration_ms
+                .checked_add(margin)
                 .is_none_or(|minimum| self.deadline_ms - now_ms < minimum)
             {
                 return AdaptiveModelAdmissionV1::InsufficientSlack;
@@ -260,10 +262,12 @@ impl AdaptiveProgressReadFacts {
     pub fn model_window_exhausted_at(&self, now_ms: u64) -> bool {
         self.kind == AdaptiveProgressReadKind::ReadyForModel
             && now_ms >= self.admission.updated_at_ms
-            && matches!(self.admission.admission_at(now_ms),
+            && matches!(
+                self.admission.admission_at(now_ms),
                 AdaptiveModelAdmissionV1::CallsExhausted
                     | AdaptiveModelAdmissionV1::DeadlineExpired
-                    | AdaptiveModelAdmissionV1::InsufficientSlack)
+                    | AdaptiveModelAdmissionV1::InsufficientSlack
+            )
     }
 }
 
@@ -1311,14 +1315,19 @@ impl AdaptiveSessionV1 {
     pub fn progress_read_facts(&self) -> AdaptiveProgressReadFacts {
         let kind = match &self.cursor {
             AdaptiveCursorV1::ReadyForModel => AdaptiveProgressReadKind::ReadyForModel,
-            AdaptiveCursorV1::Blocked { reason_code } if reason_code == "no_private_observation" => {
+            AdaptiveCursorV1::Blocked { reason_code }
+                if reason_code == "no_private_observation" =>
+            {
                 AdaptiveProgressReadKind::NoPrivateObservation
             }
             AdaptiveCursorV1::ModelUnknown { .. } => AdaptiveProgressReadKind::ModelUnknown,
             AdaptiveCursorV1::ToolUnknown { .. } => AdaptiveProgressReadKind::ToolUnknown,
             _ => AdaptiveProgressReadKind::Other,
         };
-        AdaptiveProgressReadFacts { kind, admission: self.model_admission_read_facts() }
+        AdaptiveProgressReadFacts {
+            kind,
+            admission: self.model_admission_read_facts(),
+        }
     }
 
     fn model_admission_read_facts(&self) -> ModelAdmissionReadFacts {

@@ -69,9 +69,7 @@ fn expected_overview(api: &WorkflowApi) -> serde_json::Value {
             let rows = project
                 .work_items
                 .iter()
-                .map(|(id, work)| {
-                    serde_json::json!({"work_item_id": id, "state": work.state})
-                })
+                .map(|(id, work)| serde_json::json!({"work_item_id": id, "state": work.state}))
                 .collect::<Vec<_>>();
             serde_json::json!({
                 "project_id": project.project_id,
@@ -279,11 +277,8 @@ fn batched_customer_overview_unknown_outcomes_are_private_read_only_fixed_labels
 fn batched_customer_overview_warm_read_rejects_noncurrent_exact_head() {
     let temp = tempfile::tempdir().unwrap();
     let company = temp.path().join("company.sqlite");
-    let (api, ready) = adaptive_recovery::tests::fixture(
-        &company,
-        &temp.path().join("events.sqlite"),
-        false,
-    );
+    let (api, ready) =
+        adaptive_recovery::tests::fixture(&company, &temp.path().join("events.sqlite"), false);
     overview(&api, CUSTOMER_OVERVIEW_PATH);
     let connection = sentinel_limbo::rusqlite::Connection::open(&company).unwrap();
     assert_eq!(
@@ -304,7 +299,9 @@ fn batched_customer_overview_warm_read_rejects_noncurrent_exact_head() {
     assert_eq!(body["code"], "customer_progress_unavailable");
     assert_eq!(body["error"], "Customer progress is unavailable");
     assert!(!body.to_string().contains(company.to_str().unwrap()));
-    assert!(!body.to_string().contains(&ready.grant.session_id.to_string()));
+    assert!(!body
+        .to_string()
+        .contains(&ready.grant.session_id.to_string()));
 }
 
 #[test]
@@ -351,7 +348,10 @@ fn batched_customer_progress_final_comparison_rejects_project_changed_after_capt
         .store
         .company_projects_match_snapshot(std::slice::from_ref(&captured))
         .unwrap());
-    assert_eq!(overview(&api, CUSTOMER_OVERVIEW_PATH), expected_overview(&api));
+    assert_eq!(
+        overview(&api, CUSTOMER_OVERVIEW_PATH),
+        expected_overview(&api)
+    );
     assert_eq!(api.store.company_event_cursor().unwrap(), cursor);
 }
 
@@ -556,17 +556,19 @@ fn batched_adaptive_preparation_retains_exact_legacy_digest_and_rejects_mismatch
         let mut legacy = api.prepare_adaptive_model(&binding).unwrap();
         assert!(legacy.working_memory.is_some());
         legacy.working_memory = None;
-        let legacy_bytes = serde_json::to_vec(&ModelExecutionContext::Adaptive(Box::new(
-            legacy.clone(),
-        )))
-        .unwrap();
+        let legacy_bytes =
+            serde_json::to_vec(&ModelExecutionContext::Adaptive(Box::new(legacy.clone()))).unwrap();
         let expected_digest = hex_sha256(&legacy_bytes);
         let request_id = binding.request_id();
         let request_digest = "d".repeat(64);
         let authority = &binding.grant.authority;
         let owner = sentinel_common::StateTransferScope::for_agent(authority.agent_id.to_string());
         events
-            .reserve_llm_request(&request_id, &request_digest, &authority.agent_id.to_string())
+            .reserve_llm_request(
+                &request_id,
+                &request_digest,
+                &authority.agent_id.to_string(),
+            )
             .unwrap();
         let reservation = LlmModelReservationV1 {
             schema_version: 1,
@@ -583,10 +585,8 @@ fn batched_adaptive_preparation_retains_exact_legacy_digest_and_rejects_mismatch
                 expected_digest
             } else {
                 let modern = api.prepare_adaptive_model(&binding).unwrap();
-                let modern_bytes = serde_json::to_vec(&ModelExecutionContext::Adaptive(Box::new(
-                    modern,
-                )))
-                .unwrap();
+                let modern_bytes =
+                    serde_json::to_vec(&ModelExecutionContext::Adaptive(Box::new(modern))).unwrap();
                 let digest = hex_sha256(&modern_bytes);
                 assert_ne!(digest, expected_digest);
                 // Neither the legacy nor the modern envelope is this commitment.
@@ -616,7 +616,8 @@ fn batched_adaptive_preparation_retains_exact_legacy_digest_and_rejects_mismatch
                 let prepared = result.unwrap();
                 assert!(prepared.working_memory.is_none());
                 assert_eq!(
-                    serde_json::to_vec(&ModelExecutionContext::Adaptive(Box::new(prepared))).unwrap(),
+                    serde_json::to_vec(&ModelExecutionContext::Adaptive(Box::new(prepared)))
+                        .unwrap(),
                     legacy_bytes
                 );
             } else {

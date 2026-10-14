@@ -4663,7 +4663,10 @@ impl WorkflowApi {
             Err(error) => return self.customer_overview_read_error(principal, path, error),
         };
         let requests = snapshot.requests;
-        if !requests.iter().all(|value| value.customer_id == customer_id) {
+        if !requests
+            .iter()
+            .all(|value| value.customer_id == customer_id)
+        {
             return json_error(
                 403,
                 "authority_conflict",
@@ -4726,7 +4729,8 @@ impl WorkflowApi {
         let progress_facts = if progress_authorities.is_empty() {
             Ok(Vec::new())
         } else {
-            self.store.adaptive_progress_read_batch(&progress_authorities)
+            self.store
+                .adaptive_progress_read_batch(&progress_authorities)
         };
         let mut authority_results = authority_results.into_iter();
         let mut checked_projects = Vec::new();
@@ -4816,7 +4820,8 @@ impl WorkflowApi {
             checked_projects.push(project);
         }
         if !matches!(
-            self.store.company_projects_match_snapshot(&checked_projects),
+            self.store
+                .company_projects_match_snapshot(&checked_projects),
             Ok(true)
         ) {
             return json_error(
