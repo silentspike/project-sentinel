@@ -19,7 +19,7 @@ use crate::{
 
 pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 3;
 pub(crate) mod adaptive;
-pub use adaptive::AdaptiveProjectReadSnapshot;
+pub use adaptive::{AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot};
 mod read_cache;
 mod revisions;
 pub(crate) use revisions::require_completed_source;
