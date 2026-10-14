@@ -673,6 +673,14 @@ pub(crate) fn validate_funded_review_recovery(
                 return Err("funded never-reserved proof invalid");
             }
         }
+        sentinel_workflow::AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+            request_id,
+        } => {
+            // Protected dispatch-before-provider ordering proves NoIO, not reservation history.
+            if request_id != &old.request_id() || request.release_evidence.is_some() {
+                return Err("funded durable-provider-gate proof invalid");
+            }
+        }
         sentinel_workflow::AdaptiveFundedReviewNoIoV1::ReleasedBeforeIo {
             request_id,
             request_digest,
@@ -823,6 +831,14 @@ impl TestFundedRecoveryGuard {
         });
     }
 
+    pub(crate) fn undispatched_at_durable_provider_gate(&self) {
+        TEST_FUNDED_RECOVERY.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let fixture = &mut stack.iter_mut().find(|(id, _)| *id == self.id).unwrap().1;
+            funded_proof_tests::set_durable_provider_gate(fixture);
+        });
+    }
+
     pub(crate) fn release_before_io(&self, digest: &str, released_at: u64) {
         TEST_FUNDED_RECOVERY.with(|stack| {
             let mut stack = stack.borrow_mut();
@@ -883,6 +899,22 @@ mod funded_proof_tests {
         };
         documents.insert(path, bytes);
         reference
+    }
+
+    pub(super) fn set_durable_provider_gate(fixture: &mut Fixture) {
+        let old = fixture
+            .source
+            .calls
+            .iter()
+            .find(|call| call.grant.review_id == fixture.source.source.retired_review_id)
+            .unwrap();
+        let mut request: FundedReviewRequestProofV1 =
+            serde_json::from_slice(&fixture.documents[&fixture.proof.request_proof.path]).unwrap();
+        request.no_io = AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+            request_id: old.request_id(),
+        };
+        request.release_evidence = None;
+        fixture.proof.request_proof = document(&mut fixture.documents, "request", request);
     }
 
     pub(super) fn set_release(fixture: &mut Fixture, digest: &str, released_at: u64) {
@@ -1039,6 +1071,124 @@ mod funded_proof_tests {
                         .ok_or("synthetic protected document missing")
                 },
             )
+        }
+    }
+
+    #[test]
+    fn funded_proof_durable_provider_gate_requires_exact_request_without_release_claim() {
+        let mut f = fixture();
+        set_durable_provider_gate(&mut f);
+        let evidence = f.validate().unwrap();
+        assert_eq!(
+            evidence.no_io,
+            AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+                request_id: f.source.calls[0].request_id(),
+            }
+        );
+        let mut request: FundedReviewRequestProofV1 =
+            serde_json::from_slice(&f.documents[&f.proof.request_proof.path]).unwrap();
+        assert!(request.release_evidence.is_none());
+        request.no_io = AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+            request_id: "foreign-request".into(),
+        };
+        f.proof.request_proof = document(&mut f.documents, "request", &request);
+        assert!(f.validate().is_err());
+        request.no_io = evidence.no_io;
+        request.release_evidence = Some(f.proof.retired_review.clone());
+        f.proof.request_proof = document(&mut f.documents, "request", request);
+        assert!(
+            f.validate().is_err(),
+            "the durable gate must not imply release history"
+        );
+    }
+
+    #[test]
+    fn funded_proof_durable_provider_gate_preserves_historical_and_retirement_vetoes() {
+        let mut f = fixture();
+        set_durable_provider_gate(&mut f);
+        f.validate().unwrap();
+        for field in [
+            "missing_gate",
+            "changed_gate",
+            "missing_ordering",
+            "ordering",
+            "historical_binary",
+            "missing_serving",
+            "dispatch",
+            "defer",
+            "response",
+            "resolution",
+            "retry_schema",
+        ] {
+            let mut changed = f.clone();
+            match field {
+                "missing_gate" => {
+                    changed.documents.remove(&changed.proof.gate_evidence.path);
+                }
+                "changed_gate" => {
+                    let mut gate: serde_json::Value = serde_json::from_slice(
+                        &changed.documents[&changed.proof.gate_evidence.path],
+                    )
+                    .unwrap();
+                    gate["release"]["daemon_sha256"] = serde_json::json!("a".repeat(64));
+                    changed.proof.gate_evidence = document(&mut changed.documents, "gates", gate);
+                }
+                "missing_ordering" => {
+                    changed
+                        .documents
+                        .remove(&changed.proof.admission_ordering.path);
+                }
+                "ordering" => {
+                    let mut ordering: AdmissionOrderingEvidenceV1 = serde_json::from_slice(
+                        &changed.documents[&changed.proof.admission_ordering.path],
+                    )
+                    .unwrap();
+                    ordering.ordering = "provider-before-durable-claim".into();
+                    changed.proof.admission_ordering =
+                        document(&mut changed.documents, "ordering", ordering);
+                }
+                "historical_binary" => {
+                    let mut deployment: HistoricalAdmissionDeploymentV1 = serde_json::from_slice(
+                        &changed.documents[&changed.proof.historical_deployment.path],
+                    )
+                    .unwrap();
+                    deployment.daemon_binary_digest = "a".repeat(64);
+                    changed.proof.historical_deployment =
+                        document(&mut changed.documents, "deployment", deployment);
+                }
+                "missing_serving" => {
+                    let deployment: HistoricalAdmissionDeploymentV1 = serde_json::from_slice(
+                        &changed.documents[&changed.proof.historical_deployment.path],
+                    )
+                    .unwrap();
+                    changed
+                        .documents
+                        .remove(&deployment.gateway_serving_identity.path);
+                }
+                "dispatch" => {
+                    let old = &mut changed.source.calls[0];
+                    old.dispatch = Some(sentinel_workflow::RequestProviderDispatchV1 {
+                        request_id: old.request_id(),
+                        request_digest: "a".repeat(64),
+                        context_digest: old.context_digest().unwrap(),
+                        dispatched_at_unix_ms: old.grant_issued_at_unix_ms,
+                    });
+                }
+                "defer" => {
+                    changed.source.calls[0].decision = Some(
+                        sentinel_workflow::AdaptiveLeadershipReviewDecisionV1 {
+                            schema_version: 6,
+                            decision: sentinel_workflow::AdaptiveLeadershipReviewDecisionKindV1::DeferBudget {
+                                rationale: "synthetic real decision veto".into(), evidence_refs: vec![],
+                            },
+                        });
+                }
+                "response" => changed.source.calls[0].model_response_digest = Some("a".repeat(64)),
+                "resolution" => changed.source.calls[0].resolution_event_id = Some(Uuid::new_v4()),
+                "retry_schema" => changed.source.calls[0].grant.schema_version = 6,
+                _ => unreachable!(),
+            }
+            assert!(changed.validate().is_err(), "{field}");
         }
     }
 

@@ -78,6 +78,10 @@ pub enum AdaptiveFundedReviewNoIoV1 {
         release_digest: String,
         released_at_unix_ms: u64,
     },
+    /// Trusted durable dispatch-before-I/O gate evidence, not reservation history.
+    UndispatchedAtDurableProviderGate {
+        request_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -39,6 +39,116 @@ fn recovery_evidence(source: &crate::AdaptiveFundedReviewRecoveryVerificationSou
     })
 }
 
+#[test]
+fn funded_recovery_durable_gate_evidence_is_exact_immutable_and_normally_charged() {
+    let (f, request, at) = recovery_fixture();
+    let old = f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+        request.source.retired_review_id).unwrap().unwrap();
+    let old_bytes = serde_json::to_vec(&old).unwrap();
+    let original_session = session(&f);
+    let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, |source, request| {
+            let mut evidence = recovery_evidence(source, request)?;
+            evidence.no_io = crate::AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+                request_id: old.request_id(),
+            };
+            Ok(evidence)
+        }).unwrap().1;
+    let payload = serde_json::to_value(&receipt.evidence.no_io).unwrap();
+    assert_eq!(payload, serde_json::json!({
+        "UndispatchedAtDurableProviderGate": {"request_id": old.request_id()}
+    }));
+    assert_eq!(serde_json::from_value::<crate::AdaptiveFundedReviewNoIoV1>(payload).unwrap(),
+        receipt.evidence.no_io);
+    assert_eq!(session(&f), original_session);
+    let retained_old = f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+        old.grant.review_id).unwrap().unwrap();
+    assert_eq!(serde_json::to_vec(&retained_old).unwrap(), old_bytes);
+    assert!(retained_old.dispatch.is_none() && retained_old.decision.is_none()
+        && retained_old.model_response_digest.is_none() && retained_old.continuation.is_none()
+        && retained_old.resolution_event_id.is_none());
+    assert_eq!(receipt.bound_grant().unwrap().work_funding.as_ref().unwrap().binding.ordinal,
+        request.source.ordinal);
+    assert_eq!(f.store.adaptive_leadership_review_calls(&f.leader.tenant_id,
+        f.grant.session_id).unwrap().len(), usize::from(request.source.review_count) + 1);
+    let receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+    let authority = receipt.bound_grant().unwrap();
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert_eq!(serde_json::to_vec(&reopened.adaptive_funded_review_recovery(
+        &f.leader.tenant_id, &receipt.receipt_key).unwrap().unwrap()).unwrap(), receipt_bytes);
+    let (replayed, replay) = reopened.authorize_adaptive_funded_review_recovery(
+        &funding_operator(&f), &request, &f.grant, &f.context, request.expires_at_unix_ms + 1,
+        |_, _| panic!("historical replay must not reverify or manufacture reservation history")).unwrap();
+    assert!(replayed);
+    assert_eq!(serde_json::to_vec(&replay).unwrap(), receipt_bytes);
+    assert_eq!(replay.bound_grant().unwrap(), authority);
+    assert!(reopened.adaptive_funded_review_recovery_source(&funding_operator(&f),
+        &f.grant.project_id, f.grant.session_id, old.grant.review_id, at + 1).is_err());
+}
+
+#[test]
+fn funded_recovery_durable_gate_wrong_request_or_failed_verifier_writes_nothing() {
+    let (f, request, at) = recovery_fixture();
+    let before = rows(&f.store);
+    assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, |source, request| {
+            let mut evidence = recovery_evidence(source, request)?;
+            evidence.no_io = crate::AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+                request_id: "company-leadership-not-the-retired-review".into(),
+            };
+            Ok(evidence)
+        }).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, |_, _| Err(transition())).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(session(&f), f.context.source_session);
+    assert!(f.store.adaptive_funded_review_recovery(&f.leader.tenant_id,
+        &request.source.receipt_key().unwrap()).unwrap().is_none());
+}
+
+#[test]
+fn funded_recovery_durable_gate_serde_is_additive_and_old_verifiers_reject_it() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    enum PriorNoIo {
+        NeverReserved { request_id: String },
+        ReleasedBeforeIo {
+            request_id: String,
+            request_digest: String,
+            release_digest: String,
+            released_at_unix_ms: u64,
+        },
+    }
+    let request_id = "company-leadership-22222222-2222-4222-8222-222222222222";
+    for old in [
+        serde_json::json!({"NeverReserved": {"request_id": request_id}}),
+        serde_json::json!({"ReleasedBeforeIo": {
+            "request_id": request_id, "request_digest": "a".repeat(64),
+            "release_digest": "b".repeat(64), "released_at_unix_ms": 7
+        }}),
+    ] {
+        assert!(serde_json::from_value::<PriorNoIo>(old.clone()).is_ok());
+        let retained = serde_json::from_value::<crate::AdaptiveFundedReviewNoIoV1>(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(retained).unwrap(), old);
+    }
+    let new = serde_json::json!({"UndispatchedAtDurableProviderGate": {"request_id": request_id}});
+    assert!(serde_json::from_value::<crate::AdaptiveFundedReviewNoIoV1>(new.clone()).is_ok());
+    assert!(serde_json::from_value::<PriorNoIo>(new).is_err());
+    for invalid in [
+        serde_json::json!({"UndispatchedAtDurableProviderGate": {}}),
+        serde_json::json!({"UndispatchedAtDurableProviderGate": {
+            "request_id": request_id, "released_at_unix_ms": 7
+        }}),
+        serde_json::json!({"UndispatchedAtDurableProviderGate": {
+            "request_id": request_id, "release_evidence": null
+        }}),
+    ] {
+        assert!(serde_json::from_value::<crate::AdaptiveFundedReviewNoIoV1>(invalid).is_err());
+    }
+}
+
 fn fill_recovery_context_to_exact_limit(f: &mut Fixture) {
     use crate::{
         ADAPTIVE_LEADERSHIP_MAX_CATALOG_BYTES, ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES,

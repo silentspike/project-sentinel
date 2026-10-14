@@ -262,8 +262,14 @@ Protected historical deployment and admission-ordering evidence must establish
 the exact release serving that review and its durable dispatch-before-provider-I/O
 contract. Separate retired-review and request evidence must bind the same source,
 context and authority. An absent completion row alone is not sufficient. The
-supported dispositions are `NeverReserved` and `ReleasedBeforeIo`; the latter
-requires an exact protected release receipt before review retirement. Any live
+supported dispositions are `NeverReserved`, `ReleasedBeforeIo` and
+`UndispatchedAtDurableProviderGate`. The release disposition requires an exact
+protected release receipt before review retirement. The durable-gate disposition
+instead proves no external provider I/O through the actual historical serving
+configuration and committed-dispatch boundary; it deliberately asserts neither
+reservation history nor a release timestamp. A legacy reservation may have been
+deleted after a safe release, so absence cannot be promoted into NeverReserved.
+Any live
 request ownership, completion, usage or unresolved history vetoes issuance.
 
 The protected attestation is stored under
