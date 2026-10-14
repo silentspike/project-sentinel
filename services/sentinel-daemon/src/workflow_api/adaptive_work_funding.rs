@@ -152,8 +152,16 @@ impl WorkflowApi {
             .map_err(|_| "work funding receipt unavailable")?
             .ok_or("work funding receipt missing")?;
         let source = &receipt.request.source.resume_source;
+        let funded_schema = match call.grant.schema_version {
+            5 => call.grant.funded_review_recovery.is_none(),
+            6 => {
+                self.verify_funded_review_recovery_membership(call)?;
+                true
+            }
+            _ => false,
+        };
         if receipt != epoch.receipt
-            || call.grant.schema_version != 5
+            || !funded_schema
             || call.grant.resume_policy.is_some()
             || call.grant.recovery_epoch.is_some()
             || source.project_id != call.grant.project_id
@@ -268,7 +276,7 @@ impl WorkflowApi {
         Ok(())
     }
 
-    fn validate_work_funding_operator(
+    pub(super) fn validate_work_funding_operator(
         &self,
         operator: &BoundPrincipal,
     ) -> Result<(), WorkflowError> {

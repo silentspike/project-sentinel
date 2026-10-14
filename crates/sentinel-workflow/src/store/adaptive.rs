@@ -1586,7 +1586,7 @@ pub(crate) fn continue_adaptive_session_in_transaction(
     }
     WorkflowStore::require_recovery_epoch_review(tx, review)?;
     WorkflowStore::require_adaptive_budget_review_source(tx, review)?;
-    if matches!(review.grant.schema_version, 3 | 4) && authorization.local_adoption.is_some() {
+    if matches!(review.grant.schema_version, 3 | 4 | 6) && authorization.local_adoption.is_some() {
         return Err(authority_conflict());
     }
     let stored_review: AdaptiveLeadershipReviewCallV1 = read_company_entity(
@@ -1698,7 +1698,7 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         .ok_or_else(authority_conflict)?;
     let policy_allowance = match &review.grant.subject {
         Some(crate::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget })
-            if matches!(review.grant.schema_version, 3..=5) =>
+            if matches!(review.grant.schema_version, 3..=6) =>
         {
             &budget.root_allowance
         }
@@ -1746,7 +1746,7 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         || (review.grant.resume_policy.is_none()
             && authorization.work_funding.is_none()
             && fresh.max_calls > policy_allowance.grant.max_calls)
-        || (matches!(review.grant.schema_version, 3..=5)
+        || (matches!(review.grant.schema_version, 3..=6)
             && session
                 .model_calls
                 .checked_add(fresh.max_calls)
@@ -4053,6 +4053,7 @@ mod continuation_tests {
         let review_grant = AdaptiveLeadershipReviewGrantV1 {
             schema_version: 1,
             recovery_epoch: None,
+            funded_review_recovery: None,
             resume_policy: None,
             work_funding: None,
             subject: None,

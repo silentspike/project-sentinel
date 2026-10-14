@@ -12,6 +12,7 @@ const MANIFEST_FILE: &str = "/opt/sentinel/release-manifest.json";
 const GATEWAY_FILE: &str = "/opt/sentinel/bin/cortex-gateway";
 const DAEMON_FILE: &str = "/opt/sentinel/bin/sentinel-daemon";
 const ADMISSION_REPAIR_DIRECTORY: &str = "/etc/sentinel/adaptive-admission-repair";
+const FUNDED_RECOVERY_DIRECTORY: &str = "/etc/sentinel/adaptive-funded-review-recovery";
 const MAX_EVIDENCE_BYTES: u64 = 256 * 1024;
 const MAX_GATEWAY_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -434,6 +435,754 @@ pub(crate) fn validate_admission_repair(
 
 /// File-only verifier: safe inside the WorkflowStore issuance transaction.
 /// It never acquires EventStore or reconstructs a provider effect from absence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FundedReviewRecoveryAttestationV1 {
+    pub schema_version: u16,
+    pub purpose: String,
+    pub source_digest: String,
+    pub release: AdaptiveRecoveryReleaseV1,
+    pub daemon_binary_digest: String,
+    pub historical_deployment: ProtectedRepairEvidenceV1,
+    pub admission_ordering: ProtectedRepairEvidenceV1,
+    pub retired_review: ProtectedRepairEvidenceV1,
+    pub request_proof: ProtectedRepairEvidenceV1,
+    pub gate_evidence: ProtectedRepairEvidenceV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FundedReviewRequestProofV1 {
+    pub schema_version: u16,
+    pub purpose: String,
+    pub source_digest: String,
+    pub retired_call_digest: String,
+    pub authority_digest: String,
+    pub context_digest: String,
+    pub no_io: sentinel_workflow::AdaptiveFundedReviewNoIoV1,
+    pub release_evidence: Option<ProtectedRepairEvidenceV1>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FundedReviewReleaseEvidenceV1 {
+    schema_version: u16,
+    purpose: String,
+    request_id: String,
+    request_digest: String,
+    released_at_unix_ms: u64,
+    provider_started: bool,
+}
+
+pub(crate) fn validate_funded_review_recovery(
+    bytes: &[u8],
+    manifest: &[u8],
+    gateway: &str,
+    daemon: &str,
+    source: &sentinel_workflow::AdaptiveFundedReviewRecoveryVerificationSourceV1,
+    loader: impl Fn(&ProtectedRepairEvidenceV1) -> Result<Vec<u8>, &'static str>,
+) -> Result<sentinel_workflow::AdaptiveFundedReviewRecoveryEvidenceV1, &'static str> {
+    let read = |reference: &ProtectedRepairEvidenceV1| {
+        if !reference.path.is_absolute() || !is_digest(&reference.digest) {
+            return Err("funded recovery reference invalid");
+        }
+        let bytes = loader(reference)?;
+        if bytes.is_empty()
+            || bytes.len() as u64 > MAX_EVIDENCE_BYTES
+            || format!("{:x}", Sha256::digest(&bytes)) != reference.digest
+        {
+            return Err("funded recovery referenced bytes changed");
+        }
+        Ok(bytes)
+    };
+    let proof: FundedReviewRecoveryAttestationV1 =
+        serde_json::from_slice(bytes).map_err(|_| "funded recovery attestation invalid")?;
+    let old = source
+        .calls
+        .iter()
+        .find(|call| call.grant.review_id == source.source.retired_review_id)
+        .ok_or("funded recovery retired review missing")?;
+    let source_digest = source
+        .source
+        .canonical_digest()
+        .map_err(|_| "funded recovery source invalid")?;
+    let epoch = old
+        .grant
+        .work_funding
+        .as_ref()
+        .ok_or("funded recovery epoch missing")?;
+    if proof.schema_version != 1
+        || proof.purpose != "adaptive-funded-undispatched-review-recovery"
+        || proof.source_digest != source_digest
+        || !is_digest(daemon)
+        || !is_digest(gateway)
+        || proof.daemon_binary_digest != daemon
+        || proof.release.gateway_binary_digest != gateway
+        || old.grant.schema_version != 5
+        || old.grant.funded_review_recovery.is_some()
+        || epoch.receipt != *source.funding
+        || old.context.source_project != *source.project
+        || old.context.source_session != *source.session
+        || old.dispatch.is_some()
+        || old.decision.is_some()
+        || old.continuation.is_some()
+        || old.model_response_digest.is_some()
+        || old.resolution_event_id.is_some()
+        || old
+            .retired_at_unix_ms
+            .is_none_or(|at| at < old.grant.expires_at_unix_ms)
+    {
+        return Err("funded recovery attestation binding invalid");
+    }
+    proof
+        .release
+        .validate()
+        .map_err(|_| "funded recovery release invalid")?;
+    let installed: InstalledManifest =
+        serde_json::from_slice(manifest).map_err(|_| "funded recovery manifest invalid")?;
+    if installed.version != "1.0"
+        || installed.created_at.is_empty()
+        || installed.artifacts.is_empty()
+        || installed.artifacts.len() > 4096
+        || installed.git_sha != proof.release.source_git_sha
+        || format!("{:x}", Sha256::digest(manifest)) != proof.release.release_manifest_digest
+    {
+        return Err("funded recovery installed release mismatch");
+    }
+    require_manifest_binary(
+        &installed,
+        GATEWAY_FILE,
+        "cmd/cortex-gateway/cortex-gateway",
+        gateway,
+    )?;
+    require_manifest_binary(
+        &installed,
+        DAEMON_FILE,
+        "target/release/sentinel-daemon",
+        daemon,
+    )?;
+    let gate: serde_json::Value = serde_json::from_slice(&read(&proof.gate_evidence)?)
+        .map_err(|_| "funded recovery gates invalid")?;
+    if gate.get("purpose").and_then(|value| value.as_str()) != Some("exact-release-gate-evidence")
+        || gate.get("merged_commit").and_then(|value| value.as_str())
+            != Some(proof.release.source_git_sha.as_str())
+        || gate
+            .get("merged_tree_equals_reviewed_tree")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+        || gate.pointer("/ci/status").and_then(|value| value.as_str()) != Some("completed")
+        || gate
+            .pointer("/ci/conclusion")
+            .and_then(|value| value.as_str())
+            != Some("success")
+        || gate
+            .pointer("/release/result")
+            .and_then(|value| value.as_str())
+            != Some("PASS")
+        || gate
+            .pointer("/release/gateway_sha256")
+            .and_then(|value| value.as_str())
+            != Some(gateway)
+        || gate
+            .pointer("/release/daemon_sha256")
+            .and_then(|value| value.as_str())
+            != Some(daemon)
+    {
+        return Err("funded recovery gate binding invalid");
+    }
+    let deployment: HistoricalAdmissionDeploymentV1 =
+        serde_json::from_slice(&read(&proof.historical_deployment)?)
+            .map_err(|_| "funded historical deployment invalid")?;
+    deployment
+        .release
+        .validate()
+        .map_err(|_| "funded historical release invalid")?;
+    let retired_at = old.retired_at_unix_ms.ok_or("funded retirement missing")?;
+    if deployment.schema_version != 1
+        || deployment.purpose != "verified-historical-serving-release"
+        || !is_digest(&deployment.daemon_binary_digest)
+        || deployment.valid_from_unix_ms == 0
+        || deployment.valid_from_unix_ms > old.grant_issued_at_unix_ms
+        || deployment.valid_until_unix_ms < retired_at
+        || deployment.valid_from_unix_ms >= deployment.valid_until_unix_ms
+    {
+        return Err("funded historical serving interval unproven");
+    }
+    let historical_bytes = read(&deployment.manifest)?;
+    let historical: InstalledManifest = serde_json::from_slice(&historical_bytes)
+        .map_err(|_| "funded historical manifest invalid")?;
+    if historical.version != "1.0"
+        || historical.created_at.is_empty()
+        || historical.artifacts.is_empty()
+        || historical.artifacts.len() > 4096
+        || historical.git_sha != deployment.release.source_git_sha
+        || deployment.manifest.digest != deployment.release.release_manifest_digest
+    {
+        return Err("funded historical manifest binding invalid");
+    }
+    require_manifest_binary(
+        &historical,
+        GATEWAY_FILE,
+        "cmd/cortex-gateway/cortex-gateway",
+        &deployment.release.gateway_binary_digest,
+    )?;
+    require_manifest_binary(
+        &historical,
+        DAEMON_FILE,
+        "target/release/sentinel-daemon",
+        &deployment.daemon_binary_digest,
+    )?;
+    read(&deployment.gateway_serving_identity)?;
+    read(&deployment.daemon_serving_identity)?;
+    let ordering: AdmissionOrderingEvidenceV1 =
+        serde_json::from_slice(&read(&proof.admission_ordering)?)
+            .map_err(|_| "funded ordering evidence invalid")?;
+    if ordering.schema_version != 1
+        || ordering.purpose != "verified-leadership-admission-ordering"
+        || ordering.failed_release != deployment.release
+        || ordering.daemon_binary_digest != deployment.daemon_binary_digest
+        || ordering.ordering != "durable-leadership-dispatch-before-provider-io"
+        || ordering.fencing != "no-provider-io-after-rejected-or-retired-dispatch"
+        || ordering.valid_from_unix_ms == 0
+        || ordering.valid_from_unix_ms > old.grant_issued_at_unix_ms
+        || ordering.valid_until_unix_ms < retired_at
+        || ordering.valid_from_unix_ms >= ordering.valid_until_unix_ms
+    {
+        return Err("funded historical admission ordering unproven");
+    }
+    read(&ordering.source_evidence)?;
+    let retired: RetiredAdmissionEvidenceV1 = serde_json::from_slice(&read(&proof.retired_review)?)
+        .map_err(|_| "funded retired evidence invalid")?;
+    if retired != retired_admission_evidence(old)? {
+        return Err("funded retired evidence changed");
+    }
+    let request: FundedReviewRequestProofV1 = serde_json::from_slice(&read(&proof.request_proof)?)
+        .map_err(|_| "funded request proof invalid")?;
+    if request.schema_version != 1
+        || request.purpose != "verified-funded-review-no-io"
+        || request.source_digest != source_digest
+        || request.retired_call_digest != retired.retired_call_digest
+        || request.authority_digest != retired.authority_digest
+        || request.context_digest != retired.context_digest
+    {
+        return Err("funded request proof binding invalid");
+    }
+    match &request.no_io {
+        sentinel_workflow::AdaptiveFundedReviewNoIoV1::NeverReserved { request_id } => {
+            if request_id != &old.request_id() || request.release_evidence.is_some() {
+                return Err("funded never-reserved proof invalid");
+            }
+        }
+        sentinel_workflow::AdaptiveFundedReviewNoIoV1::ReleasedBeforeIo {
+            request_id,
+            request_digest,
+            release_digest,
+            released_at_unix_ms,
+        } => {
+            let reference = request
+                .release_evidence
+                .as_ref()
+                .ok_or("funded release proof missing")?;
+            let release: FundedReviewReleaseEvidenceV1 = serde_json::from_slice(&read(reference)?)
+                .map_err(|_| "funded release evidence invalid")?;
+            if !is_digest(request_digest)
+                || !is_digest(release_digest)
+                || reference.digest != *release_digest
+                || release.schema_version != 1
+                || release.purpose != "verified-funded-review-release-before-io"
+                || request_id != &old.request_id()
+                || release.request_id != *request_id
+                || release.request_digest != *request_digest
+                || release.released_at_unix_ms != *released_at_unix_ms
+                || release.provider_started
+                || *released_at_unix_ms < old.grant_issued_at_unix_ms
+                || *released_at_unix_ms > retired_at
+            {
+                return Err("funded release-before-I/O proof invalid");
+            }
+        }
+    }
+    Ok(sentinel_workflow::AdaptiveFundedReviewRecoveryEvidenceV1 {
+        source_digest,
+        proof_digest: format!("{:x}", Sha256::digest(bytes)),
+        release: proof.release,
+        no_io: request.no_io,
+        verified_at_unix_ms: 0,
+    })
+}
+
+pub(crate) fn verified_current_funded_review_recovery(
+    source: &sentinel_workflow::AdaptiveFundedReviewRecoveryVerificationSourceV1,
+) -> Result<sentinel_workflow::AdaptiveFundedReviewRecoveryEvidenceV1, &'static str> {
+    #[cfg(test)]
+    if let Some(fixture) =
+        TEST_FUNDED_RECOVERY.with(|stack| stack.borrow().last().map(|(_, fixture)| fixture.clone()))
+    {
+        let mut value = validate_funded_review_recovery(
+            &serde_json::to_vec(&fixture.proof).map_err(|_| "funded test proof invalid")?,
+            &fixture.manifest,
+            &"b".repeat(64),
+            &"c".repeat(64),
+            source,
+            |reference| {
+                fixture
+                    .documents
+                    .get(&reference.path)
+                    .cloned()
+                    .ok_or("funded test document missing")
+            },
+        )?;
+        stamp_funded_evidence(&mut value)?;
+        return Ok(value);
+    }
+    let path = Path::new(FUNDED_RECOVERY_DIRECTORY).join(format!(
+        "{}.json",
+        source
+            .source
+            .receipt_key()
+            .map_err(|_| "funded recovery key invalid")?
+    ));
+    let proof = evidence_bytes(&path)?;
+    let manifest = evidence_bytes(Path::new(MANIFEST_FILE))?;
+    let gateway = gateway_digest()?;
+    let daemon = serving_binary_digest(Path::new(DAEMON_FILE), "sentinel-daemon.service")?;
+    let mut value = validate_funded_review_recovery(
+        &proof,
+        &manifest,
+        &gateway,
+        &daemon,
+        source,
+        referenced_evidence,
+    )?;
+    if evidence_bytes(&path)? != proof
+        || evidence_bytes(Path::new(MANIFEST_FILE))? != manifest
+        || gateway_digest()? != gateway
+        || serving_binary_digest(Path::new(DAEMON_FILE), "sentinel-daemon.service")? != daemon
+    {
+        return Err("funded recovery serving evidence changed");
+    }
+    stamp_funded_evidence(&mut value)?;
+    Ok(value)
+}
+
+fn stamp_funded_evidence(
+    evidence: &mut sentinel_workflow::AdaptiveFundedReviewRecoveryEvidenceV1,
+) -> Result<(), &'static str> {
+    let now = now_unix_ms();
+    if matches!(&evidence.no_io, sentinel_workflow::AdaptiveFundedReviewNoIoV1::ReleasedBeforeIo {
+        released_at_unix_ms, ..
+    } if *released_at_unix_ms > now)
+    {
+        return Err("funded release proof clock invalid");
+    }
+    evidence.verified_at_unix_ms = now;
+    Ok(())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_FUNDED_RECOVERY: std::cell::RefCell<Vec<(u64, funded_proof_tests::Fixture)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestFundedRecoveryGuard {
+    id: u64,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl TestFundedRecoveryGuard {
+    pub(crate) fn fixture(
+        source: &sentinel_workflow::AdaptiveFundedReviewRecoveryVerificationSourceV1,
+    ) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let copied = sentinel_workflow::AdaptiveFundedReviewRecoveryVerificationSourceV1 {
+            source: source.source.clone(),
+            project: source.project.clone(),
+            session: source.session.clone(),
+            funding: source.funding.clone(),
+            calls: source.calls.clone(),
+        };
+        TEST_FUNDED_RECOVERY.with(|stack| {
+            stack
+                .borrow_mut()
+                .push((id, funded_proof_tests::fixture_for(copied)))
+        });
+        Self {
+            id,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn reject(&self) {
+        TEST_FUNDED_RECOVERY.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let fixture = &mut stack.iter_mut().find(|(id, _)| *id == self.id).unwrap().1;
+            fixture.proof.source_digest = "f".repeat(64);
+        });
+    }
+
+    pub(crate) fn release_before_io(&self, digest: &str, released_at: u64) {
+        TEST_FUNDED_RECOVERY.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let fixture = &mut stack.iter_mut().find(|(id, _)| *id == self.id).unwrap().1;
+            funded_proof_tests::set_release(fixture, digest, released_at);
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestFundedRecoveryGuard {
+    fn drop(&mut self) {
+        TEST_FUNDED_RECOVERY.with(|stack| stack.borrow_mut().retain(|(id, _)| *id != self.id));
+    }
+}
+
+#[cfg(test)]
+mod funded_proof_tests {
+    use super::*;
+    use sentinel_workflow::{
+        AdaptiveFundedReviewNoIoV1, AdaptiveFundedReviewRecoveryVerificationSourceV1,
+    };
+
+    pub(super) struct Fixture {
+        pub(super) source: AdaptiveFundedReviewRecoveryVerificationSourceV1,
+        pub(super) proof: FundedReviewRecoveryAttestationV1,
+        pub(super) manifest: Vec<u8>,
+        pub(super) documents: HashMap<PathBuf, Vec<u8>>,
+    }
+
+    impl Clone for Fixture {
+        fn clone(&self) -> Self {
+            Self {
+                source: AdaptiveFundedReviewRecoveryVerificationSourceV1 {
+                    source: self.source.source.clone(),
+                    project: self.source.project.clone(),
+                    session: self.source.session.clone(),
+                    funding: self.source.funding.clone(),
+                    calls: self.source.calls.clone(),
+                },
+                proof: self.proof.clone(),
+                manifest: self.manifest.clone(),
+                documents: self.documents.clone(),
+            }
+        }
+    }
+
+    fn document(
+        documents: &mut HashMap<PathBuf, Vec<u8>>,
+        name: &str,
+        value: impl Serialize,
+    ) -> ProtectedRepairEvidenceV1 {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let path = Path::new("/protected/funded-test").join(name);
+        let reference = ProtectedRepairEvidenceV1 {
+            path: path.clone(),
+            digest: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        documents.insert(path, bytes);
+        reference
+    }
+
+    pub(super) fn set_release(fixture: &mut Fixture, digest: &str, released_at: u64) {
+        let old = fixture
+            .source
+            .calls
+            .iter()
+            .find(|call| call.grant.review_id == fixture.source.source.retired_review_id)
+            .unwrap();
+        let release = FundedReviewReleaseEvidenceV1 {
+            schema_version: 1,
+            purpose: "verified-funded-review-release-before-io".into(),
+            request_id: old.request_id(),
+            request_digest: digest.to_owned(),
+            released_at_unix_ms: released_at,
+            provider_started: false,
+        };
+        let reference = document(&mut fixture.documents, "release", release);
+        let mut request: FundedReviewRequestProofV1 =
+            serde_json::from_slice(&fixture.documents[&fixture.proof.request_proof.path]).unwrap();
+        request.no_io = AdaptiveFundedReviewNoIoV1::ReleasedBeforeIo {
+            request_id: old.request_id(),
+            request_digest: digest.to_owned(),
+            release_digest: reference.digest.clone(),
+            released_at_unix_ms: released_at,
+        };
+        request.release_evidence = Some(reference);
+        fixture.proof.request_proof = document(&mut fixture.documents, "request", request);
+    }
+
+    fn manifest(commit: &str, gateway: &str, daemon: &str) -> serde_json::Value {
+        serde_json::json!({"version":"1.0", "created_at":"synthetic", "git_sha":commit, "artifacts":[
+            {"source":"cmd/cortex-gateway/cortex-gateway", "path":GATEWAY_FILE, "type":"binary", "sha256":gateway},
+            {"source":"target/release/sentinel-daemon", "path":DAEMON_FILE, "type":"binary", "sha256":daemon}
+        ]})
+    }
+
+    fn fixture() -> Fixture {
+        fixture_for(super::super::funded_review_recovery::tests::source_fixture())
+    }
+
+    pub(super) fn fixture_for(source: AdaptiveFundedReviewRecoveryVerificationSourceV1) -> Fixture {
+        let old = &source.calls[0];
+        let source_digest = source.source.canonical_digest().unwrap();
+        let gateway = "b".repeat(64);
+        let daemon = "c".repeat(64);
+        let bytes = serde_json::to_vec(&manifest(&"a".repeat(40), &gateway, &daemon)).unwrap();
+        let release = AdaptiveRecoveryReleaseV1 {
+            schema_version: 1,
+            source_git_sha: "a".repeat(40),
+            release_manifest_digest: format!("{:x}", Sha256::digest(&bytes)),
+            gateway_binary_digest: gateway.clone(),
+        };
+        let mut documents = HashMap::new();
+        let historical_manifest = document(
+            &mut documents,
+            "manifest",
+            manifest(&"d".repeat(40), &"e".repeat(64), &"f".repeat(64)),
+        );
+        let historical_release = AdaptiveRecoveryReleaseV1 {
+            schema_version: 1,
+            source_git_sha: "d".repeat(40),
+            release_manifest_digest: historical_manifest.digest.clone(),
+            gateway_binary_digest: "e".repeat(64),
+        };
+        let serving = document(
+            &mut documents,
+            "serving",
+            serde_json::json!({"synthetic":"protected producer serving record"}),
+        );
+        let deployment = HistoricalAdmissionDeploymentV1 {
+            schema_version: 1,
+            purpose: "verified-historical-serving-release".into(),
+            release: historical_release.clone(),
+            daemon_binary_digest: "f".repeat(64),
+            valid_from_unix_ms: old.grant_issued_at_unix_ms,
+            valid_until_unix_ms: old.retired_at_unix_ms.unwrap(),
+            manifest: historical_manifest,
+            gateway_serving_identity: serving.clone(),
+            daemon_serving_identity: serving.clone(),
+        };
+        let historical_deployment = document(&mut documents, "deployment", deployment);
+        let ordering = AdmissionOrderingEvidenceV1 {
+            schema_version: 1,
+            purpose: "verified-leadership-admission-ordering".into(),
+            failed_release: historical_release,
+            daemon_binary_digest: "f".repeat(64),
+            valid_from_unix_ms: old.grant_issued_at_unix_ms,
+            valid_until_unix_ms: old.retired_at_unix_ms.unwrap(),
+            ordering: "durable-leadership-dispatch-before-provider-io".into(),
+            fencing: "no-provider-io-after-rejected-or-retired-dispatch".into(),
+            source_evidence: serving,
+        };
+        let admission_ordering = document(&mut documents, "ordering", ordering);
+        let retired = retired_admission_evidence(old).unwrap();
+        let request = FundedReviewRequestProofV1 {
+            schema_version: 1,
+            purpose: "verified-funded-review-no-io".into(),
+            source_digest: source_digest.clone(),
+            retired_call_digest: retired.retired_call_digest.clone(),
+            authority_digest: retired.authority_digest.clone(),
+            context_digest: retired.context_digest.clone(),
+            no_io: AdaptiveFundedReviewNoIoV1::NeverReserved {
+                request_id: old.request_id(),
+            },
+            release_evidence: None,
+        };
+        let retired_review = document(&mut documents, "retired", retired);
+        let request_proof = document(&mut documents, "request", request);
+        let gate_evidence = document(
+            &mut documents,
+            "gates",
+            serde_json::json!({
+                "purpose":"exact-release-gate-evidence", "merged_commit":release.source_git_sha,
+                "merged_tree_equals_reviewed_tree":true, "ci":{"status":"completed", "conclusion":"success"},
+                "release":{"result":"PASS", "gateway_sha256":gateway, "daemon_sha256":daemon}
+            }),
+        );
+        let proof = FundedReviewRecoveryAttestationV1 {
+            schema_version: 1,
+            purpose: "adaptive-funded-undispatched-review-recovery".into(),
+            source_digest,
+            release,
+            daemon_binary_digest: daemon,
+            historical_deployment,
+            admission_ordering,
+            retired_review,
+            request_proof,
+            gate_evidence,
+        };
+        Fixture {
+            source,
+            proof,
+            manifest: bytes,
+            documents,
+        }
+    }
+
+    impl Fixture {
+        fn validate(
+            &self,
+        ) -> Result<sentinel_workflow::AdaptiveFundedReviewRecoveryEvidenceV1, &'static str>
+        {
+            validate_funded_review_recovery(
+                &serde_json::to_vec(&self.proof).unwrap(),
+                &self.manifest,
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &self.source,
+                |reference| {
+                    self.documents
+                        .get(&reference.path)
+                        .cloned()
+                        .ok_or("synthetic protected document missing")
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn funded_proof_requires_exact_typed_source_and_historical_ordering() {
+        let f = fixture();
+        let evidence = f.validate().unwrap();
+        assert_eq!(
+            evidence.source_digest,
+            f.source.source.canonical_digest().unwrap()
+        );
+        assert_eq!(
+            evidence.verified_at_unix_ms, 0,
+            "pure parser must not invent a trusted clock"
+        );
+        for field in ["source", "schema", "ordering", "daemon", "retirement"] {
+            let mut changed = f.clone();
+            match field {
+                "source" => changed.source.source.ordinal += 1,
+                "schema" => changed.source.calls[0].grant.schema_version = 6,
+                "ordering" => {
+                    changed
+                        .documents
+                        .remove(&changed.proof.admission_ordering.path);
+                }
+                "daemon" => changed.proof.daemon_binary_digest = "a".repeat(64),
+                "retirement" => changed.source.calls[0].retired_at_unix_ms = None,
+                _ => unreachable!(),
+            }
+            assert!(changed.validate().is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn funded_proof_rejects_redigested_wrong_request_and_ordering_semantics() {
+        let f = fixture();
+        let mut changed = f.clone();
+        let mut request: FundedReviewRequestProofV1 =
+            serde_json::from_slice(&changed.documents[&changed.proof.request_proof.path]).unwrap();
+        request.no_io = AdaptiveFundedReviewNoIoV1::NeverReserved {
+            request_id: "foreign-request".into(),
+        };
+        changed.proof.request_proof = document(&mut changed.documents, "request", request);
+        assert!(changed.validate().is_err());
+        let mut changed = f;
+        let mut ordering: AdmissionOrderingEvidenceV1 =
+            serde_json::from_slice(&changed.documents[&changed.proof.admission_ordering.path])
+                .unwrap();
+        ordering.ordering = "provider-before-durable-claim".into();
+        changed.proof.admission_ordering = document(&mut changed.documents, "ordering", ordering);
+        assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn funded_proof_rejects_digest_changes_and_relative_references() {
+        let mut f = fixture();
+        f.documents
+            .get_mut(&f.proof.retired_review.path)
+            .unwrap()
+            .push(b' ');
+        assert!(f.validate().is_err());
+        let mut f = fixture();
+        f.proof.request_proof.path = PathBuf::from("relative-request");
+        assert!(f.validate().is_err());
+    }
+
+    #[test]
+    fn funded_proof_release_requires_exact_protected_release_and_no_provider_start() {
+        let mut f = fixture();
+        let old = &f.source.calls[0];
+        let released_at = old.grant_issued_at_unix_ms + 1;
+        let release = FundedReviewReleaseEvidenceV1 {
+            schema_version: 1,
+            purpose: "verified-funded-review-release-before-io".into(),
+            request_id: old.request_id(),
+            request_digest: "a".repeat(64),
+            released_at_unix_ms: released_at,
+            provider_started: false,
+        };
+        let reference = document(&mut f.documents, "release", release);
+        let mut request: FundedReviewRequestProofV1 =
+            serde_json::from_slice(&f.documents[&f.proof.request_proof.path]).unwrap();
+        request.no_io = AdaptiveFundedReviewNoIoV1::ReleasedBeforeIo {
+            request_id: old.request_id(),
+            request_digest: "a".repeat(64),
+            release_digest: reference.digest.clone(),
+            released_at_unix_ms: released_at,
+        };
+        request.release_evidence = Some(reference);
+        f.proof.request_proof = document(&mut f.documents, "request", &request);
+        f.validate().unwrap();
+        let release = FundedReviewReleaseEvidenceV1 {
+            schema_version: 1,
+            purpose: "verified-funded-review-release-before-io".into(),
+            request_id: old.request_id(),
+            request_digest: "a".repeat(64),
+            released_at_unix_ms: released_at,
+            provider_started: true,
+        };
+        let reference = document(&mut f.documents, "release", release);
+        if let AdaptiveFundedReviewNoIoV1::ReleasedBeforeIo { release_digest, .. } =
+            &mut request.no_io
+        {
+            *release_digest = reference.digest.clone();
+        }
+        request.release_evidence = Some(reference);
+        f.proof.request_proof = document(&mut f.documents, "request", &request);
+        assert!(
+            f.validate().is_err(),
+            "redigesting cannot authorize a started provider"
+        );
+        request.release_evidence = None;
+        f.proof.request_proof = document(&mut f.documents, "request", request);
+        assert!(f.validate().is_err());
+    }
+
+    #[test]
+    fn funded_file_substitution_still_runs_exact_proof_validation() {
+        let f = fixture();
+        let guard = TestFundedRecoveryGuard::fixture(&f.source);
+        let verified = verified_current_funded_review_recovery(&f.source).unwrap();
+        assert_eq!(
+            verified.source_digest,
+            f.source.source.canonical_digest().unwrap()
+        );
+        assert!(verified.verified_at_unix_ms > 0);
+        guard.reject();
+        assert!(verified_current_funded_review_recovery(&f.source).is_err());
+    }
+
+    #[test]
+    fn funded_protected_file_rejects_unprotected_parent_and_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("proof.json");
+        fs::write(&path, b"synthetic evidence").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(protected_file(&path, MAX_EVIDENCE_BYTES).is_err());
+        let link = temp.path().join("proof-link.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(protected_file(&link, MAX_EVIDENCE_BYTES).is_err());
+    }
+}
+
 pub(crate) fn verified_current_admission_repair(
     source: &AdaptiveLeadershipAdmissionRepairSourceV1,
 ) -> Result<AdaptiveLeadershipAdmissionRepairEvidenceV1, &'static str> {

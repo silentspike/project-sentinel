@@ -1082,10 +1082,11 @@ impl WorkflowApi {
         let Some(events) = self.event_store.as_ref() else {
             return Ok(false);
         };
-        let Some(entry) = events
-            .get_llm_completion(&request_id)
-            .map_err(|_| "adaptive provider outcome unavailable")?
-        else {
+        let (outcome, _) = self.measure_health_read(
+            sentinel_workflow::WorkflowDiagnosticStage::PendingModelOutcome,
+            || events.get_llm_completion(&request_id),
+        );
+        let Some(entry) = outcome.map_err(|_| "adaptive provider outcome unavailable")? else {
             return Ok(false);
         };
         Ok(entry.request_id == request_id
@@ -1106,17 +1107,18 @@ impl WorkflowApi {
         if !self.model_work_enabled {
             return Ok(false);
         }
-        let (projects, sessions) =
-            self.store
-                .adaptive_health_inventory()
-                .map_err(|error| match error {
-                    sentinel_workflow::AdaptiveHealthReadError::Projects(_) => {
-                        "adaptive projects unavailable"
-                    }
-                    sentinel_workflow::AdaptiveHealthReadError::Sessions(_) => {
-                        "adaptive sessions unavailable"
-                    }
-                })?;
+        let (inventory, _) = self.measure_health_read(
+            sentinel_workflow::WorkflowDiagnosticStage::AdaptiveInventory,
+            || self.store.adaptive_health_inventory(),
+        );
+        let (projects, sessions) = inventory.map_err(|error| match error {
+            sentinel_workflow::AdaptiveHealthReadError::Projects(_) => {
+                "adaptive projects unavailable"
+            }
+            sentinel_workflow::AdaptiveHealthReadError::Sessions(_) => {
+                "adaptive sessions unavailable"
+            }
+        })?;
         let project_ids: BTreeSet<_> = projects
             .into_iter()
             .map(|project| (project.tenant_id, project.project_id))

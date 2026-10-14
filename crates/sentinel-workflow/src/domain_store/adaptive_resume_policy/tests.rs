@@ -346,6 +346,7 @@ fn review(
             budget: Box::new(budget),
         }),
         recovery_epoch: None,
+        funded_review_recovery: None,
         resume_policy: binding.map(Box::new),
         work_funding: None,
     };

@@ -1,5 +1,14 @@
 # Changelog
 
+- Add an explicit, single-use recovery contract for proven undispatched funded
+  leadership reviews, consuming existing review capacity without changing
+  employee spending or decisions. Bind typed recovery membership to preserved
+  history and protected no-I/O evidence, share actual provider admission and
+  live ownership with the operator boundary, and preserve independent Continue
+  or Defer decisions through a dedicated native output schema. Extend bounded
+  opt-in diagnostics and slow health-stage attribution without changing cache
+  limits, validation budgets or readiness authority (#856).
+
 - Move blocking provider preparation, recovery and execution lifetime onto
   bounded owned worker lanes; coalesce pending preparation per agent while
   retaining fresh dispatch authority, configured provider concurrency and

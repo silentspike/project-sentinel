@@ -89,6 +89,9 @@ var codexCLIAdmissionRepairSchema []byte
 //go:embed codex_cli_work_funding_schema.json
 var codexCLIWorkFundingSchema []byte
 
+//go:embed codex_cli_funded_review_recovery_schema.json
+var codexCLIFundedReviewRecoverySchema []byte
+
 type codexCLIUsage struct {
 	InputTokens           int64 `json:"input_tokens"`
 	CachedInputTokens     int64 `json:"cached_input_tokens"`
@@ -387,6 +390,8 @@ func codexCLILeadershipOutputSchema(req *LLMRequest) ([]byte, error) {
 		selected = codexCLIAdmissionRepairSchema
 	case "work_funding":
 		selected = codexCLIWorkFundingSchema
+	case "funded_undispatched_recovery":
+		selected = codexCLIFundedReviewRecoverySchema
 	}
 	if _, present := req.Metadata["leadership_evidence_refs"]; present {
 		refs, err := leadershipEvidenceRefs(req.Metadata)

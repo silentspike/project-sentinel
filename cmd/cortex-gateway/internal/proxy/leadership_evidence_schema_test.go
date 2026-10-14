@@ -87,6 +87,7 @@ func TestLeadershipEvidenceSchemaExactEnumsAndHistoricalBytes(t *testing.T) {
 		{"budget_window_exhausted", codexCLIBudgetLeadershipSchema},
 		{"admission_repair", codexCLIAdmissionRepairSchema},
 		{"work_funding", codexCLIWorkFundingSchema},
+		{"funded_undispatched_recovery", codexCLIFundedReviewRecoverySchema},
 	} {
 		t.Run(tc.kind, func(t *testing.T) {
 			req := leadershipReviewTestRequest()
@@ -155,7 +156,7 @@ func TestLeadershipEvidenceSchemaEmptyLegacySource(t *testing.T) {
 			t.Fatal("legacy empty evidence must permit only an empty array, without an empty enum")
 		}
 	}
-	for _, kind := range []string{"unknown_model", "blocked_continuation", "budget_window_exhausted", "admission_repair", "work_funding"} {
+	for _, kind := range []string{"unknown_model", "blocked_continuation", "budget_window_exhausted", "admission_repair", "work_funding", "funded_undispatched_recovery"} {
 		req.Metadata["leadership_review_kind"] = kind
 		if ok, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); ok || err == nil {
 			t.Fatalf("empty subject evidence admitted for %s", kind)

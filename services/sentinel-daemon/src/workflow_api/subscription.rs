@@ -239,7 +239,12 @@ impl WorkflowApi {
                 ..
             }) => Some("budget_window_exhausted"),
         };
-        let expected_kind = if grant.schema_version == 5 && grant.work_funding.is_some() {
+        let expected_kind = if grant.schema_version == 6
+            && grant.work_funding.is_some()
+            && grant.funded_review_recovery.is_some()
+        {
+            Some("funded_undispatched_recovery")
+        } else if grant.schema_version == 5 && grant.work_funding.is_some() {
             Some("work_funding")
         } else if grant.schema_version == 4 {
             Some("admission_repair")

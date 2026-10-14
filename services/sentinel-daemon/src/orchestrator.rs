@@ -3506,7 +3506,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     #[cfg(feature = "llm")]
     let (llm_bridge_shutdown_tx, llm_bridge_shutdown_rx) = tokio::sync::watch::channel(false);
     #[cfg(feature = "llm")]
-    let llm_provider_admission = Arc::new(RwLock::new(true));
+    let llm_provider_admission = workflow_api.provider_admission_fence();
     #[cfg(feature = "llm")]
     let gateway_request_timeout_ms = std::env::var("SENTINEL_LLM_BRIDGE_REQUEST_TIMEOUT_MS")
         .ok()
@@ -3572,6 +3572,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             usage_v2_enabled: std::env::var("SENTINEL_LLM_USAGE_V2_ENABLED")
                 .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             provider_usage_authority: Some(workflow_api.clone()),
+            active_provider_requests: Some(workflow_api.active_provider_requests()),
             ..Default::default()
         };
         let bridge_telemetry =
