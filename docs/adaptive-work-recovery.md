@@ -283,6 +283,15 @@ outer dispatch envelope remains version 5. An independent real Continue decision
 alone can authorize employee continuation. Defer remains a valid terminal result.
 Exact receipt replay neither changes that decision nor refreshes expiry.
 
+If the POST response is lost, `GET ?mode=funded_undispatched_retry&receipt_only=true`
+with the exact receipt key, operation ID, project, session and retired-review ID
+reads only the validated historical issuance. Current operator authentication
+and exact stored issuer identity remain mandatory. This lookup precedes fresh
+proof, funding, head and admission checks, so release changes or expiry do not
+hide a committed receipt. Missing, mismatched or corrupt records reject without
+falling through to a new draft; absence never authorizes resubmission. The
+response marks `historical_lookup: true` and creates no new authority or expiry.
+
 ## Validation And Dispatch Preparation
 
 Project discovery validates all current and historical subscription allowances

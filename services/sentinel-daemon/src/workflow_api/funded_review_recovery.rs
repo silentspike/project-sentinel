@@ -17,47 +17,74 @@ fn conflict() -> WorkflowHttpResponse {
     )
 }
 
-fn source_only_query(path: &str, method: &str) -> Result<bool, ()> {
+fn metadata_query_modes(path: &str, method: &str) -> Result<(bool, bool), ()> {
     let Some((_, query)) = path.split_once('?') else {
-        return Ok(false);
+        return Ok((false, false));
     };
     let mut seen = std::collections::HashSet::new();
     let mut source_only = false;
+    let mut receipt_only = false;
+    let mut unknown_parameter = false;
     // Match the explicit-query validation used by work-funding supersession.
     for pair in query.split('&') {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         if matches!(
             key,
-            "mode" | "project_id" | "session_id" | "retired_review_id" | "source_only"
+            "mode"
+                | "project_id"
+                | "session_id"
+                | "retired_review_id"
+                | "source_only"
+                | "receipt_only"
+                | "receipt_key"
+                | "operation_id"
         ) {
             if value.is_empty() || !seen.insert(key) {
                 return Err(());
             }
-            if key == "source_only" {
+            if matches!(key, "source_only" | "receipt_only") {
                 if method != "GET" || value != "true" {
                     return Err(());
                 }
-                source_only = true;
+                if key == "source_only" {
+                    source_only = true;
+                } else {
+                    receipt_only = true;
+                }
             }
+        } else {
+            unknown_parameter = true;
         }
     }
-    Ok(source_only)
+    if (source_only && receipt_only) || (receipt_only && unknown_parameter) {
+        return Err(());
+    }
+    Ok((source_only, receipt_only))
 }
 
 fn receipt(value: &AdaptiveFundedReviewRecoveryReceiptV1, replayed: bool) -> WorkflowHttpResponse {
-    json(
-        200,
-        &serde_json::json!({
-            "schema_version":1, "receipt_kind":"immutable_issuance", "replayed":replayed,
-            "receipt_key":value.receipt_key, "operation_id":value.request.operation_id,
-            "review_id":value.grant_template.review_id,
-            "retired_review_id":value.request.source.retired_review_id,
-            "expires_at_unix_ms":value.request.expires_at_unix_ms,
-            "ordinal":value.request.source.ordinal,
-            "authority":"one_funded_undispatched_recovery_review",
-            "decision_state":"not_asserted_by_issuance_receipt"
-        }),
-    )
+    receipt_response(value, replayed, false)
+}
+
+fn receipt_response(
+    value: &AdaptiveFundedReviewRecoveryReceiptV1,
+    replayed: bool,
+    historical_lookup: bool,
+) -> WorkflowHttpResponse {
+    let mut public = serde_json::json!({
+        "schema_version":1, "receipt_kind":"immutable_issuance", "replayed":replayed,
+        "receipt_key":value.receipt_key, "operation_id":value.request.operation_id,
+        "review_id":value.grant_template.review_id,
+        "retired_review_id":value.request.source.retired_review_id,
+        "expires_at_unix_ms":value.request.expires_at_unix_ms,
+        "ordinal":value.request.source.ordinal,
+        "authority":"one_funded_undispatched_recovery_review",
+        "decision_state":"not_asserted_by_issuance_receipt"
+    });
+    if historical_lookup {
+        public["historical_lookup"] = serde_json::json!(true);
+    }
+    json(200, &public)
 }
 
 fn template(
@@ -152,17 +179,60 @@ impl WorkflowApi {
                 false,
             );
         }
-        let source_only = match source_only_query(path, method) {
+        let (source_only, receipt_only) = match metadata_query_modes(path, method) {
             Ok(value) => value,
             Err(()) => {
                 return json_error(
                     400,
                     "invalid_input",
-                    "invalid or ambiguous source query",
+                    "invalid or ambiguous metadata query",
                     false,
                 )
             }
         };
+        if receipt_only {
+            let key = query_parameter(path, "receipt_key").filter(|key| key.len() <= 128);
+            let operation = query_parameter(path, "operation_id")
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil());
+            let project =
+                query_parameter(path, "project_id").and_then(|id| ProjectId::parse(id).ok());
+            let session = query_parameter(path, "session_id")
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil());
+            let retired = query_parameter(path, "retired_review_id")
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil());
+            let (Some(key), Some(operation), Some(project), Some(session), Some(retired)) =
+                (key, operation, project, session, retired)
+            else {
+                return json_error(
+                    400,
+                    "invalid_input",
+                    "exact receipt identity and original scope required",
+                    false,
+                );
+            };
+            // Historical lookup never falls through to draft/issuance, even on absence.
+            return match self
+                .store
+                .adaptive_funded_review_recovery(&operator.principal.tenant_id, key)
+            {
+                Ok(Some(prior))
+                    if prior.issuer_principal == operator.principal
+                        && prior.receipt_key == key
+                        && prior.request.operation_id == operation
+                        && prior.request.source.tenant_id == operator.principal.tenant_id
+                        && prior.request.source.project_id == project
+                        && prior.request.source.session_id == session
+                        && prior.request.source.retired_review_id == retired =>
+                {
+                    receipt_response(&prior, true, true)
+                }
+                Ok(_) => conflict(),
+                Err(error) => workflow_error(error),
+            };
+        }
         let supplied = if method == "POST" {
             match serde_json::from_slice::<AdaptiveFundedReviewRecoveryRequestV1>(body) {
                 Ok(request) if request.source.tenant_id == operator.principal.tenant_id => {
