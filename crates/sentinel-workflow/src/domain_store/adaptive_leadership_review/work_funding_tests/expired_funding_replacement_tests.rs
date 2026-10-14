@@ -1299,7 +1299,7 @@ fn expired_reviewed_funding_replacement_authentic_adoption_growth_cold_source_re
 fn expired_reviewed_funding_replacement_authentic_head131_review45_cold_source_reads() {
     // All counts arise from native commits: 27 windows, 17 retained Defers and one retired review.
     // The synthetic workload spends 26/25 calls; it is not the real 27/24 corpus.
-    let (f, old, now) = authentic_expired_growth(25, 17, 23, true);
+    let (mut f, old, now) = authentic_expired_growth(25, 17, 23, true);
     let head = session(&f);
     let expected = f.store.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id).unwrap();
     assert_eq!(head.version, 131);
@@ -1331,4 +1331,61 @@ fn expired_reviewed_funding_replacement_authentic_head131_review45_cold_source_r
     assert_eq!((receipt.binding(46).unwrap().limits.total_review_ceiling,
         receipt.binding(46).unwrap().limits.total_window_ceiling), (61, 43));
     authentic_growth_readbacks(&f, &replacement, &receipt, &head, &expected, now);
+
+    authentic_growth_checked("head131-review45-successor-context", || {
+        budget_context(&mut f, now, "post-replacement-native-dispatch");
+        Ok(())
+    });
+    bind(&mut f, &receipt, request.source.current_resume_source.base_review_count + 1);
+    let (pending, failures) = validation_scope::with_validation_failures(|| issue(&f, now));
+    assert!(pending.is_ok(), "native successor issuance failed: result={pending:?}; validation_failures={failures:?}");
+    assert!(failures.is_empty(), "successor issuance exhausted its unchanged budget: {failures:?}");
+    let pending = pending.unwrap();
+    assert_eq!(pending.grant.schema_version, 5);
+    assert_eq!(pending.version, 1);
+    assert_eq!(pending.context.source_session, head);
+    let epoch = pending.grant.work_funding.as_ref().unwrap();
+    assert_eq!(epoch.receipt, receipt);
+    assert_eq!(epoch.binding.ordinal, 46);
+    assert!(pending.dispatch.is_none() && pending.decision.is_none());
+
+    // Claim in a cold scope: selector/readback proofs must not mask claim retention.
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    let proposal = claim(&pending);
+    let claimed_at = now + 1;
+    assert!(claimed_at >= pending.updated_at_unix_ms && claimed_at < pending.grant.expires_at_unix_ms);
+    let (dispatched, failures) = validation_scope::with_validation_failures(|| {
+        reopened.claim_adaptive_leadership_review_call(&f.leader, &proposal, claimed_at)
+    });
+    assert!(dispatched.is_ok(), "head131/review46 native claim failed: result={dispatched:?}; validation_failures={failures:?}");
+    assert!(failures.is_empty(), "native claim exhausted its unchanged budget: {failures:?}");
+    let dispatched = dispatched.unwrap();
+    assert_eq!(dispatched.version, 2);
+    assert_eq!(dispatched.grant, pending.grant);
+    assert_eq!(dispatched.context, pending.context);
+    assert_eq!(dispatched.updated_at_unix_ms, claimed_at);
+    let dispatch = dispatched.dispatch.as_ref().unwrap();
+    assert_eq!(dispatch.request_id, proposal.request_id);
+    assert_eq!(dispatch.request_digest, proposal.request_digest);
+    assert_eq!(dispatch.context_digest, proposal.context_digest);
+    assert_eq!(dispatch.dispatched_at_unix_ms, claimed_at);
+    assert!(dispatched.decision.is_none() && dispatched.model_response_digest.is_none()
+        && dispatched.continuation.is_none() && dispatched.resolution_event_id.is_none());
+    assert_eq!(reopened.adaptive_leadership_review_call(&f.leader.tenant_id,
+        dispatched.grant.review_id).unwrap().as_ref(), Some(&dispatched));
+    let calls = reopened.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id).unwrap();
+    assert_eq!(calls.len(), 46);
+    for prior in &expected {
+        assert_eq!(calls.iter().find(|call| call.grant.review_id == prior.grant.review_id), Some(prior));
+    }
+    assert_eq!(session(&f), head);
+    let connection = reopened.connection.lock().unwrap();
+    let dispatch_events: i64 = connection.query_row(
+        "SELECT count(*) FROM company_events WHERE tenant_id=?1
+         AND event_type='adaptive_leadership_review_dispatched'
+         AND json_extract(payload,'$.grant.review_id')=?2",
+        params![f.leader.tenant_id.0, dispatched.grant.review_id.to_string()],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(dispatch_events, 1);
 }
