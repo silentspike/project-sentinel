@@ -2115,6 +2115,52 @@ mod tests {
     }
 
     #[test]
+    fn model_work_completion_admits_and_replays_while_recovery_intent_is_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let mut api = configured_test_api(&path);
+        let binding = assign_test_work(&api);
+        let context = api.prepare_model_work(&binding).unwrap().unwrap();
+        let id = format!("company-provider-{}", binding.reservation_id);
+        let digest = "a".repeat(64);
+        let completion = ModelWorkCompletion { context,
+            content: r#"{"schema_version":1,"tools":[{"kind":"write_file","path":"index.js","content":"console.log(42);","expected_sha256":null},{"kind":"package_artifact","artifact_kind":"source_tree","media_type":"application/vnd.sentinel.source-tree","paths":["index.js"]}]}"#.to_owned(),
+            admissible: true };
+        api.event_store = Some(sentinel_limbo::EventStore::open(":memory:").unwrap());
+        let events = api.event_store.as_ref().unwrap();
+        assert!(events.get_all_events().unwrap().is_empty());
+        assert!(api.store.pending_executions(10).unwrap().is_empty());
+        let active_before =
+            HashMap::from([(id.clone(), 1), ("other-provider-request".to_owned(), 2)]);
+        *api.active_provider_requests.lock().unwrap() = active_before.clone();
+
+        api.provider_recovery_pending.store(true, Ordering::Release);
+        assert!(matches!(
+            api.try_background_mutation_read(),
+            Err(TryLockError::WouldBlock)
+        ));
+        api.accept_model_work(&completion, &id, &digest).unwrap();
+        let first = api.store.pending_executions(10).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(*api.active_provider_requests.lock().unwrap(), active_before);
+        api.accept_model_work(&completion, &id, &digest).unwrap();
+        assert_eq!(api.store.pending_executions(10).unwrap(), first);
+        assert_eq!(*api.active_provider_requests.lock().unwrap(), active_before);
+        assert!(api.provider_recovery_pending.load(Ordering::Acquire));
+        assert!(events.get_all_events().unwrap().is_empty());
+        assert!(events.get_llm_completion(&id).unwrap().is_none());
+        assert!(events.poll_llm_provider_in_flight(10).unwrap().is_empty());
+        assert!(events.poll_llm_completions(10).unwrap().is_empty());
+        api.provider_recovery_pending
+            .store(false, Ordering::Release);
+        assert!(api.try_background_mutation_read().is_ok());
+
+        drop(api);
+        let api = configured_test_api(&path);
+        assert_eq!(api.store.pending_executions(10).unwrap(), first);
+    }
+
+    #[test]
     fn model_work_product_adapter_admits_once_and_rejects_changed_proposals_after_restart() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("company.sqlite");

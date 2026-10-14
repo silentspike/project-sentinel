@@ -266,10 +266,6 @@ impl WorkflowApi {
                 Err(error) => return workflow_error(error),
             }
         }
-        let guard = match self.provider_recovery_fence() {
-            Ok(guard) => guard,
-            Err(reason) => return json_error(503, "workflow_busy", reason, true),
-        };
         let (project_id, session_id, retired_id) = if let Some(request) = &supplied {
             (
                 request.source.project_id.clone(),
@@ -298,6 +294,10 @@ impl WorkflowApi {
                     )
                 }
             }
+        };
+        let guard = match self.provider_recovery_fence() {
+            Ok(guard) => guard,
+            Err(reason) => return json_error(503, "workflow_busy", reason, true),
         };
         let now = clock();
         let source = match self
@@ -669,6 +669,101 @@ fn validate_lifetime(
         return Err("funded retry lifetime exhausted");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod input_validation_tests {
+    use super::*;
+
+    const GET_SCOPE: &str = "?mode=funded_undispatched_retry&project_id=project-input&session_id=11111111-1111-4111-8111-111111111111&retired_review_id=22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn funded_get_invalid_input_precedes_recovery_intent() {
+        let (_temp, api, _) =
+            adaptive_resume_policy::tests::unreviewed_policy_root_with_limits(120_000, false, 4, 4);
+        let operator = api.principals.principal("operator").unwrap();
+        let scope_error = "project, session and retired review required";
+        let cases = [
+            ("?mode=funded_undispatched_retry".to_owned(), scope_error),
+            (
+                GET_SCOPE.replace("project-input", "bad/project"),
+                scope_error,
+            ),
+            (
+                GET_SCOPE.replace("11111111-1111-4111-8111-111111111111", "bad-uuid"),
+                scope_error,
+            ),
+            (
+                GET_SCOPE.replace(
+                    "11111111-1111-4111-8111-111111111111",
+                    &Uuid::nil().to_string(),
+                ),
+                scope_error,
+            ),
+            (
+                GET_SCOPE.replace(
+                    "22222222-2222-4222-8222-222222222222",
+                    &Uuid::nil().to_string(),
+                ),
+                scope_error,
+            ),
+            (
+                format!(
+                    "{}&source_only=true",
+                    GET_SCOPE.replace("project-input", "bad/project")
+                ),
+                scope_error,
+            ),
+            (
+                format!("{GET_SCOPE}&project_id=duplicate"),
+                "invalid or ambiguous metadata query",
+            ),
+            (
+                format!("{GET_SCOPE}&receipt_only=true"),
+                "exact receipt identity and original scope required",
+            ),
+        ];
+        for pending in [false, true] {
+            *api.provider_admission.write().unwrap() = false;
+            api.provider_recovery_pending
+                .store(pending, Ordering::Release);
+            for (path, message) in &cases {
+                let response = api.funded_review_recovery_http_with_checks(
+                    &operator,
+                    "GET",
+                    path,
+                    b"",
+                    || panic!("invalid input must not read the clock"),
+                    |_| panic!("invalid input must not verify recovery evidence"),
+                );
+                assert_eq!(response, json_error(400, "invalid_input", message, false));
+                assert_eq!(api.provider_recovery_is_pending(), pending);
+            }
+        }
+    }
+
+    #[test]
+    fn funded_get_valid_scope_keeps_source_and_draft_fenced() {
+        let (_temp, api, _) =
+            adaptive_resume_policy::tests::unreviewed_policy_root_with_limits(120_000, false, 4, 4);
+        let operator = api.principals.principal("operator").unwrap();
+        api.provider_recovery_pending.store(true, Ordering::Release);
+        for suffix in ["", "&source_only=true"] {
+            let response = api.funded_review_recovery_http_with_checks(
+                &operator,
+                "GET",
+                &format!("{GET_SCOPE}{suffix}"),
+                b"",
+                || panic!("busy recovery must not read the clock"),
+                |_| panic!("busy recovery must not verify recovery evidence"),
+            );
+            assert_eq!(
+                response,
+                json_error(503, "workflow_busy", "workflow recovery busy", true)
+            );
+            assert!(api.provider_recovery_is_pending());
+        }
+    }
 }
 
 #[cfg(test)]

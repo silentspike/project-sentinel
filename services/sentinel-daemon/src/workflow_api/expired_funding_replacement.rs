@@ -405,10 +405,6 @@ impl WorkflowApi {
                 Err(error) => return workflow_error(error),
             }
         }
-        let guard = match self.provider_recovery_fence() {
-            Ok(guard) => guard,
-            Err(reason) => return json_error(503, "workflow_busy", reason, true),
-        };
         let (project, session, old_digest) = if let Some(value) = &supplied {
             (
                 value.project_id.clone(),
@@ -427,6 +423,38 @@ impl WorkflowApi {
                     )
                 }
             }
+        };
+        // Parse input before requesting global intent; clocks and eligibility stay fenced.
+        let draft_parameters = if source_only {
+            None
+        } else if let Some(value) = &supplied {
+            Some((
+                value.operation_id,
+                value.reason_ref.clone(),
+                value.limits.clone(),
+            ))
+        } else {
+            let Some(operation) = query_parameter(path, "operation_id")
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+            else {
+                return json_error(400, "invalid_input", "new operation UUID required", false);
+            };
+            let (Some(reason), Some(limits)) =
+                (query_parameter(path, "reason_ref"), draft_limits(path))
+            else {
+                return json_error(
+                    400,
+                    "invalid_input",
+                    "explicit replacement reason and limits required",
+                    false,
+                );
+            };
+            Some((operation, reason.to_owned(), limits))
+        };
+        let guard = match self.provider_recovery_fence() {
+            Ok(guard) => guard,
+            Err(reason) => return json_error(503, "workflow_busy", reason, true),
         };
         let now = clock();
         if source_only {
@@ -559,30 +587,8 @@ impl WorkflowApi {
         {
             return conflict();
         }
-        let (operation, reason, limits) = if let Some(value) = &supplied {
-            (
-                value.operation_id,
-                value.reason_ref.clone(),
-                value.limits.clone(),
-            )
-        } else {
-            let Some(operation) = query_parameter(path, "operation_id")
-                .and_then(|id| Uuid::parse_str(id).ok())
-                .filter(|id| !id.is_nil())
-            else {
-                return json_error(400, "invalid_input", "new operation UUID required", false);
-            };
-            let (Some(reason), Some(limits)) =
-                (query_parameter(path, "reason_ref"), draft_limits(path))
-            else {
-                return json_error(
-                    400,
-                    "invalid_input",
-                    "explicit replacement reason and limits required",
-                    false,
-                );
-            };
-            (operation, reason.to_owned(), limits)
+        let Some((operation, reason, limits)) = draft_parameters else {
+            return conflict();
         };
         let draft = AdaptiveWorkFundingExpiredReplacementDraftV1 {
             old_funding_receipt_digest: old_digest.to_owned(),
@@ -788,6 +794,152 @@ fn expired_replacement_error() -> WorkflowError {
         false,
         "expired funding proof/authority changed",
     )
+}
+
+#[cfg(test)]
+mod input_validation_tests {
+    use super::*;
+
+    const LIMIT_PARAMETERS: &[(&str, &str)] = &[
+        ("additional_model_calls", "4"),
+        ("additional_tool_calls", "4"),
+        ("additional_reviews", "4"),
+        ("additional_windows", "4"),
+        ("max_window_ms", "300000"),
+        ("max_call_duration_ms", "120000"),
+        ("dispatch_margin_ms", "5000"),
+        ("expires_at_unix_ms", "1"),
+    ];
+
+    fn get_scope() -> String {
+        format!("?mode={EXPIRED_FUNDING_REPLACEMENT_MODE}&project_id=project-input&session_id=11111111-1111-4111-8111-111111111111&old_funding_receipt_digest={}", "a".repeat(64))
+    }
+
+    fn get_draft() -> String {
+        let mut path = format!(
+            "{}&operation_id=22222222-2222-4222-8222-222222222222&reason_ref=input-validation",
+            get_scope()
+        );
+        for (key, value) in LIMIT_PARAMETERS {
+            path.push_str(&format!("&{key}={value}"));
+        }
+        path
+    }
+
+    fn get(api: &WorkflowApi, path: &str) -> WorkflowHttpResponse {
+        api.expired_funding_replacement_http_with_checks(
+            &api.principals.principal("operator").unwrap(),
+            "GET",
+            path,
+            b"",
+            || panic!("rejected input or admission must not read the clock"),
+            |_| panic!("rejected input or admission must not verify recovery evidence"),
+        )
+    }
+
+    #[test]
+    fn replacement_get_invalid_input_precedes_recovery_intent() {
+        let (_temp, api, _) =
+            adaptive_resume_policy::tests::unreviewed_policy_root_with_limits(120_000, false, 4, 4);
+        let scope = get_scope();
+        let draft = get_draft();
+        let scope_error = "project/session/old funding digest required";
+        let cases = [
+            (
+                format!("?mode={EXPIRED_FUNDING_REPLACEMENT_MODE}"),
+                scope_error,
+            ),
+            (scope.replace("project-input", "bad/project"), scope_error),
+            (
+                scope.replace(
+                    "11111111-1111-4111-8111-111111111111",
+                    &Uuid::nil().to_string(),
+                ),
+                scope_error,
+            ),
+            (scope.replace(&"a".repeat(64), "bad-digest"), scope_error),
+            (
+                format!(
+                    "{}&source_only=true",
+                    scope.replace(&"a".repeat(64), "bad-digest")
+                ),
+                scope_error,
+            ),
+            (scope, "new operation UUID required"),
+            (
+                draft.replace("22222222-2222-4222-8222-222222222222", "bad-uuid"),
+                "new operation UUID required",
+            ),
+            (
+                draft.replace(
+                    "22222222-2222-4222-8222-222222222222",
+                    &Uuid::nil().to_string(),
+                ),
+                "new operation UUID required",
+            ),
+            (
+                draft.replace("&reason_ref=input-validation", ""),
+                "explicit replacement reason and limits required",
+            ),
+            (
+                format!("{draft}&project_id=duplicate"),
+                "invalid or ambiguous replacement query",
+            ),
+        ];
+        for pending in [false, true] {
+            *api.provider_admission.write().unwrap() = false;
+            api.provider_recovery_pending
+                .store(pending, Ordering::Release);
+            for (path, message) in &cases {
+                assert_eq!(
+                    get(&api, path),
+                    json_error(400, "invalid_input", message, false)
+                );
+                assert_eq!(api.provider_recovery_is_pending(), pending);
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_get_parses_every_numeric_limit_before_recovery_intent() {
+        let (_temp, api, _) =
+            adaptive_resume_policy::tests::unreviewed_policy_root_with_limits(120_000, false, 4, 4);
+        api.provider_recovery_pending.store(true, Ordering::Release);
+        let draft = get_draft();
+        for (key, value) in LIMIT_PARAMETERS {
+            let parameter = format!("&{key}={value}");
+            for path in [
+                draft.replace(&parameter, ""),
+                draft.replace(&parameter, &format!("&{key}=not-a-number")),
+                draft.replace(&parameter, &format!("&{key}=18446744073709551616")),
+            ] {
+                assert_eq!(
+                    get(&api, &path),
+                    json_error(
+                        400,
+                        "invalid_input",
+                        "explicit replacement reason and limits required",
+                        false,
+                    )
+                );
+                assert!(api.provider_recovery_is_pending());
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_get_valid_input_keeps_source_and_draft_fenced() {
+        let (_temp, api, _) =
+            adaptive_resume_policy::tests::unreviewed_policy_root_with_limits(120_000, false, 4, 4);
+        api.provider_recovery_pending.store(true, Ordering::Release);
+        for path in [format!("{}&source_only=true", get_scope()), get_draft()] {
+            assert_eq!(
+                get(&api, &path),
+                json_error(503, "workflow_busy", "workflow recovery busy", true)
+            );
+            assert!(api.provider_recovery_is_pending());
+        }
+    }
 }
 
 #[cfg(test)]
