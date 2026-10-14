@@ -14,6 +14,7 @@ use crate::digest::serialized_json_size;
 use crate::WorkflowError;
 
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const INPUT_CHUNK_BYTES: usize = 4096;
 const MAX_INPUT_ROWS: usize = 16_384;
 const MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESULTS: usize = 32;
@@ -258,6 +259,8 @@ enum InputValue {
     RealBits(u64),
     Text(Arc<[u8]>),
     Blob(Arc<[u8]>),
+    ChunkedText(Box<[Arc<[u8]>]>),
+    ChunkedBlob(Box<[Arc<[u8]>]>),
 }
 
 impl InputValue {
@@ -268,9 +271,71 @@ impl InputValue {
             (Self::RealBits(left), ValueRef::Real(right)) => *left == right.to_bits(),
             (Self::Text(left), ValueRef::Text(right))
             | (Self::Blob(left), ValueRef::Blob(right)) => left.as_ref() == right,
+            (Self::ChunkedText(left), ValueRef::Text(right))
+            | (Self::ChunkedBlob(left), ValueRef::Blob(right)) => chunked_bytes_match(left, right),
             _ => false,
         }
     }
+}
+
+fn chunked_bytes_match(chunks: &[Arc<[u8]>], value: &[u8]) -> bool {
+    let Some(last) = chunks.last() else {
+        return false;
+    };
+    let Some(length) = chunks
+        .len()
+        .checked_sub(1)
+        .and_then(|count| count.checked_mul(INPUT_CHUNK_BYTES))
+        .and_then(|prefix| prefix.checked_add(last.len()))
+    else {
+        return false;
+    };
+    chunks.len() > 1
+        && !last.is_empty()
+        && last.len() <= INPUT_CHUNK_BYTES
+        && value.len() == length
+        && chunks
+            .iter()
+            .zip(value.chunks(INPUT_CHUNK_BYTES))
+            .all(|(expected, actual)| expected.as_ref() == actual)
+}
+
+fn input_vec<T>(capacity: usize, bytes: &mut usize) -> Option<Vec<T>> {
+    charge_input(bytes, capacity.checked_mul(size_of::<T>())?)?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(capacity).ok()?;
+    // Do not retain an allocator's unexpectedly larger capacity without accounting.
+    if values.capacity() != capacity {
+        return None;
+    }
+    Some(values)
+}
+
+fn reserve_input_row<T>(values: &mut Vec<T>, bytes: &mut usize) -> Option<()> {
+    if values.len() < values.capacity() {
+        return Some(());
+    }
+    let capacity = values
+        .len()
+        .checked_add(1)?
+        .checked_next_power_of_two()?
+        .max(4);
+    let allocation = capacity.checked_mul(size_of::<T>())?;
+    // The old vector remains charged while the allocator grows into a new one.
+    if bytes.checked_add(allocation)? > MAX_INPUT_BYTES {
+        return None;
+    }
+    let growth = capacity
+        .checked_sub(values.capacity())?
+        .checked_mul(size_of::<T>())?;
+    charge_input(bytes, growth)?;
+    values
+        .try_reserve_exact(capacity.checked_sub(values.len())?)
+        .ok()?;
+    if values.capacity() != capacity {
+        return None;
+    }
+    Some(())
 }
 
 fn charge_input(bytes: &mut usize, additional: usize) -> Option<()> {
@@ -325,13 +390,40 @@ fn intern_bytes<S: BuildHasher>(
         if bytes.checked_add(payload)?.checked_add(growth)? > MAX_INPUT_BYTES {
             return None;
         }
+        // Charge the conservative new allocation before reserve, then release
+        // unused slack once its actual capacity is known. Old/new overlap was
+        // checked above, and payload headers are charged before Arc allocation.
+        charge_input(bytes, payload.checked_add(growth.checked_sub(previous)?)?)?;
         pool.try_reserve(1).ok()?;
+        let actual = interner_bytes(pool.capacity())?;
+        *bytes = bytes.checked_sub(growth.checked_sub(actual)?)?;
+    } else {
+        charge_input(bytes, payload)?;
     }
-    let growth = interner_bytes(pool.capacity())?.checked_sub(previous)?;
-    charge_input(bytes, payload.checked_add(growth)?)?;
     let owned: Arc<[u8]> = Arc::from(value);
     pool.insert(Arc::clone(&owned));
     Some(owned)
+}
+
+fn intern_chunks<S: BuildHasher>(
+    pool: &mut HashSet<Arc<[u8]>, S>,
+    value: &[u8],
+    bytes: &mut usize,
+) -> Option<Box<[Arc<[u8]>]>> {
+    if value.len() <= INPUT_CHUNK_BYTES {
+        return None;
+    }
+    let count = value
+        .len()
+        .checked_sub(1)?
+        .checked_div(INPUT_CHUNK_BYTES)?
+        .checked_add(1)?;
+    let mut chunks = input_vec(count, bytes)?;
+    for chunk in value.chunks(INPUT_CHUNK_BYTES) {
+        chunks.push(intern_bytes(pool, chunk, bytes)?);
+    }
+    // Exact reservation and a full vector avoid reallocation during boxing.
+    Some(chunks.into_boxed_slice())
 }
 
 #[derive(Debug)]
@@ -368,11 +460,11 @@ impl Inputs {
         if temporary != 0 || attached != 0 {
             return Ok(None);
         }
-        let mut names = Vec::with_capacity(TABLES.len());
-        let mut bytes = size_of::<Self>()
-            + size_of::<HashSet<Arc<[u8]>>>()
-            + size_of::<Vec<String>>()
-            + names.capacity() * size_of::<String>();
+        let mut bytes =
+            size_of::<Self>() + size_of::<HashSet<Arc<[u8]>>>() + size_of::<Vec<String>>();
+        let Some(mut names) = input_vec::<String>(TABLES.len(), &mut bytes) else {
+            return Ok(None);
+        };
         let mut statement = connection.prepare(
             "SELECT name,type,wr FROM pragma_table_list
             WHERE schema='main' AND name!='sqlite_schema' ORDER BY name",
@@ -403,12 +495,18 @@ impl Inputs {
             if charge_input(&mut bytes, name.capacity()).is_none() {
                 return Ok(None);
             }
+            if names.len() == names.capacity() {
+                return Ok(None);
+            }
             names.push(name);
         }
-        let mut tables = Vec::with_capacity(names.len() + 1);
-        if charge_input(&mut bytes, tables.capacity() * size_of::<InputTable>()).is_none() {
+        let Some(mut tables) = names
+            .len()
+            .checked_add(1)
+            .and_then(|capacity| input_vec::<InputTable>(capacity, &mut bytes))
+        else {
             return Ok(None);
-        }
+        };
         let mut pool = HashSet::new();
         let queries = std::iter::once(SCHEMA_QUERY.to_owned()).chain(
             names
@@ -427,14 +525,14 @@ impl Inputs {
             while let Some(row) = rows.next()? {
                 observe_row(&mut stats);
                 count += 1;
-                bytes = bytes.saturating_add(size_of::<Vec<InputValue>>());
-                if count > MAX_INPUT_ROWS || bytes > MAX_INPUT_BYTES {
+                if count > MAX_INPUT_ROWS
+                    || charge_input(&mut bytes, size_of::<Vec<InputValue>>()).is_none()
+                {
                     return Ok(None);
                 }
-                let mut cells = Vec::with_capacity(columns);
-                if charge_input(&mut bytes, cells.capacity() * size_of::<InputValue>()).is_none() {
+                let Some(mut cells) = input_vec::<InputValue>(columns, &mut bytes) else {
                     return Ok(None);
-                }
+                };
                 for column in 0..columns {
                     let value = row.get_ref(column)?;
                     observe_cell(&mut stats, value);
@@ -448,28 +546,40 @@ impl Inputs {
                             if std::str::from_utf8(value).is_err() {
                                 return Ok(None);
                             }
-                            let Some(value) = intern_bytes(&mut pool, value, &mut bytes) else {
-                                return Ok(None);
-                            };
-                            InputValue::Text(value)
+                            if value.len() > INPUT_CHUNK_BYTES {
+                                let Some(value) = intern_chunks(&mut pool, value, &mut bytes)
+                                else {
+                                    return Ok(None);
+                                };
+                                InputValue::ChunkedText(value)
+                            } else {
+                                let Some(value) = intern_bytes(&mut pool, value, &mut bytes) else {
+                                    return Ok(None);
+                                };
+                                InputValue::Text(value)
+                            }
                         }
                         ValueRef::Blob(value) => {
-                            let Some(value) = intern_bytes(&mut pool, value, &mut bytes) else {
-                                return Ok(None);
-                            };
-                            InputValue::Blob(value)
+                            if value.len() > INPUT_CHUNK_BYTES {
+                                let Some(value) = intern_chunks(&mut pool, value, &mut bytes)
+                                else {
+                                    return Ok(None);
+                                };
+                                InputValue::ChunkedBlob(value)
+                            } else {
+                                let Some(value) = intern_bytes(&mut pool, value, &mut bytes) else {
+                                    return Ok(None);
+                                };
+                                InputValue::Blob(value)
+                            }
                         }
                     };
                     cells.push(owned);
                 }
-                let previous_capacity = values.capacity();
-                values.push(cells);
-                bytes = bytes.saturating_add(
-                    (values.capacity() - previous_capacity) * size_of::<Vec<InputValue>>(),
-                );
-                if bytes > MAX_INPUT_BYTES {
+                if reserve_input_row(&mut values, &mut bytes).is_none() {
                     return Ok(None);
                 }
+                values.push(cells);
             }
             tables.push(InputTable {
                 query,
@@ -844,6 +954,34 @@ mod tests {
     use std::cell::Cell;
     use std::hash::{BuildHasherDefault, Hasher};
     use std::mem::size_of_val;
+
+    fn unique_chunk_payload(size: usize, row: u64) -> Vec<u8> {
+        let mut payload = vec![0_u8; size];
+        for (index, chunk) in payload.chunks_mut(INPUT_CHUNK_BYTES).enumerate() {
+            assert!(chunk.len() >= 16);
+            chunk[..8].copy_from_slice(&row.to_le_bytes());
+            chunk[8..16].copy_from_slice(&(index as u64).to_le_bytes());
+        }
+        payload
+    }
+
+    fn partially_shared_input_fixture() -> (Connection, Vec<u8>) {
+        let connection = database(":memory:");
+        let mut payload = vec![b'a'; MAX_INPUT_BYTES / 64];
+        payload[INPUT_CHUNK_BYTES..2 * INPUT_CHUNK_BYTES].fill(b'b');
+        payload[2 * INPUT_CHUNK_BYTES..3 * INPUT_CHUNK_BYTES].fill(b'c');
+        {
+            let mut insert = connection
+                .prepare("INSERT INTO workflow_work_items VALUES(?1)")
+                .unwrap();
+            for index in 0..65 {
+                *payload.last_mut().unwrap() = index;
+                insert.execute([payload.as_slice()]).unwrap();
+            }
+        }
+        *payload.last_mut().unwrap() = 0;
+        (connection, payload)
+    }
 
     #[test]
     fn disabled_diagnostic_drain_is_empty_and_does_not_consume_records_or_loss() {
@@ -1683,7 +1821,7 @@ mod tests {
 
     fn assert_index_only_damage_rejected(new_key: bool, failure: Option<crate::WorkflowErrorCode>) {
         for enabled in [false, true] {
-            assert_index_only_damage_rejected_with_diagnostics(new_key, failure, enabled);
+            assert_index_only_damage_rejected_with_diagnostics(new_key, failure, enabled, false);
         }
     }
 
@@ -1691,25 +1829,50 @@ mod tests {
         new_key: bool,
         failure: Option<crate::WorkflowErrorCode>,
         enabled: bool,
+        chunked: bool,
     ) {
         use std::io::{Seek, SeekFrom, Write};
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("store.sqlite");
         let mut connection = database(path.to_str().unwrap());
-        connection.execute_batch("INSERT INTO workflow_work_items SELECT value FROM workflow_work_items;
-            CREATE INDEX index_value ON workflow_work_items(value); PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        if chunked {
+            let payload = vec![b'a'; 2 * INPUT_CHUNK_BYTES + 17];
+            connection
+                .execute("UPDATE workflow_work_items SET value=?1", [payload])
+                .unwrap();
+        }
+        connection
+            .execute_batch("INSERT INTO workflow_work_items SELECT value FROM workflow_work_items")
+            .unwrap();
+        if chunked {
+            let mut payload = vec![b'a'; 2 * INPUT_CHUNK_BYTES + 17];
+            *payload.last_mut().unwrap() = b'b';
+            connection
+                .execute(
+                    "UPDATE workflow_work_items SET value=?1 WHERE rowid=2",
+                    [payload],
+                )
+                .unwrap();
+        }
+        connection.execute_batch("CREATE INDEX index_value ON workflow_work_items(value); PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         let mut cache = ReadCache::default();
         let calls = Cell::new(0);
         read(&mut connection, &mut cache, &calls).unwrap();
         assert_eq!(cache.integrity_checks, 1);
         let table = cache.inputs.as_ref().unwrap().tables.last().unwrap();
-        let (InputValue::Blob(first), InputValue::Blob(second)) =
-            (&table.rows[0][1], &table.rows[1][1])
-        else {
-            panic!("interned index fixture");
-        };
-        assert!(Arc::ptr_eq(first, second));
+        match (&table.rows[0][1], &table.rows[1][1]) {
+            (InputValue::Blob(first), InputValue::Blob(second)) => {
+                assert!(!chunked);
+                assert!(Arc::ptr_eq(first, second));
+            }
+            (InputValue::ChunkedBlob(first), InputValue::ChunkedBlob(second)) => {
+                assert!(chunked);
+                assert!(Arc::ptr_eq(&first[0], &second[0]));
+                assert!(!Arc::ptr_eq(first.last().unwrap(), second.last().unwrap()));
+            }
+            _ => panic!("interned index fixture"),
+        }
         let page_size: u32 = connection
             .query_row("PRAGMA page_size", [], |row| row.get(0))
             .unwrap();
@@ -2095,6 +2258,174 @@ mod tests {
     }
 
     #[test]
+    fn exact_input_chunks_compare_boundary_middle_tail_length_order_and_type() {
+        let mut payload = vec![b'a'; 3 * INPUT_CHUNK_BYTES + 17];
+        payload[INPUT_CHUNK_BYTES..2 * INPUT_CHUNK_BYTES].fill(b'b');
+        payload[2 * INPUT_CHUNK_BYTES..3 * INPUT_CHUNK_BYTES].fill(b'c');
+        let mut pool = HashSet::new();
+        let mut bytes = 0;
+        let blob = InputValue::ChunkedBlob(intern_chunks(&mut pool, &payload, &mut bytes).unwrap());
+        let text = InputValue::ChunkedText(intern_chunks(&mut pool, &payload, &mut bytes).unwrap());
+        assert!(blob.matches(ValueRef::Blob(&payload)));
+        assert!(text.matches(ValueRef::Text(&payload)));
+        assert!(!blob.matches(ValueRef::Text(&payload)));
+        assert!(!text.matches(ValueRef::Blob(&payload)));
+        for index in [
+            INPUT_CHUNK_BYTES - 1,
+            INPUT_CHUNK_BYTES,
+            2 * INPUT_CHUNK_BYTES + 101,
+            payload.len() - 1,
+        ] {
+            let mut changed = payload.clone();
+            changed[index] ^= 1;
+            assert!(!blob.matches(ValueRef::Blob(&changed)));
+            assert!(!text.matches(ValueRef::Text(&changed)));
+        }
+        assert!(!blob.matches(ValueRef::Blob(&payload[..payload.len() - 1])));
+        let mut changed = payload.clone();
+        changed.push(b'a');
+        assert!(!blob.matches(ValueRef::Blob(&changed)));
+        changed = payload.clone();
+        changed[..INPUT_CHUNK_BYTES].fill(b'b');
+        changed[INPUT_CHUNK_BYTES..2 * INPUT_CHUNK_BYTES].fill(b'a');
+        assert!(!blob.matches(ValueRef::Blob(&changed)));
+        assert!(!chunked_bytes_match(&[], b""));
+    }
+
+    #[test]
+    fn exact_input_chunk_interner_collisions_headers_and_references_are_accounted() {
+        let mut pool = HashSet::<Arc<[u8]>, BuildHasherDefault<CollisionHasher>>::default();
+        let mut payload = vec![b'a'; 2 * INPUT_CHUNK_BYTES + 17];
+        payload[INPUT_CHUNK_BYTES..2 * INPUT_CHUNK_BYTES].fill(b'b');
+        let mut bytes = 0;
+        let first = intern_chunks(&mut pool, &payload, &mut bytes).unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(pool.len(), 3);
+        assert!(!Arc::ptr_eq(&first[0], &first[1]));
+        let references = first.len() * size_of::<Arc<[u8]>>();
+        assert_eq!(
+            bytes,
+            references
+                + 2 * payload_bytes(INPUT_CHUNK_BYTES).unwrap()
+                + payload_bytes(17).unwrap()
+                + interner_bytes(pool.capacity()).unwrap()
+        );
+        let before = bytes;
+        let duplicate = intern_chunks(&mut pool, &payload, &mut bytes).unwrap();
+        assert!(first
+            .iter()
+            .zip(duplicate.iter())
+            .all(|(left, right)| Arc::ptr_eq(left, right)));
+        assert_eq!(bytes, before + references);
+        bytes = MAX_INPUT_BYTES - references;
+        assert!(intern_chunks(&mut pool, &payload, &mut bytes).is_some());
+        assert_eq!(bytes, MAX_INPUT_BYTES);
+        let capacity = pool.capacity();
+        let count = pool.len();
+        bytes = MAX_INPUT_BYTES - references + 1;
+        assert!(intern_chunks(&mut pool, &payload, &mut bytes).is_none());
+        assert_eq!((pool.capacity(), pool.len()), (capacity, count));
+        let mut empty_budget = 0;
+        assert!(input_vec::<Arc<[u8]>>(usize::MAX, &mut empty_budget).is_none());
+        assert_eq!(empty_budget, 0);
+        assert_eq!(size_of::<InputValue>(), size_of::<(u64, Arc<[u8]>)>());
+        let mut rows = Vec::<InputValue>::new();
+        bytes = MAX_INPUT_BYTES;
+        assert!(reserve_input_row(&mut rows, &mut bytes).is_none());
+        assert_eq!(rows.capacity(), 0);
+    }
+
+    #[test]
+    fn exact_input_partial_sharing_fits_where_whole_cell_accounting_falls_back() {
+        const ROWS: usize = 65;
+        // Charge the same row/cell metadata before either representation. The
+        // new chunk descriptors and every unique Arc/pool allocation add their
+        // own charges; no budget is replaced by logical payload size.
+        let metadata = size_of::<Inputs>()
+            + size_of::<HashSet<Arc<[u8]>>>()
+            + size_of::<Vec<String>>()
+            + TABLES.len() * size_of::<String>()
+            + 2 * size_of::<InputTable>()
+            + ROWS * (size_of::<Vec<InputValue>>() + 2 * size_of::<InputValue>())
+            + ROWS.next_power_of_two() * size_of::<Vec<InputValue>>();
+        let mut whole_pool = HashSet::new();
+        let mut chunk_pool = HashSet::new();
+        let mut whole_bytes = 0;
+        let mut chunk_bytes = 0;
+        charge_input(&mut whole_bytes, metadata).unwrap();
+        charge_input(&mut chunk_bytes, metadata).unwrap();
+        let mut whole_failed = false;
+        let mut payload = vec![0_u8; MAX_INPUT_BYTES / 64];
+        for row in 0..ROWS {
+            *payload.last_mut().unwrap() = row as u8;
+            if !whole_failed {
+                whole_failed = intern_bytes(&mut whole_pool, &payload, &mut whole_bytes).is_none();
+            }
+            let chunks = intern_chunks(&mut chunk_pool, &payload, &mut chunk_bytes).unwrap();
+            assert!(chunked_bytes_match(&chunks, &payload));
+        }
+        assert!(whole_failed);
+        assert_eq!(chunk_pool.len(), ROWS);
+        assert!(chunk_bytes < MAX_INPUT_BYTES);
+        assert!(whole_bytes <= MAX_INPUT_BYTES);
+    }
+
+    #[test]
+    fn exact_input_capture_keeps_small_cells_and_validates_cross_chunk_utf8() {
+        let connection = database(":memory:");
+        for length in [0, INPUT_CHUNK_BYTES, INPUT_CHUNK_BYTES + 1] {
+            connection
+                .execute(
+                    "INSERT INTO workflow_work_items VALUES(?1)",
+                    [vec![b'a'; length]],
+                )
+                .unwrap();
+        }
+        let mut text = "a".repeat(INPUT_CHUNK_BYTES - 1);
+        text.push('\u{00e9}');
+        text.push_str("tail");
+        connection
+            .execute("INSERT INTO workflow_work_items VALUES(?1)", [&text])
+            .unwrap();
+        let inputs = Inputs::capture(&connection).unwrap().unwrap();
+        let rows = &inputs.tables.last().unwrap().rows;
+        assert!(matches!(&rows[1][1], InputValue::Blob(bytes) if bytes.is_empty()));
+        assert!(matches!(&rows[2][1], InputValue::Blob(bytes) if bytes.len() == INPUT_CHUNK_BYTES));
+        assert!(matches!(&rows[3][1], InputValue::ChunkedBlob(_)));
+        assert!(matches!(&rows[4][1], InputValue::ChunkedText(_)));
+        assert!(inputs.matches(&connection).unwrap());
+        let mut invalid = text.into_bytes();
+        invalid[INPUT_CHUNK_BYTES] = 0xff;
+        connection
+            .execute(
+                "INSERT INTO workflow_work_items VALUES(?1)",
+                [invalid.as_slice()],
+            )
+            .unwrap();
+        assert!(Inputs::capture(&connection).unwrap().is_some());
+        connection
+            .execute(
+                "INSERT INTO workflow_work_items VALUES(CAST(?1 AS TEXT))",
+                [invalid],
+            )
+            .unwrap();
+        assert!(Inputs::capture(&connection).unwrap().is_none());
+    }
+
+    #[test]
+    fn exact_read_cache_chunked_index_damage_rejects_hits_and_warm_misses() {
+        for enabled in [false, true] {
+            for (new_key, failure) in [
+                (false, None),
+                (true, None),
+                (true, Some(crate::WorkflowErrorCode::AuthorityConflict)),
+            ] {
+                assert_index_only_damage_rejected_with_diagnostics(new_key, failure, enabled, true);
+            }
+        }
+    }
+
+    #[test]
     fn exact_input_capture_shares_payloads_not_types_rows_or_schema_keys() {
         let connection = database(":memory:");
         connection
@@ -2142,20 +2473,19 @@ mod tests {
                         .unwrap();
                 }
                 "unique" => {
-                    let mut payload = vec![0_u8; payload_size];
                     let mut insert = connection
                         .prepare("INSERT INTO workflow_work_items VALUES(?1)")
                         .unwrap();
                     for index in 0..65 {
-                        payload[0] = index;
+                        let payload = unique_chunk_payload(payload_size, index);
                         insert.execute([payload.as_slice()]).unwrap();
                     }
                 }
                 "metadata" => {
                     connection
                         .execute(
-                            "UPDATE workflow_work_items SET value=zeroblob(?1)",
-                            [i64::try_from(MAX_INPUT_BYTES - 1).unwrap()],
+                            "UPDATE workflow_work_items SET value=?1",
+                            [unique_chunk_payload(MAX_INPUT_BYTES - 1, 1)],
                         )
                         .unwrap();
                 }
@@ -2262,9 +2592,11 @@ mod tests {
                         if retained {
                             assert_eq!(scan.rows, 67);
                         } else {
-                            // The 64th unique MiB crosses the cap once the
-                            // schema, row structures and interner are charged.
-                            assert_eq!(scan.rows, 66);
+                            // Unique chunks plus descriptors, Arc headers and
+                            // interner growth cross the unchanged cap before all
+                            // rows fit. Retain exact fetched-byte accounting,
+                            // without depending on HashSet's capacity schedule.
+                            assert!(scan.rows > 2 && scan.rows <= 66);
                         }
                         schema_bytes + 8 * (scan.rows - 1) + 3 + payload_size * (scan.rows - 2)
                     };
@@ -2312,25 +2644,129 @@ mod tests {
         }
         assert_eq!(calls.get(), 1);
         let rows = &cache.inputs.as_ref().unwrap().tables.last().unwrap().rows;
-        let InputValue::Blob(first) = &rows[1][1] else {
+        let InputValue::ChunkedBlob(first) = &rows[1][1] else {
             panic!("large blob input");
         };
-        assert_eq!(first.len(), payload_size);
+        assert_eq!(first.len(), payload_size / INPUT_CHUNK_BYTES);
         assert!(rows[1..].iter().all(|row| {
-            matches!(&row[1], InputValue::Blob(value) if Arc::ptr_eq(first, value))
+            matches!(&row[1], InputValue::ChunkedBlob(value)
+                if value.len() == first.len()
+                    && first.iter().zip(value.iter()).all(|(left, right)| Arc::ptr_eq(left, right)))
         }));
+    }
+
+    #[test]
+    fn exact_read_cache_partial_large_cells_retain_proof_and_recheck_every_edit() {
+        let (mut connection, original) = partially_shared_input_fixture();
+        let mut cache = ReadCache::default();
+        let calls = Cell::new(0);
+        for _ in 0..2 {
+            let snapshot = connection.savepoint().unwrap();
+            let count = cache
+                .read(&snapshot, true, "shared-large-count", || {
+                    calls.set(calls.get() + 1);
+                    Ok(66_u64)
+                })
+                .unwrap();
+            assert_eq!(count, 66);
+            assert!(cache.inputs.is_some());
+            snapshot.commit().unwrap();
+        }
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cache.integrity_checks, 2);
+        let rows = &cache.inputs.as_ref().unwrap().tables.last().unwrap().rows;
+        let (InputValue::ChunkedBlob(first), InputValue::ChunkedBlob(second)) =
+            (&rows[1][1], &rows[2][1])
+        else {
+            panic!("chunked partial sharing");
+        };
+        assert!(Arc::ptr_eq(&first[0], &second[0]));
+        assert!(!Arc::ptr_eq(first.last().unwrap(), second.last().unwrap()));
+        for edit in [
+            "boundary", "middle", "tail", "shorter", "longer", "order", "type",
+        ] {
+            connection
+                .execute(
+                    "UPDATE workflow_work_items SET value=?1 WHERE rowid=2",
+                    [original.as_slice()],
+                )
+                .unwrap();
+            let inputs = Inputs::capture(&connection).unwrap().unwrap();
+            let mut changed = original.clone();
+            match edit {
+                "boundary" => changed[INPUT_CHUNK_BYTES] ^= 1,
+                "middle" => {
+                    let index = changed.len() / 2;
+                    changed[index] ^= 1;
+                }
+                "tail" => *changed.last_mut().unwrap() ^= 1,
+                "shorter" => {
+                    changed.pop();
+                }
+                "longer" => changed.push(b'a'),
+                "order" => {
+                    changed[..INPUT_CHUNK_BYTES].fill(b'b');
+                    changed[INPUT_CHUNK_BYTES..2 * INPUT_CHUNK_BYTES].fill(b'a');
+                }
+                "type" => {}
+                _ => unreachable!(),
+            }
+            if edit == "type" {
+                connection
+                    .execute(
+                        "UPDATE workflow_work_items SET value=?1 WHERE rowid=2",
+                        [std::str::from_utf8(&changed).unwrap()],
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute(
+                        "UPDATE workflow_work_items SET value=?1 WHERE rowid=2",
+                        [changed],
+                    )
+                    .unwrap();
+            }
+            assert!(!inputs.matches(&connection).unwrap(), "{edit}");
+        }
+    }
+
+    #[test]
+    fn exact_read_cache_partial_large_cells_leave_incomplete_views_unretained() {
+        let (mut connection, _) = partially_shared_input_fixture();
+        let mut cache = ReadCache::default();
+        let calls = Cell::new(0);
+        for _ in 0..2 {
+            let snapshot = connection.savepoint().unwrap();
+            let value = cache
+                .read_keyed_if(
+                    &snapshot,
+                    true,
+                    "deferred-legacy",
+                    b"",
+                    || {
+                        calls.set(calls.get() + 1);
+                        Ok("legacy-context-still-valid".to_owned())
+                    },
+                    |_| false,
+                )
+                .unwrap();
+            assert_eq!(value, "legacy-context-still-valid");
+            assert!(cache.inputs.is_none() && cache.results.is_empty());
+            snapshot.commit().unwrap();
+        }
+        assert_eq!(calls.get(), 2);
+        assert_eq!(cache.integrity_checks, 2);
     }
 
     #[test]
     fn exact_read_cache_unique_large_payloads_still_fall_back_at_unchanged_cap() {
         let mut connection = database(":memory:");
-        let mut payload = vec![0_u8; MAX_INPUT_BYTES / 64];
         {
             let mut insert = connection
                 .prepare("INSERT INTO workflow_work_items VALUES(?1)")
                 .unwrap();
             for index in 0..65 {
-                payload[0] = index;
+                let payload = unique_chunk_payload(MAX_INPUT_BYTES / 64, index);
                 insert.execute([payload.as_slice()]).unwrap();
             }
         }
@@ -2359,8 +2795,8 @@ mod tests {
         let connection = database(":memory:");
         connection
             .execute(
-                "UPDATE workflow_work_items SET value=zeroblob(?1)",
-                [i64::try_from(MAX_INPUT_BYTES - 1).unwrap()],
+                "UPDATE workflow_work_items SET value=?1",
+                [unique_chunk_payload(MAX_INPUT_BYTES - 1, 1)],
             )
             .unwrap();
         assert!(Inputs::capture(&connection).unwrap().is_none());
