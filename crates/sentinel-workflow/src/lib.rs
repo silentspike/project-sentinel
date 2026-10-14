@@ -41,6 +41,7 @@ pub use collaboration::*;
 pub use domain::*;
 pub use domain_store::{
     AdaptiveBudgetReviewExtensionReceiptV1, AdaptiveBudgetReviewExtensionRequestV1,
+    CustomerOverviewProjectRead, CustomerOverviewReadSnapshot,
 };
 pub use engine::WorkflowCore;
 pub use error::{WorkflowError, WorkflowErrorCode};
@@ -50,7 +51,7 @@ pub use project_planning::*;
 pub use request_provider::*;
 pub use sentinel_common::AgentId;
 pub use store::{
-    AdaptiveHealthReadError, AdaptiveProjectReadSnapshot, ExecutionRevisionV1,
+    AdaptiveHealthReadError, AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot, ExecutionRevisionV1,
     WorkflowDiagnosticSpan, WorkflowDiagnosticStage, WorkflowStore, WORKFLOW_STORE_SCHEMA_VERSION,
 };
 
