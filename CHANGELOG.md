@@ -1,5 +1,11 @@
 # Changelog
 
+- Share exact large SQL input bytes in bounded interned chunks so repeated
+  journal snapshots can retain verified read proofs without raising cache limits.
+  Reuse successful customer collection snapshots only after fresh exact-input
+  and database-integrity validation; retain independent entity proof budgets,
+  external-write invalidation and corruption rejection (#856).
+
 - Batch customer collection, adaptive progress and model-preparation SQL reads
   into validated phase snapshots. Preserve complete journal and funding checks,
   fresh runtime authority, legacy retained-context selection and final project

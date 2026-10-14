@@ -26,12 +26,11 @@ impl WorkflowStore {
         if let Some(id) = request_id {
             validate_identifier(id)?;
         }
+        let key = serde_json::to_vec(&(tenant, customer_id, request_id))?;
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
-        // These collection getters were uncached entity reads. Pin them together
-        // without adding a broad read-cache input scan or a shared proof arena.
-        let snapshot = connection.savepoint()?;
-        let value = (|| {
-            let tx = &*snapshot;
+        // Retain owned facts only under the existing exact global input proof.
+        // Entity getters keep their independent validation arenas on every miss.
+        self.validated_read_snapshot(&mut connection, "company-customer-overview", &key, |tx| {
             let requests = match request_id {
                 Some(id) => get_entity::<CustomerRequestV1>(tx, tenant, "request", id)?
                     .into_iter()
@@ -68,9 +67,7 @@ impl WorkflowStore {
                 proposals,
                 projects,
             })
-        })()?;
-        snapshot.commit()?;
-        Ok(value)
+        })
     }
 
     /// A fresh batch fence, not a cached equality decision.
