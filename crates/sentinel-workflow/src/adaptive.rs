@@ -1555,6 +1555,7 @@ pub(crate) mod work_funding_tests {
                     .active_work_funding()
                     .map(|prior| prior.binding.receipt_digest.clone()),
                 supersedes_unused_receipt_digest: None,
+                expired_reviewed_replacement: None,
             },
             limits: AdaptiveWorkFundingLimitsV1 {
                 additional_model_calls: 2_u16

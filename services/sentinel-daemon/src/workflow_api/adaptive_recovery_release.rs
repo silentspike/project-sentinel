@@ -719,6 +719,627 @@ pub(crate) fn validate_funded_review_recovery(
     })
 }
 
+pub(crate) const EXPIRED_FUNDING_DIRECTORY: &str =
+    "/etc/sentinel/adaptive-expired-funding-replacement";
+pub(crate) const EXPIRED_FUNDING_PURPOSE: &str = "adaptive-expired-unadopted-funding-replacement";
+const MAX_EXPIRED_FUNDING_REFERENCES: usize = 20;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExpiredFundingReplacementAttestationV1 {
+    pub schema_version: u16,
+    pub purpose: String,
+    pub source_digest: String,
+    pub replacement_key: String,
+    pub release: AdaptiveRecoveryReleaseV1,
+    pub daemon_binary_digest: String,
+    pub gate_evidence: ProtectedRepairEvidenceV1,
+    pub per_review: Vec<ExpiredFundingReviewProofV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExpiredFundingReviewProofV1 {
+    pub review_id: Uuid,
+    pub member: sentinel_workflow::AdaptiveFundedReviewRecoveryMemberV1,
+    pub retired_review: RetiredAdmissionEvidenceV1,
+    pub request_proof: FundedReviewRequestProofV1,
+    pub historical_deployment: ProtectedRepairEvidenceV1,
+    pub admission_ordering: ProtectedRepairEvidenceV1,
+}
+
+fn evidence_reaches(edges: &HashMap<PathBuf, Vec<PathBuf>>, start: &Path, target: &Path) -> bool {
+    let mut pending = vec![start.to_path_buf()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(path) = pending.pop() {
+        if path == target {
+            return true;
+        }
+        if seen.insert(path.clone()) {
+            if let Some(children) = edges.get(&path) {
+                pending.extend(children.iter().cloned());
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn validate_expired_funding_replacement(
+    bytes: &[u8],
+    manifest: &[u8],
+    gateway: &str,
+    daemon: &str,
+    source: &sentinel_workflow::AdaptiveWorkFundingExpiredReplacementVerificationSourceV1,
+    loader: impl Fn(&ProtectedRepairEvidenceV1) -> Result<Vec<u8>, &'static str>,
+) -> Result<sentinel_workflow::AdaptiveWorkFundingExpiredReplacementEvidenceV1, &'static str> {
+    use sentinel_workflow::{
+        AdaptiveFundedReviewNoIoV1, AdaptiveWorkFundingExpiredReplacementReviewEvidenceV1,
+    };
+    if bytes.is_empty() || bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+        return Err("expired funding aggregate size invalid");
+    }
+    let proof: ExpiredFundingReplacementAttestationV1 =
+        serde_json::from_slice(bytes).map_err(|_| "expired funding aggregate invalid")?;
+    let digest = source
+        .source
+        .canonical_digest()
+        .map_err(|_| "expired funding source invalid")?;
+    let key = source
+        .source
+        .replacement_key()
+        .map_err(|_| "expired funding key invalid")?;
+    if proof.schema_version != 1
+        || proof.purpose != EXPIRED_FUNDING_PURPOSE
+        || proof.source_digest != digest
+        || proof.replacement_key != key
+        || proof.release.gateway_binary_digest != gateway
+        || proof.daemon_binary_digest != daemon
+        || !is_digest(daemon)
+        || !is_digest(gateway)
+        || proof.per_review.len() != source.review_members.len()
+        || source
+            .calls
+            .iter()
+            .filter(|call| {
+                call.grant
+                    .work_funding
+                    .as_ref()
+                    .is_some_and(|epoch| epoch.receipt == *source.old_funding)
+            })
+            .count()
+            != source.review_members.len()
+        || source.review_members.is_empty()
+    {
+        return Err("expired funding aggregate binding invalid");
+    }
+    proof
+        .release
+        .validate()
+        .map_err(|_| "expired funding release invalid")?;
+    let installed: InstalledManifest =
+        serde_json::from_slice(manifest).map_err(|_| "expired funding manifest invalid")?;
+    if installed.version != "1.0"
+        || installed.created_at.is_empty()
+        || installed.artifacts.is_empty()
+        || installed.artifacts.len() > 4096
+        || installed.git_sha != proof.release.source_git_sha
+        || format!("{:x}", Sha256::digest(manifest)) != proof.release.release_manifest_digest
+    {
+        return Err("expired funding manifest changed");
+    }
+    require_manifest_binary(
+        &installed,
+        GATEWAY_FILE,
+        "cmd/cortex-gateway/cortex-gateway",
+        gateway,
+    )?;
+    require_manifest_binary(
+        &installed,
+        DAEMON_FILE,
+        "target/release/sentinel-daemon",
+        daemon,
+    )?;
+    let aggregate_path = Path::new(EXPIRED_FUNDING_DIRECTORY).join(format!("{key}.json"));
+    let cache = std::cell::RefCell::new(HashMap::<PathBuf, (String, Vec<u8>)>::new());
+    let edges = std::cell::RefCell::new(HashMap::<PathBuf, Vec<PathBuf>>::new());
+    let read = |reference: &ProtectedRepairEvidenceV1| {
+        if !reference.path.is_absolute()
+            || reference.path == aggregate_path
+            || !is_digest(&reference.digest)
+        {
+            return Err("expired funding reference invalid");
+        }
+        if let Some((digest, bytes)) = cache.borrow().get(&reference.path) {
+            if digest != &reference.digest {
+                return Err("expired funding reference digest conflict");
+            }
+            return Ok(bytes.clone());
+        }
+        if cache.borrow().len() >= MAX_EXPIRED_FUNDING_REFERENCES {
+            return Err("expired funding reference bound exceeded");
+        }
+        let bytes = loader(reference)?;
+        if bytes.is_empty()
+            || bytes.len() as u64 > MAX_EVIDENCE_BYTES
+            || format!("{:x}", Sha256::digest(&bytes)) != reference.digest
+        {
+            return Err("expired funding referenced bytes changed");
+        }
+        cache.borrow_mut().insert(
+            reference.path.clone(),
+            (reference.digest.clone(), bytes.clone()),
+        );
+        Ok(bytes)
+    };
+    let child = |parent: &ProtectedRepairEvidenceV1, reference: &ProtectedRepairEvidenceV1| {
+        let mut graph = edges.borrow_mut();
+        if evidence_reaches(&graph, &reference.path, &parent.path) {
+            return Err("expired funding reference cycle");
+        }
+        graph
+            .entry(parent.path.clone())
+            .or_default()
+            .push(reference.path.clone());
+        drop(graph);
+        read(reference)
+    };
+    let gate: serde_json::Value = serde_json::from_slice(&read(&proof.gate_evidence)?)
+        .map_err(|_| "expired funding gate invalid")?;
+    if gate.get("purpose").and_then(|v| v.as_str()) != Some("exact-release-gate-evidence")
+        || gate.get("merged_commit").and_then(|v| v.as_str())
+            != Some(proof.release.source_git_sha.as_str())
+        || gate
+            .get("merged_tree_equals_reviewed_tree")
+            .and_then(|v| v.as_bool())
+            != Some(true)
+        || gate.pointer("/ci/status").and_then(|v| v.as_str()) != Some("completed")
+        || gate.pointer("/ci/conclusion").and_then(|v| v.as_str()) != Some("success")
+        || gate.pointer("/release/result").and_then(|v| v.as_str()) != Some("PASS")
+        || gate
+            .pointer("/release/gateway_sha256")
+            .and_then(|v| v.as_str())
+            != Some(gateway)
+        || gate
+            .pointer("/release/daemon_sha256")
+            .and_then(|v| v.as_str())
+            != Some(daemon)
+    {
+        return Err("expired funding gate binding invalid");
+    }
+    let mut per_review = Vec::with_capacity(source.calls.len());
+    let mut previous = None;
+    for item in &proof.per_review {
+        if previous.is_some_and(|id| id >= item.review_id)
+            || item.member.review_id != item.review_id
+            || !source.review_members.contains(&item.member)
+        {
+            return Err("expired funding member set invalid");
+        }
+        previous = Some(item.review_id);
+        let old = source
+            .calls
+            .iter()
+            .find(|call| call.grant.review_id == item.review_id)
+            .ok_or("expired funding review missing")?;
+        if old.version != item.member.version
+            || old.grant.session_id != source.source.session_id
+            || old.grant.project_id != source.source.project_id
+            || old
+                .grant
+                .work_funding
+                .as_ref()
+                .is_none_or(|epoch| epoch.receipt != *source.old_funding)
+            || !matches!(old.grant.schema_version, 5 | 6)
+            || (old.grant.schema_version == 5 && old.grant.funded_review_recovery.is_some())
+            || (old.grant.schema_version == 6 && old.grant.funded_review_recovery.is_none())
+            || old.dispatch.is_some()
+            || old.decision.is_some()
+            || old.continuation.is_some()
+            || old.model_response_digest.is_some()
+            || old.resolution_event_id.is_some()
+            || old
+                .retired_at_unix_ms
+                .is_none_or(|at| at < old.grant.expires_at_unix_ms)
+            || item.retired_review != retired_admission_evidence(old)?
+        {
+            return Err("expired funding retired member invalid");
+        }
+        let retired_at = old
+            .retired_at_unix_ms
+            .ok_or("expired funding retirement missing")?;
+        let deployment: HistoricalAdmissionDeploymentV1 =
+            serde_json::from_slice(&read(&item.historical_deployment)?)
+                .map_err(|_| "expired funding historical deployment invalid")?;
+        deployment
+            .release
+            .validate()
+            .map_err(|_| "expired funding historical release invalid")?;
+        if deployment.schema_version != 1
+            || deployment.purpose != "verified-historical-serving-release"
+            || !is_digest(&deployment.daemon_binary_digest)
+            || deployment.valid_from_unix_ms == 0
+            || deployment.valid_from_unix_ms > old.grant_issued_at_unix_ms
+            || deployment.valid_until_unix_ms < retired_at
+            || deployment.valid_from_unix_ms >= deployment.valid_until_unix_ms
+        {
+            return Err("expired funding historical serving interval invalid");
+        }
+        let historical_bytes = child(&item.historical_deployment, &deployment.manifest)?;
+        let historical: InstalledManifest = serde_json::from_slice(&historical_bytes)
+            .map_err(|_| "expired funding historical manifest invalid")?;
+        if historical.version != "1.0"
+            || historical.created_at.is_empty()
+            || historical.artifacts.is_empty()
+            || historical.artifacts.len() > 4096
+            || historical.git_sha != deployment.release.source_git_sha
+            || deployment.manifest.digest != deployment.release.release_manifest_digest
+        {
+            return Err("expired funding historical manifest binding invalid");
+        }
+        require_manifest_binary(
+            &historical,
+            GATEWAY_FILE,
+            "cmd/cortex-gateway/cortex-gateway",
+            &deployment.release.gateway_binary_digest,
+        )?;
+        require_manifest_binary(
+            &historical,
+            DAEMON_FILE,
+            "target/release/sentinel-daemon",
+            &deployment.daemon_binary_digest,
+        )?;
+        child(
+            &item.historical_deployment,
+            &deployment.gateway_serving_identity,
+        )?;
+        child(
+            &item.historical_deployment,
+            &deployment.daemon_serving_identity,
+        )?;
+        let ordering: AdmissionOrderingEvidenceV1 =
+            serde_json::from_slice(&read(&item.admission_ordering)?)
+                .map_err(|_| "expired funding ordering invalid")?;
+        if ordering.schema_version != 1
+            || ordering.purpose != "verified-leadership-admission-ordering"
+            || ordering.failed_release != deployment.release
+            || ordering.daemon_binary_digest != deployment.daemon_binary_digest
+            || ordering.ordering != "durable-leadership-dispatch-before-provider-io"
+            || ordering.fencing != "no-provider-io-after-rejected-or-retired-dispatch"
+            || ordering.valid_from_unix_ms == 0
+            || ordering.valid_from_unix_ms > old.grant_issued_at_unix_ms
+            || ordering.valid_until_unix_ms < retired_at
+            || ordering.valid_from_unix_ms >= ordering.valid_until_unix_ms
+        {
+            return Err("expired funding historical ordering invalid");
+        }
+        child(&item.admission_ordering, &ordering.source_evidence)?;
+        let request = &item.request_proof;
+        if request.schema_version != 1
+            || request.purpose != "verified-funded-review-no-io"
+            || request.source_digest != digest
+            || request.retired_call_digest != item.retired_review.retired_call_digest
+            || request.authority_digest != item.retired_review.authority_digest
+            || request.context_digest != item.retired_review.context_digest
+        {
+            return Err("expired funding request proof binding invalid");
+        }
+        match &request.no_io {
+            AdaptiveFundedReviewNoIoV1::NeverReserved { request_id }
+            | AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate { request_id } => {
+                if request_id != &old.request_id() || request.release_evidence.is_some() {
+                    return Err("expired funding gate/never-reserved proof invalid");
+                }
+            }
+            AdaptiveFundedReviewNoIoV1::ReleasedBeforeIo {
+                request_id,
+                request_digest,
+                release_digest,
+                released_at_unix_ms,
+            } => {
+                let reference = request
+                    .release_evidence
+                    .as_ref()
+                    .ok_or("expired funding release proof missing")?;
+                let release: FundedReviewReleaseEvidenceV1 =
+                    serde_json::from_slice(&read(reference)?)
+                        .map_err(|_| "expired funding release proof invalid")?;
+                if request_id != &old.request_id()
+                    || !is_digest(request_digest)
+                    || !is_digest(release_digest)
+                    || reference.digest != *release_digest
+                    || release.schema_version != 1
+                    || release.purpose != "verified-funded-review-release-before-io"
+                    || release.request_id != *request_id
+                    || release.request_digest != *request_digest
+                    || release.released_at_unix_ms != *released_at_unix_ms
+                    || release.provider_started
+                    || *released_at_unix_ms < old.grant_issued_at_unix_ms
+                    || *released_at_unix_ms > retired_at
+                {
+                    return Err("expired funding release-before-I/O proof invalid");
+                }
+            }
+        }
+        per_review.push(AdaptiveWorkFundingExpiredReplacementReviewEvidenceV1 {
+            member: item.member.clone(),
+            proof_digest: json_digest(item)?,
+            release: deployment.release,
+            no_io: request.no_io.clone(),
+        });
+    }
+    // Re-read every shared protected input after validation; the cache is pass-local bytes only.
+    for (path, (digest, before)) in cache.borrow().iter() {
+        let reference = ProtectedRepairEvidenceV1 {
+            path: path.clone(),
+            digest: digest.clone(),
+        };
+        if loader(&reference)? != *before {
+            return Err("expired funding evidence changed");
+        }
+    }
+    Ok(
+        sentinel_workflow::AdaptiveWorkFundingExpiredReplacementEvidenceV1 {
+            source_digest: digest,
+            proof_digest: format!("{:x}", Sha256::digest(bytes)),
+            per_review,
+            verified_at_unix_ms: 0,
+        },
+    )
+}
+
+pub(crate) fn verified_current_expired_funding_replacement(
+    source: &sentinel_workflow::AdaptiveWorkFundingExpiredReplacementVerificationSourceV1,
+) -> Result<
+    (
+        sentinel_workflow::AdaptiveWorkFundingExpiredReplacementEvidenceV1,
+        AdaptiveRecoveryReleaseV1,
+    ),
+    &'static str,
+> {
+    #[cfg(test)]
+    if let Some(fixture) =
+        TEST_EXPIRED_FUNDING.with(|stack| stack.borrow().last().map(|(_, fixture)| fixture.clone()))
+    {
+        let bytes = serde_json::to_vec(&fixture.proof)
+            .map_err(|_| "expired funding test aggregate invalid")?;
+        let mut evidence = validate_expired_funding_replacement(
+            &bytes,
+            &fixture.manifest,
+            &"b".repeat(64),
+            &"c".repeat(64),
+            source,
+            |reference| {
+                fixture
+                    .documents
+                    .get(&reference.path)
+                    .cloned()
+                    .ok_or("expired funding test evidence missing")
+            },
+        )?;
+        evidence.verified_at_unix_ms = now_unix_ms();
+        return Ok((evidence, fixture.proof.release));
+    }
+    let key = source
+        .source
+        .replacement_key()
+        .map_err(|_| "expired funding key invalid")?;
+    let path = Path::new(EXPIRED_FUNDING_DIRECTORY).join(format!("{key}.json"));
+    let bytes = evidence_bytes(&path)?;
+    let attestation: ExpiredFundingReplacementAttestationV1 =
+        serde_json::from_slice(&bytes).map_err(|_| "expired funding aggregate invalid")?;
+    let manifest = evidence_bytes(Path::new(MANIFEST_FILE))?;
+    let gateway = gateway_digest()?;
+    let daemon = serving_binary_digest(Path::new(DAEMON_FILE), "sentinel-daemon.service")?;
+    let mut value = validate_expired_funding_replacement(
+        &bytes,
+        &manifest,
+        &gateway,
+        &daemon,
+        source,
+        referenced_evidence,
+    )?;
+    if evidence_bytes(&path)? != bytes
+        || evidence_bytes(Path::new(MANIFEST_FILE))? != manifest
+        || gateway_digest()? != gateway
+        || serving_binary_digest(Path::new(DAEMON_FILE), "sentinel-daemon.service")? != daemon
+    {
+        return Err("expired funding serving evidence changed");
+    }
+    value.verified_at_unix_ms = now_unix_ms();
+    Ok((value, attestation.release))
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ExpiredFundingTestFixture {
+    proof: ExpiredFundingReplacementAttestationV1,
+    manifest: Vec<u8>,
+    documents: HashMap<PathBuf, Vec<u8>>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_EXPIRED_FUNDING: std::cell::RefCell<Vec<(Uuid, ExpiredFundingTestFixture)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestExpiredFundingGuard {
+    id: Uuid,
+    _thread_bound: std::marker::PhantomData<*mut ()>,
+}
+
+#[cfg(test)]
+impl TestExpiredFundingGuard {
+    pub(crate) fn fixture(
+        source: &sentinel_workflow::AdaptiveWorkFundingExpiredReplacementVerificationSourceV1,
+    ) -> Self {
+        use sentinel_workflow::AdaptiveFundedReviewNoIoV1;
+        let members = &source.review_members;
+        let old = source
+            .calls
+            .iter()
+            .find(|call| call.grant.review_id == members[0].review_id)
+            .unwrap();
+        let mut original = super::funded_review_recovery::tests::source_fixture();
+        original.calls = vec![old.clone()];
+        original.project = Box::new(old.context.source_project.clone());
+        original.session = Box::new(old.context.source_session.clone());
+        original.funding = source.old_funding.clone();
+        original.source.retired_review_id = old.grant.review_id;
+        let mut base = funded_proof_tests::fixture_for(original);
+        let from = source
+            .calls
+            .iter()
+            .filter(|call| members.iter().any(|m| m.review_id == call.grant.review_id))
+            .map(|call| call.grant_issued_at_unix_ms)
+            .min()
+            .unwrap();
+        let until = source
+            .calls
+            .iter()
+            .filter(|call| members.iter().any(|m| m.review_id == call.grant.review_id))
+            .map(|call| call.retired_at_unix_ms.unwrap())
+            .max()
+            .unwrap();
+        for path in [
+            &base.proof.historical_deployment.path,
+            &base.proof.admission_ordering.path,
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&base.documents[path]).unwrap();
+            value["valid_from_unix_ms"] = serde_json::json!(from);
+            value["valid_until_unix_ms"] = serde_json::json!(until);
+            base.documents
+                .insert(path.clone(), serde_json::to_vec(&value).unwrap());
+        }
+        base.proof.historical_deployment.digest = format!(
+            "{:x}",
+            Sha256::digest(&base.documents[&base.proof.historical_deployment.path])
+        );
+        base.proof.admission_ordering.digest = format!(
+            "{:x}",
+            Sha256::digest(&base.documents[&base.proof.admission_ordering.path])
+        );
+        let source_digest = source.source.canonical_digest().unwrap();
+        let per_review = members
+            .iter()
+            .map(|member| {
+                let old = source
+                    .calls
+                    .iter()
+                    .find(|call| call.grant.review_id == member.review_id)
+                    .unwrap();
+                let retired = retired_admission_evidence(old).unwrap();
+                ExpiredFundingReviewProofV1 {
+                    review_id: member.review_id,
+                    member: member.clone(),
+                    request_proof: FundedReviewRequestProofV1 {
+                        schema_version: 1,
+                        purpose: "verified-funded-review-no-io".into(),
+                        source_digest: source_digest.clone(),
+                        retired_call_digest: retired.retired_call_digest.clone(),
+                        authority_digest: retired.authority_digest.clone(),
+                        context_digest: retired.context_digest.clone(),
+                        no_io: AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+                            request_id: old.request_id(),
+                        },
+                        release_evidence: None,
+                    },
+                    retired_review: retired,
+                    historical_deployment: base.proof.historical_deployment.clone(),
+                    admission_ordering: base.proof.admission_ordering.clone(),
+                }
+            })
+            .collect();
+        let proof = ExpiredFundingReplacementAttestationV1 {
+            schema_version: 1,
+            purpose: EXPIRED_FUNDING_PURPOSE.into(),
+            source_digest,
+            replacement_key: source.source.replacement_key().unwrap(),
+            release: base.proof.release,
+            daemon_binary_digest: base.proof.daemon_binary_digest,
+            gate_evidence: base.proof.gate_evidence,
+            per_review,
+        };
+        let id = Uuid::new_v4();
+        TEST_EXPIRED_FUNDING.with(|stack| {
+            stack.borrow_mut().push((
+                id,
+                ExpiredFundingTestFixture {
+                    proof,
+                    manifest: base.manifest,
+                    documents: base.documents,
+                },
+            ))
+        });
+        Self {
+            id,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn reject(&self) {
+        self.mutate("source");
+    }
+
+    pub(crate) fn mutate(&self, kind: &str) {
+        TEST_EXPIRED_FUNDING.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let fixture = &mut stack.iter_mut().find(|(id, _)| *id == self.id).unwrap().1;
+            match kind {
+                "source" => fixture.proof.source_digest = "f".repeat(64),
+                "missing_gate" => { fixture.documents.remove(&fixture.proof.gate_evidence.path); }
+                "omitted_member" => { fixture.proof.per_review.pop(); }
+                "duplicate_member" => { fixture.proof.per_review.push(fixture.proof.per_review[0].clone()); }
+                "wrong_request" => fixture.proof.per_review[0].request_proof.no_io =
+                    sentinel_workflow::AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate { request_id: "foreign".into() },
+                "release_claim" => fixture.proof.per_review[0].request_proof.release_evidence = Some(fixture.proof.gate_evidence.clone()),
+                "oversize" => fixture.proof.purpose = "a".repeat(MAX_EVIDENCE_BYTES as usize),
+                "ordering_cycle" => {
+                    let reference = fixture.proof.per_review[0].admission_ordering.clone();
+                    let mut ordering: AdmissionOrderingEvidenceV1 = serde_json::from_slice(&fixture.documents[&reference.path]).unwrap();
+                    ordering.source_evidence = reference.clone();
+                    let bytes = serde_json::to_vec(&ordering).unwrap();
+                    let digest = format!("{:x}", Sha256::digest(&bytes));
+                    fixture.documents.insert(reference.path.clone(), bytes);
+                    fixture.proof.per_review[0].admission_ordering.digest = digest;
+                }
+                "reference_bound" => {
+                    for (index, item) in fixture.proof.per_review.iter_mut().enumerate() {
+                        let deployment: HistoricalAdmissionDeploymentV1 =
+                            serde_json::from_slice(&fixture.documents[&item.historical_deployment.path]).unwrap();
+                        let mut ordering: AdmissionOrderingEvidenceV1 =
+                            serde_json::from_slice(&fixture.documents[&item.admission_ordering.path]).unwrap();
+                        let config = fixture.documents[&ordering.source_evidence.path].clone();
+                        ordering.source_evidence.path = Path::new("/protected/expired-test").join(format!("config-{index}"));
+                        fixture.documents.insert(ordering.source_evidence.path.clone(), config);
+                        let deployment_bytes = serde_json::to_vec(&deployment).unwrap();
+                        let deployment_path = Path::new("/protected/expired-test").join(format!("deployment-{index}"));
+                        item.historical_deployment = ProtectedRepairEvidenceV1 {
+                            path: deployment_path.clone(), digest: format!("{:x}", Sha256::digest(&deployment_bytes)),
+                        };
+                        fixture.documents.insert(deployment_path, deployment_bytes);
+                        let ordering_bytes = serde_json::to_vec(&ordering).unwrap();
+                        let ordering_path = Path::new("/protected/expired-test").join(format!("ordering-{index}"));
+                        item.admission_ordering = ProtectedRepairEvidenceV1 {
+                            path: ordering_path.clone(), digest: format!("{:x}", Sha256::digest(&ordering_bytes)),
+                        };
+                        fixture.documents.insert(ordering_path, ordering_bytes);
+                    }
+                }
+                _ => panic!("unknown expired proof fixture mutation"),
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestExpiredFundingGuard {
+    fn drop(&mut self) {
+        TEST_EXPIRED_FUNDING.with(|stack| stack.borrow_mut().retain(|(id, _)| *id != self.id));
+    }
+}
+
 pub(crate) fn verified_current_funded_review_recovery(
     source: &sentinel_workflow::AdaptiveFundedReviewRecoveryVerificationSourceV1,
 ) -> Result<sentinel_workflow::AdaptiveFundedReviewRecoveryEvidenceV1, &'static str> {

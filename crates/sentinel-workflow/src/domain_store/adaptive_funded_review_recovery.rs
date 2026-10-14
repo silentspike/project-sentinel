@@ -695,14 +695,23 @@ impl WorkflowStore {
             &receipt,
             issued_at_unix_ms,
         )?;
-        Self::authorize_new_leadership_review_in_transaction(
+        adaptive_work_funding::with_recovery_publication(
             &transaction,
-            &grant.leadership_principal,
-            request.operation_id,
-            &format!("{}-allowance", receipt.receipt_key),
             &grant,
-            &normalized_context,
+            &context_digest,
+            request.operation_id,
             issued_at_unix_ms,
+            || {
+                Self::authorize_new_leadership_review_in_transaction(
+                    &transaction,
+                    &grant.leadership_principal,
+                    request.operation_id,
+                    &format!("{}-allowance", receipt.receipt_key),
+                    &grant,
+                    &normalized_context,
+                    issued_at_unix_ms,
+                )
+            },
         )?;
         transaction.commit()?;
         Ok((false, receipt))
