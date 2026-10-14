@@ -1,5 +1,11 @@
 # Changelog
 
+- Admit one bounded provider recovery attempt ahead of new background scans,
+  yielding existing reconciliation only at durable boundaries. Release every
+  partial admission/mutation/ownership lock before retrying; preserve provider
+  completion adoption, poison rejection, fresh no-I/O checks and task history
+  without changing funding windows or provider authority (#856).
+
 - Share exact large SQL input bytes in bounded interned chunks so repeated
   journal snapshots can retain verified read proofs without raising cache limits.
   Reuse successful customer collection snapshots only after fresh exact-input
