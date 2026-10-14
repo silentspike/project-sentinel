@@ -2365,11 +2365,58 @@ impl WorkflowApi {
         if binding.schema_version != 3 {
             return Err("adaptive provider schema is invalid");
         }
-        let session = self
-            .core
-            .adaptive_session(binding.grant.session_id, &binding.grant.authority)
-            .map_err(|_| "adaptive session unavailable")?
-            .ok_or("adaptive session missing")?;
+        // Each store phase returns owned facts, never a connection/read guard.
+        let preparation = {
+            let _phase = AdaptiveContextReadPhase::start("preparation_snapshot");
+            let result = self.store.adaptive_model_preparation_read_snapshot(
+                binding.grant.session_id,
+                binding.session_version,
+                binding.effect_id,
+                &binding.grant.authority,
+            );
+            match result {
+                Ok(Some(snapshot)) => snapshot,
+                outcome => {
+                    // Preserve authority-before-session diagnostics on failures,
+                    // without adding another project read to successful preparation.
+                    self.authority
+                        .as_ref()
+                        .ok_or("adaptive session unavailable")?
+                        .snapshot_for_admission(
+                            &binding.grant.authority.tenant_id,
+                            &binding.grant.authority.project_id,
+                            &binding.grant.authority.work_item_id,
+                            binding.grant.authority.agent_id,
+                            true,
+                        )
+                        .map_err(|_| "adaptive session unavailable")?;
+                    return Err(match outcome {
+                        Ok(None) => "adaptive session missing",
+                        _ => "adaptive session unavailable",
+                    });
+                }
+            }
+        };
+        let session = preparation.session();
+        let project = preparation
+            .project()
+            .map_err(|_| "adaptive session unavailable")?;
+        let current = self
+            .authority
+            .as_ref()
+            .ok_or("adaptive session unavailable")?
+            .snapshot_from_validated_project(
+                project,
+                &binding.grant.authority.tenant_id,
+                &binding.grant.authority.project_id,
+                &binding.grant.authority.work_item_id,
+                binding.grant.authority.agent_id,
+                true,
+            )
+            .map_err(|_| "adaptive session unavailable")?;
+        if current != session.grant.authority {
+            return Err("adaptive session unavailable");
+        }
         if session.effective_grant() != binding.grant
             || session.last_observation != binding.previous_observation
         {
@@ -2394,14 +2441,6 @@ impl WorkflowApi {
         if !effect_matches {
             return Err("adaptive model effect changed");
         }
-        let project = self
-            .store
-            .company_project(
-                &binding.grant.authority.tenant_id,
-                &binding.grant.authority.project_id,
-            )
-            .map_err(|_| "adaptive project unavailable")?
-            .ok_or("adaptive project missing")?;
         let work = project
             .work_items
             .get(&binding.grant.authority.work_item_id)
@@ -2454,21 +2493,63 @@ impl WorkflowApi {
                     )
                 });
         }
+        let accepted_customer_contract = self.accepted_customer_contract(project)?;
+        let artifact_inputs = self.model_artifact_inputs(project, &work.spec)?;
+        let correction = self.model_work_correction(project, &work.spec.work_item_id)?;
+        // Private observation/artifact callbacks may have changed persisted policy
+        // or session state. Start a new SQL phase before consuming feedback.
+        let post_callback = {
+            let _phase = AdaptiveContextReadPhase::start("post_callback_snapshot");
+            self.store
+                .adaptive_model_preparation_read_snapshot(
+                    binding.grant.session_id,
+                    binding.session_version,
+                    binding.effect_id,
+                    &binding.grant.authority,
+                )
+                .map_err(|_| "adaptive recovery feedback unavailable")?
+                .ok_or("adaptive recovery feedback unavailable")?
+        };
+        let schema_retry_feedback = {
+            let fresh_project = post_callback
+                .project()
+                .map_err(|_| "adaptive recovery feedback unavailable")?;
+            if fresh_project != project || post_callback.session() != session {
+                return Err("adaptive recovery feedback unavailable");
+            }
+            let current = self
+                .authority
+                .as_ref()
+                .ok_or("adaptive recovery feedback unavailable")?
+                .snapshot_from_validated_project(
+                    fresh_project,
+                    &binding.grant.authority.tenant_id,
+                    &binding.grant.authority.project_id,
+                    &binding.grant.authority.work_item_id,
+                    binding.grant.authority.agent_id,
+                    true,
+                )
+                .map_err(|_| "adaptive recovery feedback unavailable")?;
+            if current != binding.grant.authority {
+                return Err("adaptive recovery feedback unavailable");
+            }
+            post_callback
+                .recovery_feedback()
+                .map_err(|_| "adaptive recovery feedback unavailable")?
+                .cloned()
+        };
         let mut context = AdaptiveModelContext {
             binding: binding.clone(),
             task: work.spec.clone(),
-            accepted_customer_contract: self.accepted_customer_contract(&project)?,
-            artifact_inputs: self.model_artifact_inputs(&project, &work.spec)?,
-            correction: self.model_work_correction(&project, &work.spec.work_item_id)?,
+            accepted_customer_contract,
+            artifact_inputs,
+            correction,
             observation,
             fresh_observation_required,
             tool_catalog: Some(tool_catalog),
-            schema_retry_feedback: self
-                .core
-                .adaptive_recovery_feedback(&binding.grant.authority)
-                .map_err(|_| "adaptive recovery feedback unavailable")?,
+            schema_retry_feedback,
             agent_context: self.adaptive_agent_context(
-                &project,
+                project,
                 &work.spec,
                 binding.grant.authority.assignment_version,
             )?,
@@ -2502,21 +2583,36 @@ impl WorkflowApi {
             if session.active_work_funding().is_some() {
                 return Err("funded adaptive session requires sealed working memory");
             }
+            self.validate_adaptive_preparation_freshness(binding, session, project)?;
             context.validate_dispatch(now_unix_ms())?;
             context.prompt()?;
             return Ok(context);
         }
         let source = {
             let _phase = AdaptiveContextReadPhase::start("working_memory_source");
-            self.core
-                .adaptive_working_memory_source(
-                    binding.grant.session_id,
-                    binding.session_version,
-                    binding.effect_id,
-                    &binding.grant.authority,
+            let current = self
+                .authority
+                .as_ref()
+                .ok_or("adaptive working memory journal unavailable")?
+                .snapshot_from_validated_project(
+                    project,
+                    &binding.grant.authority.tenant_id,
+                    &binding.grant.authority.project_id,
+                    &binding.grant.authority.work_item_id,
+                    binding.grant.authority.agent_id,
+                    true,
                 )
-                .map_err(|_| "adaptive working memory journal unavailable")?
-                .ok_or("adaptive working memory journal missing")?
+                .map_err(|_| "adaptive working memory journal unavailable")?;
+            if current != binding.grant.authority {
+                return Err("adaptive working memory journal unavailable");
+            }
+            post_callback.working_memory_source().map_err(|error| {
+                if error.code == WorkflowErrorCode::NotFound {
+                    "adaptive working memory journal missing"
+                } else {
+                    "adaptive working memory journal unavailable"
+                }
+            })?
         };
         if source.root_model_ceiling != session.grant.max_model_calls
             || source.root_tool_ceiling != session.grant.max_tool_calls
@@ -2568,7 +2664,7 @@ impl WorkflowApi {
                     }
                 }
             };
-            working_memory::compose(source, context.observation.as_ref(), |effect| {
+            working_memory::compose(source.clone(), context.observation.as_ref(), |effect| {
                 Ok(observations.remove(&effect))
             })?
         });
@@ -2578,9 +2674,69 @@ impl WorkflowApi {
         {
             return Err("adaptive retained context changed");
         }
+        self.validate_adaptive_preparation_freshness(binding, session, project)?;
         context.validate_dispatch(now_unix_ms())?;
         context.prompt()?;
         Ok(context)
+    }
+
+    fn validate_adaptive_preparation_freshness(
+        &self,
+        binding: &AdaptiveProviderAuthority,
+        session: &AdaptiveSessionV1,
+        project: &sentinel_workflow::ProjectV1,
+    ) -> Result<(), &'static str> {
+        let snapshot = self
+            .store
+            .adaptive_project_snapshot(
+                &binding.grant.authority.tenant_id,
+                &binding.grant.authority.project_id,
+                &binding.grant.authority.work_item_id,
+                binding.grant.authority.agent_id,
+            )
+            .map_err(|_| "adaptive session unavailable")?
+            .ok_or("adaptive session missing")?;
+        if snapshot.project() != project {
+            return Err("adaptive session authority changed");
+        }
+        let current = self
+            .authority
+            .as_ref()
+            .ok_or("adaptive authority unavailable")?
+            .snapshot_from_validated_project(
+                snapshot.project(),
+                &binding.grant.authority.tenant_id,
+                &binding.grant.authority.project_id,
+                &binding.grant.authority.work_item_id,
+                binding.grant.authority.agent_id,
+                true,
+            )
+            .map_err(|_| "adaptive session unavailable")?;
+        if current != binding.grant.authority
+            || snapshot
+                .session_for_authority(&current)
+                .map_err(|_| "adaptive session unavailable")?
+                .as_ref()
+                != Some(session)
+        {
+            return Err("adaptive session authority changed");
+        }
+        drop(snapshot);
+        if let Some(epoch) = session.active_work_funding() {
+            let receipt = self
+                .store
+                .adaptive_work_funding(
+                    &binding.grant.authority.tenant_id,
+                    binding.grant.session_id,
+                    epoch.receipt.request.operation_id,
+                )
+                .map_err(|_| "adaptive adopted funding receipt unavailable")?
+                .ok_or("adaptive adopted funding receipt missing")?;
+            if receipt != epoch.receipt {
+                return Err("adaptive adopted funding receipt changed");
+            }
+        }
+        Ok(())
     }
 
     fn adaptive_agent_context(

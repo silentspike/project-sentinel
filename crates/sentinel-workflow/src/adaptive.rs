@@ -201,6 +201,76 @@ pub enum AdaptiveModelAdmissionV1 {
     InsufficientSlack,
 }
 
+#[cfg(test)]
+mod progress_read_tests;
+
+/// Compact validated journal facts, never a model or tool admission grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum AdaptiveProgressReadKind {
+    ReadyForModel,
+    NoPrivateObservation,
+    ModelUnknown,
+    ToolUnknown,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdaptiveProgressReadFacts {
+    kind: AdaptiveProgressReadKind,
+    admission: ModelAdmissionReadFacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ModelAdmissionReadFacts {
+    updated_at_ms: u64,
+    model_calls: u16,
+    model_ceiling: u16,
+    deadline_ms: u64,
+    call_duration_ms: u64,
+    dispatch_margin_ms: Option<u64>,
+}
+
+impl ModelAdmissionReadFacts {
+    fn admission_at(&self, now_ms: u64) -> AdaptiveModelAdmissionV1 {
+        if now_ms < self.updated_at_ms {
+            return AdaptiveModelAdmissionV1::DeadlineExpired;
+        }
+        if self.model_calls >= self.model_ceiling {
+            return AdaptiveModelAdmissionV1::CallsExhausted;
+        }
+        if now_ms >= self.deadline_ms {
+            return AdaptiveModelAdmissionV1::DeadlineExpired;
+        }
+        if let Some(margin) = self.dispatch_margin_ms {
+            if self
+                .call_duration_ms
+                .checked_add(margin)
+                .is_none_or(|minimum| self.deadline_ms - now_ms < minimum)
+            {
+                return AdaptiveModelAdmissionV1::InsufficientSlack;
+            }
+        }
+        AdaptiveModelAdmissionV1::Admissible
+    }
+}
+
+impl AdaptiveProgressReadFacts {
+    pub fn kind(&self) -> AdaptiveProgressReadKind {
+        self.kind
+    }
+
+    pub fn model_window_exhausted_at(&self, now_ms: u64) -> bool {
+        self.kind == AdaptiveProgressReadKind::ReadyForModel
+            && now_ms >= self.admission.updated_at_ms
+            && matches!(
+                self.admission.admission_at(now_ms),
+                AdaptiveModelAdmissionV1::CallsExhausted
+                    | AdaptiveModelAdmissionV1::DeadlineExpired
+                    | AdaptiveModelAdmissionV1::InsufficientSlack
+            )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdaptiveContinuationStateV1 {
@@ -1235,26 +1305,32 @@ impl AdaptiveSessionV1 {
     /// Reports active model-window exhaustion, including root exhaustion,
     /// without authorizing continuation or changing session state.
     pub fn model_window_exhausted_at(&self, now_ms: u64) -> bool {
-        matches!(self.cursor, AdaptiveCursorV1::ReadyForModel)
-            && now_ms >= self.updated_at_ms
-            && matches!(
-                self.model_admission_at(now_ms),
-                AdaptiveModelAdmissionV1::CallsExhausted
-                    | AdaptiveModelAdmissionV1::DeadlineExpired
-                    | AdaptiveModelAdmissionV1::InsufficientSlack
-            )
+        self.progress_read_facts().model_window_exhausted_at(now_ms)
     }
 
     pub fn model_admission_at(&self, now_ms: u64) -> AdaptiveModelAdmissionV1 {
-        if now_ms < self.updated_at_ms {
-            return AdaptiveModelAdmissionV1::DeadlineExpired;
+        self.model_admission_read_facts().admission_at(now_ms)
+    }
+
+    pub fn progress_read_facts(&self) -> AdaptiveProgressReadFacts {
+        let kind = match &self.cursor {
+            AdaptiveCursorV1::ReadyForModel => AdaptiveProgressReadKind::ReadyForModel,
+            AdaptiveCursorV1::Blocked { reason_code }
+                if reason_code == "no_private_observation" =>
+            {
+                AdaptiveProgressReadKind::NoPrivateObservation
+            }
+            AdaptiveCursorV1::ModelUnknown { .. } => AdaptiveProgressReadKind::ModelUnknown,
+            AdaptiveCursorV1::ToolUnknown { .. } => AdaptiveProgressReadKind::ToolUnknown,
+            _ => AdaptiveProgressReadKind::Other,
+        };
+        AdaptiveProgressReadFacts {
+            kind,
+            admission: self.model_admission_read_facts(),
         }
-        if self.model_calls >= self.active_model_ceiling() {
-            return AdaptiveModelAdmissionV1::CallsExhausted;
-        }
-        if now_ms >= self.active_deadline_ms() {
-            return AdaptiveModelAdmissionV1::DeadlineExpired;
-        }
+    }
+
+    fn model_admission_read_facts(&self) -> ModelAdmissionReadFacts {
         let margin = self
             .active_work_funding()
             .map(|epoch| epoch.binding.limits.dispatch_margin_ms)
@@ -1265,16 +1341,14 @@ impl AdaptiveSessionV1 {
                     .and_then(|authorization| authorization.resume_policy.as_ref())
                     .map(|binding| binding.limits.dispatch_margin_ms)
             });
-        if let Some(margin) = margin {
-            if self
-                .effective_call_duration_ms()
-                .checked_add(margin)
-                .is_none_or(|minimum| self.active_deadline_ms() - now_ms < minimum)
-            {
-                return AdaptiveModelAdmissionV1::InsufficientSlack;
-            }
+        ModelAdmissionReadFacts {
+            updated_at_ms: self.updated_at_ms,
+            model_calls: self.model_calls,
+            model_ceiling: self.active_model_ceiling(),
+            deadline_ms: self.active_deadline_ms(),
+            call_duration_ms: self.effective_call_duration_ms(),
+            dispatch_margin_ms: margin,
         }
-        AdaptiveModelAdmissionV1::Admissible
     }
 
     pub(crate) fn continuation_window_limit(&self) -> usize {
