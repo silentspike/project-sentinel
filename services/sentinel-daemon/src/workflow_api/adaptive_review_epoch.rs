@@ -74,6 +74,9 @@ impl WorkflowApi {
         path: &str,
         body: &[u8],
     ) -> WorkflowHttpResponse {
+        if query_parameter(path, "mode") == Some("funded_undispatched_retry") {
+            return self.funded_review_recovery_http(principal, method, path, body);
+        }
         if principal.principal.kind != CompanyPrincipalKindV1::Operator
             || !matches!(
                 principal.principal.role,
@@ -861,6 +864,9 @@ impl WorkflowApi {
         &self,
         call: &sentinel_workflow::AdaptiveLeadershipReviewCallV1,
     ) -> Result<(), &'static str> {
+        if call.grant.funded_review_recovery.is_some() {
+            return self.verify_funded_review_recovery_membership(call);
+        }
         let Some(binding) = &call.grant.recovery_epoch else {
             return Ok(());
         };

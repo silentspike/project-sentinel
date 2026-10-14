@@ -33,6 +33,8 @@ mod adaptive_review_epoch;
 #[path = "workflow_api/tests/budget_window.rs"]
 mod budget_window_tests;
 mod company_reconciliation_worker;
+#[cfg(feature = "llm")]
+mod funded_review_recovery;
 pub(crate) use company_reconciliation_worker::CompanyReconciliationWorker;
 mod delivery_intent;
 mod delivery_runtime;
@@ -3347,6 +3349,20 @@ struct ReconciliationStatus {
     last_error: Option<String>,
 }
 
+#[cfg(feature = "llm")]
+pub(super) struct ProviderRecoveryGuard<'a> {
+    _admission: std::sync::RwLockWriteGuard<'a, bool>,
+    _mutation: std::sync::RwLockWriteGuard<'a, ()>,
+    active_requests: std::sync::MutexGuard<'a, std::collections::HashMap<String, usize>>,
+}
+
+#[cfg(feature = "llm")]
+impl ProviderRecoveryGuard<'_> {
+    fn request_is_active(&self, request_id: &str) -> bool {
+        self.active_requests.contains_key(request_id)
+    }
+}
+
 pub struct WorkflowApi {
     core: Arc<ProductWorkflowCore>,
     delivery: Option<Arc<ProductDeliveryCore>>,
@@ -3356,6 +3372,10 @@ pub struct WorkflowApi {
     workbench: Option<Arc<WorkbenchExecutionAdapter>>,
     event_store: Option<sentinel_limbo::EventStore>,
     mutation_fence: RwLock<()>,
+    #[cfg(feature = "llm")]
+    provider_admission: Arc<RwLock<bool>>,
+    #[cfg(feature = "llm")]
+    active_provider_requests: Arc<Mutex<std::collections::HashMap<String, usize>>>,
     reconciliation_fence: Mutex<()>,
     enabled: bool,
     model_work_enabled: bool,
@@ -3393,6 +3413,47 @@ impl std::fmt::Debug for WorkflowApi {
 }
 
 impl WorkflowApi {
+    #[cfg(feature = "llm")]
+    pub(crate) fn provider_admission_fence(&self) -> Arc<RwLock<bool>> {
+        Arc::clone(&self.provider_admission)
+    }
+
+    #[cfg(feature = "llm")]
+    pub(crate) fn active_provider_requests(
+        &self,
+    ) -> Arc<Mutex<std::collections::HashMap<String, usize>>> {
+        Arc::clone(&self.active_provider_requests)
+    }
+
+    #[cfg(feature = "llm")]
+    fn provider_recovery_fence(&self) -> Result<ProviderRecoveryGuard<'_>, &'static str> {
+        if !self.enabled || !self.model_work_enabled {
+            return Err("provider recovery unavailable");
+        }
+        // Reservation uses this same admission lock. Keep the global lock order
+        // ahead of mutation and live ownership inspection; never wait on contention.
+        let admission = self
+            .provider_admission
+            .try_write()
+            .map_err(|_| "provider recovery admission unavailable")?;
+        if !*admission {
+            return Err("provider admission closed");
+        }
+        let mutation = self
+            .mutation_fence
+            .try_write()
+            .map_err(|_| "workflow recovery busy")?;
+        let active_requests = self
+            .active_provider_requests
+            .try_lock()
+            .map_err(|_| "provider ownership unavailable")?;
+        Ok(ProviderRecoveryGuard {
+            _admission: admission,
+            _mutation: mutation,
+            active_requests,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn disabled() -> Result<Self, WorkflowError> {
         Self::new_disabled(Arc::new(WorkflowStore::open(":memory:")?))
@@ -3560,6 +3621,10 @@ impl WorkflowApi {
             workbench: Some(workbench),
             event_store: Some(event_store),
             mutation_fence: RwLock::new(()),
+            #[cfg(feature = "llm")]
+            provider_admission: Arc::new(RwLock::new(true)),
+            #[cfg(feature = "llm")]
+            active_provider_requests: Arc::new(Mutex::new(std::collections::HashMap::new())),
             reconciliation_fence: Mutex::new(()),
             enabled: true,
             model_work_enabled,
@@ -3611,6 +3676,10 @@ impl WorkflowApi {
             workbench: None,
             event_store: None,
             mutation_fence: RwLock::new(()),
+            #[cfg(feature = "llm")]
+            provider_admission: Arc::new(RwLock::new(false)),
+            #[cfg(feature = "llm")]
+            active_provider_requests: Arc::new(Mutex::new(std::collections::HashMap::new())),
             reconciliation_fence: Mutex::new(()),
             enabled: false,
             model_work_enabled: false,
@@ -5859,21 +5928,69 @@ impl WorkflowApi {
         Ok(())
     }
 
+    fn measure_health_read<T, E>(
+        &self,
+        stage: sentinel_workflow::WorkflowDiagnosticStage,
+        read: impl FnOnce() -> Result<T, E>,
+    ) -> (Result<T, E>, std::time::Duration) {
+        let span = self.store.diagnostic_span(stage);
+        let started = std::time::Instant::now();
+        let result = read();
+        let elapsed = started.elapsed();
+        span.finish(result.is_ok());
+        if elapsed >= std::time::Duration::from_millis(100) {
+            tracing::info!(stage = ?stage, elapsed_us = elapsed.as_micros(),
+                succeeded = result.is_ok(), "Slow workflow health read finished");
+        }
+        (result, elapsed)
+    }
+
+    pub(crate) fn health_serialization_span(&self) -> sentinel_workflow::WorkflowDiagnosticSpan {
+        self.store
+            .diagnostic_span(sentinel_workflow::WorkflowDiagnosticStage::HealthSerialization)
+    }
+
     pub fn health(&self) -> WorkflowHealthSnapshot {
-        let pending_execution = self.store.pending_executions(MAX_RECONCILE_BATCH);
-        let pending_completion = self.store.pending_completion_evidence(MAX_RECONCILE_BATCH);
-        let pending_gate = self.store.pending_gate_evidence(MAX_RECONCILE_BATCH);
+        use sentinel_workflow::WorkflowDiagnosticStage;
+        let total_span = self.store.diagnostic_span(WorkflowDiagnosticStage::Health);
+        let started = std::time::Instant::now();
+        let (pending_execution, execution_elapsed) = self
+            .measure_health_read(WorkflowDiagnosticStage::PendingExecutions, || {
+                self.store.pending_executions(MAX_RECONCILE_BATCH)
+            });
+        let (pending_completion, completion_elapsed) = self
+            .measure_health_read(WorkflowDiagnosticStage::PendingCompletions, || {
+                self.store.pending_completion_evidence(MAX_RECONCILE_BATCH)
+            });
+        let (pending_gate, gate_elapsed) = self
+            .measure_health_read(WorkflowDiagnosticStage::PendingGates, || {
+                self.store.pending_gate_evidence(MAX_RECONCILE_BATCH)
+            });
         #[cfg(feature = "llm")]
-        let durable_error = match self.adaptive_models_have_unknown_outcome() {
+        let (unknown_outcome, outcome_elapsed) = self
+            .measure_health_read(WorkflowDiagnosticStage::AdaptiveUnknownOutcomes, || {
+                self.adaptive_models_have_unknown_outcome()
+            });
+        #[cfg(not(feature = "llm"))]
+        let outcome_elapsed = std::time::Duration::ZERO;
+        #[cfg(feature = "llm")]
+        let durable_error = match unknown_outcome {
             Ok(true) => Some("UnknownOutcome".to_owned()),
             Err(reason) => Some(reason.to_owned()),
             Ok(false) => None,
         };
-        let canonical_event_cursor = self.store.company_event_cursor();
-        let delivery_snapshot = self
-            .delivery
-            .as_ref()
-            .and_then(|delivery| delivery.readiness_snapshot().ok());
+        let (canonical_event_cursor, cursor_elapsed) = self
+            .measure_health_read(WorkflowDiagnosticStage::CompanyCursor, || {
+                self.store.company_event_cursor()
+            });
+        let (delivery_result, delivery_elapsed) =
+            self.measure_health_read(WorkflowDiagnosticStage::DeliveryReadiness, || {
+                self.delivery
+                    .as_ref()
+                    .map(|delivery| delivery.readiness_snapshot())
+                    .transpose()
+            });
+        let delivery_snapshot = delivery_result.ok().flatten();
         let delivery_ready = delivery_snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.readiness.is_ok());
@@ -5902,6 +6019,22 @@ impl WorkflowApi {
             && delivery_publication_pending == Some(0)
             && collaboration_publication_pending == 0
             && canonical_event_cursor.is_ok();
+        total_span.finish(ready);
+        let elapsed = started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(100) {
+            // Emit only static phase names and wall times after all durable reads.
+            // This is attribution evidence, not a readiness or performance claim.
+            tracing::info!(
+                total_us = elapsed.as_micros(),
+                pending_execution_us = execution_elapsed.as_micros(),
+                pending_completion_us = completion_elapsed.as_micros(),
+                pending_gate_us = gate_elapsed.as_micros(),
+                adaptive_outcome_us = outcome_elapsed.as_micros(),
+                company_cursor_us = cursor_elapsed.as_micros(),
+                delivery_us = delivery_elapsed.as_micros(),
+                "Slow workflow health phases finished",
+            );
+        }
         WorkflowHealthSnapshot {
             enabled: self.enabled,
             model_work_enabled: self.model_work_enabled,
@@ -9167,6 +9300,145 @@ mod tests {
             .code,
             WorkflowErrorCode::InvalidInput
         );
+    }
+
+    #[cfg(feature = "llm")]
+    fn provider_recovery_test_api() -> WorkflowApi {
+        let mut api = WorkflowApi::disabled().unwrap();
+        api.enabled = true;
+        api.model_work_enabled = true;
+        *api.provider_admission.write().unwrap() = true;
+        api
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn provider_recovery_fence_excludes_actual_shared_admission_and_registration() {
+        let api = provider_recovery_test_api();
+        let admission = api.provider_admission_fence();
+        let requests = api.active_provider_requests();
+        assert!(Arc::ptr_eq(&admission, &api.provider_admission));
+        assert!(Arc::ptr_eq(&requests, &api.active_provider_requests));
+        let guard = api.provider_recovery_fence().unwrap();
+        assert!(!guard.request_is_active("old-review"));
+        assert!(admission.try_read().is_err());
+        assert!(api.mutation_fence.try_read().is_err());
+        assert!(requests.try_lock().is_err());
+        drop(guard);
+        assert!(*admission.try_read().unwrap());
+        assert!(api.mutation_fence.try_read().is_ok());
+        assert!(requests.try_lock().is_ok());
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn provider_recovery_fence_retains_exact_live_request_identity() {
+        let api = provider_recovery_test_api();
+        let requests = api.active_provider_requests();
+        requests.lock().unwrap().insert("old-review".into(), 2);
+        let guard = api.provider_recovery_fence().unwrap();
+        assert!(guard.request_is_active("old-review"));
+        assert!(!guard.request_is_active("another-review"));
+        drop(guard);
+        assert_eq!(requests.lock().unwrap().get("old-review"), Some(&2));
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn provider_recovery_fence_rejects_contention_without_leaking_admission() {
+        let api = provider_recovery_test_api();
+        let admission = api.provider_admission_fence();
+        let reservation = admission.read().unwrap();
+        assert!(matches!(
+            api.provider_recovery_fence(),
+            Err("provider recovery admission unavailable")
+        ));
+        drop(reservation);
+        let mutation = api.mutation_fence.read().unwrap();
+        assert!(matches!(
+            api.provider_recovery_fence(),
+            Err("workflow recovery busy")
+        ));
+        assert!(admission.try_read().is_ok());
+        drop(mutation);
+        let requests = api.active_provider_requests();
+        let registration = requests.lock().unwrap();
+        assert!(matches!(
+            api.provider_recovery_fence(),
+            Err("provider ownership unavailable")
+        ));
+        assert!(admission.try_read().is_ok());
+        assert!(api.mutation_fence.try_read().is_ok());
+        drop(registration);
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn provider_recovery_fence_never_reopens_closed_or_disabled_admission() {
+        let api = provider_recovery_test_api();
+        *api.provider_admission.write().unwrap() = false;
+        assert!(matches!(
+            api.provider_recovery_fence(),
+            Err("provider admission closed")
+        ));
+        assert!(!*api.provider_admission.read().unwrap());
+        let disabled = WorkflowApi::disabled().unwrap();
+        assert!(matches!(
+            disabled.provider_recovery_fence(),
+            Err("provider recovery unavailable")
+        ));
+        assert!(!*disabled.provider_admission.read().unwrap());
+    }
+
+    #[cfg(feature = "llm")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_lane_startup_closes_actual_recovery_gate_after_supervisor_exit() {
+        use crate::llm_bridge::bridge::{
+            run_llm_bridge_with_shutdown, BridgeTelemetry, LlmBridgeConfig,
+        };
+        let api = provider_recovery_test_api();
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            sentinel_redb::StateStore::open(directory.path().join("state.redb").to_str().unwrap())
+                .unwrap(),
+        );
+        let events = Arc::new(sentinel_limbo::EventStore::open(":memory:").unwrap());
+        let event_count = events.event_count().unwrap();
+        let cursor = api.store.company_event_cursor().unwrap();
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let admission = api.provider_admission_fence();
+        let requests = api.active_provider_requests();
+        let (_perception_tx, perception_rx) = std::sync::mpsc::channel();
+        let (action_tx, _action_rx) = std::sync::mpsc::channel();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // Checked lane capacity overflows before any OS worker can be created.
+        let result = run_llm_bridge_with_shutdown(
+            LlmBridgeConfig {
+                max_concurrent: usize::MAX,
+                active_provider_requests: Some(Arc::clone(&requests)),
+                ..Default::default()
+            },
+            perception_rx,
+            action_tx,
+            Arc::new(BridgeTelemetry::default()),
+            state,
+            Arc::clone(&events),
+            Arc::clone(&unavailable),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            shutdown_rx,
+            Arc::clone(&admission),
+        )
+        .await;
+        assert_eq!(result, Err("llm_blocking_lanes_spawn_failed"));
+        assert!(unavailable.load(Ordering::Acquire));
+        assert!(!*admission.read().unwrap());
+        assert!(matches!(
+            api.provider_recovery_fence(),
+            Err("provider admission closed")
+        ));
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(events.event_count().unwrap(), event_count);
+        assert_eq!(api.store.company_event_cursor().unwrap(), cursor);
     }
 
     #[test]

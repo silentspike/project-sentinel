@@ -4,7 +4,7 @@ use super::*;
 use crate::adaptive_work_funding::*;
 use crate::{
     AdaptiveContinuationAuthorizationV1, AdaptiveLeadershipReviewCallV1,
-    AdaptiveLeadershipReviewGrantV1, RuntimeAuthoritySnapshotV1,
+    AdaptiveLeadershipReviewContextV1, AdaptiveLeadershipReviewGrantV1, RuntimeAuthoritySnapshotV1,
 };
 
 const FUNDING_KIND: &str = "adaptive_work_funding";
@@ -77,7 +77,7 @@ fn adoption_id(
     ))
 }
 
-fn require_epoch_receipt(
+pub(super) fn require_epoch_receipt(
     connection: &Connection,
     epoch: &AdaptiveWorkFundingEpochV1,
 ) -> Result<(), WorkflowError> {
@@ -109,7 +109,7 @@ fn require_review_binding(
     let epoch = grant.work_funding.as_deref().ok_or_else(unauthorized)?;
     epoch.validate()?;
     let source = &epoch.receipt.request.source.resume_source;
-    if grant.schema_version != 5
+    if !matches!(grant.schema_version, 5 | 6)
         || grant.leadership_principal.tenant_id != source.tenant_id
         || grant.leadership_principal.kind != CompanyPrincipalKindV1::Agent
         || !matches!(
@@ -265,6 +265,21 @@ fn require_adoption_review(
 }
 
 pub(crate) fn require_funding_review_membership(
+    connection: &Connection,
+    grant: &AdaptiveLeadershipReviewGrantV1,
+    context_digest: &str,
+    operation_id: Uuid,
+) -> Result<(), WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        require_funding_review_membership_leaf(connection, grant, context_digest, operation_id)?;
+        if grant.schema_version == 6 {
+            super::adaptive_funded_review_recovery::require_membership(connection, grant, None)?;
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn require_funding_review_membership_leaf(
     connection: &Connection,
     grant: &AdaptiveLeadershipReviewGrantV1,
     context_digest: &str,
@@ -638,6 +653,143 @@ fn reviewed_funding_ids(
     tenant: &TenantId,
 ) -> Result<BTreeSet<String>, WorkflowError> {
     reviewed_funding_ids_with_observer(connection, tenant, |_, _| {})
+}
+
+pub(super) fn require_never_dispatched_funding(
+    connection: &Connection,
+    epoch: &AdaptiveWorkFundingEpochV1,
+) -> Result<(), WorkflowError> {
+    require_pre_recovery_funding_history(connection, epoch, None)
+}
+
+pub(super) fn require_pre_recovery_funding_history(
+    connection: &Connection,
+    epoch: &AdaptiveWorkFundingEpochV1,
+    designated: Option<(
+        &AdaptiveLeadershipReviewGrantV1,
+        &AdaptiveLeadershipReviewContextV1,
+        Uuid,
+        u64,
+    )>,
+) -> Result<(), WorkflowError> {
+    validation_scope::memoize(
+        connection,
+        "funded-recovery-history",
+        &(epoch, designated),
+        || require_pre_recovery_funding_history_uncached(connection, epoch, designated),
+    )
+}
+
+fn require_pre_recovery_funding_history_uncached(
+    connection: &Connection,
+    epoch: &AdaptiveWorkFundingEpochV1,
+    designated: Option<(
+        &AdaptiveLeadershipReviewGrantV1,
+        &AdaptiveLeadershipReviewContextV1,
+        Uuid,
+        u64,
+    )>,
+) -> Result<(), WorkflowError> {
+    let tenant = &epoch.receipt.request.source.resume_source.tenant_id;
+    // Validate all sealed review traces before filtering by funding identity.
+    reviewed_funding_ids(connection, tenant)?;
+    let ids = {
+        let mut statement = connection.prepare(
+            "SELECT entity_id FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2
+             ORDER BY entity_id LIMIT 4097",
+        )?;
+        let rows = statement.query_map(params![tenant.0, ADOPTION_KIND], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if ids.len() > 4096 {
+        return Err(corrupt());
+    }
+    for id in ids {
+        let leaf: FundingAdoptionLeaf =
+            get_entity(connection, tenant, ADOPTION_KIND, &id)?.ok_or_else(corrupt)?;
+        if leaf
+            .authorization
+            .work_funding
+            .as_ref()
+            .is_some_and(|prior| prior.same_epoch(epoch))
+            && !designated.is_some_and(|(grant, _, operation, issued)| {
+                leaf.authorization.review_id == grant.review_id
+                    && leaf.authorization.operation_id == operation
+                    && leaf.authorization.issued_at_ms >= issued
+            })
+        {
+            return Err(transition());
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT event_type,payload FROM company_events WHERE tenant_id=?1
+         AND (event_type GLOB 'adaptive_leadership_review_*' OR event_type=?2)
+         ORDER BY sequence LIMIT 4097",
+    )?;
+    let mut rows = statement.query(params![tenant.0, ADOPTION_EVENT])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        if count > 4096 {
+            return Err(corrupt());
+        }
+        let event_type: String = row.get(0)?;
+        let value = row.get_ref(1)?;
+        let rusqlite::types::ValueRef::Blob(payload) = value else {
+            return Err(corrupt());
+        };
+        validation_scope::charge_bytes(connection, payload.len())?;
+        // Adoption events have a separate typed shape and sealed membership.
+        if event_type == ADOPTION_EVENT {
+            let leaf: FundingAdoptionLeaf = decode(payload)?;
+            let stored: FundingAdoptionLeaf =
+                get_entity(connection, tenant, ADOPTION_KIND, &leaf.membership_id)?
+                    .ok_or_else(corrupt)?;
+            if stored != leaf {
+                return Err(corrupt());
+            }
+            if leaf
+                .authorization
+                .work_funding
+                .as_ref()
+                .is_some_and(|prior| prior.same_epoch(epoch))
+                && !designated.is_some_and(|(grant, _, operation, issued)| {
+                    leaf.authorization.review_id == grant.review_id
+                        && leaf.authorization.operation_id == operation
+                        && leaf.authorization.issued_at_ms >= issued
+                })
+            {
+                return Err(transition());
+            }
+        } else {
+            let call: AdaptiveLeadershipReviewCallV1 = decode(payload)?;
+            if designated.is_some_and(|(grant, context, operation, issued)| {
+                call.grant == *grant
+                    && call.context == *context
+                    && call.operation_id == operation
+                    && call.grant_issued_at_unix_ms == issued
+            }) {
+                continue;
+            }
+            if call
+                .grant
+                .work_funding
+                .as_ref()
+                .is_some_and(|prior| prior.same_epoch(epoch))
+                && (call.grant.schema_version != 5
+                    || call.dispatch.is_some()
+                    || call.decision.is_some()
+                    || call.model_response_digest.is_some()
+                    || call.continuation.is_some()
+                    || call.resolution_event_id.is_some())
+            {
+                return Err(transition());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reviewed_funding_ids_with_observer(
@@ -1046,13 +1198,26 @@ pub(super) fn require_fresh_funding_review_source(
                 .map(|active| active.receipt.receipt_digest())
                 .transpose()?
                 != source.predecessor_receipt_digest
-            || epoch.binding.ordinal
-                != initial
-                    .base_review_count
-                    .checked_add(1)
-                    .ok_or_else(corrupt)?
+            || (call.grant.schema_version != 6
+                && epoch.binding.ordinal
+                    != initial
+                        .base_review_count
+                        .checked_add(1)
+                        .ok_or_else(corrupt)?)
         {
             return Err(transition());
+        }
+        if call.grant.schema_version == 6 {
+            let receipt = super::adaptive_funded_review_recovery::require_membership(
+                connection,
+                &call.grant,
+                Some(&call.context),
+            )?;
+            if receipt.context.source_session != session
+                || receipt.request.source.session_head_digest != head_digest
+            {
+                return Err(transition());
+            }
         }
     }
     Ok(())
@@ -1601,6 +1766,7 @@ mod review_payload_budget_tests {
                 },
             ),
             recovery_epoch: None,
+            funded_review_recovery: None,
             resume_policy: None,
             work_funding: Some(Box::new(epoch)),
         };

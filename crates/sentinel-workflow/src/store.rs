@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::de::DeserializeOwned;
@@ -24,6 +25,101 @@ mod revisions;
 pub(crate) use revisions::require_completed_source;
 pub use revisions::ExecutionRevisionV1;
 const MAX_NOT_FOUND_RECONCILES: u16 = 3;
+
+/// Finite, payload-free diagnostic stages; never authority or readiness evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowDiagnosticStage {
+    Health,
+    PendingExecutions,
+    PendingCompletions,
+    PendingGates,
+    AdaptiveUnknownOutcomes,
+    AdaptiveInventory,
+    PendingModelOutcome,
+    CompanyCursor,
+    DeliveryReadiness,
+    HealthSerialization,
+}
+
+impl WorkflowDiagnosticStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Health => "health",
+            Self::PendingExecutions => "pending_executions",
+            Self::PendingCompletions => "pending_completions",
+            Self::PendingGates => "pending_gates",
+            Self::AdaptiveUnknownOutcomes => "adaptive_unknown_outcomes",
+            Self::AdaptiveInventory => "adaptive_inventory",
+            Self::PendingModelOutcome => "pending_model_outcome",
+            Self::CompanyCursor => "company_cursor",
+            Self::DeliveryReadiness => "delivery_readiness",
+            Self::HealthSerialization => "health_serialization",
+        }
+    }
+}
+
+/// Owned opt-in wall-time span, retaining no store, lock, permission, or result.
+/// Finish before draining to include this record in that batch. Serialization
+/// after a health drain is observed in a later batch unless drained again.
+/// Measures only the caller's interval, not an implicit payload clone or serialization.
+#[derive(Debug)]
+pub struct WorkflowDiagnosticSpan {
+    stage: WorkflowDiagnosticStage,
+    started: Option<Instant>,
+}
+
+impl WorkflowDiagnosticSpan {
+    fn new(stage: WorkflowDiagnosticStage, enabled: bool) -> Self {
+        Self {
+            stage,
+            started: enabled.then(Instant::now),
+        }
+    }
+
+    fn record(&mut self, completed: bool, succeeded: bool) -> Option<String> {
+        let elapsed_us = self.started.take()?.elapsed().as_micros();
+        Some(format!(
+            "workflow_stage stage={} completed={} succeeded={} elapsed_us={} elapsed_ms={}",
+            self.stage.label(),
+            completed,
+            succeeded,
+            elapsed_us,
+            elapsed_us / 1000
+        ))
+    }
+
+    /// Finish observation only; `succeeded` cannot grant readiness or permission.
+    pub fn finish(mut self, succeeded: bool) {
+        if let Some(record) = self.record(true, succeeded) {
+            read_cache::publish_record(record);
+        }
+    }
+}
+
+impl Drop for WorkflowDiagnosticSpan {
+    fn drop(&mut self) {
+        if let Some(record) = self.record(false, false) {
+            read_cache::publish_record(record);
+        }
+    }
+}
+
+#[derive(Default)]
+struct SnapshotDiagnostic {
+    cache_wait: Duration,
+    setup: Duration,
+    cleanup: Duration,
+    setup_calls: usize,
+    cleanup_calls: usize,
+}
+
+impl SnapshotDiagnostic {
+    fn summary(&self, domain: &'static str, cache_acquired: bool, succeeded: bool) -> String {
+        format!("workflow_snapshot domain={} succeeded={} cache_acquired={} cache_lock_wait_us={} snapshot_setup_calls={} snapshot_setup_us={} snapshot_cleanup_calls={} snapshot_cleanup_us={}",
+            domain, succeeded, cache_acquired, self.cache_wait.as_micros(),
+            self.setup_calls, self.setup.as_micros(), self.cleanup_calls, self.cleanup.as_micros())
+    }
+}
 
 #[derive(Debug)]
 pub enum AdaptiveHealthReadError {
@@ -200,6 +296,11 @@ struct GateRow {
 }
 
 impl WorkflowStore {
+    /// Observe an approved stage using the startup-latched, default-off diagnostic opt-in.
+    pub fn diagnostic_span(&self, stage: WorkflowDiagnosticStage) -> WorkflowDiagnosticSpan {
+        WorkflowDiagnosticSpan::new(stage, read_cache::diagnostics_enabled())
+    }
+
     /// Drain at most 64 process-wide, payload-free read-cache diagnostic records.
     /// Requires opt-in at process startup; unavailable/contended observation is empty.
     /// Consumers perform output after this method returns, outside store locks.
@@ -225,12 +326,45 @@ impl WorkflowStore {
         validate: impl FnOnce(&Connection) -> Result<T, WorkflowError>,
         retain: impl Fn(&T) -> bool,
     ) -> Result<T, WorkflowError> {
+        self.validated_read_snapshot_observed(
+            connection,
+            domain,
+            query_key,
+            validate,
+            retain,
+            read_cache::diagnostics_enabled(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validated_read_snapshot_observed<T: Clone + Serialize + Send + 'static>(
+        &self,
+        connection: &mut Connection,
+        domain: &'static str,
+        query_key: &[u8],
+        validate: impl FnOnce(&Connection) -> Result<T, WorkflowError>,
+        retain: impl Fn(&T) -> bool,
+        observe: bool,
+        observed: Option<&mut SnapshotDiagnostic>,
+    ) -> Result<T, WorkflowError> {
         let eligible = connection.is_autocommit();
+        let mut diagnostic = observe.then(SnapshotDiagnostic::default);
+        let wait_started = diagnostic.as_ref().map(|_| Instant::now());
         let mut cache = self.validated_reads.lock().ok();
+        if let (Some(diagnostic), Some(started)) = (&mut diagnostic, wait_started) {
+            diagnostic.cache_wait = started.elapsed();
+        }
         // Keep the proof private under both locks until snapshot cleanup succeeds.
         // Savepoints also preserve caller-owned transactions without nested BEGIN.
         let result = (|| {
-            let snapshot = connection.savepoint()?;
+            let started = diagnostic.as_ref().map(|_| Instant::now());
+            let snapshot = connection.savepoint();
+            if let (Some(diagnostic), Some(started)) = (&mut diagnostic, started) {
+                diagnostic.setup_calls += 1;
+                diagnostic.setup = started.elapsed();
+            }
+            let snapshot = snapshot?;
             let value = match cache.as_mut() {
                 Some(cache) => cache.read_keyed_if(
                     &snapshot,
@@ -241,13 +375,42 @@ impl WorkflowStore {
                     retain,
                 ),
                 None => validate(&snapshot),
-            }?;
-            snapshot.commit()?;
+            };
+            let started = diagnostic.as_ref().map(|_| Instant::now());
+            let value = match value {
+                Ok(value) => {
+                    let committed = snapshot.commit();
+                    if let (Some(diagnostic), Some(started)) = (&mut diagnostic, started) {
+                        diagnostic.cleanup_calls += 1;
+                        diagnostic.cleanup = started.elapsed();
+                    }
+                    committed?;
+                    value
+                }
+                Err(error) => {
+                    drop(snapshot);
+                    if let (Some(diagnostic), Some(started)) = (&mut diagnostic, started) {
+                        diagnostic.cleanup_calls += 1;
+                        diagnostic.cleanup = started.elapsed();
+                    }
+                    return Err(error);
+                }
+            };
             Ok(value)
         })();
         if result.is_err() {
             if let Some(cache) = cache.as_mut() {
                 cache.clear();
+            }
+        }
+        let cache_acquired = cache.is_some();
+        drop(cache);
+        if let Some(diagnostic) = diagnostic {
+            let record = diagnostic.summary(domain, cache_acquired, result.is_ok());
+            if let Some(observed) = observed {
+                *observed = diagnostic;
+            } else {
+                read_cache::publish_record(record);
             }
         }
         result
@@ -582,10 +745,12 @@ impl WorkflowStore {
     ) -> Result<Vec<PendingExecutionV1>, WorkflowError> {
         self.validate_state_domain(
             "SELECT COUNT(*) FROM workflow_execution_outbox WHERE state NOT IN ('not_found','reserved','executing','awaiting_evidence','failed','cancelled','timed_out','unknown_outcome')",
+            "execution_outbox",
         )?;
         self.read_pending(
             "SELECT request FROM workflow_execution_outbox WHERE state IN ('not_found','reserved','executing') ORDER BY updated_at_ms, invocation_id LIMIT ?1",
             limit,
+            "execution_outbox",
         )
     }
 
@@ -595,10 +760,12 @@ impl WorkflowStore {
     ) -> Result<Vec<PendingCompletionEvidenceV1>, WorkflowError> {
         self.validate_state_domain(
             "SELECT COUNT(*) FROM workflow_completion_outbox WHERE state NOT IN ('pending','completed')",
+            "completion_outbox",
         )?;
         self.read_pending(
             "SELECT request FROM workflow_completion_outbox WHERE state='pending' ORDER BY updated_at_ms, request_id LIMIT ?1",
             limit,
+            "completion_outbox",
         )
     }
 
@@ -608,10 +775,12 @@ impl WorkflowStore {
     ) -> Result<Vec<PendingGateEvidenceV1>, WorkflowError> {
         self.validate_state_domain(
             "SELECT COUNT(*) FROM workflow_gate_outbox WHERE state NOT IN ('pending','completed','timed_out')",
+            "gate_outbox",
         )?;
         self.read_pending(
             "SELECT request FROM workflow_gate_outbox WHERE state='pending' ORDER BY updated_at_ms, request_id LIMIT ?1",
             limit,
+            "gate_outbox",
         )
     }
 
@@ -1006,33 +1175,66 @@ impl WorkflowStore {
         &self,
         sql: &str,
         limit: usize,
+        domain: &'static str,
     ) -> Result<Vec<T>, WorkflowError> {
-        let connection = self.lock()?;
-        let mut statement = connection.prepare(sql).map_err(map_sqlite_error)?;
-        let rows = statement
-            .query_map([limit.clamp(1, 100) as i64], |row| row.get::<_, Vec<u8>>(0))
-            .map_err(map_sqlite_error)?;
-        let mut values = Vec::new();
-        for row in rows {
-            let value: T = decode(&row.map_err(map_sqlite_error)?)?;
-            if value.schema_version() != WORKFLOW_SCHEMA_VERSION {
-                return Err(corrupt_store());
+        self.with_outbox_connection(domain, "pending_rows", |connection| {
+            let mut statement = connection.prepare(sql).map_err(map_sqlite_error)?;
+            let rows = statement
+                .query_map([limit.clamp(1, 100) as i64], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(map_sqlite_error)?;
+            let mut values = Vec::new();
+            for row in rows {
+                let value: T = decode(&row.map_err(map_sqlite_error)?)?;
+                if value.schema_version() != WORKFLOW_SCHEMA_VERSION {
+                    return Err(corrupt_store());
+                }
+                values.push(value);
             }
-            values.push(value);
-        }
-        Ok(values)
+            Ok(values)
+        })
     }
 
-    fn validate_state_domain(&self, sql: &str) -> Result<(), WorkflowError> {
-        let connection = self.lock()?;
-        let invalid: i64 = connection
-            .query_row(sql, [], |row| row.get(0))
-            .map_err(map_sqlite_error)?;
-        if invalid == 0 {
-            Ok(())
-        } else {
-            Err(corrupt_store())
+    fn validate_state_domain(&self, sql: &str, domain: &'static str) -> Result<(), WorkflowError> {
+        self.with_outbox_connection(domain, "state_domain", |connection| {
+            let invalid: i64 = connection
+                .query_row(sql, [], |row| row.get(0))
+                .map_err(map_sqlite_error)?;
+            if invalid == 0 {
+                Ok(())
+            } else {
+                Err(corrupt_store())
+            }
+        })
+    }
+
+    fn with_outbox_connection<T>(
+        &self,
+        domain: &'static str,
+        phase: &'static str,
+        action: impl FnOnce(&Connection) -> Result<T, WorkflowError>,
+    ) -> Result<T, WorkflowError> {
+        let started = read_cache::diagnostics_enabled().then(Instant::now);
+        let connection = self.lock();
+        let acquired = connection.is_ok();
+        let wait = started.map(|started| started.elapsed());
+        let hold_started = started.and_then(|_| acquired.then(Instant::now));
+        let (result, hold) = match connection {
+            Ok(connection) => {
+                let result = action(&connection);
+                drop(connection);
+                (
+                    result,
+                    hold_started.map_or(Duration::ZERO, |started| started.elapsed()),
+                )
+            }
+            Err(error) => (Err(error), Duration::ZERO),
+        };
+        if let Some(wait) = wait {
+            read_cache::publish_record(format!(
+                "workflow_connection domain={} phase={} succeeded={} connection_lock_acquired={} connection_lock_wait_us={} connection_lock_hold_us={}",
+                domain, phase, result.is_ok(), acquired, wait.as_micros(), hold.as_micros()));
         }
+        result
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, WorkflowError> {
@@ -2499,6 +2701,7 @@ fn corrupt_store() -> WorkflowError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -2506,10 +2709,110 @@ mod tests {
     use serde::{Serialize, Serializer};
     use uuid::Uuid;
 
-    use super::{encode, sql_u64, WorkflowStore, SCHEMA};
+    use super::{
+        corrupt_store, encode, sql_u64, SnapshotDiagnostic, WorkflowDiagnosticSpan,
+        WorkflowDiagnosticStage, WorkflowStore, SCHEMA,
+    };
     use crate::WorkflowErrorCode;
 
     struct SerializationFailure;
+
+    #[test]
+    fn diagnostic_stages_are_finite_optional_and_single_finish() {
+        let stages = [
+            WorkflowDiagnosticStage::Health,
+            WorkflowDiagnosticStage::PendingExecutions,
+            WorkflowDiagnosticStage::PendingCompletions,
+            WorkflowDiagnosticStage::PendingGates,
+            WorkflowDiagnosticStage::AdaptiveUnknownOutcomes,
+            WorkflowDiagnosticStage::AdaptiveInventory,
+            WorkflowDiagnosticStage::PendingModelOutcome,
+            WorkflowDiagnosticStage::CompanyCursor,
+            WorkflowDiagnosticStage::DeliveryReadiness,
+            WorkflowDiagnosticStage::HealthSerialization,
+        ];
+        let mut labels = BTreeSet::new();
+        for stage in stages {
+            assert!(labels.insert(stage.label()));
+            let mut disabled = WorkflowDiagnosticSpan::new(stage, false);
+            assert!(disabled.record(true, true).is_none());
+            let mut enabled = WorkflowDiagnosticSpan::new(stage, true);
+            let record = enabled.record(true, false).unwrap();
+            assert!(record.contains(&format!(
+                "stage={} completed=true succeeded=false",
+                stage.label()
+            )));
+            assert!(record.contains("elapsed_us="));
+            assert!(record.contains("elapsed_ms="));
+            assert!(enabled.record(true, true).is_none());
+        }
+        let mut incomplete = WorkflowDiagnosticSpan::new(WorkflowDiagnosticStage::Health, true);
+        assert!(incomplete
+            .record(false, false)
+            .unwrap()
+            .contains("completed=false succeeded=false"));
+        assert!(incomplete.record(false, false).is_none());
+    }
+
+    #[test]
+    fn snapshot_diagnostics_preserve_disabled_results_cleanup_and_error_precedence() {
+        for observe in [false, true] {
+            let store = WorkflowStore::open(":memory:").unwrap();
+            let mut connection = store.connection.lock().unwrap();
+            let mut diagnostic = SnapshotDiagnostic::default();
+            assert_eq!(
+                store
+                    .validated_read_snapshot_observed(
+                        &mut connection,
+                        "fixture",
+                        &[],
+                        |_| Ok(7_u64),
+                        |_| true,
+                        observe,
+                        Some(&mut diagnostic),
+                    )
+                    .unwrap(),
+                7
+            );
+            assert_eq!(diagnostic.setup_calls, usize::from(observe));
+            assert_eq!(diagnostic.cleanup_calls, usize::from(observe));
+            let error = store
+                .validated_read_snapshot_observed::<u64>(
+                    &mut connection,
+                    "fixture-error",
+                    &[],
+                    |_| Err(corrupt_store()),
+                    |_| true,
+                    observe,
+                    Some(&mut diagnostic),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, corrupt_store().code);
+            assert!(connection.is_autocommit());
+            assert!(format!("{:?}", store.validated_reads.lock().unwrap()).contains("views: 0"));
+            let result = store.validated_read_snapshot_observed(
+                &mut connection,
+                "fixture-cleanup",
+                &[],
+                |snapshot| {
+                    snapshot.execute_batch("ROLLBACK")?;
+                    Ok(7_u64)
+                },
+                |_| true,
+                observe,
+                Some(&mut diagnostic),
+            );
+            assert!(result.is_err());
+            assert_eq!(diagnostic.setup_calls, usize::from(observe));
+            assert_eq!(diagnostic.cleanup_calls, usize::from(observe));
+            assert!(connection.is_autocommit());
+            assert!(format!("{:?}", store.validated_reads.lock().unwrap()).contains("views: 0"));
+            drop(connection);
+            assert!(store.pending_executions(10).unwrap().is_empty());
+            assert!(store.pending_completion_evidence(10).unwrap().is_empty());
+            assert!(store.pending_gate_evidence(10).unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn validated_read_snapshot_clears_proofs_after_cleanup_failure() {

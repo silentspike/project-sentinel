@@ -240,6 +240,49 @@ exceptional review. Leadership can then decide to continue the same work within
 its remaining allowance or to defer it. Neither preparation nor issuance
 implements the task or claims customer acceptance.
 
+## Funded Undispatched Review Recovery
+
+A funded schema-5 review can expire before dispatch while its funding receipt
+still has review capacity and enough remaining lifetime. This case has one
+explicit recovery slot per tenant, session head and funding receipt. It consumes
+the next ordinary funded review ordinal, not an exceptional review or a new
+funding epoch. Issuance, expiry, restart and exact replay cannot reset that slot.
+An adopted funding receipt, an unknown effect or a previously dispatched or
+decided review is ineligible.
+
+The existing operator route accepts
+`GET ?mode=funded_undispatched_retry&source_only=true&project_id=<id>&session_id=<uuid>&retired_review_id=<uuid>`.
+After authentication, current assignment checks and the shared admission fence,
+this returns bounded source metadata, its digest, the server-derived receipt key
+and retired-review identity digests. The response is explicitly
+`unverified_source_metadata`: it issues no authority and does not establish no
+provider I/O. Repeated or invalid source flags, and source flags on POST, reject.
+
+Protected historical deployment and admission-ordering evidence must establish
+the exact release serving that review and its durable dispatch-before-provider-I/O
+contract. Separate retired-review and request evidence must bind the same source,
+context and authority. An absent completion row alone is not sufficient. The
+supported dispositions are `NeverReserved` and `ReleasedBeforeIo`; the latter
+requires an exact protected release receipt before review retirement. Any live
+request ownership, completion, usage or unresolved history vetoes issuance.
+
+The protected attestation is stored under
+`/etc/sentinel/adaptive-funded-review-recovery/<receipt_key>.json`. Its key comes
+from the server export, not an independently invented client identity. With that
+evidence in place, GET without `source_only` returns the verified request draft.
+POST of those exact bytes atomically persists the receipt, schema-6 review,
+ordinary funding membership and issuance event. The server recomputes source
+bindings and verifies current evidence before writing. The draft clock is sampled
+after verification; funding expiry and original window bounds are never extended.
+
+Preparation, reservation, dispatch and completion retain fresh authority checks.
+The same-function funding and recovery check is not repeated immediately, but
+distinct admission boundaries remain independent. The Gateway uses the dedicated
+schema-6 output format only for the authoritative funded recovery grant; its
+outer dispatch envelope remains version 5. An independent real Continue decision
+alone can authorize employee continuation. Defer remains a valid terminal result.
+Exact receipt replay neither changes that decision nor refreshes expiry.
+
 ## Validation And Dispatch Preparation
 
 Project discovery validates all current and historical subscription allowances
