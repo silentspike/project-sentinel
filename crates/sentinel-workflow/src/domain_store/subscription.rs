@@ -433,12 +433,22 @@ pub(super) fn validate_allowance(
     Ok(())
 }
 
+fn project_subscription_memo_key(project: &ProjectV1) -> Result<String, WorkflowError> {
+    canonical_sha256(
+        "sentinel.workflow.project-subscription-memo-key.v1",
+        project,
+    )
+}
+
 pub(super) fn validate_persisted(
     connection: &Connection,
     project: &ProjectV1,
 ) -> Result<(), WorkflowError> {
-    validation_scope::memoize(connection, "project-subscription", project, || {
-        validate_persisted_uncached(connection, project)
+    validation_scope::with_scope(connection, || {
+        let key = project_subscription_memo_key(project)?;
+        validation_scope::memoize(connection, "project-subscription", &key, || {
+            validate_persisted_uncached(connection, project)
+        })
     })
 }
 
@@ -544,6 +554,124 @@ pub(super) fn renew_for_correction(
 #[cfg(test)]
 mod role_tests {
     use super::*;
+
+    #[test]
+    fn subscription_memo_key_binds_full_project_and_reuses_only_equal_values() {
+        let (_temp, _path, store, _customer, project) =
+            crate::domain_store::tests::accepted_project_fixture();
+        let key = project_subscription_memo_key(&project).unwrap();
+        assert_eq!(key.len(), 64);
+        assert_eq!(
+            key,
+            canonical_sha256(
+                "sentinel.workflow.project-subscription-memo-key.v1",
+                &project
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            key,
+            canonical_sha256("sentinel.workflow.project-snapshot-memo-key.v1", &project).unwrap()
+        );
+        assert!(
+            serde_json::to_vec(&key).unwrap().len() < serde_json::to_vec(&project).unwrap().len()
+        );
+        let connection = store.connection.lock().unwrap();
+        validation_scope::with_scope(&connection, || {
+            validate_persisted(&connection, &project)?;
+            validate_persisted(&connection, &project.clone())?;
+            assert_eq!(validation_scope::validations("project-subscription"), 1);
+            for (index, field) in [
+                "governance",
+                "cost",
+                "clock",
+                "tenant",
+                "project",
+                "version",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut changed = project.clone();
+                match field {
+                    "governance" => changed.governance.project_profile.digest = "b".repeat(64),
+                    "cost" => changed.cost_ceiling_micros += 1,
+                    "clock" => changed.updated_at_unix_ms += 1,
+                    "tenant" => changed.tenant_id = TenantId::parse("tenant-b").unwrap(),
+                    "project" => changed.project_id = ProjectId::parse("project-b").unwrap(),
+                    "version" => changed.version += 1,
+                    _ => unreachable!(),
+                }
+                assert_ne!(project_subscription_memo_key(&changed)?, key, "{field}");
+                if matches!(field, "governance" | "cost") {
+                    assert_eq!(changed.tenant_id, project.tenant_id);
+                    assert_eq!(changed.project_id, project.project_id);
+                    assert_eq!(changed.version, project.version);
+                }
+                validate_persisted(&connection, &changed)?;
+                assert_eq!(
+                    validation_scope::validations("project-subscription"),
+                    index + 2,
+                    "{field}"
+                );
+                validate_persisted(&connection, &changed)?;
+                assert_eq!(
+                    validation_scope::validations("project-subscription"),
+                    index + 2,
+                    "{field}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn subscription_changed_allowance_cannot_reuse_warm_unit_proof() {
+        let (_temp, _path, store, _customer, project) =
+            crate::domain_store::tests::accepted_project_fixture();
+        assert!(project.subscription_call.is_none());
+        let mut changed = project.clone();
+        changed.subscription_call = Some(SubscriptionCallAllowanceV1 {
+            allowance_id: "missing-governed-allowance".into(),
+            grant: SubscriptionCallGrantV1 {
+                schema_version: 1,
+                work_item_id: WorkItemId::parse("missing-work").unwrap(),
+                assignment_id: "missing-assignment".into(),
+                assignment_version: 1,
+                agent_id: crate::AgentId(2),
+                provider: "codex-cli".into(),
+                model: "model".into(),
+                catalog_digest: "a".repeat(64),
+                max_calls: 1,
+                max_concurrent: 1,
+                max_duration_ms: 1_000,
+                token_policy: SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+                expires_at_unix_ms: project.updated_at_unix_ms + 10_000,
+            },
+            created_by: "pm-a".into(),
+            created_at_unix_ms: project.updated_at_unix_ms,
+            dispatch: None,
+        });
+        assert_eq!(changed.tenant_id, project.tenant_id);
+        assert_eq!(changed.project_id, project.project_id);
+        assert_eq!(changed.version, project.version);
+        assert_ne!(
+            project_subscription_memo_key(&changed).unwrap(),
+            project_subscription_memo_key(&project).unwrap()
+        );
+        let connection = store.connection.lock().unwrap();
+        let error = validation_scope::with_scope(&connection, || {
+            validate_persisted(&connection, &project)?;
+            let result = validate_persisted(&connection, &changed);
+            assert_eq!(validation_scope::validations("project-subscription"), 2);
+            assert_eq!(validation_scope::validations("governed-allowance"), 1);
+            result
+        })
+        .unwrap_err();
+        assert_eq!(error.code, WorkflowErrorCode::CorruptStore);
+        assert!(connection.is_autocommit());
+    }
 
     #[test]
     fn subscription_empty_allowance_batch_does_not_discover_unrelated_receipts() {

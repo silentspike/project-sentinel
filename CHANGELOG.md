@@ -1,5 +1,22 @@
 # Changelog
 
+- Reuse immutable parsed adaptive journal entries and verified transition steps
+  within one pinned validation snapshot. Account for complete retained entries,
+  preserve historical cutoffs, corruption checks and write invalidation, and
+  avoid charging overlapping funding-history replays as new copies without
+  increasing proof or execution limits. Index snapshot and subscription proofs
+  by internally recomputed collision-resistant fingerprints of complete inputs,
+  rather than retaining additional serialized copies as keys. Retain every event
+  field, raw/result charge, historical selection limit and integrity check.
+  Share decoded entity owners between full and sealed views while retaining
+  independent typed persisted proofs. Reuse exact leaf-event proofs and linked
+  call shapes instead of rereading identical payloads for each replacement;
+  keep complete tenant and historical-event inventories mandatory.
+  Share complete historical event rows by sequence, charging their full retained
+  payload and metadata once without conflating independent caller proofs.
+  Add bounded first-failure test diagnostics and an explicitly selected read-only
+  protected-runtime probe (#856).
+
 - Admit one bounded provider recovery attempt ahead of new background scans,
   yielding existing reconciliation only at durable boundaries. Release every
   partial admission/mutation/ownership lock before retrying; preserve provider

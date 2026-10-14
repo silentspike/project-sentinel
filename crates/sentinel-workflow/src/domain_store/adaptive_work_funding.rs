@@ -649,8 +649,7 @@ fn funding_inventory_uncached(
     // The event selector cannot trust an unvalidated payload either. Match
     // every bounded issuance event to its typed, event-verified entity first.
     for sequence in sequences {
-        let row = read_company_event_row(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
-        validation_scope::charge_bytes(connection, row.payload.len())?;
+        let row = company_event_shape(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
         let event_receipt: AdaptiveWorkFundingReceiptV1 = decode(&row.payload)?;
         let stored =
             expired_replacement::sealed_funding(connection, tenant, &event_receipt.funding_id)?;
@@ -764,7 +763,7 @@ fn require_pre_recovery_funding_history_uncached(
         }
     }
     let mut statement = connection.prepare(
-        "SELECT event_type,payload FROM company_events WHERE tenant_id=?1
+        "SELECT sequence,event_type,typeof(payload) FROM company_events WHERE tenant_id=?1
          AND (event_type GLOB 'adaptive_leadership_review_*' OR event_type=?2)
          ORDER BY sequence LIMIT 4097",
     )?;
@@ -775,12 +774,14 @@ fn require_pre_recovery_funding_history_uncached(
         if count > 4096 {
             return Err(corrupt());
         }
-        let event_type: String = row.get(0)?;
-        let value = row.get_ref(1)?;
-        let rusqlite::types::ValueRef::Blob(payload) = value else {
+        let sequence: i64 = row.get(0)?;
+        let event_type: String = row.get(1)?;
+        let payload_type: String = row.get(2)?;
+        if payload_type != "blob" {
             return Err(corrupt());
-        };
-        validation_scope::charge_bytes(connection, payload.len())?;
+        }
+        let owner = company_event_shape(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
+        let payload = owner.payload.as_slice();
         // Adoption events have a separate typed shape and sealed membership.
         if event_type == ADOPTION_EVENT {
             let leaf: FundingAdoptionLeaf = decode(payload)?;
@@ -936,11 +937,12 @@ fn reviewed_funding_ids_with_observer(
                 )
                 .optional()?
                 .ok_or_else(corrupt)?;
-            let payload_bytes = usize::try_from(payload_bytes).map_err(|_| corrupt())?;
-            validation_scope::charge_bytes(connection, payload_bytes)?;
-            before_payload_copy("event", payload_bytes);
+            usize::try_from(payload_bytes).map_err(|_| corrupt())?;
             let row =
-                read_company_event_row(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
+                company_event_shape_with_observer(connection, stored_u64(sequence)?, |len| {
+                    before_payload_copy("event", len)
+                })?
+                .ok_or_else(corrupt)?;
             let (principal, project, operation, digest, time, funding_id) = if row.event_type
                 == REVIEW_EVENT
             {
@@ -1962,10 +1964,22 @@ mod review_payload_budget_tests {
         let proof_bytes = serde_json::to_vec(tenant).unwrap().len()
             + 256
             + serde_json::to_vec(&expected).unwrap().len();
+        let sequence: i64 = connection
+            .query_row(
+                "SELECT sequence FROM company_events WHERE event_type=?1 AND operation_id=?2",
+                params![REVIEW_EVENT, leaf.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sequence = stored_u64(sequence).unwrap();
+        let event = read_company_event_row(&connection, sequence)
+            .unwrap()
+            .unwrap();
+        let owner_bytes = encode(&sequence).unwrap().len() + 256 + encode(&event).unwrap().len();
         validation_scope::with_scope(&connection, || {
             validation_scope::charge_bytes(
                 &connection,
-                ARENA_BYTES - proof_bytes - 2 * payload_bytes,
+                ARENA_BYTES - proof_bytes - 2 * payload_bytes - owner_bytes,
             )?;
             let mut copies = Vec::new();
             let used = reviewed_funding_ids_with_observer(&connection, tenant, |kind, bytes| {
