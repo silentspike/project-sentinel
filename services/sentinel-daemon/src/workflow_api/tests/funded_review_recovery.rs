@@ -536,6 +536,222 @@ fn retry_path(source: &AdaptiveFundedReviewRecoveryVerificationSourceV1) -> Stri
         source.source.project_id, source.source.session_id, source.source.retired_review_id)
 }
 
+#[test]
+fn funded_retry_durable_provider_gate_accepts_legacy_deleted_reservation_without_release_history() {
+    let (temp, api, source) = live_fixture();
+    let old = source
+        .calls
+        .iter()
+        .find(|call| call.grant.review_id == source.source.retired_review_id)
+        .unwrap();
+    let id = old.request_id();
+    let digest = "a".repeat(64);
+    let events = api.event_store.as_ref().unwrap();
+    events
+        .reserve_llm_request(
+            &id,
+            &digest,
+            &old.grant.leadership_principal.agent_id.unwrap().to_string(),
+        )
+        .unwrap();
+    events
+        .release_undispatched_llm_request(&id, &digest)
+        .unwrap();
+    assert!(events.get_llm_completion(&id).unwrap().is_none());
+    let proof = adaptive_recovery_release::TestFundedRecoveryGuard::fixture(&source);
+    proof.undispatched_at_durable_provider_gate();
+    let expected =
+        sentinel_workflow::AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+            request_id: id.clone(),
+        };
+    let evidence =
+        adaptive_recovery_release::verified_current_funded_review_recovery(&source).unwrap();
+    assert_eq!(evidence.no_io, expected);
+    let operator = api.principals.principal("operator").unwrap();
+    let before = adaptive_leadership_review::tests::discovery_state(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    let exported = api.review_recovery_epoch(
+        &operator,
+        "GET",
+        &format!("{}&source_only=true", retry_path(&source)),
+        b"",
+    );
+    assert_eq!(exported.status, 200);
+    let public: serde_json::Value = serde_json::from_slice(&exported.body).unwrap();
+    assert!(
+        public.get("no_io").is_none(),
+        "metadata export is not historical NoIO proof"
+    );
+    assert_eq!(public["authority_issued"], false);
+    assert_eq!(
+        adaptive_leadership_review::tests::discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite")
+        ),
+        before
+    );
+    let request = issue_retry(&api, &source);
+    let stored = api
+        .store
+        .adaptive_funded_review_recovery(
+            &source.source.tenant_id,
+            &request.source.receipt_key().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.evidence.no_io, expected);
+    assert_eq!(stored.bound_grant().unwrap().schema_version, 6);
+    assert_eq!(
+        stored.grant_template.work_funding.as_ref().unwrap().receipt,
+        *source.funding
+    );
+    assert_eq!(
+        api.store
+            .adaptive_session_for_authority(&source.session.grant.authority)
+            .unwrap()
+            .unwrap(),
+        *source.session,
+        "issuance cannot manufacture Continue"
+    );
+    let repeated = api.review_recovery_epoch(&operator, "GET", &retry_path(&source), b"");
+    assert!(
+        matches!(repeated.status, 409 | 422),
+        "consumed source must deny another retry slot"
+    );
+    assert_eq!(
+        api.store
+            .adaptive_leadership_review_calls(&source.source.tenant_id, source.source.session_id)
+            .unwrap()
+            .len(),
+        source.calls.len() + 1
+    );
+    assert_eq!(
+        api.store
+            .adaptive_funded_review_recovery(
+                &source.source.tenant_id,
+                &request.source.receipt_key().unwrap()
+            )
+            .unwrap()
+            .unwrap(),
+        stored
+    );
+    assert!(events.get_llm_completion(&id).unwrap().is_none());
+}
+
+#[test]
+fn funded_retry_durable_provider_gate_keeps_live_completion_usage_and_history_vetoes() {
+    for case in [
+        "changed_proof",
+        "reserved",
+        "completion",
+        "unknown",
+        "usage",
+        "history",
+        "live",
+    ] {
+        let (temp, api, source) = live_fixture();
+        let proof = adaptive_recovery_release::TestFundedRecoveryGuard::fixture(&source);
+        proof.undispatched_at_durable_provider_gate();
+        let old = source
+            .calls
+            .iter()
+            .find(|call| call.grant.review_id == source.source.retired_review_id)
+            .unwrap();
+        let id = old.request_id();
+        let digest = "a".repeat(64);
+        let agent = old.grant.leadership_principal.agent_id.unwrap().to_string();
+        let events = api.event_store.as_ref().unwrap();
+        match case {
+            "changed_proof" => proof.reject(),
+            "live" => {
+                api.active_provider_requests
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), 1);
+            }
+            _ => {
+                events.reserve_llm_request(&id, &digest, &agent).unwrap();
+                match case {
+                    "reserved" => {}
+                    "completion" => events.enqueue_llm_completion(&id, &digest, "{}").unwrap(),
+                    "unknown" | "history" => {
+                        events
+                            .mark_llm_provider_outcome_unknown(
+                                &id,
+                                &digest,
+                                "UnknownOutcome: provider_transport_deadline_elapsed",
+                            )
+                            .unwrap();
+                        if case == "history" {
+                            events
+                                .resolve_llm_completion_terminal(
+                                    &id,
+                                    &digest,
+                                    "synthetic operator abandonment",
+                                )
+                                .unwrap();
+                            assert!(events.get_llm_completion(&id).unwrap().is_none());
+                        }
+                    }
+                    "usage" => {
+                        events.enqueue_llm_completion(&id, &digest, "{}").unwrap();
+                        let event = sentinel_common::DomainEvent::new(
+                            "agent_llm_usage",
+                            &agent,
+                            "{}",
+                            &id,
+                            0,
+                        )
+                        .with_operation_id(&format!("llm_usage_{id}"));
+                        events
+                            .persist_llm_completion_usage(&id, &digest, &event)
+                            .unwrap();
+                        events.claim_llm_completion_actions(&id, &digest).unwrap();
+                        events
+                            .complete_llm_completion_actions(&id, &digest)
+                            .unwrap();
+                        assert!(events.get_llm_completion(&id).unwrap().is_none());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let before = adaptive_leadership_review::tests::discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        );
+        assert_eq!(
+            api.review_recovery_epoch(
+                &api.principals.principal("operator").unwrap(),
+                "GET",
+                &retry_path(&source),
+                b""
+            )
+            .status,
+            409,
+            "{case}"
+        );
+        assert!(api
+            .store
+            .adaptive_funded_review_recovery(
+                &source.source.tenant_id,
+                &source.source.receipt_key().unwrap()
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            adaptive_leadership_review::tests::discovery_state(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite")
+            ),
+            before,
+            "{case}"
+        );
+    }
+}
+
 fn historical_receipt_path(request: &AdaptiveFundedReviewRecoveryRequestV1) -> String {
     format!("{ADAPTIVE_REVIEW_EPOCH_PATH}?mode=funded_undispatched_retry&receipt_only=true&receipt_key={}&operation_id={}&project_id={}&session_id={}&retired_review_id={}",
         request.source.receipt_key().unwrap(), request.operation_id,

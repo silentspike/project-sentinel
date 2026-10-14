@@ -304,7 +304,8 @@ impl CompanyEntity for AdaptiveFundedReviewRecoveryReceiptV1 {
             return Err(corrupt());
         }
         match &self.evidence.no_io {
-            AdaptiveFundedReviewNoIoV1::NeverReserved { request_id } => {
+            AdaptiveFundedReviewNoIoV1::NeverReserved { request_id }
+            | AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate { request_id } => {
                 if request_id != &format!("company-leadership-{}", source.retired_review_id) {
                     return Err(corrupt());
                 }
