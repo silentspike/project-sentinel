@@ -1586,7 +1586,7 @@ pub(crate) fn continue_adaptive_session_in_transaction(
     }
     WorkflowStore::require_recovery_epoch_review(tx, review)?;
     WorkflowStore::require_adaptive_budget_review_source(tx, review)?;
-    if matches!(review.grant.schema_version, 3 | 4) && authorization.local_adoption.is_some() {
+    if matches!(review.grant.schema_version, 3 | 4 | 6) && authorization.local_adoption.is_some() {
         return Err(authority_conflict());
     }
     let stored_review: AdaptiveLeadershipReviewCallV1 = read_company_entity(
@@ -1698,7 +1698,7 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         .ok_or_else(authority_conflict)?;
     let policy_allowance = match &review.grant.subject {
         Some(crate::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget })
-            if matches!(review.grant.schema_version, 3..=5) =>
+            if matches!(review.grant.schema_version, 3..=6) =>
         {
             &budget.root_allowance
         }
@@ -1746,7 +1746,7 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         || (review.grant.resume_policy.is_none()
             && authorization.work_funding.is_none()
             && fresh.max_calls > policy_allowance.grant.max_calls)
-        || (matches!(review.grant.schema_version, 3..=5)
+        || (matches!(review.grant.schema_version, 3..=6)
             && session
                 .model_calls
                 .checked_add(fresh.max_calls)
@@ -2523,6 +2523,36 @@ pub(crate) fn require_journal_source(
     Ok(())
 }
 
+/// Historical membership validates the complete immutable prefix, never later
+/// adoption entries that may currently be validating this funding relation.
+pub(crate) fn require_funding_journal_source(
+    connection: &Connection,
+    epoch: &crate::AdaptiveWorkFundingEpochV1,
+    source: &AdaptiveSessionV1,
+) -> Result<(), WorkflowError> {
+    if source.version == 0 || source.version > MAX_JOURNAL_ENTRIES as u64 {
+        return Err(corrupt_store());
+    }
+    let prefix = crate::domain_store::validation_scope::memoize(
+        connection,
+        "adaptive-funding-journal-prefix",
+        &(source.grant.session_id, source.version),
+        || {
+            replay_journal(
+                connection,
+                source.grant.session_id,
+                None,
+                Some(source.version),
+            )
+        },
+    )?
+    .ok_or_else(not_found)?;
+    if prefix.0 != *source {
+        return Err(authority_conflict());
+    }
+    require_work_funding_anchor(connection, epoch, source)
+}
+
 pub(crate) fn allowance_is_governed_in_journal(
     connection: &Connection,
     tenant: &crate::TenantId,
@@ -3143,19 +3173,40 @@ fn load_with_working_memory(
 fn replay_with_working_memory(
     connection: &Connection,
     id: Uuid,
+    collector: Option<&mut WorkingMemoryReplayCollector>,
+) -> Result<Option<LoadedSession>, WorkflowError> {
+    replay_journal(connection, id, collector, None)
+}
+
+fn replay_journal(
+    connection: &Connection,
+    id: Uuid,
     mut collector: Option<&mut WorkingMemoryReplayCollector>,
+    through_version: Option<u64>,
 ) -> Result<Option<LoadedSession>, WorkflowError> {
     #[cfg(test)]
     WORKING_MEMORY_READS.with(|reads| {
         let (replays, entries, scans, prefixes) = reads.get();
         reads.set((replays + 1, entries, scans, prefixes));
     });
-    let mut statement = connection.prepare(
+    let through_key = through_version.map(|version| format!("{version:020}"));
+    let query = if through_key.is_some() {
+        "SELECT operation_id, request_digest, response, created_at_ms FROM workflow_operations WHERE operation_namespace=?1
+         AND operation_id<=?3 ORDER BY operation_id LIMIT ?2"
+    } else {
         "SELECT operation_id, request_digest, response, created_at_ms FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2"
-    ).map_err(map_sqlite_error)?;
-    let mut rows = statement
-        .query(params![namespace(id), (MAX_JOURNAL_ENTRIES + 1) as i64])
-        .map_err(map_sqlite_error)?;
+    };
+    let mut statement = connection.prepare(query).map_err(map_sqlite_error)?;
+    let mut rows = if let Some(key) = &through_key {
+        statement.query(params![
+            namespace(id),
+            (MAX_JOURNAL_ENTRIES + 1) as i64,
+            key
+        ])
+    } else {
+        statement.query(params![namespace(id), (MAX_JOURNAL_ENTRIES + 1) as i64])
+    }
+    .map_err(map_sqlite_error)?;
     let mut previous: Option<(AdaptiveSessionV1, String)> = None;
     let mut feedback = None;
     let mut count = 0;
@@ -4053,6 +4104,7 @@ mod continuation_tests {
         let review_grant = AdaptiveLeadershipReviewGrantV1 {
             schema_version: 1,
             recovery_epoch: None,
+            funded_review_recovery: None,
             resume_policy: None,
             work_funding: None,
             subject: None,

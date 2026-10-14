@@ -38,6 +38,9 @@ pub struct AdaptiveWorkFundingSourceV1 {
     /// This is not the adopted predecessor and never carries unused capacity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes_unused_receipt_digest: Option<String>,
+    /// Dedicated sealed replacement relation; never an adopted predecessor or refund.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired_reviewed_replacement: Option<crate::AdaptiveWorkFundingExpiredReplacementBindingV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +187,15 @@ impl AdaptiveWorkFundingSourceV1 {
         if let Some(digest) = &self.supersedes_unused_receipt_digest {
             validate_digest(digest)?;
             if self.predecessor_receipt_digest.as_ref() == Some(digest) {
+                return Err(invalid());
+            }
+        }
+        if let Some(binding) = &self.expired_reviewed_replacement {
+            binding.validate(&self.resume_source)?;
+            if self.supersedes_unused_receipt_digest.is_some()
+                || self.predecessor_receipt_digest.as_ref()
+                    == Some(&binding.old_funding_receipt_digest)
+            {
                 return Err(invalid());
             }
         }

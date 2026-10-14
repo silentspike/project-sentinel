@@ -313,6 +313,8 @@ pub struct AdaptiveLeadershipReviewGrantV1 {
     /// Proposed or adopted epoch; this review grant itself changes no source capacity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_funding: Option<Box<crate::AdaptiveWorkFundingEpochV1>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funded_review_recovery: Option<Box<crate::AdaptiveFundedReviewRecoveryBindingV1>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,7 +393,7 @@ impl AdaptiveLeadershipReviewCallV1 {
             else {
                 return Err(invalid());
             };
-            if self.schema_version != 5
+            if !matches!(self.schema_version, 5 | 6)
                 || issued_at_ms < budget.observed_at_ms
                 || issued_at_ms < epoch.receipt.issued_at_unix_ms
                 || issued_at_ms >= limits.expires_at_unix_ms
@@ -633,7 +635,7 @@ impl AdaptiveLeadershipReviewDecisionV1 {
         };
         let version_matches = match self.decision {
             AdaptiveLeadershipReviewDecisionKindV1::DeferBudget { .. } => {
-                matches!(self.schema_version, 3..=5)
+                matches!(self.schema_version, 3..=6)
             }
             AdaptiveLeadershipReviewDecisionKindV1::ResolveBlocked { .. } => {
                 self.schema_version == 1
@@ -647,14 +649,14 @@ impl AdaptiveLeadershipReviewDecisionV1 {
                 window_ms,
                 ..
             } => {
-                matches!(self.schema_version, 2..=5)
+                matches!(self.schema_version, 2..=6)
                     && (1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&additional_model_calls)
                     && (1_000..=ADAPTIVE_LEADERSHIP_MAX_GRANT_MS).contains(&window_ms)
             }
         };
         if !version_matches
             || !valid_text(rationale, ADAPTIVE_LEADERSHIP_MAX_RATIONALE_BYTES)
-            || (matches!(self.schema_version, 2..=5) && refs.is_empty())
+            || (matches!(self.schema_version, 2..=6) && refs.is_empty())
         {
             return Err(invalid());
         }
@@ -676,7 +678,7 @@ impl AdaptiveLeadershipReviewDecisionV1 {
         if self.schema_version != grant.schema_version {
             return Err(invalid());
         }
-        if matches!(grant.schema_version, 3..=5)
+        if matches!(grant.schema_version, 3..=6)
             != matches!(
                 &grant.subject,
                 Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. })
@@ -840,8 +842,13 @@ pub fn adaptive_leadership_review_id(
 
 impl AdaptiveLeadershipReviewGrantV1 {
     fn validate_work_funding(&self) -> Result<(), WorkflowError> {
+        match (&self.funded_review_recovery, self.schema_version) {
+            (Some(binding), 6) => binding.validate_for(self)?,
+            (None, 1..=5) => {}
+            _ => return Err(invalid()),
+        }
         let Some(epoch) = &self.work_funding else {
-            return if self.schema_version == 5 {
+            return if matches!(self.schema_version, 5 | 6) {
                 Err(invalid())
             } else {
                 Ok(())
@@ -849,7 +856,7 @@ impl AdaptiveLeadershipReviewGrantV1 {
         };
         epoch.validate()?;
         let anchor = &epoch.receipt.request.source.resume_source;
-        if self.schema_version != 5
+        if !matches!(self.schema_version, 5 | 6)
             || self.resume_policy.is_some()
             || self.recovery_epoch.is_some()
             || !matches!(
@@ -928,7 +935,7 @@ impl AdaptiveLeadershipReviewGrantV1 {
             }
         }
         let valid_subject = match (&self.subject, self.schema_version) {
-            (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3..=5) => {
+            (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3..=6) => {
                 budget.validate_shape()?;
                 self.expected_reason_code.is_empty()
                     && budget.observed_at_ms <= issued_at_ms
@@ -938,7 +945,7 @@ impl AdaptiveLeadershipReviewGrantV1 {
                                 .recovery_epoch
                                 .as_ref()
                                 .is_some_and(|binding| binding.schema_version == 2))
-                        || (self.schema_version == 5 && self.work_funding.is_some()))
+                        || (matches!(self.schema_version, 5 | 6) && self.work_funding.is_some()))
             }
             (None, 1) => valid_reason(&self.expected_reason_code),
             (
@@ -1013,7 +1020,7 @@ impl AdaptiveLeadershipReviewContextV1 {
                 )
                 | (
                     Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }),
-                    3..=5
+                    3..=6
                 )
         ) || (grant.schema_version == 3 && grant.recovery_epoch.is_some())
             || (grant.schema_version == 4
@@ -1097,14 +1104,14 @@ impl AdaptiveLeadershipReviewContextV1 {
         let valid_subject = match &grant.subject {
             Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) => {
                 budget.validate(self)?;
-                matches!(grant.schema_version, 3..=5)
+                matches!(grant.schema_version, 3..=6)
                     && ((grant.schema_version == 3 && grant.recovery_epoch.is_none())
                         || (grant.schema_version == 4
                             && grant
                                 .recovery_epoch
                                 .as_ref()
                                 .is_some_and(|binding| binding.schema_version == 2))
-                        || (grant.schema_version == 5 && grant.work_funding.is_some()))
+                        || (matches!(grant.schema_version, 5 | 6) && grant.work_funding.is_some()))
                     && grant.expected_reason_code.is_empty()
                     && grant.assignment_id == budget.root_allowance.grant.assignment_id
                     && grant.provider == session.grant.provider
@@ -1394,6 +1401,7 @@ mod budget_tests {
                 budget: Box::new(budget),
             }),
             recovery_epoch: None,
+            funded_review_recovery: None,
             resume_policy: None,
             work_funding: None,
         };

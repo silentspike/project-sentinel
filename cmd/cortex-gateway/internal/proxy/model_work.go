@@ -252,7 +252,7 @@ func leadershipReviewSubject(metadata map[string]string) (*customerRequestExecut
 		return nil, invalid
 	}
 	reviewKind, kindPresent := metadata["leadership_review_kind"]
-	if kindPresent && reviewKind != "unknown_model" && reviewKind != "blocked_continuation" && reviewKind != "budget_window_exhausted" && reviewKind != "admission_repair" && reviewKind != "work_funding" {
+	if kindPresent && reviewKind != "unknown_model" && reviewKind != "blocked_continuation" && reviewKind != "budget_window_exhausted" && reviewKind != "admission_repair" && reviewKind != "work_funding" && reviewKind != "funded_undispatched_recovery" {
 		return nil, invalid
 	}
 	if _, err := leadershipEvidenceRefs(metadata); err != nil {

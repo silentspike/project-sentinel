@@ -485,6 +485,7 @@ fn fixture_schema2_source(
             recovery_epoch: None,
             resume_policy: None,
             work_funding: None,
+            funded_review_recovery: None,
             subject: Some(subject),
             review_id: sentinel_workflow::adaptive_leadership_review_id(
                 grant.session_id,

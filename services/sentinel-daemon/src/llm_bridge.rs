@@ -251,6 +251,8 @@ pub mod bridge {
         /// Optional productive company-workflow authority. Ambient agent calls
         /// remain valid without a binding, but cannot be committed as project cost.
         pub provider_usage_authority: Option<Arc<dyn ProviderUsageAuthorityResolver>>,
+        /// Shared with the authenticated recovery boundary; never exported to a client.
+        pub active_provider_requests: Option<Arc<Mutex<HashMap<String, usize>>>>,
     }
 
     impl Default for LlmBridgeConfig {
@@ -268,6 +270,7 @@ pub mod bridge {
                 completion_retry_interval: Duration::from_secs(1),
                 completion_max_attempts: 5,
                 provider_usage_authority: None,
+                active_provider_requests: None,
             }
         }
     }
@@ -772,6 +775,14 @@ pub mod bridge {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *open = false;
+    }
+
+    struct CloseProviderAdmissionOnExit(Arc<RwLock<bool>>);
+
+    impl Drop for CloseProviderAdmissionOnExit {
+        fn drop(&mut self) {
+            stop_provider_admission(self.0.as_ref());
+        }
     }
 
     fn reserve_provider_request_until<S: CompletionStore>(
@@ -2954,6 +2965,8 @@ pub mod bridge {
         let (owner_tx, owner_rx) = mpsc::channel();
         // The lane owner never lives on a Tokio thread, including initialization failures/unwind.
         let supervisor = tokio::task::spawn_blocking(move || {
+            // The off-runtime owner closes admission even during startup failure/unwind.
+            let _close_admission = CloseProviderAdmissionOnExit(Arc::clone(&owner_admission));
             let mut lanes = match OwnedBlockingLanes::spawn(workers, 32) {
                 Ok(lanes) => lanes,
                 Err(_) => {
@@ -3062,7 +3075,10 @@ pub mod bridge {
             state_store,
             event_store: Arc::clone(&event_store),
             action_tx: action_tx.clone(),
-            active_requests: Arc::new(Mutex::new(HashMap::new())),
+            active_requests: config
+                .active_provider_requests
+                .clone()
+                .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
             preparing_requests: Arc::new(Mutex::new(HashMap::new())),
             completion_max_attempts: config.completion_max_attempts.max(1),
             executor: executor.clone(),
@@ -3730,9 +3746,35 @@ pub mod bridge {
                         .is_none_or(serde_json::Value::is_null)
                     && grant
                         .get("recovery_epoch")
+                        .is_none_or(serde_json::Value::is_null)
+                    && grant
+                        .get("funded_review_recovery")
                         .is_none_or(serde_json::Value::is_null) =>
             {
                 Ok(Some("work_funding"))
+            }
+            Some(6)
+                if grant
+                    .get("subject")
+                    .and_then(|subject| subject.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("budget_window_exhausted")
+                    && grant
+                        .get("work_funding")
+                        .is_some_and(serde_json::Value::is_object)
+                    && grant
+                        .get("funded_review_recovery")
+                        .and_then(|binding| binding.get("schema_version"))
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(1)
+                    && grant
+                        .get("resume_policy")
+                        .is_none_or(serde_json::Value::is_null)
+                    && grant
+                        .get("recovery_epoch")
+                        .is_none_or(serde_json::Value::is_null) =>
+            {
+                Ok(Some("funded_undispatched_recovery"))
             }
             _ => Err("unsupported leadership review grant schema"),
         }
@@ -5006,6 +5048,11 @@ pub mod bridge {
                 serde_json::json!({"schema_version": 5, "subject": {"kind": "unknown_model"}, "work_funding": {}}),
                 serde_json::json!({"schema_version": 5, "subject": {"kind": "budget_window_exhausted"}, "work_funding": {}, "resume_policy": {}}),
                 serde_json::json!({"schema_version": 5, "subject": {"kind": "budget_window_exhausted"}, "work_funding": {}, "recovery_epoch": {}}),
+                serde_json::json!({"schema_version": 5, "subject": {"kind": "budget_window_exhausted"}, "work_funding": {}, "funded_review_recovery": {"schema_version": 1}}),
+                serde_json::json!({"schema_version": 6, "subject": {"kind": "budget_window_exhausted"}, "work_funding": {}}),
+                serde_json::json!({"schema_version": 6, "subject": {"kind": "budget_window_exhausted"}, "work_funding": {}, "funded_review_recovery": {"schema_version": 2}}),
+                serde_json::json!({"schema_version": 6, "subject": {"kind": "unknown_model"}, "work_funding": {}, "funded_review_recovery": {"schema_version": 1}}),
+                serde_json::json!({"schema_version": 6, "subject": {"kind": "budget_window_exhausted"}, "work_funding": {}, "funded_review_recovery": {"schema_version": 1}, "recovery_epoch": {}}),
             ] {
                 assert!(leadership_review_kind(&grant).is_err());
             }
@@ -5013,6 +5060,12 @@ pub mod bridge {
                 leadership_review_kind(&serde_json::json!({"schema_version": 5,
                 "subject": {"kind": "budget_window_exhausted"}, "work_funding": {}})),
                 Ok(Some("work_funding"))
+            );
+            assert_eq!(
+                leadership_review_kind(&serde_json::json!({"schema_version": 6,
+                    "subject": {"kind": "budget_window_exhausted"}, "work_funding": {},
+                    "funded_review_recovery": {"schema_version": 1}})),
+                Ok(Some("funded_undispatched_recovery"))
             );
             let dir = tempfile::tempdir().unwrap();
             let (_, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
@@ -7486,6 +7539,7 @@ pub mod bridge {
             activity: SharedLlmActivityTicks,
             llm_unavailable: Arc<AtomicBool>,
             provider_calls: Arc<std::sync::atomic::AtomicUsize>,
+            active_requests: ActiveProviderRequests,
             release_response: Arc<tokio::sync::Notify>,
             perception_tx: mpsc::Sender<Perception>,
             shutdown_tx: watch::Sender<bool>,
@@ -7528,6 +7582,7 @@ pub mod bridge {
                         .unwrap(),
                 );
                 let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let active_requests = Arc::new(Mutex::new(HashMap::new()));
                 let release_response = Arc::new(tokio::sync::Notify::new());
                 let (gateway_url, provider_task) = start_mock_agent_provider(
                     Arc::clone(&provider_calls),
@@ -7545,6 +7600,7 @@ pub mod bridge {
                     usage_v2_enabled: true,
                     completion_retry_interval: Duration::from_secs(3600),
                     provider_usage_authority: Some(resolver.clone()),
+                    active_provider_requests: Some(Arc::clone(&active_requests)),
                     ..Default::default()
                 };
                 let (perception_tx, perception_rx) = mpsc::channel();
@@ -7574,6 +7630,7 @@ pub mod bridge {
                     activity,
                     llm_unavailable,
                     provider_calls,
+                    active_requests,
                     release_response,
                     perception_tx,
                     shutdown_tx,
@@ -7735,6 +7792,21 @@ pub mod bridge {
         #[tokio::test]
         async fn queued_urgent_preserves_bypass_after_slow_selection_context_failure() {
             assert_queued_preparation_cooldown(true).await;
+        }
+
+        #[tokio::test]
+        async fn productive_bridge_reports_live_ownership_to_shared_recovery_registry() {
+            let f = CooldownBridgeFixture::start(false, false).await;
+            let request_id = f.resolver.legacy.context.binding().request_id();
+            let active = Arc::clone(&f.active_requests);
+            f.send_selected(f.perception(55)).await;
+            f.wait_provider_calls(1).await;
+            assert_eq!(active.lock().unwrap().get(&request_id), Some(&1));
+            let reserved = f.store.get_llm_completion(&request_id).unwrap().unwrap();
+            assert_eq!(reserved.status, "provider_in_flight");
+            assert!(reserved.payload.is_empty());
+            f.stop().await;
+            assert!(active.lock().unwrap().is_empty());
         }
 
         #[tokio::test]
