@@ -825,3 +825,112 @@ fn expired_reviewed_funding_replacement_completion_failure_rolls_back_adoption_a
     f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).unwrap();
     assert_eq!(session(&f).active_work_funding().unwrap().receipt, epoch.receipt);
 }
+
+#[test]
+fn expired_reviewed_funding_replacement_mixed_inventory_reuses_one_tenant_scan() {
+    let (mut f, old, now) = expired_fixture(true);
+    let request = draft(&f, &old, now);
+    let operator = funding_operator(&f);
+    f.store.authorize_adaptive_work_funding_expired_replacement(&operator, &request, now, evidence).unwrap();
+    let epoch = f.store.adaptive_work_funding_for_review(&operator.tenant_id,
+        f.grant.session_id, now).unwrap().unwrap();
+    budget_context(&mut f, now, "mixed-inventory-reuse");
+    bind(&mut f, &epoch.receipt, epoch.binding.ordinal);
+    let successor = issue(&f, now).unwrap();
+    let expected = f.store.adaptive_leadership_review_calls(&operator.tenant_id, f.grant.session_id).unwrap();
+    assert!(expected.iter().any(|call| call.grant.work_funding.as_ref().is_some_and(|prior|
+        prior.receipt == old && prior.receipt.request.source.expired_reviewed_replacement.is_none())));
+    assert!(successor.grant.work_funding.as_ref().unwrap().receipt.request.source.expired_reviewed_replacement.is_some());
+    let before = rows(&f.store);
+    let connection = f.store.connection.lock().unwrap();
+    for _ in 0..2 {
+        validation_scope::with_scope(&connection, || {
+            assert_eq!(calls_for_session(&connection, &operator.tenant_id, f.grant.session_id)?, expected);
+            let entities = validation_scope::validations("entity");
+            for _ in 0..3 {
+                assert_eq!(calls_for_session(&connection, &operator.tenant_id, f.grant.session_id)?, expected);
+                assert!(calls_for_session(&connection, &operator.tenant_id, Uuid::from_u128(9901))?.is_empty());
+                for call in &expected {
+                    if let Some(prior) = &call.grant.work_funding {
+                        super::super::super::super::adaptive_work_funding::require_epoch_receipt(&connection, prior)?;
+                    }
+                }
+                assert_eq!(validation_scope::validations("entity"), entities);
+                assert_eq!(validation_scope::validations("funding-inventory"), 1);
+                assert_eq!(validation_scope::validations("funding-supersession"), 1);
+                assert_eq!(validation_scope::validations("sealed-funding-inventory"), 0);
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(validation_scope::validations("funding-inventory"), 0);
+    }
+    drop(connection);
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn expired_reviewed_funding_replacement_mixed_inventory_pins_external_corruption_then_rejects_next_scope() {
+    let (mut f, old, now) = expired_fixture(true);
+    let request = draft(&f, &old, now);
+    let operator = funding_operator(&f);
+    f.store.authorize_adaptive_work_funding_expired_replacement(&operator, &request, now, evidence).unwrap();
+    let epoch = f.store.adaptive_work_funding_for_review(&operator.tenant_id,
+        f.grant.session_id, now).unwrap().unwrap();
+    budget_context(&mut f, now, "mixed-inventory-snapshot");
+    bind(&mut f, &epoch.receipt, epoch.binding.ordinal);
+    issue(&f, now).unwrap();
+    let expected = f.store.adaptive_leadership_review_calls(&operator.tenant_id, f.grant.session_id).unwrap();
+    let connection = f.store.connection.lock().unwrap();
+    let peer = Connection::open(&f.path).unwrap();
+    validation_scope::with_scope(&connection, || {
+        assert_eq!(calls_for_session(&connection, &operator.tenant_id, f.grant.session_id)?, expected);
+        peer.execute("INSERT INTO company_entities VALUES(?1,'adaptive_work_funding',
+            'unrelated-malformed-mixed-funding',1,X'00','invalid')", [&operator.tenant_id.0])?;
+        assert!(calls_for_session(&connection, &operator.tenant_id, Uuid::from_u128(9902))?.is_empty());
+        assert_eq!(calls_for_session(&connection, &operator.tenant_id, f.grant.session_id)?, expected);
+        super::super::super::super::adaptive_work_funding::require_epoch_receipt(&connection, &epoch)?;
+        assert_eq!(validation_scope::validations("funding-inventory"), 1);
+        assert_eq!(validation_scope::validations("funding-supersession"), 1);
+        Ok(())
+    }).unwrap();
+    for session_id in [f.grant.session_id, Uuid::from_u128(9902)] {
+        assert_eq!(calls_for_session(&connection, &operator.tenant_id, session_id).unwrap_err().code,
+            WorkflowErrorCode::CorruptStore);
+    }
+    peer.execute("DELETE FROM company_entities WHERE entity_id='unrelated-malformed-mixed-funding'", []).unwrap();
+    assert_eq!(calls_for_session(&connection, &operator.tenant_id, f.grant.session_id).unwrap(), expected);
+    assert!(connection.is_autocommit());
+}
+
+#[test]
+fn expired_reviewed_funding_replacement_shared_inventory_preserves_full_receipt_relation_membership() {
+    for damage in ["relation-row", "relation-event", "funding-event"] {
+        let (f, old, now) = expired_fixture(false);
+        let request = draft(&f, &old, now);
+        let operator = funding_operator(&f);
+        let (_, replacement) = f.store.authorize_adaptive_work_funding_expired_replacement(
+            &operator, &request, now, evidence).unwrap();
+        assert!(f.store.adaptive_work_funding(&operator.tenant_id, f.grant.session_id,
+            request.funding_request.operation_id).unwrap().is_some());
+        let limits = draft_input(&f, &old, now).limits;
+        assert_eq!(f.store.adaptive_work_funding_draft(&operator, &f.grant.project_id,
+            f.grant.session_id, Uuid::new_v4(), "live-successor-still-pending", limits.clone(), now)
+            .unwrap_err().code, WorkflowErrorCode::InvalidTransition);
+        let peer = Connection::open(&f.path).unwrap();
+        match damage {
+            "relation-row" => { peer.execute("DELETE FROM company_entities WHERE entity_kind='adaptive_work_funding_expired_replacement'
+                AND entity_id=?1", [&replacement.replacement_key]).unwrap(); }
+            "relation-event" => { peer.execute("DELETE FROM company_events WHERE event_type='adaptive_work_funding_expired_replacement_issued'
+                AND operation_id=?1", [request.funding_request.operation_id.to_string()]).unwrap(); }
+            _ => { peer.execute("DELETE FROM company_events WHERE event_type='adaptive_work_funding_issued'
+                AND operation_id=?1", [request.funding_request.operation_id.to_string()]).unwrap(); }
+        }
+        let before = rows(&f.store);
+        assert_eq!(f.store.adaptive_work_funding(&operator.tenant_id, f.grant.session_id,
+            request.funding_request.operation_id).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert_eq!(f.store.adaptive_work_funding_draft(&operator, &f.grant.project_id,
+            f.grant.session_id, Uuid::new_v4(), "damaged-successor-is-not-inventory-only", limits, now)
+            .unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert_eq!(rows(&f.store), before);
+    }
+}

@@ -6,6 +6,8 @@
   spending, lifetime caps, original journals and independent leadership
   decisions. Separate historical membership from fresh execution eligibility
   and provide exact immutable-result lookup after an unknown submission (#856).
+  Share one tenant-scoped sealed funding inventory across legacy and replacement
+  receipts while retaining full relation checks and snapshot invalidation.
 
 - Add an explicit, single-use recovery contract for proven undispatched funded
   leadership reviews, consuming existing review capacity without changing

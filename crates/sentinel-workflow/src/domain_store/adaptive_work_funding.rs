@@ -564,7 +564,10 @@ fn read_funding_leaf_with_observer(
 ) -> Result<Option<AdaptiveWorkFundingReceiptV1>, WorkflowError> {
     validation_scope::with_scope(connection, || {
         let key = adaptive_work_funding_id(tenant, session_id, operation_id)?;
-        let receipt = get_entity(connection, tenant, FUNDING_KIND, &key)?;
+        let receipt = expired_replacement::read_sealed_funding(connection, tenant, &key)?;
+        if let Some(receipt) = &receipt {
+            expired_replacement::require_successor_membership(connection, receipt)?;
+        }
         after_entity_read()?;
         if receipt.is_none() {
             let orphan: bool = connection.query_row(
@@ -590,8 +593,10 @@ fn funding_receipts(
         let ids = funding_inventory(connection, tenant)?;
         let mut receipts = Vec::new();
         for id in ids {
-            let receipt: AdaptiveWorkFundingReceiptV1 =
-                get_entity(connection, tenant, FUNDING_KIND, &id)?.ok_or_else(corrupt)?;
+            let receipt = expired_replacement::sealed_funding(connection, tenant, &id)?;
+            // Discovery shares sealed row/event proofs. Full successor membership
+            // is still checked for every tenant receipt before session filtering.
+            expired_replacement::require_successor_membership(connection, &receipt)?;
             if receipt.request.source.resume_source.session_id == session_id {
                 receipts.push(receipt);
             }
@@ -628,11 +633,10 @@ fn funding_inventory_uncached(
     if ids.len() > 4096 {
         return Err(corrupt());
     }
-    // Retain only validated keys; typed payload proofs already belong to this scope.
-    // Validate every row and issuance event before any session selection.
+    // Retain sealed keys only, not a claim of full successor membership. The
+    // primitive must not traverse relations that may be validating this inventory.
     for id in &ids {
-        let _: AdaptiveWorkFundingReceiptV1 =
-            get_entity(connection, tenant, FUNDING_KIND, id)?.ok_or_else(corrupt)?;
+        expired_replacement::sealed_funding(connection, tenant, id)?;
     }
     let mut events = connection.prepare(
         "SELECT sequence FROM company_events WHERE tenant_id=?1 AND event_type=?2 ORDER BY sequence LIMIT 4097")?;
@@ -648,9 +652,8 @@ fn funding_inventory_uncached(
         let row = read_company_event_row(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
         validation_scope::charge_bytes(connection, row.payload.len())?;
         let event_receipt: AdaptiveWorkFundingReceiptV1 = decode(&row.payload)?;
-        let stored: AdaptiveWorkFundingReceiptV1 =
-            get_entity(connection, tenant, FUNDING_KIND, &event_receipt.funding_id)?
-                .ok_or_else(corrupt)?;
+        let stored =
+            expired_replacement::sealed_funding(connection, tenant, &event_receipt.funding_id)?;
         if stored != event_receipt {
             return Err(corrupt());
         }
