@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::thread;
