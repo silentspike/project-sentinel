@@ -482,16 +482,20 @@ fn require_call_review_link(
     Ok(())
 }
 
-fn sealed_funding(
+pub(super) fn read_sealed_funding(
+    connection: &Connection,
+    tenant: &TenantId,
+    id: &str,
+) -> Result<Option<AdaptiveWorkFundingReceiptV1>, WorkflowError> {
+    Ok(get_entity::<SealedFunding>(connection, tenant, FUNDING_KIND, id)?.map(|receipt| receipt.0))
+}
+
+pub(super) fn sealed_funding(
     connection: &Connection,
     tenant: &TenantId,
     id: &str,
 ) -> Result<AdaptiveWorkFundingReceiptV1, WorkflowError> {
-    Ok(
-        get_entity::<SealedFunding>(connection, tenant, FUNDING_KIND, id)?
-            .ok_or_else(corrupt)?
-            .0,
-    )
+    read_sealed_funding(connection, tenant, id)?.ok_or_else(corrupt)
 }
 
 pub(super) fn sealed_receipts(
@@ -499,55 +503,20 @@ pub(super) fn sealed_receipts(
     tenant: &TenantId,
     session_id: Uuid,
 ) -> Result<Vec<AdaptiveWorkFundingReceiptV1>, WorkflowError> {
-    validation_scope::memoize(
-        connection,
-        "sealed-funding-inventory",
-        &(tenant, session_id),
-        || {
-            let mut statement = connection.prepare(
-                "SELECT entity_id FROM company_entities WHERE tenant_id=?1
-            AND entity_kind=?2 ORDER BY entity_id LIMIT 4097",
-            )?;
-            let ids = statement
-                .query_map(params![tenant.0, FUNDING_KIND], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            if ids.len() > 4096 {
-                return Err(corrupt());
+    validation_scope::with_scope(connection, || {
+        let ids = funding_inventory(connection, tenant)?;
+        let mut receipts = Vec::new();
+        for id in ids {
+            let receipt = sealed_funding(connection, tenant, &id)?;
+            if receipt.request.source.resume_source.session_id == session_id {
+                receipts.push(receipt);
             }
-            let mut receipts = Vec::new();
-            for id in ids {
-                let receipt = sealed_funding(connection, tenant, &id)?;
-                if receipt.request.source.resume_source.session_id == session_id {
-                    receipts.push(receipt);
-                }
-            }
-            if receipts.len() > 128 {
-                return Err(corrupt());
-            }
-            let mut events = connection.prepare(
-                "SELECT sequence FROM company_events WHERE tenant_id=?1
-            AND event_type=?2 ORDER BY sequence LIMIT 4097",
-            )?;
-            let sequences = events
-                .query_map(params![tenant.0, FUNDING_EVENT], |row| row.get::<_, i64>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            if sequences.len() > 4096 {
-                return Err(corrupt());
-            }
-            for sequence in sequences {
-                let row = read_company_event_row(connection, stored_u64(sequence)?)?
-                    .ok_or_else(corrupt)?;
-                validation_scope::charge_bytes(connection, row.payload.len())?;
-                let event: AdaptiveWorkFundingReceiptV1 = decode(&row.payload)?;
-                if sealed_funding(connection, tenant, &event.funding_id)? != event {
-                    return Err(corrupt());
-                }
-            }
-            Ok(receipts)
-        },
-    )
+        }
+        if receipts.len() > 128 {
+            return Err(corrupt());
+        }
+        Ok(receipts)
+    })
 }
 
 fn members(
