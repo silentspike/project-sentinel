@@ -1,5 +1,12 @@
 # Changelog
 
+- Cache validated review membership as IDs rather than a duplicate full review
+  collection. Reuse the same typed entity owners within one pinned scope while
+  retaining complete tenant inventory validation, ordering, cardinality checks,
+  write invalidation and the unchanged 64 MiB proof limit. Preserve native
+  leadership dispatch error codes in private diagnostics without changing the
+  public denial or permitting provider I/O (#856).
+
 - Reuse immutable parsed adaptive journal entries and verified transition steps
   within one pinned validation snapshot. Account for complete retained entries,
   preserve historical cutoffs, corruption checks and write invalidation, and

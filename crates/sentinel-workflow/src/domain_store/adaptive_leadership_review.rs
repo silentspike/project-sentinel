@@ -420,16 +420,23 @@ pub(super) fn calls_for_session(
     tenant: &TenantId,
     session_id: Uuid,
 ) -> Result<Vec<AdaptiveLeadershipReviewCallV1>, WorkflowError> {
-    validation_scope::memoize(connection, "review-calls", &(tenant, session_id), || {
-        calls_for_session_uncached(connection, tenant, session_id)
+    validation_scope::with_scope(connection, || {
+        // Cache membership, not another serialized copy of already-owned typed rows.
+        let ids =
+            validation_scope::memoize(connection, "review-calls", &(tenant, session_id), || {
+                call_ids_for_session_uncached(connection, tenant, session_id)
+            })?;
+        ids.into_iter()
+            .map(|id| get_entity(connection, tenant, KIND, &id)?.ok_or_else(corrupt))
+            .collect()
     })
 }
 
-fn calls_for_session_uncached(
+fn call_ids_for_session_uncached(
     connection: &Connection,
     tenant: &TenantId,
     session_id: Uuid,
-) -> Result<Vec<AdaptiveLeadershipReviewCallV1>, WorkflowError> {
+) -> Result<Vec<String>, WorkflowError> {
     tenant.validate()?;
     if session_id.is_nil() {
         return Err(invalid("invalid adaptive session identity"));
@@ -440,7 +447,7 @@ fn calls_for_session_uncached(
         let call: AdaptiveLeadershipReviewCallV1 =
             get_entity(connection, tenant, KIND, &id)?.ok_or_else(corrupt)?;
         if call.grant.session_id == session_id {
-            matching.push(call);
+            matching.push(id);
         }
     }
     if matching.len() > MAX_AGGREGATE_ITEMS {

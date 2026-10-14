@@ -306,7 +306,15 @@ impl WorkflowApi {
                 },
                 now,
             )
-            .map_err(|_| "leadership dispatch consumed or denied")?;
+            .map_err(|error| {
+                tracing::warn!(
+                    review_id = %review_id,
+                    error_code = ?error.code,
+                    retryable = error.retryable,
+                    "Leadership dispatch claim rejected before provider I/O"
+                );
+                "leadership dispatch consumed or denied"
+            })?;
         Ok(grant
             .expires_at_unix_ms
             .min(now.saturating_add(grant.max_duration_ms)))
