@@ -102,7 +102,66 @@ impl CompanyEntity for ResumeReviewMembershipLeaf {
 }
 
 // Leaf verification deliberately has no project, journal, policy or review dependencies.
-pub(super) fn require_leaf_event<T: serde::de::DeserializeOwned + Serialize + PartialEq>(
+struct LeafEventProof<T>(std::marker::PhantomData<T>);
+
+impl<T> Clone for LeafEventProof<T> {
+    fn clone(&self) -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<T> Serialize for LeafEventProof<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_unit()
+    }
+}
+
+pub(super) fn require_leaf_event<
+    T: serde::de::DeserializeOwned + Serialize + PartialEq + 'static,
+>(
+    connection: &Connection,
+    tenant: &TenantId,
+    project: &ProjectId,
+    event_type: &str,
+    operation_id: Uuid,
+    operation_digest: &str,
+    principal: &AuthenticatedCompanyPrincipalV1,
+    issued_at_ms: u64,
+    value: &T,
+) -> Result<(), WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        let key = canonical_sha256(
+            "sentinel.workflow.leaf-event-memo-key.v1",
+            &(
+                tenant,
+                project,
+                event_type,
+                operation_id,
+                operation_digest,
+                principal,
+                issued_at_ms,
+                value,
+            ),
+        )?;
+        validation_scope::memoize(connection, "leaf-event", &key, || {
+            require_leaf_event_uncached(
+                connection,
+                tenant,
+                project,
+                event_type,
+                operation_id,
+                operation_digest,
+                principal,
+                issued_at_ms,
+                value,
+            )?;
+            Ok(LeafEventProof::<T>(std::marker::PhantomData))
+        })
+        .map(|_| ())
+    })
+}
+
+fn require_leaf_event_uncached<T: serde::de::DeserializeOwned + Serialize + PartialEq>(
     connection: &Connection,
     tenant: &TenantId,
     project: &ProjectId,
@@ -125,8 +184,8 @@ pub(super) fn require_leaf_event<T: serde::de::DeserializeOwned + Serialize + Pa
     if ids.len() != 1 {
         return Err(corrupt());
     }
-    let row = read_company_event_row(connection, stored_u64(ids[0])?)?.ok_or_else(corrupt)?;
-    validation_scope::charge_bytes(connection, row.payload.len())?;
+    let sequence = stored_u64(ids[0])?;
+    let row = super::company_event_shape(connection, sequence)?.ok_or_else(corrupt)?;
     let issuer = company_event_principal(&row)?;
     let payload_digest = bytes_digest("sentinel.workflow.company-event-payload.v1", &row.payload)?;
     let event_id = canonical_sha256(

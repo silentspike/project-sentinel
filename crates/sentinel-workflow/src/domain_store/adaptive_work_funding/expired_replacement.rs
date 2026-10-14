@@ -98,6 +98,14 @@ pub(super) fn with_recovery_publication<T>(
 struct SealedFunding(AdaptiveWorkFundingReceiptV1);
 
 impl CompanyEntity for SealedFunding {
+    fn load_shape(
+        connection: &Connection,
+        tenant: &TenantId,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<Self>, WorkflowError> {
+        super::super::entity_shape(connection, tenant, kind, id).map(|value| value.map(Self))
+    }
     fn row_binding(&self) -> (&TenantId, &'static str, &str, u64) {
         self.0.row_binding()
     }
@@ -141,6 +149,14 @@ impl CompanyEntity for SealedFunding {
 struct SealedAdoption(FundingAdoptionLeaf);
 
 impl CompanyEntity for SealedAdoption {
+    fn load_shape(
+        connection: &Connection,
+        tenant: &TenantId,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<Self>, WorkflowError> {
+        super::super::entity_shape(connection, tenant, kind, id).map(|value| value.map(Self))
+    }
     fn row_binding(&self) -> (&TenantId, &'static str, &str, u64) {
         self.0.row_binding()
     }
@@ -209,6 +225,14 @@ pub(super) fn sealed_adoption(
 struct SealedReview(FundingReviewLeaf);
 
 impl CompanyEntity for SealedReview {
+    fn load_shape(
+        connection: &Connection,
+        tenant: &TenantId,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<Self>, WorkflowError> {
+        super::super::entity_shape(connection, tenant, kind, id).map(|value| value.map(Self))
+    }
     fn row_binding(&self) -> (&TenantId, &'static str, &str, u64) {
         self.0.row_binding()
     }
@@ -252,6 +276,14 @@ impl CompanyEntity for SealedReview {
 struct SealedCall(AdaptiveLeadershipReviewCallV1);
 
 impl CompanyEntity for SealedCall {
+    fn load_shape(
+        connection: &Connection,
+        tenant: &TenantId,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<Self>, WorkflowError> {
+        super::super::entity_shape(connection, tenant, kind, id).map(|value| value.map(Self))
+    }
     fn row_binding(&self) -> (&TenantId, &'static str, &str, u64) {
         self.0.row_binding()
     }
@@ -265,6 +297,14 @@ impl CompanyEntity for SealedCall {
 struct SealedRecovery(AdaptiveFundedReviewRecoveryReceiptV1);
 
 impl CompanyEntity for SealedRecovery {
+    fn load_shape(
+        connection: &Connection,
+        tenant: &TenantId,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<Self>, WorkflowError> {
+        super::super::entity_shape(connection, tenant, kind, id).map(|value| value.map(Self))
+    }
     fn row_binding(&self) -> (&TenantId, &'static str, &str, u64) {
         self.0.row_binding()
     }
@@ -599,17 +639,15 @@ fn require_history(
         if leaf.grant.schema_version == 6 {
             require_sealed_recovery_review(connection, &leaf)?;
         }
-        let payload: Option<Vec<u8>> = connection
-            .query_row(
-                "SELECT payload FROM company_entities
-            WHERE tenant_id=?1 AND entity_kind='adaptive_leadership_review_call' AND entity_id=?2",
-                params![tenant.0, leaf.grant.review_id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let call = get_entity::<SealedCall>(
+            connection,
+            tenant,
+            "adaptive_leadership_review_call",
+            &leaf.grant.review_id.to_string(),
+        )?;
         // Only the exact call currently being published on this connection may
         // be absent. Persisted unrelated leaves never receive this exception.
-        let Some(payload) = payload else {
+        let Some(SealedCall(call)) = call else {
             if is_exact_recovery_publication(connection, &leaf)
                 && leaf
                     .grant
@@ -621,8 +659,6 @@ fn require_history(
             }
             return Err(corrupt());
         };
-        validation_scope::charge_bytes(connection, payload.len())?;
-        let call: AdaptiveLeadershipReviewCallV1 = decode(&payload)?;
         if call.grant != leaf.grant
             || call.context_digest()? != leaf.context_digest
             || call.operation_id != leaf.operation_id
@@ -673,8 +709,8 @@ fn require_history(
         return Err(corrupt());
     }
     for sequence in sequences {
-        let row = read_company_event_row(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
-        validation_scope::charge_bytes(connection, row.payload.len())?;
+        let row = super::super::company_event_shape(connection, stored_u64(sequence)?)?
+            .ok_or_else(corrupt)?;
         if row.event_type == ADOPTION_EVENT {
             let event: FundingAdoptionLeaf = decode(&row.payload)?;
             let stored = get_entity::<SealedAdoption>(
