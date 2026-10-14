@@ -1,5 +1,12 @@
 # Changelog
 
+- Add explicit finite replacement of expired, unadopted, already-reviewed work
+  funding proposals. Bind complete retired-review no-provider-I/O evidence to
+  an atomic new funding receipt and permanent predecessor consumption; preserve
+  spending, lifetime caps, original journals and independent leadership
+  decisions. Separate historical membership from fresh execution eligibility
+  and provide exact immutable-result lookup after an unknown submission (#856).
+
 - Add an explicit, single-use recovery contract for proven undispatched funded
   leadership reviews, consuming existing review capacity without changing
   employee spending or decisions. Bind typed recovery membership to preserved

@@ -2569,6 +2569,9 @@ impl WorkflowStore {
             }
             return Ok(call);
         }
+        if let Some(epoch) = &call.grant.work_funding {
+            super::adaptive_work_funding::require_fresh_epoch_eligibility(&transaction, epoch)?;
+        }
         if let Some(event) = audit {
             require_local_adoption_audit(&call, result, event, now_ms)?;
         }

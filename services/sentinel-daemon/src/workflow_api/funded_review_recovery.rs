@@ -478,7 +478,7 @@ impl WorkflowApi {
         Ok(())
     }
 
-    fn validate_funded_request_no_io(
+    pub(super) fn validate_funded_request_no_io(
         &self,
         id: &str,
         guard: &ProviderRecoveryGuard<'_>,

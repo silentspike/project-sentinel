@@ -7,6 +7,42 @@ use crate::{
     AdaptiveLeadershipReviewContextV1, AdaptiveLeadershipReviewGrantV1, RuntimeAuthoritySnapshotV1,
 };
 
+mod expired_replacement;
+
+pub(super) fn with_recovery_publication<T>(
+    transaction: &Transaction<'_>,
+    grant: &AdaptiveLeadershipReviewGrantV1,
+    context_digest: &str,
+    operation_id: Uuid,
+    issued_at_unix_ms: u64,
+    publish: impl FnOnce() -> Result<T, WorkflowError>,
+) -> Result<T, WorkflowError> {
+    let epoch = require_review_binding(grant)?;
+    let leaf = FundingReviewLeaf {
+        schema_version: 1,
+        membership_id: review_id(epoch),
+        grant: grant.clone(),
+        operation_id,
+        context_digest: context_digest.to_owned(),
+        issued_at_unix_ms,
+    };
+    expired_replacement::with_recovery_publication(transaction, &leaf, publish)
+}
+
+pub(super) fn require_fresh_epoch_eligibility(
+    connection: &Connection,
+    epoch: &AdaptiveWorkFundingEpochV1,
+) -> Result<(), WorkflowError> {
+    require_epoch_receipt(connection, epoch)?;
+    let source = &epoch.receipt.request.source.resume_source;
+    if expired_replacement::consumed_receipts(connection, &source.tenant_id, source.session_id)?
+        .contains(&epoch.receipt.funding_id)
+    {
+        return Err(transition());
+    }
+    Ok(())
+}
+
 const FUNDING_KIND: &str = "adaptive_work_funding";
 const FUNDING_EVENT: &str = "adaptive_work_funding_issued";
 const REVIEW_KIND: &str = "adaptive_work_funding_review";
@@ -312,7 +348,7 @@ pub(super) fn insert_funding_review_membership(
     issued_at_ms: u64,
 ) -> Result<(), WorkflowError> {
     let epoch = require_review_binding(grant)?;
-    require_epoch_receipt(transaction, epoch)?;
+    require_fresh_epoch_eligibility(transaction, epoch)?;
     let leaf = FundingReviewLeaf {
         schema_version: 1,
         membership_id: review_id(epoch),
@@ -425,6 +461,7 @@ pub(crate) fn insert_funding_adoption_membership(
             Err(funding_conflict())
         };
     }
+    require_fresh_epoch_eligibility(transaction, epoch)?;
     let orphan: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM company_events WHERE tenant_id=?1 AND event_type=?2
          AND (operation_id=?3 OR json_extract(payload,'$.membership_id')=?4))",
@@ -504,7 +541,8 @@ impl CompanyEntity for AdaptiveWorkFundingReceiptV1 {
             &self.issuer_principal,
             self.issued_at_unix_ms,
             self,
-        )
+        )?;
+        expired_replacement::require_successor_membership(connection, self)
     }
 }
 
@@ -707,8 +745,7 @@ fn require_pre_recovery_funding_history_uncached(
         return Err(corrupt());
     }
     for id in ids {
-        let leaf: FundingAdoptionLeaf =
-            get_entity(connection, tenant, ADOPTION_KIND, &id)?.ok_or_else(corrupt)?;
+        let leaf = expired_replacement::sealed_adoption(connection, tenant, &id)?;
         if leaf
             .authorization
             .work_funding
@@ -744,9 +781,8 @@ fn require_pre_recovery_funding_history_uncached(
         // Adoption events have a separate typed shape and sealed membership.
         if event_type == ADOPTION_EVENT {
             let leaf: FundingAdoptionLeaf = decode(payload)?;
-            let stored: FundingAdoptionLeaf =
-                get_entity(connection, tenant, ADOPTION_KIND, &leaf.membership_id)?
-                    .ok_or_else(corrupt)?;
+            let stored =
+                expired_replacement::sealed_adoption(connection, tenant, &leaf.membership_id)?;
             if stored != leaf {
                 return Err(corrupt());
             }
@@ -986,7 +1022,7 @@ fn superseded_unused_receipts(
         "funding-supersession",
         &(tenant, session_id),
         || {
-            let receipts = funding_receipts(connection, tenant, session_id)?;
+            let receipts = expired_replacement::sealed_receipts(connection, tenant, session_id)?;
             superseded_unused_receipts_uncached(connection, &receipts)
         },
     )
@@ -1060,6 +1096,32 @@ fn require_unfunded_source(
     supersedes_unused_receipt_digest: Option<&str>,
     limits: &AdaptiveWorkFundingLimitsV1,
 ) -> Result<(AdaptiveWorkFundingSourceV1, u64), WorkflowError> {
+    require_unfunded_source_with_candidate(
+        connection,
+        tenant,
+        project_id,
+        session_id,
+        now_ms,
+        supersedes_unused_receipt_digest.map(PendingFundingReplacement::Unused),
+        limits,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PendingFundingReplacement<'a> {
+    Unused(&'a str),
+    Reviewed(&'a str),
+}
+
+fn require_unfunded_source_with_candidate(
+    connection: &Connection,
+    tenant: &TenantId,
+    project_id: &ProjectId,
+    session_id: Uuid,
+    now_ms: u64,
+    replacement: Option<PendingFundingReplacement<'_>>,
+    limits: &AdaptiveWorkFundingLimitsV1,
+) -> Result<(AdaptiveWorkFundingSourceV1, u64), WorkflowError> {
     let scope = validation_scope::enter(connection)?;
     let receipts = funding_receipts(connection, tenant, session_id)?;
     if receipts.len() >= 128 {
@@ -1079,7 +1141,7 @@ fn require_unfunded_source(
             return Err(transition());
         }
     }
-    let superseded = superseded_validated_receipts(connection, tenant, session_id, &receipts)?;
+    let superseded = consumed_validated_receipts(connection, tenant, session_id, &receipts)?;
     let pending = receipts
         .iter()
         .filter(|receipt| {
@@ -1087,9 +1149,11 @@ fn require_unfunded_source(
                 && !superseded.contains(&receipt.funding_id)
         })
         .collect::<Vec<_>>();
-    match (pending.as_slice(), supersedes_unused_receipt_digest) {
+    match (pending.as_slice(), replacement) {
         ([], None) => {}
-        ([old], Some(digest))
+        ([old], Some(PendingFundingReplacement::Reviewed(digest)))
+            if old.receipt_digest()? == digest => {}
+        ([old], Some(PendingFundingReplacement::Unused(digest)))
             if old.receipt_digest()? == digest
                 && old.request.limits.expires_at_unix_ms <= now_ms =>
         {
@@ -1110,7 +1174,11 @@ fn require_unfunded_source(
             .active_work_funding()
             .map(|epoch| epoch.receipt.receipt_digest())
             .transpose()?,
-        supersedes_unused_receipt_digest: supersedes_unused_receipt_digest.map(str::to_owned),
+        supersedes_unused_receipt_digest: match replacement {
+            Some(PendingFundingReplacement::Unused(digest)) => Some(digest.to_owned()),
+            _ => None,
+        },
+        expired_reviewed_replacement: None,
     };
     source.validate()?;
     scope.finish()?;
@@ -1127,7 +1195,7 @@ pub(super) fn require_unfunded_review_lane(
     let scope = validation_scope::enter(connection)?;
     let receipts = funding_receipts(connection, tenant, session_id)?;
     let adopted = adopted_epochs(session);
-    let superseded = superseded_validated_receipts(connection, tenant, session_id, &receipts)?;
+    let superseded = consumed_validated_receipts(connection, tenant, session_id, &receipts)?;
     // Selection and authorization are separate reads. A concurrently issued
     // live proposal must be reselected, not stranded by an older unfunded call.
     if receipts.iter().any(|receipt| {
@@ -1146,7 +1214,7 @@ pub(super) fn require_fresh_funding_review_source(
     call: &AdaptiveLeadershipReviewCallV1,
 ) -> Result<(), WorkflowError> {
     let epoch = require_review_binding(&call.grant)?;
-    require_epoch_receipt(connection, epoch)?;
+    require_fresh_epoch_eligibility(connection, epoch)?;
     let source = &epoch.receipt.request.source;
     let (session, root_digest, head_digest) =
         crate::store::adaptive::adaptive_resume_journal_source(connection, call.grant.session_id)?
@@ -1258,8 +1326,7 @@ impl WorkflowStore {
         }
         let receipts = funding_receipts(&transaction, tenant, session_id)?;
         let adopted = adopted_epochs(&session);
-        let superseded =
-            superseded_validated_receipts(&transaction, tenant, session_id, &receipts)?;
+        let superseded = consumed_validated_receipts(&transaction, tenant, session_id, &receipts)?;
         let pending: Vec<_> = receipts
             .iter()
             .filter(|receipt| {
@@ -1402,6 +1469,7 @@ impl WorkflowStore {
             read_funding_leaf(&transaction, &principal.tenant_id, session_id, operation_id)?
         {
             if prior.issuer_principal != *principal
+                || prior.request.source.expired_reviewed_replacement.is_some()
                 || prior.request.source.resume_source.project_id != *project_id
                 || prior.request.reason_ref != reason_ref
                 || prior.request.limits != limits
@@ -1470,6 +1538,9 @@ impl WorkflowStore {
             return Ok((true, prior));
         }
         request.validate_at(principal, now_ms)?;
+        if request.source.expired_reviewed_replacement.is_some() {
+            return Err(unauthorized());
+        }
         let (fresh, duration) = require_unfunded_source(
             &transaction,
             &source.tenant_id,
@@ -1507,24 +1578,7 @@ impl WorkflowStore {
             superseded_unused_receipts_uncached(&transaction, &receipts)?;
         }
         scope.finish()?;
-        put_entity(
-            &transaction,
-            &source.tenant_id,
-            FUNDING_KIND,
-            &receipt.funding_id,
-            1,
-            &receipt,
-        )?;
-        append_event(
-            &transaction,
-            principal,
-            request.operation_id,
-            &request.canonical_digest()?,
-            Some(&source.project_id),
-            FUNDING_EVENT,
-            &receipt,
-            now_ms,
-        )?;
+        put_funding_receipt(&transaction, &receipt)?;
         transaction.commit()?;
         Ok((false, receipt))
     }
@@ -1547,6 +1601,47 @@ fn funding_conflict() -> WorkflowError {
         false,
         "adaptive work funding is immutable",
     )
+}
+
+fn put_funding_receipt(
+    transaction: &Transaction<'_>,
+    receipt: &AdaptiveWorkFundingReceiptV1,
+) -> Result<(), WorkflowError> {
+    let source = &receipt.request.source.resume_source;
+    put_entity(
+        transaction,
+        &source.tenant_id,
+        FUNDING_KIND,
+        &receipt.funding_id,
+        1,
+        receipt,
+    )?;
+    append_event(
+        transaction,
+        &receipt.issuer_principal,
+        receipt.request.operation_id,
+        &receipt.request.canonical_digest()?,
+        Some(&source.project_id),
+        FUNDING_EVENT,
+        receipt,
+        receipt.issued_at_unix_ms,
+    )?;
+    Ok(())
+}
+
+fn consumed_validated_receipts(
+    connection: &Connection,
+    tenant: &TenantId,
+    session_id: Uuid,
+    receipts: &[AdaptiveWorkFundingReceiptV1],
+) -> Result<BTreeSet<String>, WorkflowError> {
+    let mut consumed = superseded_validated_receipts(connection, tenant, session_id, receipts)?;
+    for id in expired_replacement::consumed_receipts(connection, tenant, session_id)? {
+        if !consumed.insert(id) {
+            return Err(corrupt());
+        }
+    }
+    Ok(consumed)
 }
 
 // Inject a second connection's atomic commit between the two actual reads.
@@ -1672,6 +1767,7 @@ mod review_payload_budget_tests {
                 current_tool_call_ceiling: 2,
                 predecessor_receipt_digest: None,
                 supersedes_unused_receipt_digest: None,
+                expired_reviewed_replacement: None,
             },
             limits: AdaptiveWorkFundingLimitsV1 {
                 additional_model_calls: 2,

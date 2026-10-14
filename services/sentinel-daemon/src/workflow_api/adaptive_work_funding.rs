@@ -113,6 +113,53 @@ fn supersession_query(path: &str) -> Result<Option<&str>, WorkflowError> {
     Ok(digest)
 }
 
+fn replacement_route(path: &str, method: &str) -> Result<bool, ()> {
+    let Some((_, query)) = path.split_once('?') else {
+        return Ok(false);
+    };
+    let mut mode = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut replacement_parameter = false;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key.is_empty() || value.is_empty() || !seen.insert(key) {
+            return Err(());
+        }
+        if method == "POST" && key != "mode" {
+            return Err(());
+        }
+        match key {
+            "mode" => mode = Some(value),
+            "old_funding_receipt_digest" | "source_only" | "receipt_only" | "replacement_key" => {
+                replacement_parameter = true
+            }
+            "project_id"
+            | "session_id"
+            | "operation_id"
+            | "reason_ref"
+            | "additional_model_calls"
+            | "additional_tool_calls"
+            | "additional_reviews"
+            | "additional_windows"
+            | "max_window_ms"
+            | "max_call_duration_ms"
+            | "dispatch_margin_ms"
+            | "expires_at_unix_ms"
+            | "supersedes_unused_receipt_digest" => {}
+            _ => return Err(()),
+        }
+    }
+    match mode {
+        Some(super::expired_funding_replacement::EXPIRED_FUNDING_REPLACEMENT_MODE)
+            if !seen.contains("supersedes_unused_receipt_digest") =>
+        {
+            Ok(true)
+        }
+        None if !replacement_parameter => Ok(false),
+        _ => Err(()),
+    }
+}
+
 impl WorkflowApi {
     pub(super) fn validate_work_funding_review(
         &self,
@@ -400,6 +447,18 @@ impl WorkflowApi {
                 "registered operator funding authority required",
                 false,
             );
+        }
+        match replacement_route(path, method) {
+            Ok(true) => return self.expired_funding_replacement_http(operator, method, path, body),
+            Ok(false) => {}
+            Err(()) => {
+                return json_error(
+                    400,
+                    "invalid_input",
+                    "incompatible or ambiguous funding query",
+                    false,
+                )
+            }
         }
         if !self.enabled || !self.model_work_enabled {
             return workflow_error(workflow_unavailable());

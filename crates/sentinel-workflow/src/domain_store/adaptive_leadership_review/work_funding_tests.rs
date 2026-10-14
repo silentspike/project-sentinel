@@ -3,6 +3,10 @@ use crate::{AdaptiveWorkFundingEpochV1, AdaptiveWorkFundingLimitsV1, AdaptiveWor
 
 const WINDOW_MS: u64 = 180_000;
 
+mod expired_funding_replacement_tests {
+    include!("work_funding_tests/expired_funding_replacement_tests.rs");
+}
+
 fn recovery_fixture() -> (Fixture, crate::AdaptiveFundedReviewRecoveryRequestV1, u64) {
     let (mut f, receipt, now) = funded_fixture();
     let old = issue(&f, now).unwrap();

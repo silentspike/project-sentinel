@@ -41,6 +41,8 @@ mod delivery_runtime;
 #[cfg(all(test, feature = "llm"))]
 mod exact_adaptive_dispatch_tests;
 #[cfg(feature = "llm")]
+mod expired_funding_replacement;
+#[cfg(feature = "llm")]
 mod historical_model_boundary;
 #[cfg(feature = "llm")]
 pub mod model_execution;

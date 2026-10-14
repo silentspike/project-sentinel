@@ -298,6 +298,50 @@ hide a committed receipt. Missing, mismatched or corrupt records reject without
 falling through to a new draft; absence never authorizes resubmission. The
 response marks `historical_lookup: true` and creates no new authority or expiry.
 
+## Expired Reviewed Funding Proposals
+
+An expired, unadopted funding proposal that already has leadership reviews is
+neither unused funding nor an adopted zero-call epoch. Replacing it therefore
+uses a distinct explicit operator path on the funding endpoint:
+`mode=expired_unadopted_replacement`. It does not extend the old expiry or reset
+the employee journal, provider usage, review history or lifetime limits.
+
+The server binds the proposal to the original tenant, project, session and old
+funding receipt digest. Every review of that proposal must be retired with no
+decision, dispatch, response, continuation, resolution or adoption. Protected
+historical evidence must prove no provider I/O for each exact review; absence
+of a mutable reservation row is not proof that no reservation ever existed.
+Current live, reserved, unknown, completion and usage evidence veto replacement.
+
+One SQLite transaction issues an ordinary finite funding receipt, permanently
+consumes the old proposal, and records the replacement relation and both events.
+The permanent predecessor key does not change with operation IDs, release,
+reason or time. Capacity derives from current adopted limits and actual spending,
+not the expired proposal's unused capacity. Existing global bounds still apply.
+Consumed epochs remain valid historical members but cannot authorize new review
+selection, claims, completion or adoption. Queued preparation must revalidate
+that eligibility before provider I/O.
+
+`GET` with `source_only=true` exports source metadata and the complete retired
+review inventory; it is not a no-I/O certificate or permission to execute.
+Consumed proposals may be inspected as explicitly historical, noneligible
+metadata after assignment or head changes. Fresh unconsumed exports still
+require current authority and reject live, reserved or unknown request evidence.
+A normal `GET` prepares an explicit new proposal, and `POST` submits its exact
+server-bound fields. Issuance creates no developer window and records no model
+decision. A normal schema-5 leadership review must independently choose Continue
+or Defer before employee work can resume.
+
+If submission has an unknown outcome, `GET` with `receipt_only=true` and the
+exact replacement key, operation ID, project, session and old receipt digest
+reads the immutable result for the original authenticated issuer. It does not
+require fresh issuance evidence and cannot fall through to a new proposal.
+The result includes the original compact submission and issuer binding so the
+operator can compare all inputs, not just an operation ID or expiry.
+Missing or conflicting receipts do not authorize resubmission. Further finite
+replacements require a separate explicit authorization and complete evidence;
+there is no automatic replacement loop.
+
 ## Validation And Dispatch Preparation
 
 Project discovery validates all current and historical subscription allowances
@@ -359,7 +403,7 @@ cursors, changed operation content, bounded DTO/raw identity rejection, missing
 EventStore, unavailable assignee runtime authority, and changed assignment or
 rotated leadership credentials after a durable decision.
 
-These Rust tests have not been run in this lane. ORC must wire both lanes and
-queue focused daemon tests, formatting, and compilation through its authorized
-Rust queue, then perform any required product acceptance separately. Source
-inspection and local static checks are not live customer acceptance evidence.
+Run applicable focused tests, formatting, compilation and integration gates
+through the authorized Cargo Remote workflow, then verify the deployed product
+separately. Source inspection and passing tests are not live customer acceptance
+evidence. Exact commands and revision-bound results belong in the delivery PR.
