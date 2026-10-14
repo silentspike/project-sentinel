@@ -422,9 +422,10 @@ pub(super) fn calls_for_session(
 ) -> Result<Vec<AdaptiveLeadershipReviewCallV1>, WorkflowError> {
     validation_scope::with_scope(connection, || {
         // Cache membership, not another serialized copy of already-owned typed rows.
-        let ids = validation_scope::memoize(connection, "review-calls", &(tenant, session_id), || {
-            call_ids_for_session_uncached(connection, tenant, session_id)
-        })?;
+        let ids =
+            validation_scope::memoize(connection, "review-calls", &(tenant, session_id), || {
+                call_ids_for_session_uncached(connection, tenant, session_id)
+            })?;
         ids.into_iter()
             .map(|id| get_entity(connection, tenant, KIND, &id)?.ok_or_else(corrupt))
             .collect()
