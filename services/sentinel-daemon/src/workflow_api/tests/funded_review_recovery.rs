@@ -536,6 +536,251 @@ fn retry_path(source: &AdaptiveFundedReviewRecoveryVerificationSourceV1) -> Stri
         source.source.project_id, source.source.session_id, source.source.retired_review_id)
 }
 
+fn historical_receipt_path(request: &AdaptiveFundedReviewRecoveryRequestV1) -> String {
+    format!("{ADAPTIVE_REVIEW_EPOCH_PATH}?mode=funded_undispatched_retry&receipt_only=true&receipt_key={}&operation_id={}&project_id={}&session_id={}&retired_review_id={}",
+        request.source.receipt_key().unwrap(), request.operation_id,
+        request.source.project_id, request.source.session_id, request.source.retired_review_id)
+}
+
+#[test]
+fn funded_retry_historical_receipt_survives_closed_admission_expiry_stale_scope_and_proof() {
+    let (temp, api, source) = live_fixture();
+    let proof = adaptive_recovery_release::TestFundedRecoveryGuard::fixture(&source);
+    let request = issue_retry(&api, &source);
+    let operator = api.principals.principal("operator").unwrap();
+    let bytes = serde_json::to_vec(&request).unwrap();
+    let replay = api.review_recovery_epoch(&operator, "POST", &retry_path(&source), &bytes);
+    assert_eq!(replay.status, 200);
+    let mut expected: serde_json::Value = serde_json::from_slice(&replay.body).unwrap();
+    expected["historical_lookup"] = serde_json::json!(true);
+    let path = historical_receipt_path(&request);
+    let initial = api.review_recovery_epoch(&operator, "GET", &path, b"");
+    assert_eq!(initial.status, 200);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&initial.body).unwrap(),
+        expected
+    );
+    drop(proof);
+    let invalid_new_release = adaptive_recovery_release::TestFundedRecoveryGuard::fixture(&source);
+    invalid_new_release.reject();
+    *api.provider_admission.write().unwrap() = false;
+    let authority = &source.session.grant.authority;
+    let old = source
+        .calls
+        .iter()
+        .find(|call| call.grant.review_id == source.source.retired_review_id)
+        .unwrap();
+    api.store
+        .apply_company_command(
+            &old.grant.leadership_principal,
+            Uuid::new_v4(),
+            &CompanyWorkflowCommandV1::ReassignWork {
+                project_id: authority.project_id.clone(),
+                expected_version: source.project.version,
+                work_item_id: authority.work_item_id.clone(),
+                expected_assignment_version: authority.assignment_version,
+                agent_id: authority.agent_id,
+                organization_generation: authority.organization_generation,
+                organization_digest: authority.organization_digest.clone(),
+                reason_ref: "synthetic historical receipt stale assignment".into(),
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let before = adaptive_leadership_review::tests::discovery_state(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    let _mutation = api.mutation_fence.write().unwrap();
+    let clock_reads = std::cell::Cell::new(0);
+    let historical = api.funded_review_recovery_http_with_checks(
+        &operator,
+        "GET",
+        &path,
+        b"",
+        || {
+            clock_reads.set(clock_reads.get() + 1);
+            request.expires_at_unix_ms + 1
+        },
+        |_| panic!("historical receipt lookup must not consult current release proof"),
+    );
+    assert_eq!(
+        historical.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&historical.body)
+    );
+    assert_eq!(
+        clock_reads.get(),
+        0,
+        "immutable lookup has no current expiry check"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&historical.body).unwrap(),
+        expected
+    );
+    assert_eq!(
+        adaptive_leadership_review::tests::discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite")
+        ),
+        before
+    );
+}
+
+#[test]
+fn funded_retry_historical_receipt_rejects_wrong_identity_flags_and_issuer_without_writes() {
+    let (temp, mut api, source) = live_fixture();
+    let _proof = adaptive_recovery_release::TestFundedRecoveryGuard::fixture(&source);
+    let request = issue_retry(&api, &source);
+    let operator = api.principals.principal("operator").unwrap();
+    let mut other = operator.clone();
+    other.principal.principal_id = "operator-other".into();
+    other.execution_authority =
+        PrincipalAuthorityV1::derive("operator-other", 1, &[9; 32]).unwrap();
+    let mut foreign = operator.clone();
+    foreign.principal.principal_id = "operator-foreign".into();
+    foreign.principal.tenant_id = TenantId::parse("tenant-foreign").unwrap();
+    foreign.execution_authority =
+        PrincipalAuthorityV1::derive("operator-foreign", 1, &[8; 32]).unwrap();
+    let mut principals = PrincipalAuthenticator {
+        by_principal_id: api.principals.by_principal_id.clone(),
+        by_credential_digest: api.principals.by_credential_digest.clone(),
+    };
+    principals
+        .by_principal_id
+        .insert(other.principal.principal_id.clone(), other.clone());
+    principals
+        .by_principal_id
+        .insert(foreign.principal.principal_id.clone(), foreign.clone());
+    api.principals = Arc::new(principals);
+    assert!(api.validate_work_funding_operator(&other).is_ok());
+    assert!(api.validate_work_funding_operator(&foreign).is_ok());
+    let path = historical_receipt_path(&request);
+    let key = request.source.receipt_key().unwrap();
+    let missing_key = format!("funded-review-recovery-{}", "f".repeat(64));
+    let before = adaptive_leadership_review::tests::discovery_state(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    *api.provider_admission.write().unwrap() = false;
+    for invalid in [
+        path.replace(&key, &missing_key),
+        path.replace(
+            &request.operation_id.to_string(),
+            &Uuid::new_v4().to_string(),
+        ),
+        path.replace(
+            &format!("project_id={}", request.source.project_id),
+            "project_id=wrong-project",
+        ),
+        path.replace(
+            &format!("session_id={}", request.source.session_id),
+            &format!("session_id={}", Uuid::new_v4()),
+        ),
+        path.replace(
+            &format!("retired_review_id={}", request.source.retired_review_id),
+            &format!("retired_review_id={}", Uuid::new_v4()),
+        ),
+        path.replace(&format!("&receipt_key={key}"), ""),
+        path.replace(&format!("&operation_id={}", request.operation_id), ""),
+        path.replace("receipt_only=true", "receipt_only=false"),
+        path.replace("receipt_only=true", "receipt_only="),
+        path.replace("receipt_only=true", "receipt_only"),
+        path.replace("receipt_only=true", "receipt_only=1"),
+        format!("{path}&receipt_only=true"),
+        format!("{path}&source_only=true"),
+        format!("{path}&operation_id={}", request.operation_id),
+        format!("{path}&receipt_key={key}"),
+        format!("{path}&unrecognized=true"),
+        path.replace(&request.operation_id.to_string(), &Uuid::nil().to_string()),
+    ] {
+        let response = api.review_recovery_epoch(&operator, "GET", &invalid, b"");
+        assert!(
+            matches!(response.status, 400 | 409),
+            "{invalid}: {}",
+            response.status
+        );
+    }
+    assert_eq!(
+        api.review_recovery_epoch(&other, "GET", &path, b"").status,
+        409
+    );
+    assert_eq!(
+        api.review_recovery_epoch(&foreign, "GET", &path, b"")
+            .status,
+        409
+    );
+    assert_eq!(
+        api.review_recovery_epoch(&api.principals.principal("pm").unwrap(), "GET", &path, b"")
+            .status,
+        403
+    );
+    assert_eq!(
+        api.review_recovery_epoch(
+            &operator,
+            "POST",
+            &path,
+            &serde_json::to_vec(&request).unwrap()
+        )
+        .status,
+        400
+    );
+    assert_eq!(
+        adaptive_leadership_review::tests::discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite")
+        ),
+        before
+    );
+}
+
+#[test]
+fn funded_retry_historical_receipt_rejects_corrupt_or_orphaned_receipt_without_fallback() {
+    for orphan in [false, true] {
+        let (temp, api, source) = live_fixture();
+        let _proof = adaptive_recovery_release::TestFundedRecoveryGuard::fixture(&source);
+        let request = issue_retry(&api, &source);
+        let key = request.source.receipt_key().unwrap();
+        let connection =
+            sentinel_limbo::rusqlite::Connection::open(temp.path().join("company.sqlite")).unwrap();
+        let sql = if orphan {
+            "DELETE FROM company_entities WHERE entity_kind='adaptive_funded_review_recovery' AND entity_id=?1"
+        } else {
+            "UPDATE company_entities SET payload_digest='corrupt' WHERE entity_kind='adaptive_funded_review_recovery' AND entity_id=?1"
+        };
+        assert_eq!(
+            connection
+                .execute(sql, sentinel_limbo::rusqlite::params![key])
+                .unwrap(),
+            1
+        );
+        let before = adaptive_leadership_review::tests::discovery_state(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        );
+        *api.provider_admission.write().unwrap() = false;
+        let response = api.review_recovery_epoch(
+            &api.principals.principal("operator").unwrap(),
+            "GET",
+            &historical_receipt_path(&request),
+            b"",
+        );
+        assert_ne!(response.status, 200);
+        assert_ne!(
+            response.status, 503,
+            "must reject historical corruption before admission"
+        );
+        assert_eq!(
+            adaptive_leadership_review::tests::discovery_state(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite")
+            ),
+            before
+        );
+    }
+}
+
 #[test]
 fn funded_retry_source_metadata_is_bounded_and_not_no_io_authority() {
     let (_temp, api, source) = live_fixture();
@@ -1002,6 +1247,22 @@ fn funded_retry_normal_pipeline_continue_and_defer_commit_once() {
             )
             .status,
             200
+        );
+        let historical =
+            api.review_recovery_epoch(operator, "GET", &historical_receipt_path(&request), b"");
+        assert_eq!(
+            historical.status, 200,
+            "Continue advances the head, not the immutable receipt"
+        );
+        let historical: serde_json::Value = serde_json::from_slice(&historical.body).unwrap();
+        assert_eq!(historical["historical_lookup"], true);
+        assert_eq!(historical["replayed"], true);
+        assert_eq!(historical["expires_at_unix_ms"], request.expires_at_unix_ms);
+        assert_eq!(historical["operation_id"], request.operation_id.to_string());
+        assert_eq!(events.get_llm_completion(&id).unwrap().unwrap(), retained);
+        assert_eq!(
+            serde_json::to_value(events.get_all_events().unwrap()).unwrap(),
+            audit
         );
     }
 }
