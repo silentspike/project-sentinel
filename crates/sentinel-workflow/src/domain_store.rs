@@ -29,6 +29,9 @@ mod subscription;
 pub(crate) mod validation_scope;
 mod work_corrections;
 
+#[cfg(test)]
+mod entity_shape_reuse_tests;
+
 use crate::admission::*;
 use crate::collaboration::*;
 use crate::digest::{canonical_bytes_sha256, canonical_sha256, constant_time_eq};
@@ -330,9 +333,23 @@ struct CompanyEventRow {
     authority_generation: i64,
     authority_digest: String,
     authority_binding_digest: String,
+    #[serde(serialize_with = "serialize_company_event_payload")]
     payload: Vec<u8>,
     payload_digest: String,
     created_at_ms: i64,
+}
+
+fn serialize_company_event_payload<S: serde::Serializer>(
+    payload: &[u8],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    // Hash the byte-exact payload as text without a decimal-array expansion.
+    let payload = std::str::from_utf8(payload).map_err(<S::Error as serde::ser::Error>::custom)?;
+    serializer.serialize_str(payload)
+}
+
+fn project_snapshot_memo_key(row: &CompanyEventRow) -> Result<String, WorkflowError> {
+    canonical_sha256("sentinel.workflow.project-snapshot-memo-key.v1", row)
 }
 
 fn validate_project_snapshot_event(
@@ -358,7 +375,10 @@ fn validate_project_snapshot_event_with_byte_budget(
             // A cached event still consumes this historical selection's exact byte budget.
             budget.charge(response_bytes)?;
         }
-        validation_scope::memoize(connection, "project-snapshot", row, || {
+        // Reject malformed stored bytes before memo serialization can map the error to persistence.
+        std::str::from_utf8(&row.payload).map_err(|_| corrupt())?;
+        let key = project_snapshot_memo_key(row)?;
+        validation_scope::memoize(connection, "project-snapshot", &key, || {
             validate_project_snapshot_event_uncached(connection, row)
         })
     })
@@ -1064,6 +1084,66 @@ fn read_company_event_row(
         )
         .optional()
         .map_err(WorkflowError::from)
+}
+
+#[derive(Clone)]
+struct CompanyEventShape(std::sync::Arc<CompanyEventRow>);
+
+impl std::ops::Deref for CompanyEventShape {
+    type Target = CompanyEventRow;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl Serialize for CompanyEventShape {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+fn company_event_shape(
+    connection: &Connection,
+    sequence: u64,
+) -> Result<Option<CompanyEventShape>, WorkflowError> {
+    company_event_shape_with_observer(connection, sequence, |_| {})
+}
+
+fn company_event_shape_with_observer(
+    connection: &Connection,
+    sequence: u64,
+    mut before_payload_copy: impl FnMut(usize),
+) -> Result<Option<CompanyEventShape>, WorkflowError> {
+    validation_scope::memoize(connection, "event-shape", &sequence, || {
+        let payload_bytes: Option<usize> = connection
+            .query_row(
+                "SELECT payload FROM company_events WHERE sequence=?1",
+                [sql_u64(sequence)?],
+                |row| {
+                    let value = row.get_ref(0)?;
+                    match value {
+                        rusqlite::types::ValueRef::Blob(payload) => Ok(payload.len()),
+                        _ => Err(rusqlite::Error::InvalidColumnType(
+                            0,
+                            "payload".into(),
+                            value.data_type(),
+                        )),
+                    }
+                },
+            )
+            .optional()?;
+        let Some(payload_bytes) = payload_bytes else {
+            return Ok(None);
+        };
+        validation_scope::charge_bytes(connection, payload_bytes)?;
+        before_payload_copy(payload_bytes);
+        let row = read_company_event_row(connection, sequence)?.ok_or_else(corrupt)?;
+        // This is data ownership, not an event or caller-authority proof.
+        // Invalid UTF-8 must fail as corruption before owner accounting.
+        std::str::from_utf8(&row.payload).map_err(|_| corrupt())?;
+        Ok(Some(CompanyEventShape(std::sync::Arc::new(row))))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7454,6 +7534,17 @@ fn put_entity<T: Serialize>(
 trait CompanyEntity {
     fn row_binding(&self) -> (&TenantId, &'static str, &str, u64);
     fn validate_entity(&self) -> Result<(), WorkflowError>;
+    fn load_shape(
+        connection: &Connection,
+        tenant_id: &TenantId,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<Self>, WorkflowError>
+    where
+        Self: DeserializeOwned + Serialize + Clone + Sized + 'static,
+    {
+        entity_shape(connection, tenant_id, kind, id)
+    }
     fn validate_persisted(&self, _connection: &Connection) -> Result<(), WorkflowError> {
         Ok(())
     }
@@ -7576,35 +7667,121 @@ fn get_entity<T: DeserializeOwned + Serialize + Clone + CompanyEntity + 'static>
     kind: &str,
     id: &str,
 ) -> Result<Option<T>, WorkflowError> {
-    validation_scope::memoize(connection, "entity", &(tenant_id, kind, id), || {
-        get_entity_uncached(connection, tenant_id, kind, id)
+    validation_scope::with_scope(connection, || {
+        let mut loaded = None;
+        let proof =
+            validation_scope::memoize(connection, "entity", &(tenant_id, kind, id), || {
+                let value = T::load_shape(connection, tenant_id, kind, id)?;
+                if let Some(value) = &value {
+                    value.validate_entity().map_err(|_| corrupt())?;
+                    value
+                        .validate_persisted(connection)
+                        .map_err(|_| corrupt())?;
+                }
+                let present = value.is_some();
+                loaded = Some(value);
+                Ok(EntityViewProof::<T> {
+                    present,
+                    view: std::marker::PhantomData,
+                })
+            })?;
+        if !proof.present {
+            return Ok(None);
+        }
+        // A view proof is not a data owner. Full and sealed views share shape
+        // storage, but each view must finish its own persisted validation.
+        let value = match loaded {
+            Some(value) => value,
+            None => T::load_shape(connection, tenant_id, kind, id)?,
+        };
+        value.map(Some).ok_or_else(corrupt)
     })
 }
 
-fn get_entity_uncached<T: DeserializeOwned + CompanyEntity>(
+#[derive(Clone)]
+struct EntityViewProof<T> {
+    present: bool,
+    view: std::marker::PhantomData<T>,
+}
+
+impl<T> Serialize for EntityViewProof<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.present.serialize(serializer)
+    }
+}
+
+#[derive(Clone)]
+struct EntityShape<T>(std::sync::Arc<T>);
+
+impl<T: Serialize> Serialize for EntityShape<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Charge the complete retained value, never just its shared pointer.
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+fn entity_shape<T: DeserializeOwned + Serialize + Clone + CompanyEntity + 'static>(
     connection: &Connection,
     tenant_id: &TenantId,
     kind: &str,
     id: &str,
 ) -> Result<Option<T>, WorkflowError> {
-    connection.query_row("SELECT tenant_id,entity_kind,entity_id,version,payload,payload_digest FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3", params![tenant_id.0, kind, id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, String>(5)?))).optional().map_err(WorkflowError::from)?.map(|(row_tenant,row_kind,row_id,row_version,payload,payload_digest)| {
-        validation_scope::charge_bytes(connection, payload.len())?;
-        if row_tenant != tenant_id.0 || row_kind != kind || row_id != id || row_version <= 0 || !constant_time_eq(&bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?, &payload_digest) {
-            return Err(corrupt());
-        }
-        let value: T = decode(&payload)?;
-        let (value_tenant, value_kind, value_id, value_version) = value.row_binding();
-        if value_tenant != tenant_id
-            || value_kind != kind
-            || value_id != id
-            || value_version != stored_u64(row_version)?
-        {
-            return Err(corrupt());
-        }
-        value.validate_entity().map_err(|_| corrupt())?;
-        value.validate_persisted(connection).map_err(|_| corrupt())?;
-        Ok(value)
-    }).transpose()
+    let owner: Option<EntityShape<T>> =
+        validation_scope::memoize(connection, "entity-shape", &(tenant_id, kind, id), || {
+            entity_shape_uncached(connection, tenant_id, kind, id)
+                .map(|value| value.map(|value| EntityShape(std::sync::Arc::new(value))))
+        })?;
+    Ok(owner.map(|value| value.0.as_ref().clone()))
+}
+
+fn entity_shape_uncached<T: DeserializeOwned + CompanyEntity>(
+    connection: &Connection,
+    tenant_id: &TenantId,
+    kind: &str,
+    id: &str,
+) -> Result<Option<T>, WorkflowError> {
+    let mut statement = connection.prepare("SELECT tenant_id,entity_kind,entity_id,version,payload,payload_digest FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3")?;
+    let mut rows = statement.query(params![tenant_id.0, kind, id])?;
+    rows.next()?
+        .map(|row| {
+            let row_tenant: String = row.get(0)?;
+            let row_kind: String = row.get(1)?;
+            let row_id: String = row.get(2)?;
+            let row_version: i64 = row.get(3)?;
+            let payload_value = row.get_ref(4)?;
+            let rusqlite::types::ValueRef::Blob(payload) = payload_value else {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    4,
+                    "payload".into(),
+                    payload_value.data_type(),
+                )
+                .into());
+            };
+            let payload_digest: String = row.get(5)?;
+            validation_scope::charge_bytes(connection, payload.len())?;
+            if row_tenant != tenant_id.0
+                || row_kind != kind
+                || row_id != id
+                || row_version <= 0
+                || !constant_time_eq(
+                    &bytes_digest("sentinel.workflow.company-entity-row.v1", payload)?,
+                    &payload_digest,
+                )
+            {
+                return Err(corrupt());
+            }
+            let value: T = decode(payload)?;
+            let (value_tenant, value_kind, value_id, value_version) = value.row_binding();
+            if value_tenant != tenant_id
+                || value_kind != kind
+                || value_id != id
+                || value_version != stored_u64(row_version)?
+            {
+                return Err(corrupt());
+            }
+            Ok(value)
+        })
+        .transpose()
 }
 
 fn bytes_digest(domain: &'static str, value: &[u8]) -> Result<String, WorkflowError> {
@@ -7718,6 +7895,231 @@ mod tests {
             profile_id: id.to_owned(),
             generation: 1,
             digest: DIGEST.to_owned(),
+        }
+    }
+
+    fn project_snapshot_row(connection: &Connection, project: &ProjectV1) -> CompanyEventRow {
+        let sequence: i64 = connection
+            .query_row(
+                "SELECT source_sequence FROM company_project_projections WHERE tenant_id=?1 AND project_id=?2",
+                params![project.tenant_id.0, project.project_id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        read_company_event_row(connection, stored_u64(sequence).unwrap())
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn project_snapshot_memo_payload_is_byte_exact_reversible_utf8() {
+        let (_temp, _path, store, _principal, project) = accepted_project_fixture();
+        let connection = store.connection.lock().unwrap();
+        for payload in [
+            b"{\"message\":\"plain\"}".to_vec(),
+            b" \n { \"message\" : \"plain\" } \t\r\n".to_vec(),
+            "{ \"unicode\": \"\u{00e4}\u{1f642}\" }\n"
+                .as_bytes()
+                .to_vec(),
+            r#" { "escaped": "\u00e4\n\"\\", "numbers": [ 1, 2 ] } "#
+                .as_bytes()
+                .to_vec(),
+        ] {
+            let mut row = project_snapshot_row(&connection, &project);
+            row.payload = payload;
+            let key = serde_json::to_vec(&row).unwrap();
+            let mut representation: serde_json::Value = serde_json::from_slice(&key).unwrap();
+            assert_eq!(
+                representation["payload"].as_str().unwrap().as_bytes(),
+                row.payload.as_slice()
+            );
+            assert_eq!(
+                crate::digest::serialized_json_size(&row).unwrap(),
+                key.len()
+            );
+            representation["payload"] = serde_json::to_value(&row.payload).unwrap();
+            assert!(key.len() < serde_json::to_vec(&representation).unwrap().len());
+        }
+    }
+
+    #[test]
+    fn project_snapshot_memo_key_binds_actual_payload_hash_and_every_metadata_field() {
+        let (_temp, _path, store, _principal, project) = accepted_project_fixture();
+        let connection = store.connection.lock().unwrap();
+        let original = project_snapshot_row(&connection, &project);
+        let key = project_snapshot_memo_key(&original).unwrap();
+        let baseline = serde_json::to_value(&original).unwrap();
+        assert_eq!(
+            key,
+            canonical_sha256("sentinel.workflow.project-snapshot-memo-key.v1", &original).unwrap()
+        );
+        assert_eq!(key.len(), 64);
+        assert!(
+            serde_json::to_vec(&key).unwrap().len() < serde_json::to_vec(&original).unwrap().len()
+        );
+        let fields = [
+            "sequence",
+            "event_id",
+            "tenant_id",
+            "project_id",
+            "event_type",
+            "operation_id",
+            "operation_digest",
+            "principal_id",
+            "principal_kind",
+            "principal_role",
+            "agent_id",
+            "customer_id",
+            "authority_generation",
+            "authority_digest",
+            "authority_binding_digest",
+            "payload",
+            "payload_digest",
+            "created_at_ms",
+        ];
+        assert_eq!(baseline.as_object().unwrap().len(), fields.len());
+        for field in fields {
+            let mut changed = project_snapshot_row(&connection, &project);
+            match field {
+                "sequence" => changed.sequence += 1,
+                "event_id" => changed.event_id.push('x'),
+                "tenant_id" => changed.tenant_id.push('x'),
+                "project_id" => changed.project_id.get_or_insert_with(String::new).push('x'),
+                "event_type" => changed.event_type.push('x'),
+                "operation_id" => changed.operation_id.push('x'),
+                "operation_digest" => changed.operation_digest.push('x'),
+                "principal_id" => changed.principal_id.push('x'),
+                "principal_kind" => changed.principal_kind.push('x'),
+                "principal_role" => changed.principal_role.push('x'),
+                "agent_id" => changed.agent_id = Some(changed.agent_id.unwrap_or(0) + 1),
+                "customer_id" => changed
+                    .customer_id
+                    .get_or_insert_with(String::new)
+                    .push('x'),
+                "authority_generation" => changed.authority_generation += 1,
+                "authority_digest" => changed.authority_digest.push('x'),
+                "authority_binding_digest" => changed.authority_binding_digest.push('x'),
+                "payload" => changed.payload.push(b' '),
+                "payload_digest" => changed.payload_digest.push('x'),
+                "created_at_ms" => changed.created_at_ms += 1,
+                _ => unreachable!(),
+            }
+            let changed_key = project_snapshot_memo_key(&changed).unwrap();
+            assert_ne!(key, changed_key, "{field}");
+            let changed_value = serde_json::to_value(&changed).unwrap();
+            for (name, value) in baseline.as_object().unwrap() {
+                if name.as_str() == field {
+                    assert_ne!(*value, changed_value[name.as_str()], "{field}");
+                } else {
+                    assert_eq!(
+                        *value,
+                        changed_value[name.as_str()],
+                        "{field} changed {name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn project_snapshot_equal_rows_reuse_but_altered_rows_miss_warm_proof() {
+        let (_temp, _path, store, _principal, project) = accepted_project_fixture();
+        let connection = store.connection.lock().unwrap();
+        let before: i64 = connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        validation_scope::with_scope(&connection, || {
+            let row = project_snapshot_row(&connection, &project);
+            let expected = validate_project_snapshot_event(&connection, &row)?;
+            for _ in 0..3 {
+                let equal = project_snapshot_row(&connection, &project);
+                assert_eq!(
+                    validate_project_snapshot_event(&connection, &equal)?,
+                    expected
+                );
+            }
+            assert_eq!(validation_scope::validations("project-snapshot"), 1);
+            Ok(())
+        })
+        .unwrap();
+        for field in [
+            "payload",
+            "payload_digest",
+            "payload_and_claimed_digest",
+            "event_id",
+        ] {
+            let error = validation_scope::with_scope(&connection, || {
+                let row = project_snapshot_row(&connection, &project);
+                validate_project_snapshot_event(&connection, &row)?;
+                let mut changed = project_snapshot_row(&connection, &project);
+                match field {
+                    "payload" => changed.payload.push(b' '),
+                    "payload_and_claimed_digest" => {
+                        changed.payload.push(b' ');
+                        changed.payload_digest = bytes_digest(
+                            "sentinel.workflow.company-event-payload.v1",
+                            &changed.payload,
+                        )?;
+                    }
+                    "payload_digest" => {
+                        let replacement = if changed.payload_digest.starts_with('0') {
+                            "1"
+                        } else {
+                            "0"
+                        };
+                        changed.payload_digest.replace_range(..1, replacement);
+                    }
+                    "event_id" => {
+                        let replacement = if changed.event_id.starts_with('0') {
+                            "1"
+                        } else {
+                            "0"
+                        };
+                        changed.event_id.replace_range(..1, replacement);
+                    }
+                    _ => unreachable!(),
+                }
+                let result = validate_project_snapshot_event(&connection, &changed);
+                assert_eq!(
+                    validation_scope::validations("project-snapshot"),
+                    2,
+                    "{field}"
+                );
+                result
+            })
+            .unwrap_err();
+            assert_eq!(error.code, WorkflowErrorCode::CorruptStore, "{field}");
+            assert!(connection.is_autocommit());
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn project_snapshot_invalid_utf8_is_corrupt_before_cold_or_warm_memo_lookup() {
+        let (_temp, _path, store, _principal, project) = accepted_project_fixture();
+        let connection = store.connection.lock().unwrap();
+        for warm in [false, true] {
+            let error = validation_scope::with_scope(&connection, || {
+                let mut row = project_snapshot_row(&connection, &project);
+                if warm {
+                    validate_project_snapshot_event(&connection, &row)?;
+                }
+                row.payload.push(0xff);
+                let result = validate_project_snapshot_event(&connection, &row);
+                assert_eq!(
+                    validation_scope::validations("project-snapshot"),
+                    usize::from(warm)
+                );
+                result
+            })
+            .unwrap_err();
+            assert_eq!(error.code, WorkflowErrorCode::CorruptStore);
+            assert!(connection.is_autocommit());
         }
     }
 

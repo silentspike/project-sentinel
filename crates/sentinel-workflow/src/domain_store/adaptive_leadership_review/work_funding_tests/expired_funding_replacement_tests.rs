@@ -934,3 +934,401 @@ fn expired_reviewed_funding_replacement_shared_inventory_preserves_full_receipt_
         assert_eq!(rows(&f.store), before);
     }
 }
+
+fn authentic_growth_checked<T>(phase: &str, action: impl FnOnce() -> Result<T, WorkflowError>) -> T {
+    let (result, failures) = validation_scope::with_validation_failures(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(action))
+    });
+    match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => panic!("{phase}: error={error:?}; validation_failures={failures:?}"),
+        Err(payload) => {
+            eprintln!("{phase}: native helper unwound; validation_failures={failures:?}");
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+fn authentic_growth_unknown_inspection(f: &Fixture, mut source: crate::AdaptiveSessionV1, now: u64)
+    -> crate::AdaptiveSessionV1
+{
+    let model = AdaptiveEffectV1 { id: Uuid::new_v4(), request_digest: DIGEST.into() };
+    let effect = AdaptiveEffectV1 { id: Uuid::new_v4(), request_digest: DIGEST.into() };
+    let tool = sentinel_common::WorkbenchTool::InspectFile { path: "src/lib.rs".into(), max_bytes: 128 };
+    let tool_digest = crate::adaptive_tool_digest(&tool).unwrap();
+    // Reconcile this same inspection effect after Unknown; never replay it or rewrite rows.
+    let commands = [
+        AdaptiveTransitionV1::ClaimModel {
+            effect: model.clone(),
+            previous_observation_digest: source.last_observation.as_ref().map(|value| value.observation_digest.clone()),
+        },
+        AdaptiveTransitionV1::ResolveModel {
+            effect: model, result_digest: DIGEST.into(),
+            decision: AdaptiveModelDecisionV1::Tool { tool, tool_digest: tool_digest.clone() },
+        },
+        AdaptiveTransitionV1::ClaimTool { effect: effect.clone(), tool_digest },
+        AdaptiveTransitionV1::MarkUnknown { effect: effect.clone() },
+        AdaptiveTransitionV1::ObserveTool {
+            observation: crate::AdaptiveObservationRefV1 { effect, observation_digest: DIGEST.into() },
+        },
+    ];
+    for (offset, command) in commands.iter().enumerate() {
+        source = authentic_growth_checked(&format!("growth-inspection-transition-{offset}"), || {
+            f.store.advance_adaptive_session(source.grant.session_id, source.version, Uuid::new_v4(),
+                command, &f.grant.assignee_authority, now + offset as u64)
+        }).1;
+    }
+    assert!(matches!(source.cursor, AdaptiveCursorV1::ReadyForModel));
+    assert!(!source.requires_fresh_observation());
+    source
+}
+
+fn authentic_expired_growth(adoptions: usize, deferrals: usize, inspections: usize, reconcile_unknown: bool)
+    -> (Fixture, AdaptiveWorkFundingReceiptV1, u64)
+{
+    assert!(deferrals <= inspections && inspections <= adoptions);
+    assert!(adoptions <= 25 && deferrals <= 17 && inspections <= 23);
+    let (mut f, mut adopted, mut now) = authentic_growth_checked("growth-capped-seed", || {
+        Ok(capped_renewal_fixture(5))
+    });
+    for index in 0..adoptions {
+        let phase = format!("growth-adoption-{index}");
+        if index < deferrals {
+            authentic_growth_checked(&format!("{phase}-defer-context"), || {
+                budget_context(&mut f, now, &format!("retained-historical-defer-{index}"));
+                Ok(())
+            });
+            let ordinal = authentic_growth_checked(&format!("{phase}-defer-ordinal"), || {
+                f.store.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+            }).len() as u16 + 1;
+            bind(&mut f, &adopted, ordinal);
+            let pending = authentic_growth_checked(&format!("{phase}-defer-issue"), || issue(&f, now));
+            let call = authentic_growth_checked(&format!("{phase}-defer-claim"), || {
+                f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&pending), now + 1)
+            });
+            authentic_growth_checked(&format!("{phase}-defer-completion"), || {
+                f.store.complete_adaptive_leadership_review_call(&f.leader, &defer(&call), now + 2)
+            });
+            now += 3;
+        }
+        authentic_growth_checked(&format!("{phase}-context"), || {
+            budget_context(&mut f, now, &format!("explicit-historical-zero-call-renewal-{index}"));
+            Ok(())
+        });
+        let request = authentic_growth_checked(&format!("{phase}-funding-draft"), || {
+            zero_call_renewal_draft(&f, &adopted, now)
+        });
+        assert_eq!((request.limits.additional_model_calls, request.limits.additional_tool_calls), (0, 0));
+        adopted = authentic_growth_checked(&format!("{phase}-funding-issue"), || {
+            f.store.authorize_adaptive_work_funding(&funding_operator(&f), &request, now)
+        }).1;
+        bind(&mut f, &adopted, request.source.resume_source.base_review_count + 1);
+        let pending = authentic_growth_checked(&format!("{phase}-review-issue"), || issue(&f, now));
+        let call = authentic_growth_checked(&format!("{phase}-review-claim"), || {
+            f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&pending), now + 1)
+        });
+        authentic_growth_checked(&format!("{phase}-continue"), || {
+            f.store.complete_adaptive_leadership_review_call(&f.leader, &continued(&call, now + 2, 5), now + 2)
+        });
+        let source = authentic_growth_checked(&format!("{phase}-adopted-head"), || {
+            f.store.adaptive_session(f.grant.session_id, &f.grant.assignee_authority)
+        }).unwrap();
+        let source = if index < inspections {
+            if index == 0 && reconcile_unknown {
+                authentic_growth_unknown_inspection(&f, source, now + 3)
+            } else {
+                authentic_growth_checked(&format!("{phase}-inspection"), || {
+                    Ok(observe_budget_inspection(&f, source, now + 3))
+                })
+            }
+        } else {
+            source
+        };
+        assert_eq!((source.funded_model_call_ceiling(), source.funded_tool_call_ceiling()), (64, 64));
+        assert!(source.model_calls < 64 && source.tool_calls < 64);
+        now = source.active_deadline_ms();
+    }
+    authentic_growth_checked("growth-current-unused-context", || {
+        budget_context(&mut f, now, "current-unused-expired-funding");
+        Ok(())
+    });
+    let mut request = authentic_growth_checked("growth-current-unused-draft", || {
+        zero_call_renewal_draft(&f, &adopted, now)
+    });
+    request.limits.additional_reviews = 4;
+    request.limits.additional_windows = 4;
+    let old = authentic_growth_checked("growth-current-unused-issue", || {
+        f.store.authorize_adaptive_work_funding(&funding_operator(&f), &request, now)
+    }).1;
+    assert_eq!((old.request.limits.additional_model_calls, old.request.limits.additional_tool_calls,
+        old.request.limits.additional_reviews, old.request.limits.additional_windows), (0, 0, 4, 4));
+    bind(&mut f, &old, request.source.resume_source.base_review_count + 1);
+    let call = authentic_growth_checked("growth-current-schema5-review", || issue(&f, now));
+    assert_eq!(call.grant.schema_version, 5);
+    assert!(call.dispatch.is_none() && call.decision.is_none());
+    authentic_growth_checked("growth-current-undispatched-retirement", || {
+        f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+            call.version, call.grant.expires_at_unix_ms)
+    });
+    let at = old.request.limits.expires_at_unix_ms + 1;
+    (f, old, at)
+}
+
+fn authentic_growth_overlapping_prefixes(
+    connection: &Connection,
+    calls: &[AdaptiveLeadershipReviewCallV1],
+    reverse: bool,
+) -> Result<(), WorkflowError> {
+    let mut funded: Vec<_> = calls.iter().filter(|call| call.grant.work_funding.is_some()).collect();
+    funded.sort_by_key(|call| call.context.source_session.version);
+    let versions: BTreeSet<_> = funded.iter().map(|call| call.context.source_session.version).collect();
+    assert!(versions.len() > 1 && versions.len() <= 45);
+    assert!(funded.len() <= 45);
+    let session_id = funded[0].grant.session_id;
+    assert!(funded.iter().all(|call| call.grant.session_id == session_id));
+    let namespace = format!("adaptive-session-v1:{session_id}");
+    let mut prefix_payload_bytes = 0_u64;
+    for version in &versions {
+        assert!(*version <= 131);
+        let bytes: i64 = connection.query_row(
+            "SELECT COALESCE(SUM(LENGTH(response)),0) FROM workflow_operations
+             WHERE operation_namespace=?1 AND operation_id>=?2 AND operation_id<=?3",
+            params![namespace, format!("{:020}", 1), format!("{version:020}")], |row| row.get(0),
+        )?;
+        assert!(bytes > 0);
+        prefix_payload_bytes = prefix_payload_bytes.checked_add(u64::try_from(bytes).unwrap()).unwrap();
+    }
+    // This counts overlapping raw prefixes, not actual charges or a production measurement.
+    eprintln!("synthetic-overlap-workload: session={session_id}; distinct_prefixes={}; raw_prefix_payload_sum={prefix_payload_bytes}; unchanged_budget_bytes={}",
+        versions.len(), 64 * 1024 * 1024);
+    if reverse { funded.reverse(); }
+    let mut completed_prefixes = None;
+    for pass in 0..3 {
+        for call in &funded {
+            let epoch = call.grant.work_funding.as_ref().unwrap();
+            crate::domain_store::adaptive_work_funding::require_epoch_receipt(connection, epoch)?;
+            crate::store::adaptive::require_funding_journal_source(connection, epoch,
+                &call.context.source_session)?;
+        }
+        let proofs = validation_scope::validations("adaptive-funding-journal-prefix");
+        if let Some(completed) = completed_prefixes {
+            assert_eq!(proofs, completed, "overlapping prefix proof was repeated; pass={pass}; reverse={reverse}");
+        } else {
+            assert!(proofs >= versions.len());
+            completed_prefixes = Some(proofs);
+        }
+        funded.reverse();
+    }
+    Ok(())
+}
+
+fn authentic_growth_readbacks(
+    f: &Fixture,
+    replacement: &crate::AdaptiveWorkFundingExpiredReplacementReceiptV1,
+    receipt: &AdaptiveWorkFundingReceiptV1,
+    expected_head: &crate::AdaptiveSessionV1,
+    expected_calls: &[AdaptiveLeadershipReviewCallV1],
+    now: u64,
+) {
+    let operator = funding_operator(f);
+    for reverse in [false, true] {
+        let store = WorkflowStore::open(&f.path).unwrap();
+        let before = rows(&store);
+        let connection = store.connection.lock().unwrap();
+        let namespaces: Vec<String> = connection.prepare(
+            "SELECT operation_namespace FROM workflow_operations
+             WHERE operation_namespace LIKE 'adaptive-session-v1:%'
+             GROUP BY operation_namespace ORDER BY operation_namespace",
+        ).unwrap().query_map([], |row| row.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        // Command companions are namespaces, not additional native sessions.
+        let mut session_ids = BTreeSet::new();
+        let mut root_ids = BTreeSet::new();
+        for namespace in &namespaces {
+            let key = namespace.strip_prefix("adaptive-session-v1:").unwrap();
+            let (session_key, suffix) = key.split_once(':')
+                .map_or((key, None), |(session, suffix)| (session, Some(suffix)));
+            let id = Uuid::parse_str(session_key).unwrap();
+            assert!(!id.is_nil());
+            assert_eq!(session_key, id.to_string());
+            assert!(matches!(suffix, None | Some("operations") | Some("rejected-model-dispositions")),
+                "foreign adaptive namespace: {namespace}");
+            session_ids.insert(id);
+            if suffix.is_none() { root_ids.insert(id); }
+        }
+        assert_eq!(root_ids, session_ids, "companion namespace lacked a native root");
+        assert!(session_ids.contains(&f.grant.session_id));
+        let siblings: Vec<_> = session_ids.iter().copied()
+            .filter(|id| *id != f.grant.session_id).collect();
+        assert!(!siblings.is_empty(), "native fixture lost its rollover sibling");
+        let changes_before: i64 = connection.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+        let (result, failures) = validation_scope::with_validation_failures(|| {
+            validation_scope::with_scope(&connection, || {
+                let mut selectors = siblings.clone();
+                selectors.push(f.grant.session_id);
+                if reverse { selectors.reverse(); }
+                let mut inspected = BTreeSet::new();
+                for id in selectors {
+                    let calls = calls_for_session(&connection, &operator.tenant_id, id)?;
+                    let (head, _) = crate::store::adaptive::load(&connection, id)?.unwrap();
+                    assert!(inspected.insert(id));
+                    assert_eq!(head.grant.session_id, id);
+                    if id != f.grant.session_id {
+                        assert!(calls.is_empty());
+                        assert_eq!(head.grant.authority, expected_head.grant.authority);
+                        assert!(head.active_work_funding().is_none());
+                        assert!(head.continuation.is_none());
+                        assert!(matches!(head.cursor, AdaptiveCursorV1::Cancelled));
+                    } else {
+                        assert_eq!(calls, expected_calls);
+                        assert_eq!(head, *expected_head);
+                        let (source, loaded) = crate::domain_store::adaptive_resume_policy::fresh_resume_source(
+                            &connection, &operator.tenant_id, &f.grant.project_id, id, now, None,
+                        )?;
+                        assert_eq!(loaded, *expected_head);
+                        assert_eq!(source.expected_session_version, expected_head.version);
+                        assert_eq!(usize::from(source.base_review_count), expected_calls.len());
+                        assert_eq!(usize::from(source.base_window_count),
+                            expected_head.continuation.as_ref().unwrap().authorizations.len());
+                        assert_eq!((source.base_model_calls, source.base_tool_calls),
+                            (expected_head.model_calls, expected_head.tool_calls));
+                        let retained = get_entity::<crate::AdaptiveWorkFundingExpiredReplacementReceiptV1>(
+                            &connection, &operator.tenant_id, "adaptive_work_funding_expired_replacement",
+                            &replacement.replacement_key,
+                        )?.unwrap();
+                        assert_eq!(retained, *replacement);
+                        authentic_growth_overlapping_prefixes(&connection, &calls, reverse)?;
+                    }
+                }
+                assert_eq!(inspected, session_ids, "native sibling validation was incomplete");
+                Ok(())
+            })
+        });
+        let changes_after: i64 = connection.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+        assert_eq!(changes_after, changes_before, "read lease wrote rows; reverse={reverse}");
+        assert!(connection.is_autocommit());
+        drop(connection);
+        assert_eq!(rows(&store), before, "read lease changed durable history; reverse={reverse}");
+        assert!(result.is_ok(), "cold single-lease read failed; reverse={reverse}; head={}; reviews={}; result={result:?}; validation_failures={failures:?}",
+            expected_head.version, expected_calls.len());
+        assert!(failures.is_empty(), "successful read retained validation failures: {failures:?}");
+        let (inventory, failures) = validation_scope::with_validation_failures(|| {
+            store.adaptive_sessions_for_health()
+        });
+        assert_eq!(rows(&store), before);
+        assert!(inventory.is_ok(), "complete native inventory failed; reverse={reverse}; result={inventory:?}; validation_failures={failures:?}");
+        assert!(failures.is_empty(), "complete native inventory exhausted its unchanged budget: {failures:?}");
+        let inventory = inventory.unwrap();
+        // The rollover retains cancelled journals, not extra current head rows.
+        // Every historical root was validated above; health exposes the current head.
+        assert_eq!(inventory.as_slice(), std::slice::from_ref(expected_head));
+        let (selected, failures) = validation_scope::with_validation_failures(|| {
+            store.adaptive_work_funding_for_review(&operator.tenant_id, f.grant.session_id, now)
+        });
+        assert_eq!(rows(&store), before);
+        assert!(selected.is_ok(), "native selector failed; reverse={reverse}; result={selected:?}; validation_failures={failures:?}");
+        assert!(failures.is_empty(), "native selector exhausted its unchanged budget: {failures:?}");
+        let selected = selected.unwrap().unwrap();
+        assert_eq!(selected.receipt, *receipt);
+        assert_eq!(usize::from(selected.binding.ordinal), expected_calls.len() + 1);
+        let (historical, failures) = validation_scope::with_validation_failures(|| {
+            store.adaptive_work_funding_expired_replacement_source(&operator, &f.grant.project_id,
+                f.grant.session_id, &replacement.request.source.old_funding_receipt_digest, now)
+        });
+        assert_eq!(rows(&store), before);
+        assert!(historical.is_ok(), "historical metadata read failed; reverse={reverse}; result={historical:?}; validation_failures={failures:?}");
+        assert!(failures.is_empty(), "historical source exhausted its unchanged budget: {failures:?}");
+        assert_eq!(historical.unwrap(), replacement.request.source);
+        let (head, failures) = validation_scope::with_validation_failures(|| {
+            store.adaptive_session(f.grant.session_id, &f.grant.assignee_authority)
+        });
+        assert_eq!(rows(&store), before);
+        assert!(head.is_ok(), "preserved head read failed; reverse={reverse}; result={head:?}; validation_failures={failures:?}");
+        assert!(failures.is_empty(), "preserved head exhausted its unchanged budget: {failures:?}");
+        assert_eq!(head.unwrap().as_ref(), Some(expected_head));
+    }
+}
+
+#[test]
+fn expired_reviewed_funding_replacement_authentic_adoption_growth_cold_source_reads() {
+    let (mut f, old, now) = authentic_expired_growth(1, 0, 1, false);
+    let original = session(&f);
+    let mut expected = f.store.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id).unwrap();
+    assert_eq!(original.version, 18);
+    assert_eq!(expected.len(), 4);
+    let mut input = draft_input(&f, &old, now);
+    input.limits.additional_model_calls = 0;
+    input.limits.additional_tool_calls = 0;
+    input.limits.additional_reviews = 3;
+    input.limits.additional_windows = 3;
+    let request = authentic_growth_checked("small-growth-replacement-draft", || {
+        f.store.adaptive_work_funding_expired_replacement_draft(&funding_operator(&f),
+            &f.grant.project_id, f.grant.session_id, &input, now)
+    });
+    assert_eq!(request.source.prior_review_count, 1);
+    let replacement = authentic_growth_checked("small-growth-replacement-issue", || {
+        f.store.authorize_adaptive_work_funding_expired_replacement(&funding_operator(&f), &request, now, evidence)
+    }).1;
+    let receipt = authentic_growth_checked("small-growth-funding-read", || {
+        f.store.adaptive_work_funding(&f.leader.tenant_id, f.grant.session_id, request.funding_request.operation_id)
+    }).unwrap();
+    authentic_growth_checked("small-growth-successor-context", || {
+        budget_context(&mut f, now, "post-replacement-native-adoption");
+        Ok(())
+    });
+    bind(&mut f, &receipt, request.source.current_resume_source.base_review_count + 1);
+    let pending = authentic_growth_checked("small-growth-successor-review", || issue(&f, now));
+    let call = authentic_growth_checked("small-growth-successor-claim", || {
+        f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&pending), now + 1)
+    });
+    let completed = authentic_growth_checked("small-growth-successor-continue", || {
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &continued(&call, now + 2, 5), now + 2)
+    });
+    expected.push(completed);
+    expected.sort_by_key(|call| call.grant.review_id);
+    let head = authentic_growth_checked("small-growth-successor-inspection", || {
+        Ok(observe_budget_inspection(&f, session(&f), now + 3))
+    });
+    assert_eq!(head.version, 23);
+    assert_eq!(head.active_work_funding().unwrap().receipt, receipt);
+    assert_eq!(replacement.request.source.current_resume_source.expected_session_version, original.version);
+    authentic_growth_readbacks(&f, &replacement, &receipt, &head, &expected, head.active_deadline_ms());
+}
+
+#[test]
+fn expired_reviewed_funding_replacement_authentic_head131_review45_cold_source_reads() {
+    // All counts arise from native commits: 27 windows, 17 retained Defers and one retired review.
+    // The synthetic workload spends 26/25 calls; it is not the real 27/24 corpus.
+    let (f, old, now) = authentic_expired_growth(25, 17, 23, true);
+    let head = session(&f);
+    let expected = f.store.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id).unwrap();
+    assert_eq!(head.version, 131);
+    assert_eq!(expected.len(), 45);
+    assert_eq!(head.continuation.as_ref().unwrap().authorizations.len(), 27);
+    assert_eq!((head.funded_model_call_ceiling(), head.funded_tool_call_ceiling()), (64, 64));
+    assert_eq!((head.model_calls, head.tool_calls), (26, 25));
+    let mut input = draft_input(&f, &old, now);
+    input.limits.additional_model_calls = 0;
+    input.limits.additional_tool_calls = 0;
+    input.limits.additional_reviews = 16;
+    input.limits.additional_windows = 16;
+    let request = authentic_growth_checked("head131-review45-replacement-draft", || {
+        f.store.adaptive_work_funding_expired_replacement_draft(&funding_operator(&f),
+            &f.grant.project_id, f.grant.session_id, &input, now)
+    });
+    assert_eq!(request.source.prior_review_count, 1);
+    assert_eq!((request.source.current_resume_source.base_review_count,
+        request.source.current_resume_source.base_window_count), (45, 27));
+    assert_eq!((request.source.current_resume_source.base_model_calls,
+        request.source.current_resume_source.base_tool_calls), (26, 25));
+    let replacement = authentic_growth_checked("head131-review45-replacement-issue", || {
+        f.store.authorize_adaptive_work_funding_expired_replacement(&funding_operator(&f), &request, now, evidence)
+    }).1;
+    let receipt = authentic_growth_checked("head131-review45-funding-read", || {
+        f.store.adaptive_work_funding(&f.leader.tenant_id, f.grant.session_id, request.funding_request.operation_id)
+    }).unwrap();
+    assert_eq!((receipt.resulting_model_call_ceiling().unwrap(), receipt.resulting_tool_call_ceiling().unwrap()), (64, 64));
+    assert_eq!((receipt.binding(46).unwrap().limits.total_review_ceiling,
+        receipt.binding(46).unwrap().limits.total_window_ceiling), (61, 43));
+    authentic_growth_readbacks(&f, &replacement, &receipt, &head, &expected, now);
+}

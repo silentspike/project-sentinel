@@ -588,9 +588,20 @@ fn require_budget_source(
     grant: &AdaptiveLeadershipReviewGrantV1,
     context: &AdaptiveLeadershipReviewContextV1,
 ) -> Result<(), WorkflowError> {
-    validation_scope::memoize(connection, "budget-source", &(grant, context), || {
+    let key = budget_source_memo_key(grant, context)?;
+    validation_scope::memoize(connection, "budget-source", &key, || {
         require_budget_source_uncached(connection, grant, context)
     })
+}
+
+fn budget_source_memo_key(
+    grant: &AdaptiveLeadershipReviewGrantV1,
+    context: &AdaptiveLeadershipReviewContextV1,
+) -> Result<String, WorkflowError> {
+    canonical_sha256(
+        "sentinel.workflow.budget-source-memo-key.v1",
+        &(grant, context),
+    )
 }
 
 fn require_budget_source_uncached(
@@ -2713,6 +2724,51 @@ impl WorkflowStore {
 #[cfg(test)]
 mod tests {
     include!("adaptive_leadership_review/tests.rs");
+
+    #[test]
+    fn budget_source_memo_key_binds_full_grant_and_context_without_retaining_them() {
+        let f = budget_fixture(2);
+        let original = budget_source_memo_key(&f.grant, &f.context).unwrap();
+        assert_eq!(original.len(), 64);
+        assert!(encode(&original).unwrap().len() < encode(&(&f.grant, &f.context)).unwrap().len());
+        for mutation in 0..6 {
+            let mut grant = f.grant.clone();
+            let mut context = f.context.clone();
+            match mutation {
+                0 => grant.review_id = Uuid::new_v4(),
+                1 => grant.leadership_principal.authority_generation += 1,
+                2 => grant.expires_at_unix_ms += 1,
+                3 => context.source_project.version += 1,
+                4 => context.source_session.version += 1,
+                _ => context.source_project.created_at_unix_ms += 1,
+            }
+            assert_ne!(original, budget_source_memo_key(&grant, &context).unwrap());
+        }
+    }
+
+    #[test]
+    fn budget_source_memo_warm_success_cannot_authorize_changed_context() {
+        let f = budget_fixture(2);
+        let connection = f.store.connection.lock().unwrap();
+        validation_scope::with_scope(&connection, || {
+            require_budget_source(&connection, &f.grant, &f.context)?;
+            require_budget_source(&connection, &f.grant, &f.context)?;
+            assert_eq!(validation_scope::validations("budget-source"), 1);
+            let mut changed = f.context.clone();
+            changed.source_session.updated_at_ms = u64::MAX;
+            assert_eq!(
+                require_budget_source(&connection, &f.grant, &changed)
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::AuthorityConflict
+            );
+            assert_eq!(validation_scope::validations("budget-source"), 2);
+            require_budget_source(&connection, &f.grant, &f.context)?;
+            assert_eq!(validation_scope::validations("budget-source"), 2);
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn governed_allowance_batch_compact_keys_preserve_exact_allowance_bytes_and_digest() {

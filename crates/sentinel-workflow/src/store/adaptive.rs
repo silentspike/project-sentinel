@@ -94,6 +94,22 @@ struct Entry {
     recovery_feedback: Option<AdaptiveRecoveryFeedbackV1>,
 }
 
+#[derive(Debug, Serialize)]
+struct JournalEntryData {
+    digest: String,
+    entry: Entry,
+}
+
+#[derive(Debug, Clone)]
+struct JournalEntry(std::sync::Arc<JournalEntryData>);
+
+impl Serialize for JournalEntry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The arena charges the complete retained entry, not just its Arc handle.
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RejectedModelDisposition {
@@ -1198,19 +1214,15 @@ fn evidence_entry(
         let (replays, entries, scans, prefixes) = reads.get();
         reads.set((replays, entries, scans, prefixes + 1));
     });
-    let (digest, bytes, created) =
-        read_operation(connection, ns, &format!("{version:020}"))?.ok_or_else(corrupt_store)?;
-    let entry: Entry = decode(&bytes)?;
-    if entry.session.version != version
-        || stored_u64(created)? != entry.session.updated_at_ms
-        || !constant_time_eq(
-            &digest,
-            &canonical_sha256("sentinel.workflow.adaptive-entry.v1", &entry)?,
-        )
-    {
+    let id = ns
+        .strip_prefix("adaptive-session-v1:")
+        .ok_or_else(corrupt_store)?;
+    let id = Uuid::parse_str(id).map_err(|_| corrupt_store())?;
+    if ns != namespace(id) {
         return Err(corrupt_store());
     }
-    Ok((digest, entry))
+    let stored = journal_entry(connection, id, version)?.ok_or_else(corrupt_store)?;
+    Ok((stored.0.digest.clone(), stored.0.entry.clone()))
 }
 
 fn working_memory_model_effect_id(session_id: Uuid, version: u64) -> Uuid {
@@ -2407,14 +2419,9 @@ pub(crate) fn require_journal_source(
     source: &AdaptiveSessionV1,
 ) -> Result<(), WorkflowError> {
     let (head, _) = load(connection, source.grant.session_id)?.ok_or_else(not_found)?;
-    let (_, bytes, _) = read_operation(
-        connection,
-        &namespace(source.grant.session_id),
-        &format!("{:020}", source.version),
-    )?
-    .ok_or_else(not_found)?;
-    let entry: Entry = decode(&bytes)?;
-    if entry.session != *source || head.grant != source.grant {
+    let entry = journal_entry(connection, source.grant.session_id, source.version)?
+        .ok_or_else(not_found)?;
+    if entry.0.entry.session != *source || head.grant != source.grant {
         return Err(authority_conflict());
     }
     Ok(())
@@ -3075,6 +3082,152 @@ fn replay_with_working_memory(
     replay_journal(connection, id, collector, None)
 }
 
+fn journal_entry(
+    connection: &Connection,
+    id: Uuid,
+    version: u64,
+) -> Result<Option<JournalEntry>, WorkflowError> {
+    crate::domain_store::validation_scope::memoize(
+        connection,
+        "adaptive-journal-entry",
+        &(id, version),
+        || {
+            let mut statement = connection
+                .prepare(
+                    "SELECT request_digest,response,created_at_ms FROM workflow_operations
+                 WHERE operation_namespace=?1 AND operation_id=?2",
+                )
+                .map_err(map_sqlite_error)?;
+            let mut rows = statement
+                .query(params![namespace(id), format!("{version:020}")])
+                .map_err(map_sqlite_error)?;
+            let Some(row) = rows.next().map_err(map_sqlite_error)? else {
+                return Ok(None);
+            };
+            let digest: String = row.get(0).map_err(map_sqlite_error)?;
+            let value = row.get_ref(1).map_err(map_sqlite_error)?;
+            let rusqlite::types::ValueRef::Blob(bytes) = value else {
+                return Err(corrupt_store());
+            };
+            crate::domain_store::validation_scope::charge_bytes(connection, bytes.len())?;
+            let entry: Entry = decode(bytes)?;
+            #[cfg(test)]
+            WORKING_MEMORY_READS.with(|reads| {
+                let (replays, entries, scans, prefixes) = reads.get();
+                reads.set((replays, entries + 1, scans, prefixes));
+            });
+            let created: i64 = row.get(2).map_err(map_sqlite_error)?;
+            if entry.session.grant.session_id != id
+                || entry.session.version != version
+                || stored_u64(created)? != entry.session.updated_at_ms
+                || !constant_time_eq(
+                    &digest,
+                    &canonical_sha256("sentinel.workflow.adaptive-entry.v1", &entry)?,
+                )
+            {
+                return Err(corrupt_store());
+            }
+            Ok(Some(JournalEntry(std::sync::Arc::new(JournalEntryData {
+                digest,
+                entry,
+            }))))
+        },
+    )
+}
+
+fn require_journal_step(
+    connection: &Connection,
+    stored: &JournalEntry,
+    previous: Option<&JournalEntry>,
+) -> Result<(), WorkflowError> {
+    let entry = &stored.0.entry;
+    // Replay supplies an already-validated predecessor prefix, not an isolated
+    // row. Digest-bound step proofs cannot manufacture membership or authority.
+    crate::domain_store::validation_scope::memoize(
+        connection,
+        "adaptive-journal-step",
+        &(
+            entry.session.grant.session_id,
+            entry.session.version,
+            &stored.0.digest,
+            previous.map(|prior| &prior.0.digest),
+        ),
+        || {
+            let expected = match previous {
+                None if entry.previous_digest.is_none() && entry.command.is_none() => {
+                    if let Some(inherited) = &entry.recovery_feedback {
+                        inherited.validate().map_err(|_| corrupt_store())?;
+                        if inherited.count == 0
+                            || inherited.previous_session_id == entry.session.grant.session_id
+                        {
+                            return Err(corrupt_store());
+                        }
+                    }
+                    let mut initial = AdaptiveSessionV1::initial(entry.session.grant.clone())
+                        .map_err(|_| corrupt_store())?;
+                    if entry.session.updated_at_ms < initial.grant.created_at_ms
+                        || entry.session.updated_at_ms >= initial.grant.deadline_ms
+                    {
+                        return Err(corrupt_store());
+                    }
+                    initial.updated_at_ms = entry.session.updated_at_ms;
+                    Ok(initial)
+                }
+                Some(prior)
+                    if entry.previous_digest.as_ref() == Some(&prior.0.digest)
+                        && entry.recovery_feedback.is_none() =>
+                {
+                    let prior = &prior.0.entry.session;
+                    if let Some(AdaptiveTransitionV1::ContinueGoverned { authorization }) =
+                        &entry.command
+                    {
+                        if authorization.resume_policy.is_some() {
+                            require_resume_authorization_membership(
+                                connection,
+                                authorization,
+                                &prior.grant.authority,
+                            )?;
+                        }
+                        if let Some(epoch) = &authorization.work_funding {
+                            require_funding_authorization_membership(
+                                connection,
+                                authorization,
+                                &prior.grant.authority,
+                            )?;
+                            require_work_funding_anchor(connection, epoch, prior)?;
+                        }
+                    }
+                    if let Some(AdaptiveTransitionV1::ResumeRejectedModel {
+                        disposition_operation_id,
+                        ..
+                    }) = &entry.command
+                    {
+                        let record = read_rejected_model_disposition(
+                            connection,
+                            entry.session.grant.session_id,
+                            *disposition_operation_id,
+                        )?
+                        .ok_or_else(corrupt_store)?;
+                        if record.response != entry.session {
+                            return Err(corrupt_store());
+                        }
+                    }
+                    prior.transition(
+                        entry.command.as_ref().ok_or_else(corrupt_store)?,
+                        entry.session.updated_at_ms,
+                    )
+                }
+                _ => return Err(corrupt_store()),
+            }
+            .map_err(|_| corrupt_store())?;
+            if expected != entry.session {
+                return Err(corrupt_store());
+            }
+            Ok(())
+        },
+    )
+}
+
 fn replay_journal(
     connection: &Connection,
     id: Uuid,
@@ -3088,10 +3241,10 @@ fn replay_journal(
     });
     let through_key = through_version.map(|version| format!("{version:020}"));
     let query = if through_key.is_some() {
-        "SELECT operation_id, request_digest, response, created_at_ms FROM workflow_operations WHERE operation_namespace=?1
+        "SELECT operation_id FROM workflow_operations WHERE operation_namespace=?1
          AND operation_id<=?3 ORDER BY operation_id LIMIT ?2"
     } else {
-        "SELECT operation_id, request_digest, response, created_at_ms FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2"
+        "SELECT operation_id FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2"
     };
     let mut statement = connection.prepare(query).map_err(map_sqlite_error)?;
     let mut rows = if let Some(key) = &through_key {
@@ -3104,106 +3257,433 @@ fn replay_journal(
         statement.query(params![namespace(id), (MAX_JOURNAL_ENTRIES + 1) as i64])
     }
     .map_err(map_sqlite_error)?;
-    let mut previous: Option<(AdaptiveSessionV1, String)> = None;
+    let mut previous: Option<JournalEntry> = None;
     let mut feedback = None;
     let mut count = 0;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         count += 1;
         let key: String = row.get(0).map_err(map_sqlite_error)?;
-        let digest: String = row.get(1).map_err(map_sqlite_error)?;
-        let bytes: Vec<u8> = row.get(2).map_err(map_sqlite_error)?;
-        crate::domain_store::validation_scope::charge_bytes(connection, bytes.len())?;
-        let created: i64 = row.get(3).map_err(map_sqlite_error)?;
-        let entry: Entry = decode(&bytes)?;
-        #[cfg(test)]
-        WORKING_MEMORY_READS.with(|reads| {
-            let (replays, entries, scans, prefixes) = reads.get();
-            reads.set((replays, entries + 1, scans, prefixes));
-        });
-        let recomputed = canonical_sha256("sentinel.workflow.adaptive-entry.v1", &entry)?;
-        if count > MAX_JOURNAL_ENTRIES
-            || entry.session.grant.session_id != id
-            || key != format!("{:020}", entry.session.version)
-            || !constant_time_eq(&digest, &recomputed)
-            || stored_u64(created)? != entry.session.updated_at_ms
-        {
+        let version = key.parse::<u64>().map_err(|_| corrupt_store())?;
+        if count > MAX_JOURNAL_ENTRIES || key != format!("{version:020}") {
             return Err(corrupt_store());
         }
-        let expected = match &previous {
-            None if entry.previous_digest.is_none() && entry.command.is_none() => {
-                if let Some(inherited) = &entry.recovery_feedback {
-                    inherited.validate().map_err(|_| corrupt_store())?;
-                    if inherited.count == 0 || inherited.previous_session_id == id {
-                        return Err(corrupt_store());
-                    }
-                }
-                feedback = entry.recovery_feedback.clone();
-                let mut initial = AdaptiveSessionV1::initial(entry.session.grant.clone())
-                    .map_err(|_| corrupt_store())?;
-                if entry.session.updated_at_ms < initial.grant.created_at_ms
-                    || entry.session.updated_at_ms >= initial.grant.deadline_ms
-                {
-                    return Err(corrupt_store());
-                }
-                initial.updated_at_ms = entry.session.updated_at_ms;
-                Ok(initial)
-            }
-            Some((prior, prior_digest))
-                if entry.previous_digest.as_ref() == Some(prior_digest)
-                    && entry.recovery_feedback.is_none() =>
-            {
-                if let Some(AdaptiveTransitionV1::ContinueGoverned { authorization }) =
-                    &entry.command
-                {
-                    if authorization.resume_policy.is_some() {
-                        require_resume_authorization_membership(
-                            connection,
-                            authorization,
-                            &prior.grant.authority,
-                        )?;
-                    }
-                    if let Some(epoch) = &authorization.work_funding {
-                        require_funding_authorization_membership(
-                            connection,
-                            authorization,
-                            &prior.grant.authority,
-                        )?;
-                        require_work_funding_anchor(connection, epoch, prior)?;
-                    }
-                }
-                if let Some(AdaptiveTransitionV1::ResumeRejectedModel {
-                    disposition_operation_id,
-                    ..
-                }) = &entry.command
-                {
-                    let record =
-                        read_rejected_model_disposition(connection, id, *disposition_operation_id)?
-                            .ok_or_else(corrupt_store)?;
-                    if record.response != entry.session {
-                        return Err(corrupt_store());
-                    }
-                }
-                prior.transition(
-                    entry.command.as_ref().ok_or_else(corrupt_store)?,
-                    entry.session.updated_at_ms,
-                )
-            }
-            _ => return Err(corrupt_store()),
-        }
-        .map_err(|_| corrupt_store())?;
-        if expected != entry.session {
-            return Err(corrupt_store());
+        let stored = journal_entry(connection, id, version)?.ok_or_else(corrupt_store)?;
+        require_journal_step(connection, &stored, previous.as_ref())?;
+        let entry = &stored.0.entry;
+        if previous.is_none() {
+            feedback = entry.recovery_feedback.clone();
         }
         if let Some(collector) = collector.as_deref_mut() {
             collector.observe(
-                &entry,
-                &digest,
-                previous.as_ref().map(|(session, _)| session),
+                entry,
+                &stored.0.digest,
+                previous.as_ref().map(|prior| &prior.0.entry.session),
             );
         }
-        previous = Some((entry.session, digest));
+        previous = Some(stored);
     }
-    Ok(previous.map(|(session, digest)| (session, digest, feedback)))
+    Ok(previous.map(|stored| {
+        (
+            stored.0.entry.session.clone(),
+            stored.0.digest.clone(),
+            feedback,
+        )
+    }))
+}
+
+#[cfg(test)]
+mod journal_entry_reuse_tests {
+    use super::*;
+    use crate::adaptive::continuation_tests::{effect, grant};
+    use crate::domain_store::validation_scope::{self, ValidationFailureReason};
+    use sentinel_common::WorkbenchTool;
+
+    const ARENA_BYTES: usize = 64 * 1024 * 1024;
+
+    fn journal(id: Uuid, rounds: u16, padding: usize) -> Vec<Entry> {
+        let mut root = grant();
+        root.session_id = id;
+        root.max_model_calls = 64;
+        root.max_tool_calls = 64;
+        for index in 0..padding {
+            root.authority
+                .capabilities
+                .insert(format!("entry-{index}-{}", "x".repeat(100)));
+        }
+        let mut entries = vec![Entry {
+            previous_digest: None,
+            command: None,
+            session: AdaptiveSessionV1::initial(root).unwrap(),
+            recovery_feedback: Some(AdaptiveRecoveryFeedbackV1 {
+                count: 1,
+                reason_code: "invalid_model_response".into(),
+                resolution_event_id: Uuid::from_u128(998).to_string(),
+                previous_session_id: Uuid::from_u128(999),
+            }),
+        }];
+        for round in 0..rounds {
+            let model = effect(10_000 + u128::from(round));
+            let tool = WorkbenchTool::InspectFile {
+                path: format!("src/file-{round}.rs"),
+                max_bytes: 1024,
+            };
+            let tool_digest = crate::adaptive_tool_digest(&tool).unwrap();
+            let tool_effect = effect(20_000 + u128::from(round));
+            let previous_observation_digest = entries
+                .last()
+                .unwrap()
+                .session
+                .last_observation
+                .as_ref()
+                .map(|observation| observation.observation_digest.clone());
+            for command in [
+                AdaptiveTransitionV1::ClaimModel {
+                    effect: model.clone(),
+                    previous_observation_digest,
+                },
+                AdaptiveTransitionV1::ResolveModel {
+                    effect: model,
+                    result_digest: "a".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Tool {
+                        tool,
+                        tool_digest: tool_digest.clone(),
+                    },
+                },
+                AdaptiveTransitionV1::ClaimTool {
+                    effect: tool_effect.clone(),
+                    tool_digest,
+                },
+                AdaptiveTransitionV1::ObserveTool {
+                    observation: crate::AdaptiveObservationRefV1 {
+                        effect: tool_effect,
+                        observation_digest: format!("{:064x}", round + 1),
+                    },
+                },
+            ] {
+                let prior = entries.last().unwrap();
+                let session = prior
+                    .session
+                    .transition(&command, prior.session.updated_at_ms + 1)
+                    .unwrap();
+                let previous_digest =
+                    Some(canonical_sha256("sentinel.workflow.adaptive-entry.v1", prior).unwrap());
+                entries.push(Entry {
+                    previous_digest,
+                    command: Some(command),
+                    session,
+                    recovery_feedback: None,
+                });
+            }
+        }
+        entries
+    }
+
+    fn persist(store: &WorkflowStore, entries: &[Entry]) {
+        let mut connection = store.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for entry in entries {
+            append(
+                &transaction,
+                &namespace(entry.session.grant.session_id),
+                entry,
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn overlapping_prefixes_reuse_entry_and_step_proofs_in_one_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("entries.sqlite");
+        let store = WorkflowStore::open(&path).unwrap();
+        let id = Uuid::from_u128(101);
+        let entries = journal(id, 32, 80);
+        persist(&store, &entries);
+        let repeated_raw_bytes: usize = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| encode(entry).unwrap().len() * (entries.len() - index))
+            .sum();
+        assert!(repeated_raw_bytes > ARENA_BYTES);
+        for reopened in [false, true] {
+            let reopened_store;
+            let selected = if reopened {
+                reopened_store = WorkflowStore::open(&path).unwrap();
+                &reopened_store
+            } else {
+                &store
+            };
+            let connection = selected.lock().unwrap();
+            let before: i64 = connection
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            for _ in 0..2 {
+                WORKING_MEMORY_READS.with(|reads| reads.set((0, 0, 0, 0)));
+                let (result, failures) = validation_scope::with_validation_failures(|| {
+                    validation_scope::with_scope(&connection, || {
+                        for version in 1..=entries.len() as u64 {
+                            let prefix = validation_scope::memoize(
+                                &connection,
+                                "adaptive-funding-journal-prefix",
+                                &(id, version),
+                                || replay_journal(&connection, id, None, Some(version)),
+                            )?
+                            .unwrap();
+                            assert_eq!(prefix.0, entries[version as usize - 1].session);
+                            assert_eq!(prefix.2, entries[0].recovery_feedback);
+                        }
+                        assert_eq!(
+                            load_with_feedback(&connection, id)?.unwrap().0,
+                            entries.last().unwrap().session
+                        );
+                        assert_eq!(
+                            validation_scope::validations("adaptive-journal-entry"),
+                            entries.len()
+                        );
+                        assert_eq!(
+                            validation_scope::validations("adaptive-journal-step"),
+                            entries.len()
+                        );
+                        assert_eq!(
+                            WORKING_MEMORY_READS.with(|reads| reads.get().1),
+                            entries.len()
+                        );
+                        Ok(())
+                    })
+                });
+                result.unwrap();
+                assert!(failures.is_empty());
+            }
+            assert_eq!(
+                connection
+                    .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn cached_entry_serializes_full_payload_and_charges_retained_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(root.path().join("entry-cost.sqlite")).unwrap();
+        let id = Uuid::from_u128(101);
+        let entries = journal(id, 0, 0);
+        persist(&store, &entries);
+        let connection = store.lock().unwrap();
+        let retained = JournalEntry(std::sync::Arc::new(JournalEntryData {
+            digest: canonical_sha256("sentinel.workflow.adaptive-entry.v1", &entries[0]).unwrap(),
+            entry: entries[0].clone(),
+        }));
+        assert_eq!(
+            encode(&retained).unwrap(),
+            encode(retained.0.as_ref()).unwrap()
+        );
+        let retained_bytes = crate::digest::serialized_json_size(&Some(retained)).unwrap();
+        let key_bytes = encode(&(id, 1_u64)).unwrap().len() + 256;
+        let raw_bytes = encode(&entries[0]).unwrap().len();
+        let (result, failures) = validation_scope::with_validation_failures(|| {
+            validation_scope::with_scope(&connection, || {
+                validation_scope::charge_bytes(
+                    &connection,
+                    ARENA_BYTES - key_bytes - raw_bytes - retained_bytes + 1,
+                )?;
+                journal_entry(&connection, id, 1)
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].reason, ValidationFailureReason::BytesLimit);
+        assert_eq!(failures[0].domain, Some("adaptive-journal-entry"));
+        assert_eq!(failures[0].attempted_bytes, Some(retained_bytes));
+        assert_eq!(failures[0].bytes, ARENA_BYTES - retained_bytes + 1);
+    }
+
+    #[test]
+    fn warm_step_proofs_preserve_collector_and_feedback() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(root.path().join("collector.sqlite")).unwrap();
+        let id = Uuid::from_u128(101);
+        let entries = journal(id, 3, 0);
+        persist(&store, &entries);
+        let connection = store.lock().unwrap();
+        let collect = |connection: &Connection| {
+            let mut collector = WorkingMemoryReplayCollector::new(9);
+            let loaded = replay_journal(connection, id, Some(&mut collector), None)?.unwrap();
+            Ok::<_, WorkflowError>((loaded, collector.finish(&entries[0].session.grant)?))
+        };
+        let cold = validation_scope::with_scope(&connection, || collect(&connection)).unwrap();
+        validation_scope::with_scope(&connection, || {
+            replay_journal(&connection, id, None, Some(5))?;
+            let first = journal_entry(&connection, id, 1)?.unwrap();
+            let again = journal_entry(&connection, id, 1)?.unwrap();
+            assert!(std::sync::Arc::ptr_eq(&first.0, &again.0));
+            assert_eq!(collect(&connection)?, cold);
+            assert_eq!(collect(&connection)?, cold);
+            assert_eq!(
+                validation_scope::validations("adaptive-journal-step"),
+                entries.len()
+            );
+            assert_eq!(cold.1 .3, 2);
+            assert_eq!(cold.0 .2, entries[0].recovery_feedback);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn entry_proofs_pin_external_writes_and_disable_reuse_after_local_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("snapshot.sqlite");
+        let store = WorkflowStore::open(&path).unwrap();
+        let id = Uuid::from_u128(101);
+        let entries = journal(id, 1, 0);
+        persist(&store, &entries);
+        let connection = store.lock().unwrap();
+        let writer = Connection::open(&path).unwrap();
+        validation_scope::with_scope(&connection, || {
+            let expected = replay_journal(&connection, id, None, None)?;
+            writer.execute("UPDATE workflow_operations SET request_digest='invalid' WHERE operation_namespace=?1 AND operation_id=?2",
+                params![namespace(id), format!("{:020}", entries.len())])?;
+            assert_eq!(replay_journal(&connection, id, None, None)?, expected);
+            Ok(())
+        }).unwrap();
+        assert!(load_with_feedback(&connection, id).is_err());
+        writer.execute("UPDATE workflow_operations SET request_digest=?1 WHERE operation_namespace=?2 AND operation_id=?3",
+            params![canonical_sha256("sentinel.workflow.adaptive-entry.v1", entries.last().unwrap()).unwrap(), namespace(id), format!("{:020}", entries.len())]).unwrap();
+        validation_scope::with_scope(&connection, || {
+            let first = journal_entry(&connection, id, 1)?.unwrap();
+            validation_scope::before_write(&connection)?;
+            connection.execute(
+                "UPDATE workflow_operations SET response=response WHERE operation_namespace=?1",
+                [namespace(id)],
+            )?;
+            let second = journal_entry(&connection, id, 1)?.unwrap();
+            let third = journal_entry(&connection, id, 1)?.unwrap();
+            assert!(!std::sync::Arc::ptr_eq(&first.0, &second.0));
+            assert!(!std::sync::Arc::ptr_eq(&second.0, &third.0));
+            assert_eq!(validation_scope::validations("adaptive-journal-entry"), 3);
+            replay_journal(&connection, id, None, None)?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn historical_cut_does_not_validate_future_funding_adoption() {
+        use crate::adaptive::work_funding_tests::{epoch_for, funded_authorization};
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(root.path().join("cut.sqlite")).unwrap();
+        let initial = Entry {
+            previous_digest: None,
+            command: None,
+            session: AdaptiveSessionV1::initial(grant()).unwrap(),
+            recovery_feedback: None,
+        };
+        let source = &initial.session;
+        let epoch = epoch_for(source, 10);
+        epoch.validate().unwrap();
+        let authorization = funded_authorization(source, epoch, source.grant.deadline_ms);
+        authorization.validate().unwrap();
+        let command = AdaptiveTransitionV1::ContinueGoverned { authorization };
+        let adopted = Entry {
+            previous_digest: Some(
+                canonical_sha256("sentinel.workflow.adaptive-entry.v1", &initial).unwrap(),
+            ),
+            session: source
+                .transition(&command, source.grant.deadline_ms)
+                .unwrap(),
+            command: Some(command),
+            recovery_feedback: None,
+        };
+        persist(&store, &[initial.clone(), adopted]);
+        let connection = store.lock().unwrap();
+        validation_scope::with_scope(&connection, || {
+            assert_eq!(
+                replay_journal(&connection, source.grant.session_id, None, Some(1))?
+                    .unwrap()
+                    .0,
+                *source
+            );
+            assert_eq!(validation_scope::validations("adaptive-journal-entry"), 1);
+            assert_eq!(validation_scope::validations("entity"), 0);
+            Ok(())
+        })
+        .unwrap();
+        let error = validation_scope::with_scope(&connection, || {
+            let replayed = replay_journal(&connection, source.grant.session_id, None, None);
+            assert_eq!(validation_scope::validations("adaptive-journal-entry"), 2);
+            assert_eq!(validation_scope::validations("entity"), 1);
+            replayed
+        })
+        .unwrap_err();
+        assert_eq!(error.code, WorkflowErrorCode::CorruptStore);
+        assert!(connection.is_autocommit());
+    }
+
+    #[test]
+    fn cold_and_warm_replays_reject_row_chain_transition_and_sibling_damage() {
+        for damage in [
+            "digest",
+            "clock",
+            "key",
+            "session",
+            "chain",
+            "transition",
+            "gap",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = WorkflowStore::open(root.path().join("damage.sqlite")).unwrap();
+            let id = Uuid::from_u128(101);
+            let entries = journal(id, 1, 0);
+            let sibling = journal(Uuid::from_u128(102), 0, 0);
+            persist(&store, &entries);
+            persist(&store, &sibling);
+            let connection = store.lock().unwrap();
+            let key = format!("{:020}", entries.len());
+            match damage {
+                "digest" => {
+                    connection.execute("UPDATE workflow_operations SET request_digest='invalid' WHERE operation_namespace=?1 AND operation_id=?2", params![namespace(id), key]).unwrap();
+                }
+                "clock" => {
+                    connection.execute("UPDATE workflow_operations SET created_at_ms=created_at_ms+1 WHERE operation_namespace=?1 AND operation_id=?2", params![namespace(id), key]).unwrap();
+                }
+                "key" => {
+                    connection.execute("UPDATE workflow_operations SET operation_id=operation_id||'x' WHERE operation_namespace=?1 AND operation_id=?2", params![namespace(id), key]).unwrap();
+                }
+                "gap" => {
+                    connection.execute("DELETE FROM workflow_operations WHERE operation_namespace=?1 AND operation_id=?2", params![namespace(id), format!("{:020}", 2)]).unwrap();
+                }
+                _ => {
+                    let mut changed = entries.last().unwrap().clone();
+                    match damage {
+                        "session" => changed.session.grant.session_id = Uuid::from_u128(102),
+                        "chain" => changed.previous_digest = Some("b".repeat(64)),
+                        "transition" => changed.session.model_calls += 1,
+                        _ => unreachable!(),
+                    }
+                    connection.execute("UPDATE workflow_operations SET response=?1,request_digest=?2 WHERE operation_namespace=?3 AND operation_id=?4",
+                        params![encode(&changed).unwrap(), canonical_sha256("sentinel.workflow.adaptive-entry.v1", &changed).unwrap(), namespace(id), key]).unwrap();
+                }
+            }
+            for warm in [false, true] {
+                let result = validation_scope::with_scope(&connection, || {
+                    load_with_feedback(&connection, sibling[0].session.grant.session_id)?;
+                    if warm {
+                        replay_journal(&connection, id, None, Some(1))?;
+                    }
+                    replay_journal(&connection, id, None, None)
+                });
+                assert_eq!(
+                    result.unwrap_err().code,
+                    WorkflowErrorCode::CorruptStore,
+                    "{damage}, warm={warm}"
+                );
+            }
+            assert!(connection.is_autocommit());
+        }
+    }
 }
 
 #[cfg(test)]

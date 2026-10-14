@@ -2701,6 +2701,80 @@ fn corrupt_store() -> WorkflowError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "Explicit protected-runtime read-only diagnostic; not product acceptance"]
+    fn diagnose_existing_expired_funding_source_read_only() {
+        use std::io::Read;
+
+        let path = std::env::var_os("SENTINEL_DIAGNOSTIC_READ_ONLY_DB")
+            .expect("explicit existing database required");
+        let metadata_path = std::env::var_os("SENTINEL_DIAGNOSTIC_FUNDING_METADATA")
+            .expect("explicit retained source metadata required");
+        let info = std::fs::symlink_metadata(&metadata_path).unwrap();
+        assert!(info.file_type().is_file() && info.len() <= 256 * 1024);
+        let mut bytes = Vec::new();
+        std::fs::File::open(&metadata_path)
+            .unwrap()
+            .take(256 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes.len() as u64, info.len());
+        let metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let source: crate::AdaptiveWorkFundingExpiredReplacementSourceV1 =
+            serde_json::from_value(metadata["source"].clone()).unwrap();
+        let operator: crate::AuthenticatedCompanyPrincipalV1 =
+            serde_json::from_value(metadata["issuer"].clone()).unwrap();
+        source.validate().unwrap();
+        operator.validate().unwrap();
+        let connection = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        connection.pragma_update(None, "query_only", true).unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(connection.is_readonly("main").unwrap());
+        super::validate_store_schema(&connection, super::WORKFLOW_STORE_SCHEMA_VERSION).unwrap();
+        let changes: i64 = connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        let store = super::WorkflowStore {
+            connection: std::sync::Mutex::new(connection),
+            validated_reads: std::sync::Mutex::new(super::read_cache::ReadCache::default()),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let (result, failures) =
+            crate::domain_store::validation_scope::with_validation_failures(|| {
+                store.adaptive_work_funding_expired_replacement_verification_source(
+                    &operator,
+                    &source.project_id,
+                    source.session_id,
+                    &source.old_funding_receipt_digest,
+                    now,
+                )
+            });
+        let connection = store.connection.lock().unwrap();
+        let after: i64 = connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert!(connection.is_readonly("main").unwrap());
+        assert_eq!(after, changes);
+        eprintln!(
+            "READ_ONLY_FUNDING_DIAGNOSTIC elapsed_ms={} error_code={:?} failures={:?} writes=0",
+            started.elapsed().as_millis(),
+            result.as_ref().err().map(|error| error.code),
+            failures,
+        );
+    }
+
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::Arc;
