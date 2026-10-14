@@ -53,9 +53,15 @@ mod model_review;
 #[cfg(feature = "llm")]
 pub mod model_work;
 mod project_profiles;
+#[cfg(feature = "llm")]
+mod recovery_admission;
+#[cfg(feature = "llm")]
+use recovery_admission::ProviderRecoveryGuard;
 #[cfg(test)]
 #[path = "workflow_api/tests/reconciliation_status.rs"]
 mod reconciliation_status_tests;
+#[cfg(all(test, feature = "llm"))]
+mod recovery_admission_tests;
 #[cfg(feature = "llm")]
 mod subscription;
 #[cfg(feature = "llm")]
@@ -3354,20 +3360,6 @@ struct ReconciliationStatus {
     last_error: Option<String>,
 }
 
-#[cfg(feature = "llm")]
-pub(super) struct ProviderRecoveryGuard<'a> {
-    _admission: std::sync::RwLockWriteGuard<'a, bool>,
-    _mutation: std::sync::RwLockWriteGuard<'a, ()>,
-    active_requests: std::sync::MutexGuard<'a, std::collections::HashMap<String, usize>>,
-}
-
-#[cfg(feature = "llm")]
-impl ProviderRecoveryGuard<'_> {
-    fn request_is_active(&self, request_id: &str) -> bool {
-        self.active_requests.contains_key(request_id)
-    }
-}
-
 pub struct WorkflowApi {
     core: Arc<ProductWorkflowCore>,
     delivery: Option<Arc<ProductDeliveryCore>>,
@@ -3377,6 +3369,8 @@ pub struct WorkflowApi {
     workbench: Option<Arc<WorkbenchExecutionAdapter>>,
     event_store: Option<sentinel_limbo::EventStore>,
     mutation_fence: RwLock<()>,
+    #[cfg(feature = "llm")]
+    provider_recovery_pending: AtomicBool,
     #[cfg(feature = "llm")]
     provider_admission: Arc<RwLock<bool>>,
     #[cfg(feature = "llm")]
@@ -3430,33 +3424,30 @@ impl WorkflowApi {
         Arc::clone(&self.active_provider_requests)
     }
 
-    #[cfg(feature = "llm")]
-    fn provider_recovery_fence(&self) -> Result<ProviderRecoveryGuard<'_>, &'static str> {
-        if !self.enabled || !self.model_work_enabled {
-            return Err("provider recovery unavailable");
+    fn try_background_mutation_read(
+        &self,
+    ) -> std::sync::TryLockResult<std::sync::RwLockReadGuard<'_, ()>> {
+        if self.provider_recovery_is_pending() {
+            return Err(TryLockError::WouldBlock);
         }
-        // Reservation uses this same admission lock. Keep the global lock order
-        // ahead of mutation and live ownership inspection; never wait on contention.
-        let admission = self
-            .provider_admission
-            .try_write()
-            .map_err(|_| "provider recovery admission unavailable")?;
-        if !*admission {
-            return Err("provider admission closed");
+        let guard = self.mutation_fence.try_read()?;
+        // Close the intent/read race. Existing owners finish their current
+        // durable step; only a new background pass yields to recovery.
+        if self.provider_recovery_is_pending() {
+            return Err(TryLockError::WouldBlock);
         }
-        let mutation = self
-            .mutation_fence
-            .try_write()
-            .map_err(|_| "workflow recovery busy")?;
-        let active_requests = self
-            .active_provider_requests
-            .try_lock()
-            .map_err(|_| "provider ownership unavailable")?;
-        Ok(ProviderRecoveryGuard {
-            _admission: admission,
-            _mutation: mutation,
-            active_requests,
-        })
+        Ok(guard)
+    }
+
+    fn provider_recovery_is_pending(&self) -> bool {
+        #[cfg(feature = "llm")]
+        {
+            self.provider_recovery_pending.load(Ordering::Acquire)
+        }
+        #[cfg(not(feature = "llm"))]
+        {
+            false
+        }
     }
 
     #[cfg(test)]
@@ -3627,6 +3618,8 @@ impl WorkflowApi {
             event_store: Some(event_store),
             mutation_fence: RwLock::new(()),
             #[cfg(feature = "llm")]
+            provider_recovery_pending: AtomicBool::new(false),
+            #[cfg(feature = "llm")]
             provider_admission: Arc::new(RwLock::new(true)),
             #[cfg(feature = "llm")]
             active_provider_requests: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -3681,6 +3674,8 @@ impl WorkflowApi {
             workbench: None,
             event_store: None,
             mutation_fence: RwLock::new(()),
+            #[cfg(feature = "llm")]
+            provider_recovery_pending: AtomicBool::new(false),
             #[cfg(feature = "llm")]
             provider_admission: Arc::new(RwLock::new(false)),
             #[cfg(feature = "llm")]
@@ -5516,6 +5511,11 @@ impl WorkflowApi {
         &self,
         should_stop: impl Fn() -> bool,
     ) -> Result<bool, WorkflowError> {
+        let yielded = std::cell::Cell::new(false);
+        let should_stop = || {
+            yielded.set(yielded.get() || should_stop() || self.provider_recovery_is_pending());
+            yielded.get()
+        };
         if !self.enabled || !self.model_work_enabled || should_stop() {
             return Ok(false);
         }
@@ -5534,7 +5534,7 @@ impl WorkflowApi {
                 return self.record_adaptive_tool_progress_result(Err(workflow_unavailable()));
             }
         };
-        let _mutation = match self.mutation_fence.try_read() {
+        let _mutation = match self.try_background_mutation_read() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Ok(false),
             Err(TryLockError::Poisoned(_)) => {
@@ -5600,6 +5600,11 @@ impl WorkflowApi {
         if !self.enabled {
             return;
         }
+        let yielded = std::cell::Cell::new(false);
+        let should_stop = || {
+            yielded.set(yielded.get() || should_stop() || self.provider_recovery_is_pending());
+            yielded.get()
+        };
         let _batch = match self.reconciliation_fence.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return,
@@ -5611,7 +5616,7 @@ impl WorkflowApi {
             }
         };
         // Normal batches may coexist with durable dispatch claims, but never recovery.
-        let _guard = match self.mutation_fence.try_read() {
+        let _guard = match self.try_background_mutation_read() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return,
             Err(TryLockError::Poisoned(_)) => {
@@ -5693,6 +5698,11 @@ impl WorkflowApi {
 
     fn reconcile_batch(&self, should_stop: &impl Fn() -> bool) -> Result<(), WorkflowError> {
         let result = self.reconcile_work_batch(should_stop);
+        if should_stop() {
+            // Publication is durable and resumes on the next pass. Do not
+            // extend a reader's lifetime after an exclusive recovery request.
+            return result;
+        }
         // Committed facts must drain even when one project's next action is
         // blocked. Publishing evidence does not authorize a failed QA release.
         publish_after_reconciliation(result, || {
@@ -5724,6 +5734,9 @@ impl WorkflowApi {
             .inspect_err(|_| {
                 log_reconciliation_failure("sales_intake", "intake reconciliation failed");
             })?;
+        if should_stop() {
+            return Ok(());
+        }
         #[cfg(feature = "llm")]
         let tool_inventory_generation = self
             .adaptive_tool_progress_inventory_generation
@@ -5733,6 +5746,9 @@ impl WorkflowApi {
             .inspect_err(|_| {
                 log_reconciliation_failure("project_scan", "project ledger unavailable");
             })?;
+        if should_stop() {
+            return Ok(());
+        }
         #[cfg(feature = "llm")]
         self.trace_reconciliation_phase("tool_hint_inventory", || {
             self.refresh_existing_adaptive_tool_hints(&projects, tool_inventory_generation)
@@ -5744,6 +5760,9 @@ impl WorkflowApi {
             return Ok(());
         }
         for project in projects {
+            if should_stop() {
+                return Ok(());
+            }
             #[cfg(feature = "llm")]
             if self
                 .recover_known_rejected_adaptive_model(&project)
@@ -5764,6 +5783,9 @@ impl WorkflowApi {
                 log_reconciliation_failure("unknown_model", reason);
                 workflow_unavailable()
             })?;
+            if should_stop() {
+                return Ok(());
+            }
             #[cfg(feature = "llm")]
             if self
                 .trace_reconciliation_phase("adaptive_leadership", || {
@@ -5775,6 +5797,9 @@ impl WorkflowApi {
                 })?
             {
                 continue;
+            }
+            if should_stop() {
+                return Ok(());
             }
             if project.lifecycle_state
                 == sentinel_workflow::ProjectLifecycleStateV1::DeliveryCandidate
@@ -5864,12 +5889,18 @@ impl WorkflowApi {
                 .map_err(|_| workflow_unavailable())?;
             }
         }
+        if should_stop() {
+            return Ok(());
+        }
         for pending in self.store.pending_executions(MAX_RECONCILE_BATCH)? {
             if should_stop() {
                 return Ok(());
             }
             let work = self.core.reconcile_execution(&pending, now_unix_ms())?;
             self.sync_company_state(&work)?;
+        }
+        if should_stop() {
+            return Ok(());
         }
         for pending in self
             .store
@@ -5883,12 +5914,18 @@ impl WorkflowApi {
                 .reconcile_completion_evidence(&pending, now_unix_ms())?;
             self.sync_company_state(&work)?;
         }
+        if should_stop() {
+            return Ok(());
+        }
         for pending in self.store.pending_gate_evidence(MAX_RECONCILE_BATCH)? {
             if should_stop() {
                 return Ok(());
             }
             let work = self.core.reconcile_gate_evidence(&pending, now_unix_ms())?;
             self.sync_company_state(&work)?;
+        }
+        if should_stop() {
+            return Ok(());
         }
         self.reconcile_company_state_page()?;
         Ok(())
@@ -9516,13 +9553,13 @@ mod tests {
         let admission = api.provider_admission_fence();
         let reservation = admission.read().unwrap();
         assert!(matches!(
-            api.provider_recovery_fence(),
+            api.provider_recovery_fence_until(std::time::Instant::now()),
             Err("provider recovery admission unavailable")
         ));
         drop(reservation);
         let mutation = api.mutation_fence.read().unwrap();
         assert!(matches!(
-            api.provider_recovery_fence(),
+            api.provider_recovery_fence_until(std::time::Instant::now()),
             Err("workflow recovery busy")
         ));
         assert!(admission.try_read().is_ok());
@@ -9530,7 +9567,7 @@ mod tests {
         let requests = api.active_provider_requests();
         let registration = requests.lock().unwrap();
         assert!(matches!(
-            api.provider_recovery_fence(),
+            api.provider_recovery_fence_until(std::time::Instant::now()),
             Err("provider ownership unavailable")
         ));
         assert!(admission.try_read().is_ok());
