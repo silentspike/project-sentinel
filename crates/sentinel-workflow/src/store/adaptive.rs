@@ -27,6 +27,8 @@ mod company_claim_tests;
 #[cfg(test)]
 mod health_inventory_tests;
 mod recovery_lineage;
+mod read_sources;
+pub use read_sources::AdaptiveModelPreparationReadSnapshot;
 #[cfg(test)]
 mod rejected_model_tests;
 #[cfg(test)]
@@ -346,108 +348,9 @@ impl WorkflowStore {
                 };
                 authorize(&current_session.grant, current)?;
                 require_head(tx, &current_session)?;
-                let effect_matches = match &current_session.cursor {
-                    crate::AdaptiveCursorV1::ReadyForModel => {
-                        current_session.version == provider_version
-                            && working_memory_model_effect_id(session_id, provider_version)
-                                == effect_id
-                    }
-                    crate::AdaptiveCursorV1::ModelPending { effect }
-                    | crate::AdaptiveCursorV1::ModelUnknown { effect } => {
-                        provider_version.checked_add(1) == Some(current_session.version)
-                            && effect.id == effect_id
-                    }
-                    _ => false,
-                };
-                if !effect_matches {
-                    return Err(authority_conflict());
-                }
-                let (head_entry_digest, session, mut rows, completed_tool_count, latest_test) =
-                    match collected {
-                        Some(collected) => collected.finish(&current_session.grant)?,
-                        None => {
-                            // A pre-existing normal journal proof has no projection.
-                            let (digest, prefix) =
-                                evidence_entry(tx, &namespace(session_id), provider_version)?;
-                            if prefix.session.grant != current_session.grant {
-                                return Err(corrupt_store());
-                            }
-                            let rows = working_memory_rows(tx, &prefix.session)?;
-                            let count = u16::try_from(rows.len()).map_err(|_| corrupt_store())?;
-                            let latest_test = rows
-                                .iter()
-                                .rfind(|row| {
-                                    row.tool_kind == AdaptiveWorkingMemoryToolKindV1::RunTests
-                                })
-                                .cloned();
-                            (digest, prefix.session, rows, count, latest_test)
-                        }
-                    };
-                if session.grant != current_session.grant {
-                    return Err(corrupt_store());
-                }
-                if rows.len() > ADAPTIVE_WORKING_MEMORY_MAX_ROWS {
-                    rows = rows.split_off(rows.len() - ADAPTIVE_WORKING_MEMORY_MAX_ROWS);
-                }
-                if usize::from(completed_tool_count) > ADAPTIVE_WORKING_MEMORY_MAX_ROWS {
-                    if let Some(test) = &latest_test {
-                        if !rows
-                            .iter()
-                            .any(|row| row.session_version == test.session_version)
-                        {
-                            rows.remove(0);
-                            rows.insert(0, test.clone());
-                        }
-                    }
-                }
-                let mut source = AdaptiveWorkingMemorySourceV1 {
-                    schema_version: 1,
-                    session_id,
-                    authority: session.grant.authority.clone(),
-                    provider_version,
-                    effect_id,
-                    head_version: session.version,
-                    head_entry_digest,
-                    last_observation: session.last_observation.clone(),
-                    model_calls: session.model_calls,
-                    tool_calls: session.tool_calls,
-                    root_model_ceiling: session.grant.max_model_calls,
-                    root_tool_ceiling: session.grant.max_tool_calls,
-                    active_model_ceiling: session.active_model_ceiling(),
-                    continuation_windows: u16::try_from(
-                        session
-                            .continuation
-                            .as_ref()
-                            .map_or(0, |state| state.authorizations.len()),
-                    )
-                    .map_err(|_| corrupt_store())?,
-                    completed_tool_count,
-                    omitted_count: completed_tool_count - rows.len() as u16,
-                    rows,
-                    work_funding: session.active_work_funding().cloned().map(Box::new),
-                };
-                while serde_json::to_vec(&source)
-                    .map_err(|_| corrupt_store())?
-                    .len()
-                    > ADAPTIVE_WORKING_MEMORY_MAX_BYTES
-                {
-                    let index = source
-                        .rows
-                        .iter()
-                        .position(|row| {
-                            source
-                                .rows
-                                .last()
-                                .is_some_and(|last| last.session_version != row.session_version)
-                                && latest_test
-                                    .as_ref()
-                                    .is_none_or(|test| test.session_version != row.session_version)
-                        })
-                        .ok_or_else(corrupt_store)?;
-                    source.rows.remove(index);
-                    source.omitted_count += 1;
-                }
-                source.validate().map_err(|_| corrupt_store())?;
+                let source = read_sources::working_memory_source_from_loaded(
+                    tx, &current_session, provider_version, effect_id, collected,
+                )?;
                 scope.finish()?;
                 Ok(Some(source))
             },
@@ -682,19 +585,7 @@ impl WorkflowStore {
             load_with_feedback(&tx, head.session_id)?.ok_or_else(corrupt_store)?;
         authorize(&session.grant, current)?;
         validate_head(&head, &session)?;
-        if let crate::AdaptiveCursorV1::ModelRejected {
-            reason_code,
-            resolution_event_id,
-        } = session.cursor
-        {
-            return Ok(Some(AdaptiveRecoveryFeedbackV1 {
-                count: feedback.as_ref().map_or(0, |feedback| feedback.count),
-                reason_code,
-                resolution_event_id,
-                previous_session_id: session.grant.session_id,
-            }));
-        }
-        Ok(feedback)
+        Ok(read_sources::recovery_feedback_from_loaded(&session, feedback))
     }
 
     /// Reads exact durable adoption evidence; does not authorize or dispatch an effect.

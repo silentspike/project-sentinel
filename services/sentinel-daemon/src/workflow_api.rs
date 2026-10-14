@@ -16,6 +16,9 @@ mod adaptive_resume_policy;
 mod adaptive_tool_poll_tests;
 #[cfg(feature = "llm")]
 mod adaptive_work_funding;
+#[cfg(test)]
+#[path = "workflow_api/batched_reads_tests.rs"]
+mod batched_reads_tests;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/budget_review_extension.rs"]
 mod budget_review_extension_tests;
@@ -4651,35 +4654,34 @@ impl WorkflowApi {
         let Ok(_guard) = self.mutation_fence.read() else {
             return json_error(503, "workflow_busy", "workflow recovery is active", true);
         };
-        let requests = if let Some(id) = query_parameter(path, "request_id") {
-            self.store
-                .company_customer_request(&principal.principal.tenant_id, id)
-                .map(|value| value.into_iter().collect::<Vec<_>>())
-        } else {
-            self.store
-                .company_customer_requests(&principal.principal.tenant_id, customer_id)
+        let snapshot = match self.store.customer_overview_read_snapshot(
+            &principal.principal.tenant_id,
+            customer_id,
+            query_parameter(path, "request_id"),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return self.customer_overview_read_error(principal, path, error),
         };
-        let requests = match requests {
-            Ok(values) if values.iter().all(|value| value.customer_id == customer_id) => values,
-            Ok(_) => {
-                return json_error(
-                    403,
-                    "authority_conflict",
-                    "customer request is foreign",
-                    false,
-                )
-            }
-            Err(error) => return workflow_error(error),
-        };
+        let requests = snapshot.requests;
+        if !requests.iter().all(|value| value.customer_id == customer_id) {
+            return json_error(
+                403,
+                "authority_conflict",
+                "customer request is foreign",
+                false,
+            );
+        }
+        let proposal_by_id = snapshot
+            .proposals
+            .iter()
+            .map(|proposal| (proposal.proposal_id.as_str(), proposal))
+            .collect::<HashMap<_, _>>();
         let mut proposals = Vec::new();
         for request in &requests {
             for id in &request.proposal_ids {
-                let proposal = match self
-                    .store
-                    .company_proposal(&principal.principal.tenant_id, id)
-                {
-                    Ok(Some(value)) if value.request_id == request.request_id => value,
-                    Ok(_) => {
+                let proposal = match proposal_by_id.get(id.as_str()) {
+                    Some(value) if value.request_id == request.request_id => value,
+                    _ => {
                         return json_error(
                             503,
                             "workflow_corrupt",
@@ -4687,7 +4689,6 @@ impl WorkflowApi {
                             false,
                         )
                     }
-                    Err(error) => return workflow_error(error),
                 };
                 proposals.push(serde_json::json!({
                     "proposal_id": proposal.proposal_id, "request_id": proposal.request_id,
@@ -4699,30 +4700,48 @@ impl WorkflowApi {
                 }));
             }
         }
-        let projects = match self
-            .store
-            .company_customer_projects(&principal.principal.tenant_id, customer_id)
-        {
-            Ok(values) => values,
-            Err(error) => return workflow_error(error),
-        };
-        let mut progress = Vec::new();
-        for project in projects {
-            let agreement = match self
-                .store
-                .company_agreement(&principal.principal.tenant_id, &project.agreement_id)
+        let projects = snapshot.projects;
+        // All SQL reads return owned facts before runtime authority or delivery I/O.
+        let mut progress_authorities = Vec::new();
+        let mut authority_results = Vec::new();
+        for entry in &projects {
+            if !requests
+                .iter()
+                .any(|request| request.request_id == entry.agreement.request_id)
             {
-                Ok(Some(value)) if value.customer_id == customer_id => value,
-                Ok(_) => {
-                    return json_error(
-                        503,
-                        "workflow_corrupt",
-                        "agreement binding is invalid",
-                        false,
-                    )
-                }
-                Err(error) => return workflow_error(error),
-            };
+                continue;
+            }
+            for (id, work) in &entry.project.work_items {
+                let result = self.customer_adaptive_authority(&entry.project, id, work);
+                let result = result.map(|current| {
+                    current.map(|current| {
+                        let index = progress_authorities.len();
+                        progress_authorities.push(current);
+                        index
+                    })
+                });
+                authority_results.push(result);
+            }
+        }
+        let progress_facts = if progress_authorities.is_empty() {
+            Ok(Vec::new())
+        } else {
+            self.store.adaptive_progress_read_batch(&progress_authorities)
+        };
+        let mut authority_results = authority_results.into_iter();
+        let mut checked_projects = Vec::new();
+        let mut progress = Vec::new();
+        for entry in projects {
+            let project = entry.project;
+            let agreement = entry.agreement;
+            if agreement.customer_id != customer_id {
+                return json_error(
+                    503,
+                    "workflow_corrupt",
+                    "agreement binding is invalid",
+                    false,
+                );
+            }
             if !requests
                 .iter()
                 .any(|request| request.request_id == agreement.request_id)
@@ -4734,7 +4753,25 @@ impl WorkflowApi {
                 let mut row = serde_json::json!({
                     "work_item_id": id, "state": work.state,
                 });
-                match self.customer_adaptive_progress(&project, id, work) {
+                let adaptive_progress = match authority_results.next() {
+                    Some(Ok(Some(index))) => progress_facts
+                        .as_ref()
+                        .map_err(|_| ())
+                        .and_then(|facts| facts.get(index).ok_or(()))
+                        .and_then(|fact| match fact {
+                            Ok(Some(fact)) => {
+                                Ok(Self::customer_progress_facts(fact, now_unix_ms()))
+                            }
+                            Ok(None) => Ok(None),
+                            Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => {
+                                Ok(None)
+                            }
+                            Err(_) => Err(()),
+                        }),
+                    Some(Ok(None)) => Ok(None),
+                    _ => Err(()),
+                };
+                match adaptive_progress {
                     Ok(Some(progress)) => row["adaptive_progress"] = progress,
                     Ok(None) => {}
                     Err(()) => {
@@ -4776,6 +4813,18 @@ impl WorkflowApi {
                 "work_items": work_rows,
                 "deliveries": deliveries,
             }));
+            checked_projects.push(project);
+        }
+        if !matches!(
+            self.store.company_projects_match_snapshot(&checked_projects),
+            Ok(true)
+        ) {
+            return json_error(
+                503,
+                "customer_progress_unavailable",
+                "Customer progress is unavailable",
+                true,
+            );
         }
         json(
             200,
@@ -4783,13 +4832,83 @@ impl WorkflowApi {
         )
     }
 
-    // Only current, replay-verified heads contribute public progress, never history.
-    fn customer_adaptive_progress(
+    // The batched API intentionally has a domain-only error type. On failure,
+    // preserve the legacy HTTP phase diagnostics without classifying error text.
+    // A failed snapshot can never become a successful response through this path.
+    fn customer_overview_read_error(
+        &self,
+        principal: &BoundPrincipal,
+        path: &str,
+        original: WorkflowError,
+    ) -> WorkflowHttpResponse {
+        let tenant = &principal.principal.tenant_id;
+        let customer = principal
+            .principal
+            .customer_id
+            .as_deref()
+            .unwrap_or_default();
+        let requests = if let Some(id) = query_parameter(path, "request_id") {
+            self.store
+                .company_customer_request(tenant, id)
+                .map(|value| value.into_iter().collect::<Vec<_>>())
+        } else {
+            self.store.company_customer_requests(tenant, customer)
+        };
+        let requests = match requests {
+            Ok(values) if values.iter().all(|value| value.customer_id == customer) => values,
+            Ok(_) => {
+                return json_error(
+                    403,
+                    "authority_conflict",
+                    "customer request is foreign",
+                    false,
+                )
+            }
+            Err(error) => return workflow_error(error),
+        };
+        for request in &requests {
+            for id in &request.proposal_ids {
+                match self.store.company_proposal(tenant, id) {
+                    Ok(Some(value)) if value.request_id == request.request_id => {}
+                    Ok(_) => {
+                        return json_error(
+                            503,
+                            "workflow_corrupt",
+                            "proposal binding is invalid",
+                            false,
+                        )
+                    }
+                    Err(error) => return workflow_error(error),
+                }
+            }
+        }
+        let projects = match self.store.company_customer_projects(tenant, customer) {
+            Ok(values) => values,
+            Err(error) => return workflow_error(error),
+        };
+        for project in projects {
+            match self.store.company_agreement(tenant, &project.agreement_id) {
+                Ok(Some(value)) if value.customer_id == customer => {}
+                Ok(_) => {
+                    return json_error(
+                        503,
+                        "workflow_corrupt",
+                        "agreement binding is invalid",
+                        false,
+                    )
+                }
+                Err(error) => return workflow_error(error),
+            }
+        }
+        workflow_error(original)
+    }
+
+    fn customer_adaptive_authority(
         &self,
         project: &sentinel_workflow::ProjectV1,
         id: &WorkItemId,
         work: &sentinel_workflow::CompanyWorkItemV1,
-    ) -> Result<Option<serde_json::Value>, ()> {
+    ) -> Result<Option<RuntimeAuthoritySnapshotV1>, ()> {
         if id != &work.spec.work_item_id
             || !matches!(
                 work.spec.required_role,
@@ -4817,7 +4936,8 @@ impl WorkflowApi {
         let Some(authority) = self.authority.as_ref() else {
             return Ok(None);
         };
-        let current = match authority.snapshot_for_admission(
+        let current = match authority.snapshot_from_validated_project(
+            project,
             &project.tenant_id,
             &project.project_id,
             id,
@@ -4839,9 +4959,23 @@ impl WorkflowApi {
         {
             return Err(());
         }
+        Ok(Some(current))
+    }
+
+    // Compatibility adapter for exact-scope callers and legacy progress tests.
+    #[cfg(test)]
+    fn customer_adaptive_progress(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        id: &WorkItemId,
+        work: &sentinel_workflow::CompanyWorkItemV1,
+    ) -> Result<Option<serde_json::Value>, ()> {
+        let Some(current) = self.customer_adaptive_authority(project, id, work)? else {
+            return Ok(None);
+        };
         let session = match self.store.adaptive_session_for_authority(&current) {
             Ok(session) => session,
-            Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => return Ok(None),
+            Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => None,
             Err(_) => return Err(()),
         };
         if self
@@ -4859,6 +4993,31 @@ impl WorkflowApi {
         Ok(Self::customer_session_progress(&session, now_unix_ms()))
     }
 
+    fn customer_progress_facts(
+        facts: &sentinel_workflow::AdaptiveProgressReadFacts,
+        now_ms: u64,
+    ) -> Option<serde_json::Value> {
+        use sentinel_workflow::AdaptiveProgressReadKind;
+        let (status, label) = match facts.kind() {
+            AdaptiveProgressReadKind::NoPrivateObservation => (
+                "paused_internal_observation",
+                "Paused: awaiting internal observation.",
+            ),
+            AdaptiveProgressReadKind::ModelUnknown => {
+                ("model_outcome_unknown", "Model outcome unknown.")
+            }
+            AdaptiveProgressReadKind::ToolUnknown => {
+                ("tool_outcome_unknown", "Tool outcome unknown.")
+            }
+            AdaptiveProgressReadKind::ReadyForModel if facts.model_window_exhausted_at(now_ms) => {
+                ("paused_work_window", "Paused: work window unavailable.")
+            }
+            _ => return None,
+        };
+        Some(serde_json::json!({"status": status, "label": label}))
+    }
+
+    #[cfg(test)]
     fn customer_session_progress(
         session: &AdaptiveSessionV1,
         now_ms: u64,

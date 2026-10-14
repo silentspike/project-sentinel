@@ -1,5 +1,10 @@
 # Changelog
 
+- Batch customer collection, adaptive progress and model-preparation SQL reads
+  into validated phase snapshots. Preserve complete journal and funding checks,
+  fresh runtime authority, legacy retained-context selection and final project
+  consistency without changing deadlines, validation budgets or admission (#856).
+
 - Add explicit finite replacement of expired, unadopted, already-reviewed work
   funding proposals. Bind complete retired-review no-provider-I/O evidence to
   an atomic new funding receipt and permanent predecessor consumption; preserve
