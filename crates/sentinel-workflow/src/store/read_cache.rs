@@ -1,8 +1,9 @@
 use std::any::{Any, TypeId};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::mem::{align_of, size_of};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rusqlite::types::ValueRef;
 use rusqlite::Connection;
@@ -16,6 +17,9 @@ const MAX_INPUT_ROWS: usize = 16_384;
 const MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESULTS: usize = 32;
 const MAX_KEY_BYTES: usize = 4096;
+const MAX_DIAGNOSTIC_RECORDS: usize = 64;
+const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+static DIAGNOSTICS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 const TABLES: &[&str] = &[
     "company_schema_meta",
     "company_entities",
@@ -34,6 +38,132 @@ const TABLES: &[&str] = &[
 ];
 const SCHEMA_QUERY: &str =
     "SELECT type,name,tbl_name,rootpage,sql FROM main.sqlite_schema ORDER BY type,name";
+
+fn diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SENTINEL_WORKFLOW_READ_CACHE_DIAGNOSTICS").is_ok_and(|value| value == "1")
+    })
+}
+
+fn publish_diagnostic(sink: &Mutex<VecDeque<String>>, record: String) -> bool {
+    if record.len() > MAX_DIAGNOSTIC_BYTES {
+        return false;
+    }
+    let Ok(mut records) = sink.try_lock() else {
+        return false;
+    };
+    if records.len() == MAX_DIAGNOSTIC_RECORDS {
+        records.pop_front();
+    }
+    records.push_back(record);
+    true
+}
+
+pub(super) fn take_diagnostics() -> Vec<String> {
+    drain_diagnostics(&DIAGNOSTICS)
+}
+
+fn drain_diagnostics(sink: &Mutex<VecDeque<String>>) -> Vec<String> {
+    let Ok(mut records) = sink.try_lock() else {
+        return Vec::new();
+    };
+    records.drain(..).collect()
+}
+
+enum DiagnosticPhase {
+    Capture,
+    Compare,
+    Integrity,
+    Validator,
+    Size,
+    Clone,
+}
+
+#[derive(Default)]
+struct PhaseDiagnostic {
+    calls: usize,
+    elapsed: Duration,
+}
+
+struct ReadDiagnostic {
+    started: Instant,
+    category: &'static str,
+    views_before: usize,
+    bytes_before: usize,
+    candidate_bytes: usize,
+    capture_available: bool,
+    count_evictions: usize,
+    byte_evictions: usize,
+    combined_evictions: usize,
+    capture: PhaseDiagnostic,
+    compare: PhaseDiagnostic,
+    integrity: PhaseDiagnostic,
+    validator: PhaseDiagnostic,
+    size: PhaseDiagnostic,
+    clone: PhaseDiagnostic,
+}
+
+impl ReadDiagnostic {
+    fn new(cache: &ReadCache) -> Self {
+        Self {
+            started: Instant::now(),
+            category: "setup",
+            views_before: cache.results.len(),
+            bytes_before: cache.result_bytes,
+            candidate_bytes: 0,
+            capture_available: false,
+            count_evictions: 0,
+            byte_evictions: 0,
+            combined_evictions: 0,
+            capture: PhaseDiagnostic::default(),
+            compare: PhaseDiagnostic::default(),
+            integrity: PhaseDiagnostic::default(),
+            validator: PhaseDiagnostic::default(),
+            size: PhaseDiagnostic::default(),
+            clone: PhaseDiagnostic::default(),
+        }
+    }
+
+    fn summary(&self, domain: &'static str, succeeded: bool, cache: &ReadCache) -> String {
+        // No key, TypeId, payload, fingerprint or error message enters the record.
+        format!(
+            "workflow_read_cache domain={} category={} succeeded={} views_before={} views_after={} result_bytes_before={} result_bytes_after={} candidate_bytes={} count_evictions={} byte_evictions={} combined_evictions={} capture_available={} capture_calls={} capture_us={} compare_calls={} compare_us={} integrity_calls={} integrity_us={} validator_calls={} validator_us={} size_calls={} size_us={} clone_calls={} clone_us={} total_us={}",
+            domain, self.category, succeeded, self.views_before, cache.results.len(),
+            self.bytes_before, cache.result_bytes, self.candidate_bytes,
+            self.count_evictions, self.byte_evictions, self.combined_evictions,
+            self.capture_available, self.capture.calls, self.capture.elapsed.as_micros(),
+            self.compare.calls, self.compare.elapsed.as_micros(),
+            self.integrity.calls, self.integrity.elapsed.as_micros(),
+            self.validator.calls, self.validator.elapsed.as_micros(),
+            self.size.calls, self.size.elapsed.as_micros(),
+            self.clone.calls, self.clone.elapsed.as_micros(), self.started.elapsed().as_micros(),
+        )
+    }
+}
+
+fn measure<T>(
+    diagnostic: &mut Option<ReadDiagnostic>,
+    phase: DiagnosticPhase,
+    action: impl FnOnce() -> T,
+) -> T {
+    let Some(diagnostic) = diagnostic.as_mut() else {
+        return action();
+    };
+    let started = Instant::now();
+    let result = action();
+    let measured = match phase {
+        DiagnosticPhase::Capture => &mut diagnostic.capture,
+        DiagnosticPhase::Compare => &mut diagnostic.compare,
+        DiagnosticPhase::Integrity => &mut diagnostic.integrity,
+        DiagnosticPhase::Validator => &mut diagnostic.validator,
+        DiagnosticPhase::Size => &mut diagnostic.size,
+        DiagnosticPhase::Clone => &mut diagnostic.clone,
+    };
+    measured.calls += 1;
+    measured.elapsed += started.elapsed();
+    result
+}
 
 #[derive(Debug)]
 enum InputValue {
@@ -339,7 +469,7 @@ impl ReadCache {
         self.use_counter
     }
 
-    fn evict_for(&mut self, bytes: usize) {
+    fn evict_for(&mut self, bytes: usize, diagnostic: &mut Option<ReadDiagnostic>) {
         while self.results.len() >= MAX_RESULTS
             || self.result_bytes.saturating_add(bytes) > MAX_RESULT_BYTES
         {
@@ -350,6 +480,16 @@ impl ReadCache {
                 .map(|(key, _)| key.clone());
             let Some(key) = oldest else { break };
             if let Some(proof) = self.results.remove(&key) {
+                if let Some(diagnostic) = diagnostic.as_mut() {
+                    let count_pressure = self.results.len() + 1 >= MAX_RESULTS;
+                    let byte_pressure = self.result_bytes.saturating_add(bytes) > MAX_RESULT_BYTES;
+                    match (count_pressure, byte_pressure) {
+                        (true, true) => diagnostic.combined_evictions += 1,
+                        (true, false) => diagnostic.count_evictions += 1,
+                        (false, true) => diagnostic.byte_evictions += 1,
+                        (false, false) => {}
+                    }
+                }
                 self.result_bytes -= proof.accounted_bytes;
             }
         }
@@ -388,9 +528,24 @@ impl ReadCache {
         validate: impl FnOnce() -> Result<T, WorkflowError>,
         retain: impl Fn(&T) -> bool,
     ) -> Result<T, WorkflowError> {
-        let result = self.read_inner(connection, eligible, domain, query_key, validate, retain);
+        let mut diagnostic = diagnostics_enabled().then(|| ReadDiagnostic::new(self));
+        let result = self.read_inner(
+            connection,
+            eligible,
+            (domain, query_key),
+            validate,
+            retain,
+            &mut diagnostic,
+        );
         if result.is_err() {
             self.clear();
+        }
+        if let Some(diagnostic) = diagnostic {
+            // Diagnostic consumers never retain store locks or block authority reads.
+            publish_diagnostic(
+                &DIAGNOSTICS,
+                diagnostic.summary(domain, result.is_ok(), self),
+            );
         }
         result
     }
@@ -399,24 +554,44 @@ impl ReadCache {
         &mut self,
         connection: &Connection,
         eligible: bool,
-        domain: &'static str,
-        query_key: &[u8],
+        view: (&'static str, &[u8]),
         validate: impl FnOnce() -> Result<T, WorkflowError>,
         retain: impl Fn(&T) -> bool,
+        diagnostic: &mut Option<ReadDiagnostic>,
     ) -> Result<T, WorkflowError> {
+        let (domain, query_key) = view;
         if !eligible || query_key.len() > MAX_KEY_BYTES {
+            if let Some(diagnostic) = diagnostic.as_mut() {
+                diagnostic.category = if !eligible {
+                    "outer_transaction_bypass"
+                } else {
+                    "oversized_key_bypass"
+                };
+            }
             // Caller-owned transactions may include transient state or rollbacks.
             self.clear();
-            return validate();
+            return measure(diagnostic, DiagnosticPhase::Validator, validate);
         }
         connection.query_row("SELECT COUNT(*) FROM main.sqlite_schema", [], |row| {
             row.get::<_, i64>(0)
         })?;
         let changes: i64 = connection.query_row("SELECT total_changes()", [], |row| row.get(0))?;
-        let same = self
-            .inputs
-            .as_ref()
-            .is_some_and(|inputs| inputs.matches(connection).unwrap_or(false));
+        let had_inputs = self.inputs.is_some();
+        let same = self.inputs.as_ref().is_some_and(|inputs| {
+            measure(diagnostic, DiagnosticPhase::Compare, || {
+                inputs.matches(connection)
+            })
+            .unwrap_or(false)
+        });
+        if let Some(diagnostic) = diagnostic.as_mut() {
+            diagnostic.category = if same {
+                "warm_view_miss"
+            } else if had_inputs {
+                "input_mismatch_miss"
+            } else {
+                "cold_miss"
+            };
+        }
         let key = (domain, TypeId::of::<T>(), query_key.to_vec());
         if same {
             if self
@@ -424,16 +599,23 @@ impl ReadCache {
                 .get(&key)
                 .is_some_and(|proof| proof.value.downcast_ref::<T>().is_some())
             {
+                if let Some(diagnostic) = diagnostic.as_mut() {
+                    diagnostic.category = "hit";
+                }
                 // Table equality cannot detect index-only damage. Hits check
                 // before return; misses use the post-validation check below.
-                if !self.integrity_ok(connection)? {
+                if !measure(diagnostic, DiagnosticPhase::Integrity, || {
+                    self.integrity_ok(connection)
+                })? {
                     return Err(super::corrupt_store());
                 }
                 let used = self.next_use();
                 if let Some(proof) = self.results.get_mut(&key) {
                     if let Some(value) = proof.value.downcast_ref::<T>() {
                         proof.last_used = used;
-                        return Ok(value.clone());
+                        return Ok(measure(diagnostic, DiagnosticPhase::Clone, || {
+                            value.clone()
+                        }));
                     }
                 }
             }
@@ -443,15 +625,27 @@ impl ReadCache {
         let candidate = if same {
             None
         } else {
-            Inputs::capture(connection).ok().flatten()
+            let captured = measure(diagnostic, DiagnosticPhase::Capture, || {
+                Inputs::capture(connection)
+            })
+            .ok()
+            .flatten();
+            if let Some(diagnostic) = diagnostic.as_mut() {
+                diagnostic.capture_available = captured.is_some();
+            }
+            captured
         };
-        let value = match validate() {
+        let value = match measure(diagnostic, DiagnosticPhase::Validator, validate) {
             Ok(value) => value,
             Err(error) => {
                 self.clear();
                 // Preserve corruption precedence on warm typed misses, even
                 // when the read-only validator rejects the requested view.
-                if same && !self.integrity_ok(connection)? {
+                if same
+                    && !measure(diagnostic, DiagnosticPhase::Integrity, || {
+                        self.integrity_ok(connection)
+                    })?
+                {
                     return Err(super::corrupt_store());
                 }
                 return Err(error);
@@ -463,25 +657,41 @@ impl ReadCache {
             return Err(super::corrupt_store());
         }
         let inputs = candidate.as_ref().or(self.inputs.as_ref());
-        if inputs.is_some_and(|inputs| inputs.matches(connection).unwrap_or(false)) {
-            if !self.integrity_ok(connection)? {
+        if inputs.is_some_and(|inputs| {
+            measure(diagnostic, DiagnosticPhase::Compare, || {
+                inputs.matches(connection)
+            })
+            .unwrap_or(false)
+        }) {
+            if !measure(diagnostic, DiagnosticPhase::Integrity, || {
+                self.integrity_ok(connection)
+            })? {
                 return Err(super::corrupt_store());
             }
             if !retain(&value) {
                 self.clear();
                 return Ok(value);
             }
-            let size = serialized_json_size(&value).ok().and_then(|bytes| {
+            let size = measure(diagnostic, DiagnosticPhase::Size, || {
+                serialized_json_size(&value)
+            })
+            .ok()
+            .and_then(|bytes| {
                 bytes.checked_add(size_of::<T>() + size_of::<ResultProof>() + key.2.len())
             });
+            if let Some(diagnostic) = diagnostic.as_mut() {
+                diagnostic.candidate_bytes = size.unwrap_or(0);
+            }
             if let Some(bytes) = size.filter(|bytes| *bytes <= MAX_RESULT_BYTES) {
                 if !self.results.contains_key(&key) {
-                    self.evict_for(bytes);
+                    self.evict_for(bytes, diagnostic);
                     let last_used = self.next_use();
                     self.results.insert(
                         key,
                         ResultProof {
-                            value: Box::new(value.clone()),
+                            value: Box::new(measure(diagnostic, DiagnosticPhase::Clone, || {
+                                value.clone()
+                            })),
                             accounted_bytes: bytes,
                             last_used,
                         },
@@ -525,6 +735,59 @@ mod tests {
     use std::cell::Cell;
     use std::hash::{BuildHasherDefault, Hasher};
     use std::mem::size_of_val;
+
+    #[test]
+    fn store_diagnostic_drain_is_bounded_destructive_and_independent_of_store_reads() {
+        let store = super::super::WorkflowStore::open(":memory:").unwrap();
+        let sink = Mutex::new(VecDeque::new());
+        for index in 0..MAX_DIAGNOSTIC_RECORDS + 8 {
+            assert!(publish_diagnostic(
+                &sink,
+                format!("workflow_read_cache domain=fixture category=hit index={index}"),
+            ));
+        }
+        let rows = drain_diagnostics(&sink);
+        assert_eq!(rows.len(), MAX_DIAGNOSTIC_RECORDS);
+        assert!(rows.first().unwrap().ends_with("index=8"));
+        assert!(drain_diagnostics(&sink).is_empty());
+        // Other tests may concurrently produce process-wide observations.
+        assert!(store.take_read_cache_diagnostics().len() <= MAX_DIAGNOSTIC_RECORDS);
+        assert_eq!(store.company_event_cursor().unwrap(), 0);
+    }
+
+    #[test]
+    fn diagnostic_consumer_cannot_block_store_work_or_retain_unbounded_records() {
+        let sink = Arc::new(Mutex::new(VecDeque::new()));
+        let held_sink = Arc::clone(&sink);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let consumer = std::thread::spawn(move || {
+            let _records = held_sink.lock().unwrap();
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let published = publish_diagnostic(&sink, "bounded fixture".to_owned());
+        let connection = Connection::open_in_memory().unwrap();
+        let mutation = connection.execute_batch(
+            "CREATE TABLE diagnostic_fixture(value INTEGER); INSERT INTO diagnostic_fixture VALUES(1)",
+        );
+        release_tx.send(()).unwrap();
+        consumer.join().unwrap();
+        assert!(!published);
+        mutation.unwrap();
+        for index in 0..MAX_DIAGNOSTIC_RECORDS + 8 {
+            assert!(publish_diagnostic(&sink, index.to_string()));
+        }
+        let records = sink.lock().unwrap();
+        assert_eq!(records.len(), MAX_DIAGNOSTIC_RECORDS);
+        assert_eq!(records.front().unwrap(), "8");
+        drop(records);
+        assert!(!publish_diagnostic(
+            &sink,
+            "x".repeat(MAX_DIAGNOSTIC_BYTES + 1)
+        ));
+    }
 
     #[derive(Default)]
     struct CollisionHasher;
@@ -570,6 +833,306 @@ mod tests {
         })?;
         snapshot.commit()?;
         Ok(result)
+    }
+
+    fn observed_read<T: Clone + Serialize + Send + 'static>(
+        cache: &mut ReadCache,
+        connection: &Connection,
+        eligible: bool,
+        view: (&'static str, &[u8]),
+        validate: impl FnOnce() -> Result<T, WorkflowError>,
+        enabled: bool,
+    ) -> (Result<T, WorkflowError>, Option<ReadDiagnostic>) {
+        let mut diagnostic = enabled.then(|| ReadDiagnostic::new(cache));
+        let result = cache.read_inner(
+            connection,
+            eligible,
+            view,
+            validate,
+            |_| true,
+            &mut diagnostic,
+        );
+        if result.is_err() {
+            cache.clear();
+        }
+        (result, diagnostic)
+    }
+
+    #[test]
+    fn exact_read_cache_diagnostics_show_36_view_count_pressure_without_behavior_changes() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut observed = ReadCache::default();
+        let mut plain = ReadCache::default();
+        let observed_calls = Cell::new(0);
+        let plain_calls = Cell::new(0);
+        let mut count_evictions = 0;
+        for round in 0..2 {
+            for index in 0..36_usize {
+                let key = index.to_le_bytes();
+                let (actual, diagnostic) = observed_read(
+                    &mut observed,
+                    &snapshot,
+                    true,
+                    ("synthetic-cycle", &key),
+                    || {
+                        observed_calls.set(observed_calls.get() + 1);
+                        value(&snapshot)
+                    },
+                    true,
+                );
+                let (expected, disabled) = observed_read(
+                    &mut plain,
+                    &snapshot,
+                    true,
+                    ("synthetic-cycle", &key),
+                    || {
+                        plain_calls.set(plain_calls.get() + 1);
+                        value(&snapshot)
+                    },
+                    false,
+                );
+                assert!(disabled.is_none());
+                assert_eq!(actual, expected);
+                assert_eq!(actual.unwrap(), b"old");
+                let diagnostic = diagnostic.unwrap();
+                let cold = round == 0 && index == 0;
+                assert_eq!(
+                    diagnostic.category,
+                    if cold { "cold_miss" } else { "warm_view_miss" }
+                );
+                assert_eq!(diagnostic.capture.calls, usize::from(cold));
+                assert_eq!(diagnostic.capture_available, cold);
+                assert_eq!(diagnostic.compare.calls, if cold { 1 } else { 2 });
+                assert_eq!(diagnostic.integrity.calls, 1);
+                assert_eq!(diagnostic.validator.calls, 1);
+                assert_eq!(diagnostic.size.calls, 1);
+                assert_eq!(diagnostic.clone.calls, 1);
+                assert_eq!(diagnostic.byte_evictions, 0);
+                assert_eq!(diagnostic.combined_evictions, 0);
+                count_evictions += diagnostic.count_evictions;
+                assert!(observed.results.len() <= MAX_RESULTS);
+                assert!(observed.result_bytes < MAX_RESULT_BYTES);
+                assert_eq!(observed.result_bytes, plain.result_bytes);
+                assert_eq!(observed.results.len(), plain.results.len());
+                assert_eq!(observed.integrity_checks, plain.integrity_checks);
+            }
+        }
+        assert_eq!(MAX_RESULTS, 32);
+        assert_eq!(count_evictions, 40);
+        assert_eq!(observed_calls.get(), 72);
+        assert_eq!(plain_calls.get(), observed_calls.get());
+        let (result, diagnostic) = observed_read(
+            &mut observed,
+            &snapshot,
+            true,
+            ("synthetic-cycle", &35_usize.to_le_bytes()),
+            || -> Result<Vec<u8>, WorkflowError> { panic!("retained typed hit must not validate") },
+            true,
+        );
+        assert_eq!(result.unwrap(), b"old");
+        let diagnostic = diagnostic.unwrap();
+        assert_eq!(diagnostic.category, "hit");
+        assert_eq!(diagnostic.compare.calls, 1);
+        assert_eq!(diagnostic.integrity.calls, 1);
+        assert_eq!(diagnostic.validator.calls, 0);
+        assert_eq!(diagnostic.capture.calls, 0);
+        assert_eq!(diagnostic.size.calls, 0);
+        assert_eq!(diagnostic.clone.calls, 1);
+    }
+
+    #[test]
+    fn exact_read_cache_diagnostics_separate_byte_and_combined_evictions() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut cache = ReadCache::default();
+        for index in 0..2_usize {
+            let (result, diagnostic) = observed_read(
+                &mut cache,
+                &snapshot,
+                true,
+                ("byte-pressure", &index.to_le_bytes()),
+                || Ok("x".repeat(MAX_RESULT_BYTES / 2)),
+                true,
+            );
+            assert_eq!(result.unwrap().len(), MAX_RESULT_BYTES / 2);
+            let diagnostic = diagnostic.unwrap();
+            assert_eq!(diagnostic.byte_evictions, index);
+            assert_eq!(diagnostic.count_evictions, 0);
+            assert_eq!(diagnostic.combined_evictions, 0);
+            assert_eq!(cache.results.len(), 1);
+            assert!(cache.result_bytes <= MAX_RESULT_BYTES);
+        }
+        cache.clear();
+        for index in 0..MAX_RESULTS {
+            cache
+                .read_keyed(&snapshot, true, "small", &index.to_le_bytes(), || Ok(index))
+                .unwrap();
+        }
+        let (result, diagnostic) = observed_read(
+            &mut cache,
+            &snapshot,
+            true,
+            ("combined-pressure", b"large"),
+            || Ok("y".repeat(MAX_RESULT_BYTES - 1024)),
+            true,
+        );
+        assert_eq!(result.unwrap().len(), MAX_RESULT_BYTES - 1024);
+        let diagnostic = diagnostic.unwrap();
+        assert_eq!(diagnostic.combined_evictions, 1);
+        assert!(diagnostic.byte_evictions > 0);
+        assert_eq!(diagnostic.count_evictions, 0);
+        assert!(cache.results.len() <= MAX_RESULTS);
+        assert!(cache.result_bytes <= MAX_RESULT_BYTES);
+    }
+
+    #[test]
+    fn exact_read_cache_diagnostics_preserve_bypass_failure_and_mutation_checks() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut cache = ReadCache::default();
+        let (result, diagnostic) = observed_read(
+            &mut cache,
+            &snapshot,
+            false,
+            ("fixture", b""),
+            || value(&snapshot),
+            true,
+        );
+        assert_eq!(result.unwrap(), b"old");
+        let diagnostic = diagnostic.unwrap();
+        assert_eq!(diagnostic.category, "outer_transaction_bypass");
+        assert_eq!(diagnostic.validator.calls, 1);
+        assert_eq!(
+            diagnostic.capture.calls + diagnostic.compare.calls + diagnostic.integrity.calls,
+            0
+        );
+        let oversized = vec![b'k'; MAX_KEY_BYTES + 1];
+        let (result, diagnostic) = observed_read(
+            &mut cache,
+            &snapshot,
+            true,
+            ("fixture", &oversized),
+            || value(&snapshot),
+            true,
+        );
+        assert_eq!(result.unwrap(), b"old");
+        assert_eq!(diagnostic.unwrap().category, "oversized_key_bypass");
+        cache
+            .read(&snapshot, true, "fixture", || value(&snapshot))
+            .unwrap();
+        let (result, diagnostic) = observed_read::<Vec<u8>>(
+            &mut cache,
+            &snapshot,
+            true,
+            ("fixture", b"rejected"),
+            || {
+                Err(WorkflowError::new(
+                    crate::WorkflowErrorCode::AuthorityConflict,
+                    false,
+                    "private-rejection",
+                ))
+            },
+            true,
+        );
+        assert_eq!(
+            result.unwrap_err().code,
+            crate::WorkflowErrorCode::AuthorityConflict
+        );
+        let diagnostic = diagnostic.unwrap();
+        assert_eq!(diagnostic.category, "warm_view_miss");
+        assert_eq!(diagnostic.validator.calls, 1);
+        assert_eq!(diagnostic.compare.calls, 1);
+        assert_eq!(diagnostic.integrity.calls, 1);
+        let summary = diagnostic.summary("fixture", false, &cache);
+        assert!(summary.contains("succeeded=false"));
+        assert!(!summary.contains("private-rejection"));
+        assert!(cache.inputs.is_none());
+        assert!(cache.results.is_empty());
+        cache
+            .read(&snapshot, true, "fixture", || value(&snapshot))
+            .unwrap();
+        let (result, diagnostic) = observed_read(
+            &mut cache,
+            &snapshot,
+            true,
+            ("fixture", b"write"),
+            || {
+                snapshot.execute("UPDATE workflow_work_items SET value=X'6e6577'", [])?;
+                value(&snapshot)
+            },
+            true,
+        );
+        assert_eq!(
+            result.unwrap_err().code,
+            crate::WorkflowErrorCode::CorruptStore
+        );
+        let diagnostic = diagnostic.unwrap();
+        assert_eq!(diagnostic.compare.calls, 1);
+        assert_eq!(diagnostic.validator.calls, 1);
+        assert_eq!(diagnostic.integrity.calls, 0);
+        assert!(cache.results.is_empty());
+        drop(snapshot);
+        assert_eq!(value(&connection).unwrap(), b"old");
+        assert!(connection.is_autocommit());
+    }
+
+    #[test]
+    fn exact_read_cache_diagnostics_classify_changed_and_unsupported_inputs_without_payloads() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut cache = ReadCache::default();
+        cache
+            .read(&snapshot, true, "fixture", || value(&snapshot))
+            .unwrap();
+        snapshot
+            .execute("UPDATE workflow_work_items SET value=X'6e6577'", [])
+            .unwrap();
+        let (result, diagnostic) = observed_read(
+            &mut cache,
+            &snapshot,
+            true,
+            ("fixture", b"private-query-key"),
+            || value(&snapshot),
+            true,
+        );
+        assert_eq!(result.unwrap(), b"new");
+        let diagnostic = diagnostic.unwrap();
+        assert_eq!(diagnostic.category, "input_mismatch_miss");
+        assert_eq!(diagnostic.compare.calls, 2);
+        assert_eq!(diagnostic.capture.calls, 1);
+        assert!(diagnostic.capture_available);
+        snapshot
+            .execute_batch("CREATE TABLE unsupported(value BLOB)")
+            .unwrap();
+        let (result, diagnostic) = observed_read(
+            &mut cache,
+            &snapshot,
+            true,
+            ("fixture", b"another-private-key"),
+            || Ok("private-result-value".to_owned()),
+            true,
+        );
+        assert_eq!(result.unwrap(), "private-result-value");
+        let diagnostic = diagnostic.unwrap();
+        assert_eq!(diagnostic.category, "input_mismatch_miss");
+        assert_eq!(diagnostic.capture.calls, 1);
+        assert!(!diagnostic.capture_available);
+        assert_eq!(diagnostic.compare.calls, 1);
+        assert_eq!(diagnostic.validator.calls, 1);
+        assert_eq!(diagnostic.integrity.calls, 0);
+        assert!(cache.inputs.is_none());
+        let summary = diagnostic.summary("fixture", true, &cache);
+        for private in [
+            "private-query-key",
+            "another-private-key",
+            "private-result-value",
+            "private-rejection",
+            "TypeId",
+            "fingerprint",
+        ] {
+            assert!(!summary.contains(private));
+        }
     }
 
     #[test]
@@ -930,6 +1493,16 @@ mod tests {
     }
 
     fn assert_index_only_damage_rejected(new_key: bool, failure: Option<crate::WorkflowErrorCode>) {
+        for enabled in [false, true] {
+            assert_index_only_damage_rejected_with_diagnostics(new_key, failure, enabled);
+        }
+    }
+
+    fn assert_index_only_damage_rejected_with_diagnostics(
+        new_key: bool,
+        failure: Option<crate::WorkflowErrorCode>,
+        enabled: bool,
+    ) {
         use std::io::{Seek, SeekFrom, Write};
 
         let directory = tempfile::tempdir().unwrap();
@@ -977,11 +1550,11 @@ mod tests {
                     }
                     Err(error) => error.into(),
                 };
-            let result = cache.read_keyed::<Vec<u8>>(
+            let (result, diagnostic) = observed_read::<Vec<u8>>(
+                &mut cache,
                 &snapshot,
                 true,
-                "fixture",
-                if new_key { b"uncached" } else { b"" },
+                ("fixture", if new_key { b"uncached" } else { b"" }),
                 || {
                     assert!(new_key, "typed hit must reject before validation");
                     calls.set(calls.get() + 1);
@@ -990,8 +1563,22 @@ mod tests {
                     }
                     value(&snapshot)
                 },
+                enabled,
             );
             assert_eq!(result.unwrap_err(), expected_error);
+            if let Some(diagnostic) = diagnostic {
+                assert_eq!(
+                    diagnostic.category,
+                    if new_key { "warm_view_miss" } else { "hit" }
+                );
+                assert_eq!(diagnostic.integrity.calls, 1);
+                assert_eq!(diagnostic.validator.calls, usize::from(new_key));
+                if new_key && failure.is_none() {
+                    assert!((1..=2).contains(&diagnostic.compare.calls));
+                } else {
+                    assert_eq!(diagnostic.compare.calls, 1);
+                }
+            }
             assert_eq!(cache.integrity_checks, 2);
             assert!(cache.inputs.is_none());
             assert!(cache.results.is_empty());

@@ -1,5 +1,13 @@
 # Changelog
 
+- Move blocking provider preparation, recovery and execution lifetime onto
+  bounded owned worker lanes; coalesce pending preparation per agent while
+  retaining fresh dispatch authority, configured provider concurrency and
+  durable completion ownership. Add opt-in payload-free read-cache diagnostics
+  without changing validation or cache limits. Retain actual worker ownership
+  through shutdown deadlines and provide a self-contained Console tab icon
+  instead of a failing implicit favicon request (#856).
+
 - Own the full company reconciliation worker through startup, panic and shutdown,
   retaining terminal worker failure in readiness. Trace slow and initial scan
   phases without private payloads, and reduce repeated existing-task project and
