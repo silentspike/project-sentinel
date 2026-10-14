@@ -1,5 +1,23 @@
 # Changelog
 
+- Add explicit finite replacement of expired, unadopted, already-reviewed work
+  funding proposals. Bind complete retired-review no-provider-I/O evidence to
+  an atomic new funding receipt and permanent predecessor consumption; preserve
+  spending, lifetime caps, original journals and independent leadership
+  decisions. Separate historical membership from fresh execution eligibility
+  and provide exact immutable-result lookup after an unknown submission (#856).
+  Share one tenant-scoped sealed funding inventory across legacy and replacement
+  receipts while retaining full relation checks and snapshot invalidation.
+
+- Add an explicit, single-use recovery contract for proven undispatched funded
+  leadership reviews, consuming existing review capacity without changing
+  employee spending or decisions. Bind typed recovery membership to preserved
+  history and protected no-I/O evidence, share actual provider admission and
+  live ownership with the operator boundary, and preserve independent Continue
+  or Defer decisions through a dedicated native output schema. Extend bounded
+  opt-in diagnostics and slow health-stage attribution without changing cache
+  limits, validation budgets or readiness authority (#856).
+
 - Move blocking provider preparation, recovery and execution lifetime onto
   bounded owned worker lanes; coalesce pending preparation per agent while
   retaining fresh dispatch authority, configured provider concurrency and

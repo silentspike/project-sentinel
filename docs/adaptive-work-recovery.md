@@ -240,6 +240,108 @@ exceptional review. Leadership can then decide to continue the same work within
 its remaining allowance or to defer it. Neither preparation nor issuance
 implements the task or claims customer acceptance.
 
+## Funded Undispatched Review Recovery
+
+A funded schema-5 review can expire before dispatch while its funding receipt
+still has review capacity and enough remaining lifetime. This case has one
+explicit recovery slot per tenant, session head and funding receipt. It consumes
+the next ordinary funded review ordinal, not an exceptional review or a new
+funding epoch. Issuance, expiry, restart and exact replay cannot reset that slot.
+An adopted funding receipt, an unknown effect or a previously dispatched or
+decided review is ineligible.
+
+The existing operator route accepts
+`GET ?mode=funded_undispatched_retry&source_only=true&project_id=<id>&session_id=<uuid>&retired_review_id=<uuid>`.
+After authentication, current assignment checks and the shared admission fence,
+this returns bounded source metadata, its digest, the server-derived receipt key
+and retired-review identity digests. The response is explicitly
+`unverified_source_metadata`: it issues no authority and does not establish no
+provider I/O. Repeated or invalid source flags, and source flags on POST, reject.
+
+Protected historical deployment and admission-ordering evidence must establish
+the exact release serving that review and its durable dispatch-before-provider-I/O
+contract. Separate retired-review and request evidence must bind the same source,
+context and authority. An absent completion row alone is not sufficient. The
+supported dispositions are `NeverReserved`, `ReleasedBeforeIo` and
+`UndispatchedAtDurableProviderGate`. The release disposition requires an exact
+protected release receipt before review retirement. The durable-gate disposition
+instead proves no external provider I/O through the actual historical serving
+configuration and committed-dispatch boundary; it deliberately asserts neither
+reservation history nor a release timestamp. A legacy reservation may have been
+deleted after a safe release, so absence cannot be promoted into NeverReserved.
+Any live
+request ownership, completion, usage or unresolved history vetoes issuance.
+
+The protected attestation is stored under
+`/etc/sentinel/adaptive-funded-review-recovery/<receipt_key>.json`. Its key comes
+from the server export, not an independently invented client identity. With that
+evidence in place, GET without `source_only` returns the verified request draft.
+POST of those exact bytes atomically persists the receipt, schema-6 review,
+ordinary funding membership and issuance event. The server recomputes source
+bindings and verifies current evidence before writing. The draft clock is sampled
+after verification; funding expiry and original window bounds are never extended.
+
+Preparation, reservation, dispatch and completion retain fresh authority checks.
+The same-function funding and recovery check is not repeated immediately, but
+distinct admission boundaries remain independent. The Gateway uses the dedicated
+schema-6 output format only for the authoritative funded recovery grant; its
+outer dispatch envelope remains version 5. An independent real Continue decision
+alone can authorize employee continuation. Defer remains a valid terminal result.
+Exact receipt replay neither changes that decision nor refreshes expiry.
+
+If the POST response is lost, `GET ?mode=funded_undispatched_retry&receipt_only=true`
+with the exact receipt key, operation ID, project, session and retired-review ID
+reads only the validated historical issuance. Current operator authentication
+and exact stored issuer identity remain mandatory. This lookup precedes fresh
+proof, funding, head and admission checks, so release changes or expiry do not
+hide a committed receipt. Missing, mismatched or corrupt records reject without
+falling through to a new draft; absence never authorizes resubmission. The
+response marks `historical_lookup: true` and creates no new authority or expiry.
+
+## Expired Reviewed Funding Proposals
+
+An expired, unadopted funding proposal that already has leadership reviews is
+neither unused funding nor an adopted zero-call epoch. Replacing it therefore
+uses a distinct explicit operator path on the funding endpoint:
+`mode=expired_unadopted_replacement`. It does not extend the old expiry or reset
+the employee journal, provider usage, review history or lifetime limits.
+
+The server binds the proposal to the original tenant, project, session and old
+funding receipt digest. Every review of that proposal must be retired with no
+decision, dispatch, response, continuation, resolution or adoption. Protected
+historical evidence must prove no provider I/O for each exact review; absence
+of a mutable reservation row is not proof that no reservation ever existed.
+Current live, reserved, unknown, completion and usage evidence veto replacement.
+
+One SQLite transaction issues an ordinary finite funding receipt, permanently
+consumes the old proposal, and records the replacement relation and both events.
+The permanent predecessor key does not change with operation IDs, release,
+reason or time. Capacity derives from current adopted limits and actual spending,
+not the expired proposal's unused capacity. Existing global bounds still apply.
+Consumed epochs remain valid historical members but cannot authorize new review
+selection, claims, completion or adoption. Queued preparation must revalidate
+that eligibility before provider I/O.
+
+`GET` with `source_only=true` exports source metadata and the complete retired
+review inventory; it is not a no-I/O certificate or permission to execute.
+Consumed proposals may be inspected as explicitly historical, noneligible
+metadata after assignment or head changes. Fresh unconsumed exports still
+require current authority and reject live, reserved or unknown request evidence.
+A normal `GET` prepares an explicit new proposal, and `POST` submits its exact
+server-bound fields. Issuance creates no developer window and records no model
+decision. A normal schema-5 leadership review must independently choose Continue
+or Defer before employee work can resume.
+
+If submission has an unknown outcome, `GET` with `receipt_only=true` and the
+exact replacement key, operation ID, project, session and old receipt digest
+reads the immutable result for the original authenticated issuer. It does not
+require fresh issuance evidence and cannot fall through to a new proposal.
+The result includes the original compact submission and issuer binding so the
+operator can compare all inputs, not just an operation ID or expiry.
+Missing or conflicting receipts do not authorize resubmission. Further finite
+replacements require a separate explicit authorization and complete evidence;
+there is no automatic replacement loop.
+
 ## Validation And Dispatch Preparation
 
 Project discovery validates all current and historical subscription allowances
@@ -301,7 +403,7 @@ cursors, changed operation content, bounded DTO/raw identity rejection, missing
 EventStore, unavailable assignee runtime authority, and changed assignment or
 rotated leadership credentials after a durable decision.
 
-These Rust tests have not been run in this lane. ORC must wire both lanes and
-queue focused daemon tests, formatting, and compilation through its authorized
-Rust queue, then perform any required product acceptance separately. Source
-inspection and local static checks are not live customer acceptance evidence.
+Run applicable focused tests, formatting, compilation and integration gates
+through the authorized Cargo Remote workflow, then verify the deployed product
+separately. Source inspection and passing tests are not live customer acceptance
+evidence. Exact commands and revision-bound results belong in the delivery PR.

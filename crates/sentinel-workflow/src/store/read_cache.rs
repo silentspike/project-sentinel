@@ -2,6 +2,7 @@ use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::mem::{align_of, size_of};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,29 @@ const MAX_RESULTS: usize = 32;
 const MAX_KEY_BYTES: usize = 4096;
 const MAX_DIAGNOSTIC_RECORDS: usize = 64;
 const MAX_DIAGNOSTIC_BYTES: usize = 4096;
-static DIAGNOSTICS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+struct DiagnosticSink {
+    records: Mutex<VecDeque<String>>,
+    dropped: AtomicU64,
+}
+
+impl DiagnosticSink {
+    const fn new() -> Self {
+        Self {
+            records: Mutex::new(VecDeque::new()),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    fn record_drop(&self) {
+        let _ = self
+            .dropped
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(1))
+            });
+    }
+}
+
+static DIAGNOSTICS: DiagnosticSink = DiagnosticSink::new();
 const TABLES: &[&str] = &[
     "company_schema_meta",
     "company_entities",
@@ -39,41 +62,63 @@ const TABLES: &[&str] = &[
 const SCHEMA_QUERY: &str =
     "SELECT type,name,tbl_name,rootpage,sql FROM main.sqlite_schema ORDER BY type,name";
 
-fn diagnostics_enabled() -> bool {
+pub(super) fn diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("SENTINEL_WORKFLOW_READ_CACHE_DIAGNOSTICS").is_ok_and(|value| value == "1")
     })
 }
 
-fn publish_diagnostic(sink: &Mutex<VecDeque<String>>, record: String) -> bool {
+fn publish_diagnostic(sink: &DiagnosticSink, record: String) -> bool {
     if record.len() > MAX_DIAGNOSTIC_BYTES {
+        sink.record_drop();
         return false;
     }
-    let Ok(mut records) = sink.try_lock() else {
+    let Ok(mut records) = sink.records.try_lock() else {
+        sink.record_drop();
         return false;
     };
     if records.len() == MAX_DIAGNOSTIC_RECORDS {
         records.pop_front();
+        sink.record_drop();
     }
     records.push_back(record);
     true
 }
 
-pub(super) fn take_diagnostics() -> Vec<String> {
-    drain_diagnostics(&DIAGNOSTICS)
+pub(super) fn publish_record(record: String) {
+    if diagnostics_enabled() {
+        publish_diagnostic(&DIAGNOSTICS, record);
+    }
 }
 
-fn drain_diagnostics(sink: &Mutex<VecDeque<String>>) -> Vec<String> {
-    let Ok(mut records) = sink.try_lock() else {
+pub(super) fn take_diagnostics() -> Vec<String> {
+    take_diagnostics_if(&DIAGNOSTICS, diagnostics_enabled())
+}
+
+fn take_diagnostics_if(sink: &DiagnosticSink, enabled: bool) -> Vec<String> {
+    if !enabled {
+        return Vec::new();
+    }
+    drain_diagnostics(sink)
+}
+
+fn drain_diagnostics(sink: &DiagnosticSink) -> Vec<String> {
+    let Ok(mut records) = sink.records.try_lock() else {
         return Vec::new();
     };
+    let mut dropped = sink.dropped.swap(0, Ordering::Relaxed);
+    if dropped != 0 {
+        if records.len() == MAX_DIAGNOSTIC_RECORDS {
+            records.pop_front();
+            dropped = dropped.saturating_add(1);
+        }
+        records.push_back(format!("workflow_diagnostics dropped_records={dropped}"));
+    }
     records.drain(..).collect()
 }
 
 enum DiagnosticPhase {
-    Capture,
-    Compare,
     Integrity,
     Validator,
     Size,
@@ -84,6 +129,47 @@ enum DiagnosticPhase {
 struct PhaseDiagnostic {
     calls: usize,
     elapsed: Duration,
+    rows: usize,
+    cells: usize,
+    payload_bytes: usize,
+}
+
+fn observe_row(stats: &mut Option<&mut PhaseDiagnostic>) {
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.rows = stats.rows.saturating_add(1);
+    }
+}
+
+fn observe_cell(stats: &mut Option<&mut PhaseDiagnostic>, value: ValueRef<'_>) {
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.cells = stats.cells.saturating_add(1);
+        let bytes = match value {
+            ValueRef::Null => 0,
+            ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
+        };
+        stats.payload_bytes = stats.payload_bytes.saturating_add(bytes);
+    }
+}
+
+fn measure_scan<T>(
+    diagnostic: &mut Option<ReadDiagnostic>,
+    capture: bool,
+    action: impl FnOnce(Option<&mut PhaseDiagnostic>) -> T,
+) -> T {
+    let Some(diagnostic) = diagnostic.as_mut() else {
+        return action(None);
+    };
+    let phase = if capture {
+        &mut diagnostic.capture
+    } else {
+        &mut diagnostic.compare
+    };
+    let started = Instant::now();
+    let result = action(Some(&mut *phase));
+    phase.calls += 1;
+    phase.elapsed += started.elapsed();
+    result
 }
 
 struct ReadDiagnostic {
@@ -128,7 +214,7 @@ impl ReadDiagnostic {
     fn summary(&self, domain: &'static str, succeeded: bool, cache: &ReadCache) -> String {
         // No key, TypeId, payload, fingerprint or error message enters the record.
         format!(
-            "workflow_read_cache domain={} category={} succeeded={} views_before={} views_after={} result_bytes_before={} result_bytes_after={} candidate_bytes={} count_evictions={} byte_evictions={} combined_evictions={} capture_available={} capture_calls={} capture_us={} compare_calls={} compare_us={} integrity_calls={} integrity_us={} validator_calls={} validator_us={} size_calls={} size_us={} clone_calls={} clone_us={} total_us={}",
+            "workflow_read_cache domain={} category={} succeeded={} views_before={} views_after={} result_bytes_before={} result_bytes_after={} candidate_bytes={} count_evictions={} byte_evictions={} combined_evictions={} capture_available={} capture_calls={} capture_us={} compare_calls={} compare_us={} integrity_calls={} integrity_us={} validator_calls={} validator_us={} size_calls={} size_us={} clone_calls={} clone_us={} total_us={} capture_rows={} capture_cells={} capture_payload_bytes={} compare_rows={} compare_cells={} compare_payload_bytes={}",
             domain, self.category, succeeded, self.views_before, cache.results.len(),
             self.bytes_before, cache.result_bytes, self.candidate_bytes,
             self.count_evictions, self.byte_evictions, self.combined_evictions,
@@ -138,6 +224,8 @@ impl ReadDiagnostic {
             self.validator.calls, self.validator.elapsed.as_micros(),
             self.size.calls, self.size.elapsed.as_micros(),
             self.clone.calls, self.clone.elapsed.as_micros(), self.started.elapsed().as_micros(),
+            self.capture.rows, self.capture.cells, self.capture.payload_bytes,
+            self.compare.rows, self.compare.cells, self.compare.payload_bytes,
         )
     }
 }
@@ -153,8 +241,6 @@ fn measure<T>(
     let started = Instant::now();
     let result = action();
     let measured = match phase {
-        DiagnosticPhase::Capture => &mut diagnostic.capture,
-        DiagnosticPhase::Compare => &mut diagnostic.compare,
         DiagnosticPhase::Integrity => &mut diagnostic.integrity,
         DiagnosticPhase::Validator => &mut diagnostic.validator,
         DiagnosticPhase::Size => &mut diagnostic.size,
@@ -261,7 +347,15 @@ struct Inputs {
 }
 
 impl Inputs {
+    #[cfg(test)]
     fn capture(connection: &Connection) -> rusqlite::Result<Option<Self>> {
+        Self::capture_observed(connection, None)
+    }
+
+    fn capture_observed(
+        connection: &Connection,
+        mut stats: Option<&mut PhaseDiagnostic>,
+    ) -> rusqlite::Result<Option<Self>> {
         let temporary: i64 =
             connection.query_row("SELECT COUNT(*) FROM temp.sqlite_schema", [], |row| {
                 row.get(0)
@@ -331,6 +425,7 @@ impl Inputs {
             let mut rows = statement.query([])?;
             let mut values = Vec::new();
             while let Some(row) = rows.next()? {
+                observe_row(&mut stats);
                 count += 1;
                 bytes = bytes.saturating_add(size_of::<Vec<InputValue>>());
                 if count > MAX_INPUT_ROWS || bytes > MAX_INPUT_BYTES {
@@ -342,6 +437,7 @@ impl Inputs {
                 }
                 for column in 0..columns {
                     let value = row.get_ref(column)?;
+                    observe_cell(&mut stats, value);
                     // SQLite TEXT need not be valid UTF-8. Optional proof capture
                     // must never panic on corrupt input or poison the store lock.
                     let owned = match value {
@@ -384,7 +480,16 @@ impl Inputs {
         Ok(Some(Self { tables }))
     }
 
+    #[cfg(test)]
     fn matches(&self, connection: &Connection) -> rusqlite::Result<bool> {
+        self.matches_observed(connection, None)
+    }
+
+    fn matches_observed(
+        &self,
+        connection: &Connection,
+        mut stats: Option<&mut PhaseDiagnostic>,
+    ) -> rusqlite::Result<bool> {
         let temporary: i64 =
             connection.query_row("SELECT COUNT(*) FROM temp.sqlite_schema", [], |row| {
                 row.get(0)
@@ -409,13 +514,17 @@ impl Inputs {
                 let Some(row) = rows.next()? else {
                     return Ok(false);
                 };
+                observe_row(&mut stats);
                 for (column, expected) in expected.iter().enumerate() {
-                    if !expected.matches(row.get_ref(column)?) {
+                    let value = row.get_ref(column)?;
+                    observe_cell(&mut stats, value);
+                    if !expected.matches(value) {
                         return Ok(false);
                     }
                 }
             }
             if rows.next()?.is_some() {
+                observe_row(&mut stats);
                 return Ok(false);
             }
         }
@@ -578,8 +687,8 @@ impl ReadCache {
         let changes: i64 = connection.query_row("SELECT total_changes()", [], |row| row.get(0))?;
         let had_inputs = self.inputs.is_some();
         let same = self.inputs.as_ref().is_some_and(|inputs| {
-            measure(diagnostic, DiagnosticPhase::Compare, || {
-                inputs.matches(connection)
+            measure_scan(diagnostic, false, |stats| {
+                inputs.matches_observed(connection, stats)
             })
             .unwrap_or(false)
         });
@@ -625,8 +734,8 @@ impl ReadCache {
         let candidate = if same {
             None
         } else {
-            let captured = measure(diagnostic, DiagnosticPhase::Capture, || {
-                Inputs::capture(connection)
+            let captured = measure_scan(diagnostic, true, |stats| {
+                Inputs::capture_observed(connection, stats)
             })
             .ok()
             .flatten();
@@ -658,8 +767,8 @@ impl ReadCache {
         }
         let inputs = candidate.as_ref().or(self.inputs.as_ref());
         if inputs.is_some_and(|inputs| {
-            measure(diagnostic, DiagnosticPhase::Compare, || {
-                inputs.matches(connection)
+            measure_scan(diagnostic, false, |stats| {
+                inputs.matches_observed(connection, stats)
             })
             .unwrap_or(false)
         }) {
@@ -737,9 +846,24 @@ mod tests {
     use std::mem::size_of_val;
 
     #[test]
+    fn disabled_diagnostic_drain_is_empty_and_does_not_consume_records_or_loss() {
+        let sink = DiagnosticSink::new();
+        assert!(publish_diagnostic(&sink, "fixture".into()));
+        sink.record_drop();
+        assert!(take_diagnostics_if(&sink, false).is_empty());
+        assert_eq!(sink.records.lock().unwrap().len(), 1);
+        assert_eq!(sink.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            take_diagnostics_if(&sink, true),
+            vec!["fixture", "workflow_diagnostics dropped_records=1"]
+        );
+        assert!(take_diagnostics_if(&sink, false).is_empty());
+    }
+
+    #[test]
     fn store_diagnostic_drain_is_bounded_destructive_and_independent_of_store_reads() {
         let store = super::super::WorkflowStore::open(":memory:").unwrap();
-        let sink = Mutex::new(VecDeque::new());
+        let sink = DiagnosticSink::new();
         for index in 0..MAX_DIAGNOSTIC_RECORDS + 8 {
             assert!(publish_diagnostic(
                 &sink,
@@ -748,7 +872,11 @@ mod tests {
         }
         let rows = drain_diagnostics(&sink);
         assert_eq!(rows.len(), MAX_DIAGNOSTIC_RECORDS);
-        assert!(rows.first().unwrap().ends_with("index=8"));
+        assert!(rows.first().unwrap().ends_with("index=9"));
+        assert_eq!(
+            rows.last().unwrap(),
+            "workflow_diagnostics dropped_records=9"
+        );
         assert!(drain_diagnostics(&sink).is_empty());
         // Other tests may concurrently produce process-wide observations.
         assert!(store.take_read_cache_diagnostics().len() <= MAX_DIAGNOSTIC_RECORDS);
@@ -757,12 +885,12 @@ mod tests {
 
     #[test]
     fn diagnostic_consumer_cannot_block_store_work_or_retain_unbounded_records() {
-        let sink = Arc::new(Mutex::new(VecDeque::new()));
+        let sink = Arc::new(DiagnosticSink::new());
         let held_sink = Arc::clone(&sink);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let consumer = std::thread::spawn(move || {
-            let _records = held_sink.lock().unwrap();
+            let _records = held_sink.records.lock().unwrap();
             entered_tx.send(()).unwrap();
             let _ = release_rx.recv();
         });
@@ -779,7 +907,7 @@ mod tests {
         for index in 0..MAX_DIAGNOSTIC_RECORDS + 8 {
             assert!(publish_diagnostic(&sink, index.to_string()));
         }
-        let records = sink.lock().unwrap();
+        let records = sink.records.lock().unwrap();
         assert_eq!(records.len(), MAX_DIAGNOSTIC_RECORDS);
         assert_eq!(records.front().unwrap(), "8");
         drop(records);
@@ -787,6 +915,67 @@ mod tests {
             &sink,
             "x".repeat(MAX_DIAGNOSTIC_BYTES + 1)
         ));
+        let rows = drain_diagnostics(&sink);
+        assert_eq!(rows.len(), MAX_DIAGNOSTIC_RECORDS);
+        assert_eq!(
+            rows.last().unwrap(),
+            "workflow_diagnostics dropped_records=11"
+        );
+        assert!(drain_diagnostics(&sink).is_empty());
+    }
+
+    #[test]
+    fn diagnostic_loss_survives_contended_drain_and_saturates_without_wrapping() {
+        let sink = DiagnosticSink::new();
+        let held = sink.records.lock().unwrap();
+        assert!(!publish_diagnostic(&sink, "fixture".into()));
+        assert!(drain_diagnostics(&sink).is_empty());
+        assert_eq!(sink.dropped.load(Ordering::Relaxed), 1);
+        drop(held);
+        assert_eq!(
+            drain_diagnostics(&sink),
+            vec!["workflow_diagnostics dropped_records=1"]
+        );
+        sink.dropped.store(u64::MAX, Ordering::Relaxed);
+        sink.record_drop();
+        assert_eq!(sink.dropped.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(
+            drain_diagnostics(&sink),
+            vec![format!("workflow_diagnostics dropped_records={}", u64::MAX)]
+        );
+        assert!(drain_diagnostics(&sink).is_empty());
+    }
+
+    #[test]
+    fn exact_scan_diagnostics_count_existing_fetches_without_changing_proofs() {
+        let connection = database(":memory:");
+        let mut capture = PhaseDiagnostic::default();
+        let inputs = Inputs::capture_observed(&connection, Some(&mut capture))
+            .unwrap()
+            .unwrap();
+        let plain = Inputs::capture(&connection).unwrap().unwrap();
+        let mut compare = PhaseDiagnostic::default();
+        assert!(inputs
+            .matches_observed(&connection, Some(&mut compare))
+            .unwrap());
+        assert!(plain.matches(&connection).unwrap());
+        assert!(capture.rows > 0);
+        assert!(capture.cells > 0);
+        assert!(capture.payload_bytes > 0);
+        assert_eq!(capture.rows, compare.rows);
+        assert_eq!(capture.cells, compare.cells);
+        assert_eq!(capture.payload_bytes, compare.payload_bytes);
+        connection
+            .execute("UPDATE workflow_work_items SET value=X'6e6577'", [])
+            .unwrap();
+        let mut changed = PhaseDiagnostic::default();
+        assert!(!inputs
+            .matches_observed(&connection, Some(&mut changed))
+            .unwrap());
+        assert!(!plain.matches(&connection).unwrap());
+        assert!(changed.rows > 0);
+        assert!(changed.cells > 0);
+        assert!(changed.payload_bytes > 0);
     }
 
     #[derive(Default)]
@@ -1935,6 +2124,160 @@ mod tests {
             .execute_batch("CREATE INDEX index_value ON workflow_work_items(value)")
             .unwrap();
         assert!(!inputs.matches(&connection).unwrap());
+    }
+
+    #[test]
+    fn exact_read_cache_large_input_diagnostics_preserve_parity_and_fetched_accounting() {
+        for fixture in ["repeated", "unique", "metadata"] {
+            let mut connection = database(":memory:");
+            let payload_size = MAX_INPUT_BYTES / 64;
+            match fixture {
+                "repeated" => {
+                    connection
+                        .execute(
+                            "WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n<65)
+                             INSERT INTO workflow_work_items SELECT zeroblob(?1) FROM rows",
+                            [i64::try_from(payload_size).unwrap()],
+                        )
+                        .unwrap();
+                }
+                "unique" => {
+                    let mut payload = vec![0_u8; payload_size];
+                    let mut insert = connection
+                        .prepare("INSERT INTO workflow_work_items VALUES(?1)")
+                        .unwrap();
+                    for index in 0..65 {
+                        payload[0] = index;
+                        insert.execute([payload.as_slice()]).unwrap();
+                    }
+                }
+                "metadata" => {
+                    connection
+                        .execute(
+                            "UPDATE workflow_work_items SET value=zeroblob(?1)",
+                            [i64::try_from(MAX_INPUT_BYTES - 1).unwrap()],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let retained = fixture == "repeated";
+            let expected_count = if fixture == "metadata" { 1_i64 } else { 66 };
+            let snapshot = connection.savepoint().unwrap();
+            // Test-only accounting oracle for this fixture's one schema row.
+            let schema_bytes: usize = snapshot
+                .query_row(SCHEMA_QUERY, [], |row| {
+                    Ok(row.get::<_, String>(0)?.len()
+                        + row.get::<_, String>(1)?.len()
+                        + row.get::<_, String>(2)?.len()
+                        + 8
+                        + row.get::<_, String>(4)?.len())
+                })
+                .unwrap();
+            let mut plain = ReadCache::default();
+            let mut observed = ReadCache::default();
+            let plain_calls = Cell::new(0);
+            let observed_calls = Cell::new(0);
+            for round in 0..3 {
+                let reject = round == 2;
+                let key: &[u8] = if reject { b"rejected" } else { b"count" };
+                let validate = |calls: &Cell<usize>| -> Result<i64, WorkflowError> {
+                    calls.set(calls.get() + 1);
+                    if reject {
+                        return Err(WorkflowError::new(
+                            crate::WorkflowErrorCode::AuthorityConflict,
+                            false,
+                            "rejected large-input view",
+                        ));
+                    }
+                    Ok(snapshot.query_row(
+                        "SELECT COUNT(*) FROM workflow_work_items",
+                        [],
+                        |row| row.get(0),
+                    )?)
+                };
+                let (expected, disabled) = observed_read(
+                    &mut plain,
+                    &snapshot,
+                    true,
+                    ("large-input-parity", key),
+                    || validate(&plain_calls),
+                    false,
+                );
+                let (actual, diagnostic) = observed_read(
+                    &mut observed,
+                    &snapshot,
+                    true,
+                    ("large-input-parity", key),
+                    || validate(&observed_calls),
+                    true,
+                );
+                assert!(disabled.is_none());
+                assert_eq!(actual, expected);
+                if reject {
+                    assert_eq!(
+                        actual.unwrap_err().code,
+                        crate::WorkflowErrorCode::AuthorityConflict
+                    );
+                } else {
+                    assert_eq!(actual.unwrap(), expected_count);
+                }
+                assert_eq!(observed_calls.get(), plain_calls.get());
+                assert_eq!(observed.integrity_checks, plain.integrity_checks);
+                assert_eq!(observed.inputs.is_some(), plain.inputs.is_some());
+                assert_eq!(observed.results.len(), plain.results.len());
+                assert_eq!(observed.result_bytes, plain.result_bytes);
+                assert_eq!(observed.inputs.is_some(), retained && !reject);
+                assert_eq!(observed.results.len(), usize::from(retained && !reject));
+                if retained && !reject {
+                    assert!(observed.result_bytes > 0);
+                } else {
+                    assert_eq!(observed.result_bytes, 0);
+                }
+                let diagnostic = diagnostic.unwrap();
+                let hit = retained && round == 1;
+                assert_eq!(diagnostic.validator.calls, usize::from(!hit));
+                assert_eq!(diagnostic.integrity.calls, usize::from(retained));
+                assert_eq!(diagnostic.size.calls, usize::from(retained && round == 0));
+                assert_eq!(diagnostic.clone.calls, usize::from(retained && !reject));
+                assert_eq!(
+                    diagnostic.capture.calls,
+                    usize::from(!retained || round == 0)
+                );
+                assert_eq!(diagnostic.capture_available, retained && round == 0);
+                assert_eq!(diagnostic.compare.calls, usize::from(retained));
+                for scan in [&diagnostic.capture, &diagnostic.compare] {
+                    if scan.calls == 0 {
+                        assert_eq!((scan.rows, scan.cells, scan.payload_bytes), (0, 0, 0));
+                        continue;
+                    }
+                    assert_eq!(scan.calls, 1);
+                    // Schema: five cells. Data: rowid and blob, including the
+                    // rejecting blob already fetched before capture falls back.
+                    assert_eq!(scan.cells, 5 + 2 * (scan.rows - 1));
+                    let bytes = if fixture == "metadata" {
+                        assert_eq!(scan.rows, 2);
+                        schema_bytes + 8 + MAX_INPUT_BYTES - 1
+                    } else {
+                        if retained {
+                            assert_eq!(scan.rows, 67);
+                        } else {
+                            // The 64th unique MiB crosses the cap once the
+                            // schema, row structures and interner are charged.
+                            assert_eq!(scan.rows, 66);
+                        }
+                        schema_bytes + 8 * (scan.rows - 1) + 3 + payload_size * (scan.rows - 2)
+                    };
+                    assert_eq!(scan.payload_bytes, bytes);
+                    if retained || fixture == "metadata" {
+                        assert!(scan.payload_bytes > MAX_INPUT_BYTES);
+                    }
+                }
+            }
+            assert_eq!(observed_calls.get(), if retained { 2 } else { 3 });
+            assert_eq!(observed.integrity_checks, if retained { 3 } else { 0 });
+            snapshot.commit().unwrap();
+        }
     }
 
     #[test]

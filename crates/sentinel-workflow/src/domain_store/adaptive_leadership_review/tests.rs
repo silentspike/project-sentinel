@@ -272,6 +272,7 @@ fn fixture() -> Fixture {
         expires_at_unix_ms: 200_000,
         subject: None,
         recovery_epoch: None,
+        funded_review_recovery: None,
         resume_policy: None,
         work_funding: None,
     };

@@ -6,11 +6,13 @@
 mod adaptive;
 mod adaptive_accounting_reconsideration;
 mod adaptive_core;
+mod adaptive_funded_review_recovery;
 mod adaptive_leadership_local_adoption;
 mod adaptive_leadership_recovery;
 mod adaptive_leadership_review;
 mod adaptive_resume_policy;
 mod adaptive_work_funding;
+mod adaptive_work_funding_expired_replacement;
 mod admission;
 mod collaboration;
 mod digest;
@@ -27,11 +29,13 @@ mod store;
 pub use adaptive::*;
 pub use adaptive_accounting_reconsideration::*;
 pub use adaptive_core::*;
+pub use adaptive_funded_review_recovery::*;
 pub use adaptive_leadership_local_adoption::*;
 pub use adaptive_leadership_recovery::*;
 pub use adaptive_leadership_review::*;
 pub use adaptive_resume_policy::*;
 pub use adaptive_work_funding::*;
+pub use adaptive_work_funding_expired_replacement::*;
 pub use admission::*;
 pub use collaboration::*;
 pub use domain::*;
@@ -46,8 +50,8 @@ pub use project_planning::*;
 pub use request_provider::*;
 pub use sentinel_common::AgentId;
 pub use store::{
-    AdaptiveHealthReadError, AdaptiveProjectReadSnapshot, ExecutionRevisionV1, WorkflowStore,
-    WORKFLOW_STORE_SCHEMA_VERSION,
+    AdaptiveHealthReadError, AdaptiveProjectReadSnapshot, ExecutionRevisionV1,
+    WorkflowDiagnosticSpan, WorkflowDiagnosticStage, WorkflowStore, WORKFLOW_STORE_SCHEMA_VERSION,
 };
 
 pub const WORKFLOW_SCHEMA_VERSION: u16 = 1;

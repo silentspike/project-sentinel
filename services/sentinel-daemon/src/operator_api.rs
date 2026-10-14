@@ -985,10 +985,13 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                             if let Some(hook) = state.before_workflow_health.as_ref() {
                                 hook();
                             }
+                            let workflow_health = state.workflow_api.health();
+                            let serialization = state.workflow_api.health_serialization_span();
+                            let serialized_workflow_health = serde_json::to_value(workflow_health);
+                            serialization.finish(serialized_workflow_health.is_ok());
                             object.insert(
                                 "company_workflow".to_owned(),
-                                serde_json::to_value(state.workflow_api.health())
-                                    .unwrap_or(serde_json::Value::Null),
+                                serialized_workflow_health.unwrap_or(serde_json::Value::Null),
                             );
                         }
                         json_response(200, payload)

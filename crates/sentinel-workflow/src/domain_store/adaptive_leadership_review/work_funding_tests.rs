@@ -3,6 +3,607 @@ use crate::{AdaptiveWorkFundingEpochV1, AdaptiveWorkFundingLimitsV1, AdaptiveWor
 
 const WINDOW_MS: u64 = 180_000;
 
+mod expired_funding_replacement_tests {
+    include!("work_funding_tests/expired_funding_replacement_tests.rs");
+}
+
+fn recovery_fixture() -> (Fixture, crate::AdaptiveFundedReviewRecoveryRequestV1, u64) {
+    let (mut f, receipt, now) = funded_fixture();
+    let old = issue(&f, now).unwrap();
+    let at = old.grant.expires_at_unix_ms;
+    f.store.expire_adaptive_leadership_review_call(&f.leader, old.grant.review_id, old.version, at).unwrap();
+    let source = f.store.adaptive_funded_review_recovery_source(&funding_operator(&f),
+        &f.grant.project_id, f.grant.session_id, old.grant.review_id, at).unwrap();
+    budget_context(&mut f, at, "explicit-single-pre-io-recovery");
+    bind(&mut f, &receipt, source.ordinal);
+    f.grant.expires_at_unix_ms = at + WINDOW_MS;
+    let request = crate::AdaptiveFundedReviewRecoveryRequestV1 {
+        schema_version: 1, operation_id: Uuid::new_v4(), source_digest: source.canonical_digest().unwrap(),
+        source: Box::new(source),
+        release: crate::AdaptiveRecoveryReleaseV1 {
+            schema_version: 1, source_git_sha: "a".repeat(40),
+            release_manifest_digest: "b".repeat(64), gateway_binary_digest: "c".repeat(64),
+        },
+        proof_digest: "d".repeat(64), reason_ref: "protected-pre-io-expiry".into(),
+        expires_at_unix_ms: f.grant.expires_at_unix_ms,
+    };
+    (f, request, at)
+}
+
+fn recovery_evidence(source: &crate::AdaptiveFundedReviewRecoveryVerificationSourceV1,
+    request: &crate::AdaptiveFundedReviewRecoveryRequestV1)
+    -> Result<crate::AdaptiveFundedReviewRecoveryEvidenceV1, WorkflowError>
+{
+    let old = source.calls.iter().find(|call| call.grant.review_id == source.source.retired_review_id).unwrap();
+    Ok(crate::AdaptiveFundedReviewRecoveryEvidenceV1 {
+        source_digest: source.source.canonical_digest()?, proof_digest: request.proof_digest.clone(),
+        release: request.release.clone(),
+        no_io: crate::AdaptiveFundedReviewNoIoV1::NeverReserved { request_id: old.request_id() },
+        verified_at_unix_ms: old.retired_at_unix_ms.unwrap(),
+    })
+}
+
+#[test]
+fn funded_recovery_durable_gate_evidence_is_exact_immutable_and_normally_charged() {
+    let (f, request, at) = recovery_fixture();
+    let old = f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+        request.source.retired_review_id).unwrap().unwrap();
+    let old_bytes = serde_json::to_vec(&old).unwrap();
+    let original_session = session(&f);
+    let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, |source, request| {
+            let mut evidence = recovery_evidence(source, request)?;
+            evidence.no_io = crate::AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+                request_id: old.request_id(),
+            };
+            Ok(evidence)
+        }).unwrap().1;
+    let payload = serde_json::to_value(&receipt.evidence.no_io).unwrap();
+    assert_eq!(payload, serde_json::json!({
+        "UndispatchedAtDurableProviderGate": {"request_id": old.request_id()}
+    }));
+    assert_eq!(serde_json::from_value::<crate::AdaptiveFundedReviewNoIoV1>(payload).unwrap(),
+        receipt.evidence.no_io);
+    assert_eq!(session(&f), original_session);
+    let retained_old = f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+        old.grant.review_id).unwrap().unwrap();
+    assert_eq!(serde_json::to_vec(&retained_old).unwrap(), old_bytes);
+    assert!(retained_old.dispatch.is_none() && retained_old.decision.is_none()
+        && retained_old.model_response_digest.is_none() && retained_old.continuation.is_none()
+        && retained_old.resolution_event_id.is_none());
+    assert_eq!(receipt.bound_grant().unwrap().work_funding.as_ref().unwrap().binding.ordinal,
+        request.source.ordinal);
+    assert_eq!(f.store.adaptive_leadership_review_calls(&f.leader.tenant_id,
+        f.grant.session_id).unwrap().len(), usize::from(request.source.review_count) + 1);
+    let receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+    let authority = receipt.bound_grant().unwrap();
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert_eq!(serde_json::to_vec(&reopened.adaptive_funded_review_recovery(
+        &f.leader.tenant_id, &receipt.receipt_key).unwrap().unwrap()).unwrap(), receipt_bytes);
+    let (replayed, replay) = reopened.authorize_adaptive_funded_review_recovery(
+        &funding_operator(&f), &request, &f.grant, &f.context, request.expires_at_unix_ms + 1,
+        |_, _| panic!("historical replay must not reverify or manufacture reservation history")).unwrap();
+    assert!(replayed);
+    assert_eq!(serde_json::to_vec(&replay).unwrap(), receipt_bytes);
+    assert_eq!(replay.bound_grant().unwrap(), authority);
+    assert!(reopened.adaptive_funded_review_recovery_source(&funding_operator(&f),
+        &f.grant.project_id, f.grant.session_id, old.grant.review_id, at + 1).is_err());
+}
+
+#[test]
+fn funded_recovery_durable_gate_wrong_request_or_failed_verifier_writes_nothing() {
+    let (f, request, at) = recovery_fixture();
+    let before = rows(&f.store);
+    assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, |source, request| {
+            let mut evidence = recovery_evidence(source, request)?;
+            evidence.no_io = crate::AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+                request_id: "company-leadership-not-the-retired-review".into(),
+            };
+            Ok(evidence)
+        }).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, |_, _| Err(transition())).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(session(&f), f.context.source_session);
+    assert!(f.store.adaptive_funded_review_recovery(&f.leader.tenant_id,
+        &request.source.receipt_key().unwrap()).unwrap().is_none());
+}
+
+#[test]
+fn funded_recovery_durable_gate_serde_is_additive_and_old_verifiers_reject_it() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    enum PriorNoIo {
+        NeverReserved { request_id: String },
+        ReleasedBeforeIo {
+            request_id: String,
+            request_digest: String,
+            release_digest: String,
+            released_at_unix_ms: u64,
+        },
+    }
+    let request_id = "company-leadership-22222222-2222-4222-8222-222222222222";
+    for old in [
+        serde_json::json!({"NeverReserved": {"request_id": request_id}}),
+        serde_json::json!({"ReleasedBeforeIo": {
+            "request_id": request_id, "request_digest": "a".repeat(64),
+            "release_digest": "b".repeat(64), "released_at_unix_ms": 7
+        }}),
+    ] {
+        assert!(serde_json::from_value::<PriorNoIo>(old.clone()).is_ok());
+        let retained = serde_json::from_value::<crate::AdaptiveFundedReviewNoIoV1>(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(retained).unwrap(), old);
+    }
+    let new = serde_json::json!({"UndispatchedAtDurableProviderGate": {"request_id": request_id}});
+    assert!(serde_json::from_value::<crate::AdaptiveFundedReviewNoIoV1>(new.clone()).is_ok());
+    assert!(serde_json::from_value::<PriorNoIo>(new).is_err());
+    for invalid in [
+        serde_json::json!({"UndispatchedAtDurableProviderGate": {}}),
+        serde_json::json!({"UndispatchedAtDurableProviderGate": {
+            "request_id": request_id, "released_at_unix_ms": 7
+        }}),
+        serde_json::json!({"UndispatchedAtDurableProviderGate": {
+            "request_id": request_id, "release_evidence": null
+        }}),
+    ] {
+        assert!(serde_json::from_value::<crate::AdaptiveFundedReviewNoIoV1>(invalid).is_err());
+    }
+}
+
+fn fill_recovery_context_to_exact_limit(f: &mut Fixture) {
+    use crate::{
+        ADAPTIVE_LEADERSHIP_MAX_CATALOG_BYTES, ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES,
+        ADAPTIVE_LEADERSHIP_MAX_SUPPLIED_REFS,
+    };
+    f.context.tool_catalog["context_byte_boundary_padding"] = serde_json::json!("");
+    let catalog_bytes = serde_json::to_vec(&f.context.tool_catalog).unwrap().len();
+    // Leave catalog slack so the overbound test fails only the whole-context cap.
+    let padding_bytes = ADAPTIVE_LEADERSHIP_MAX_CATALOG_BYTES.checked_sub(catalog_bytes + 8).unwrap();
+    f.context.tool_catalog["context_byte_boundary_padding"] = serde_json::json!("x".repeat(padding_bytes));
+    while serde_json::to_vec(&f.context).unwrap().len() < ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES {
+        assert!(f.context.evidence_refs.len() < ADAPTIVE_LEADERSHIP_MAX_SUPPLIED_REFS);
+        let prefix = format!("boundary-byte-ref-{}:", f.context.evidence_refs.len());
+        f.context.evidence_refs.push(format!("{prefix}{}", "y".repeat(4096 - prefix.len())));
+    }
+    let excess = serde_json::to_vec(&f.context).unwrap().len() - ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES;
+    let last = f.context.evidence_refs.last_mut().unwrap();
+    let trim = excess.min(last.len() - 1);
+    last.truncate(last.len() - trim);
+    let remaining = excess - trim;
+    if remaining != 0 {
+        f.context.tool_catalog["context_byte_boundary_padding"] =
+            serde_json::json!("x".repeat(padding_bytes.checked_sub(remaining).unwrap()));
+    }
+    rebind_budget_evidence(f);
+    assert_eq!(serde_json::to_vec(&f.context).unwrap().len(), ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES);
+    assert!(serde_json::to_vec(&f.context.tool_catalog).unwrap().len() < ADAPTIVE_LEADERSHIP_MAX_CATALOG_BYTES);
+    assert!(f.context.evidence_refs.iter().all(|reference| reference.len() <= 4096));
+    f.context.validate(&f.grant).unwrap();
+}
+
+#[test]
+fn funded_recovery_exact_context_byte_limit_survives_reopen_and_historical_replay() {
+    let (mut f, request, at) = recovery_fixture();
+    let request_bytes = serde_json::to_vec(&request).unwrap();
+    fill_recovery_context_to_exact_limit(&mut f);
+    assert_eq!(serde_json::to_vec(&request).unwrap(), request_bytes);
+    let original_session = session(&f);
+    let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, recovery_evidence).unwrap().1;
+    assert_eq!(serde_json::to_vec(&receipt.context).unwrap().len(), crate::ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES);
+    let receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+    let receipt_json = serde_json::to_value(&receipt).unwrap();
+    assert_eq!(receipt_json["request"], serde_json::to_value(&request).unwrap());
+    assert_eq!(std::str::from_utf8(&receipt_bytes).unwrap()
+        .matches("\"context_byte_boundary_padding\"").count(), 1);
+    for member in receipt_json["review_members"].as_array().unwrap() {
+        assert_eq!(member.as_object().unwrap().len(), 3);
+        assert!(member.get("context").is_none());
+        assert!(member.get("tool_catalog").is_none());
+    }
+    let authority = receipt.bound_grant().unwrap();
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    let before = rows(&reopened);
+    let retained = reopened.adaptive_funded_review_recovery(&f.leader.tenant_id,
+        &receipt.receipt_key).unwrap().unwrap();
+    assert_eq!(serde_json::to_vec(&retained).unwrap(), receipt_bytes);
+    let call = reopened.adaptive_leadership_review_call(&f.leader.tenant_id,
+        authority.review_id).unwrap().unwrap();
+    assert_eq!(call.context, retained.context);
+    assert_eq!(call.grant, authority);
+    let historical = reopened.adaptive_funded_review_recovery_historical_verification_source(
+        &f.leader.tenant_id, &receipt.receipt_key).unwrap().unwrap();
+    assert_eq!(historical.source, *request.source);
+    assert_eq!(*historical.session, original_session);
+    let (replayed, replay) = reopened.authorize_adaptive_funded_review_recovery(
+        &funding_operator(&f), &request, &f.grant, &f.context,
+        request.expires_at_unix_ms + 1,
+        |_, _| panic!("immutable replay must not invoke fresh proof verification")).unwrap();
+    assert!(replayed);
+    assert_eq!(serde_json::to_vec(&replay).unwrap(), receipt_bytes);
+    assert_eq!(replay.bound_grant().unwrap(), authority);
+    assert_eq!(replay.issued_at_unix_ms, at);
+    assert_eq!(replay.grant_template.expires_at_unix_ms, request.expires_at_unix_ms);
+    assert_eq!(rows(&reopened), before);
+    assert_eq!(session(&f), original_session);
+}
+
+#[test]
+fn funded_recovery_one_byte_over_context_limit_rejects_before_commit() {
+    let (mut f, request, at) = recovery_fixture();
+    fill_recovery_context_to_exact_limit(&mut f);
+    let mut padding = f.context.tool_catalog["context_byte_boundary_padding"].as_str().unwrap().to_owned();
+    padding.push('x');
+    f.context.tool_catalog["context_byte_boundary_padding"] = serde_json::json!(padding);
+    rebind_budget_evidence(&mut f);
+    assert_eq!(serde_json::to_vec(&f.context).unwrap().len(), crate::ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES + 1);
+    assert!(serde_json::to_vec(&f.context.tool_catalog).unwrap().len() <= crate::ADAPTIVE_LEADERSHIP_MAX_CATALOG_BYTES);
+    f.grant.validate(at).unwrap();
+    assert!(f.context.validate(&f.grant).is_err());
+    let original_session = session(&f);
+    let before = rows(&f.store);
+    assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, recovery_evidence).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(session(&f), original_session);
+    assert!(f.store.adaptive_funded_review_recovery(&f.leader.tenant_id,
+        &request.source.receipt_key().unwrap()).unwrap().is_none());
+    assert_eq!(f.store.adaptive_leadership_review_calls(&f.leader.tenant_id,
+        f.grant.session_id).unwrap().len(), usize::from(request.source.review_count));
+}
+
+#[test]
+fn funded_recovery_is_atomic_normally_charged_and_historical_after_restart() {
+    let (f, request, at) = recovery_fixture();
+    let before = session(&f);
+    assert_eq!(f.store.adaptive_work_funding_for_review(&f.leader.tenant_id, f.grant.session_id, at).unwrap(), None);
+    let (replayed, receipt) = f.store.authorize_adaptive_funded_review_recovery(
+        &funding_operator(&f), &request, &f.grant, &f.context, at, recovery_evidence).unwrap();
+    assert!(!replayed);
+    assert_eq!(session(&f), before);
+    let bound = receipt.bound_grant().unwrap();
+    assert_eq!(bound.schema_version, 6);
+    assert_eq!(bound.work_funding.as_ref().unwrap().binding.ordinal, request.source.ordinal);
+    assert_eq!(bound.work_funding.as_ref().unwrap().binding.receipt_digest, request.source.funding_receipt_digest);
+    assert!(f.store.authorize_adaptive_leadership_review_call(&f.leader, request.operation_id,
+        "forged-generic", &bound, &f.context, at).is_err());
+    let replay = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, request.expires_at_unix_ms + 1,
+        |_, _| panic!("historical replay must not verify fresh authority")).unwrap();
+    assert!(replay.0);
+    assert_eq!(replay.1, receipt);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert_eq!(reopened.adaptive_funded_review_recovery(&f.leader.tenant_id, &receipt.receipt_key).unwrap(), Some(receipt));
+}
+
+#[test]
+fn funded_recovery_real_continue_and_defer_preserve_spend_and_terminal_consumption() {
+    for do_continue in [false, true] {
+        let (f, request, at) = recovery_fixture();
+        let old_session = session(&f);
+        let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+            &request, &f.grant, &f.context, at, recovery_evidence).unwrap().1;
+        let call = f.store.adaptive_leadership_review_call(&f.leader.tenant_id, receipt.grant_template.review_id).unwrap().unwrap();
+        let dispatched = f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), at + 1).unwrap();
+        let result = if do_continue { continued(&dispatched, at + 2, 1) } else { defer(&dispatched) };
+        let completed = f.store.complete_adaptive_leadership_review_call(&f.leader, &result, at + 2).unwrap();
+        assert_eq!(completed.decision, Some(result.decision));
+        let current = session(&f);
+        assert_eq!(current.model_calls, old_session.model_calls);
+        assert_eq!(current.tool_calls, old_session.tool_calls);
+        if do_continue { assert_eq!(current.version, old_session.version + 1); }
+        else { assert_eq!(current, old_session); }
+        assert_eq!(f.store.adaptive_funded_review_recovery(&f.leader.tenant_id, &receipt.receipt_key).unwrap(), Some(receipt.clone()));
+        assert!(f.store.adaptive_funded_review_recovery_source(&funding_operator(&f),
+            &f.grant.project_id, f.grant.session_id, request.source.retired_review_id, at + 3).is_err());
+        let mut changed = request.clone();
+        changed.operation_id = Uuid::new_v4();
+        assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+            &changed, &f.grant, &f.context, at + 3, recovery_evidence).is_err());
+    }
+}
+
+#[test]
+fn funded_recovery_rejects_stale_source_and_verifier_failure_without_writes() {
+    let (f, request, at) = recovery_fixture();
+    let before = rows(&f.store);
+    let error = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, |_, _| Err(transition()));
+    assert!(error.is_err());
+    assert_eq!(rows(&f.store), before);
+    let mut changed = request.clone();
+    changed.source.session_head_digest = "f".repeat(64);
+    assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &changed, &f.grant, &f.context, at, |_, _| panic!("stale source reached verifier")).is_err());
+    assert_eq!(rows(&f.store), before);
+    change_project(&f, at + 1);
+    let before = rows(&f.store);
+    assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at + 1, |_, _| panic!("changed authority reached verifier")).is_err());
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn funded_recovery_event_failure_rolls_back_receipt_review_and_membership() {
+    let (f, request, at) = recovery_fixture();
+    let external = Connection::open(&f.path).unwrap();
+    external.execute_batch("CREATE TRIGGER reject_recovery_review BEFORE INSERT ON company_events
+        WHEN NEW.event_type='adaptive_leadership_review_authorized'
+        BEGIN SELECT RAISE(ABORT,'reject retry'); END;").unwrap();
+    let before = rows(&f.store);
+    assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, recovery_evidence).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(f.store.adaptive_funded_review_recovery(&f.leader.tenant_id, &request.source.receipt_key().unwrap()).unwrap(), None);
+    external.execute_batch("DROP TRIGGER reject_recovery_review").unwrap();
+    assert!(!f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, recovery_evidence).unwrap().0);
+}
+
+#[test]
+fn funded_recovery_concurrent_issuance_commits_one_immutable_slot() {
+    let (f, request, at) = recovery_fixture();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let store = WorkflowStore::open(&f.path).unwrap();
+        let request = request.clone();
+        let grant = f.grant.clone();
+        let context = f.context.clone();
+        let operator = funding_operator(&f);
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.authorize_adaptive_funded_review_recovery(&operator, &request,
+                &grant, &context, at, recovery_evidence).unwrap()
+        }));
+    }
+    let results: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|result| !result.0).count(), 1);
+    assert_eq!(results[0].1, results[1].1);
+    assert_eq!(f.store.adaptive_leadership_review_calls(&f.leader.tenant_id,
+        f.grant.session_id).unwrap().len(), usize::from(request.source.review_count) + 1);
+}
+
+#[test]
+fn funded_recovery_expired_retry_remains_permanently_consumed() {
+    let (f, request, at) = recovery_fixture();
+    let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, recovery_evidence).unwrap().1;
+    let call = f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+        receipt.grant_template.review_id).unwrap().unwrap();
+    f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+        call.version, call.grant.expires_at_unix_ms).unwrap();
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert!(reopened.adaptive_funded_review_recovery_source(&funding_operator(&f),
+        &f.grant.project_id, f.grant.session_id, call.grant.review_id,
+        call.grant.expires_at_unix_ms + 1).is_err());
+    assert!(reopened.adaptive_funded_review_recovery_source(&funding_operator(&f),
+        &f.grant.project_id, f.grant.session_id, request.source.retired_review_id,
+        call.grant.expires_at_unix_ms + 1).is_err());
+    assert_eq!(reopened.adaptive_funded_review_recovery(&f.leader.tenant_id,
+        &receipt.receipt_key).unwrap(), Some(receipt));
+}
+
+#[test]
+fn funded_recovery_schema6_rejects_untyped_legacy_and_action_authority() {
+    let (f, request, at) = recovery_fixture();
+    let encoded = serde_json::to_value(&f.grant).unwrap();
+    assert!(encoded.get("funded_review_recovery").is_none());
+    assert_eq!(serde_json::from_value::<AdaptiveLeadershipReviewGrantV1>(encoded).unwrap(), f.grant);
+    let mut missing = f.grant.clone();
+    missing.schema_version = 6;
+    assert!(missing.validate(at).is_err());
+    let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, recovery_evidence).unwrap().1;
+    let bound = receipt.bound_grant().unwrap();
+    for version in 1..=5 {
+        let mut wrong = bound.clone();
+        wrong.schema_version = version;
+        assert!(wrong.validate(at).is_err());
+    }
+    let mut no_funding = bound.clone();
+    no_funding.work_funding = None;
+    assert!(no_funding.validate(at).is_err());
+    let call = f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+        bound.review_id).unwrap().unwrap();
+    let dispatched = f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), at + 1).unwrap();
+    let mut result = defer(&dispatched);
+    result.decision.decision = AdaptiveLeadershipReviewDecisionKindV1::KeepUnknown {
+        rationale: "not funded recovery authority".into(), evidence_refs: f.context.evidence_refs.clone(),
+    };
+    let before = rows(&f.store);
+    assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, at + 2).is_err());
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn funded_recovery_rejects_expired_margin_and_corrupt_dedicated_membership() {
+    let (f, request, at) = recovery_fixture();
+    let before = rows(&f.store);
+    assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, |source, request| {
+            let mut evidence = recovery_evidence(source, request)?;
+            evidence.verified_at_unix_ms = request.expires_at_unix_ms;
+            Ok(evidence)
+        }).is_err());
+    assert_eq!(rows(&f.store), before);
+    let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, recovery_evidence).unwrap().1;
+    let external = Connection::open(&f.path).unwrap();
+    external.execute("DELETE FROM company_events WHERE event_type='adaptive_funded_review_recovery_issued'", []).unwrap();
+    assert!(f.store.adaptive_funded_review_recovery(&f.leader.tenant_id, &receipt.receipt_key).is_err());
+    assert!(f.store.adaptive_leadership_review_call(&f.leader.tenant_id, receipt.grant_template.review_id).is_err());
+    assert!(f.store.claim_adaptive_leadership_review_call(&f.leader,
+        &ClaimAdaptiveLeadershipReviewCallV1 {
+            review_id: receipt.grant_template.review_id, allowance_id: format!("{}-allowance", receipt.receipt_key),
+            request_id: "not-an-authorized-request".into(), request_digest: "a".repeat(64), context_digest: "b".repeat(64),
+        }, at + 1).is_err());
+}
+
+#[test]
+fn funded_recovery_dispatched_deferred_adopted_and_live_sources_are_denied() {
+    for state in ["live", "dispatched", "defer", "continue"] {
+        let (f, _, now) = funded_fixture();
+        let call = if state == "live" { issue(&f, now).unwrap() } else { dispatch(&f, now) };
+        match state {
+            "dispatched" => {
+                f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+                    call.version, call.grant.expires_at_unix_ms).unwrap();
+            }
+            "defer" => {
+                f.store.complete_adaptive_leadership_review_call(&f.leader, &defer(&call), now + 2).unwrap();
+            }
+            "continue" => {
+                f.store.complete_adaptive_leadership_review_call(&f.leader, &continued(&call, now + 2, 1), now + 2).unwrap();
+            }
+            _ => {}
+        }
+        let before = rows(&f.store);
+        assert!(f.store.adaptive_funded_review_recovery_source(&funding_operator(&f),
+            &f.grant.project_id, f.grant.session_id, call.grant.review_id,
+            call.grant.expires_at_unix_ms).is_err(), "accepted {state}");
+        assert_eq!(rows(&f.store), before);
+    }
+}
+
+#[test]
+fn funded_recovery_has_no_review_cap_exception_or_funding_expiry_extension() {
+    let mut f = budget_fixture(2);
+    let now = CONTINUATION_AT + 7;
+    let operator = funding_operator(&f);
+    let request = f.store.adaptive_work_funding_draft(&operator, &f.grant.project_id,
+        f.grant.session_id, Uuid::new_v4(), "one-normal-review", AdaptiveWorkFundingLimitsV1 {
+            additional_model_calls: 6, additional_tool_calls: 6, additional_reviews: 1,
+            additional_windows: 1, max_window_ms: WINDOW_MS,
+            max_call_duration_ms: f.context.source_session.grant.max_call_duration_ms,
+            dispatch_margin_ms: crate::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+            expires_at_unix_ms: now + 3_600_000,
+        }, now).unwrap();
+    let funding = f.store.authorize_adaptive_work_funding(&operator, &request, now).unwrap().1;
+    bind(&mut f, &funding, funding.request.source.resume_source.base_review_count + 1);
+    let call = issue(&f, now).unwrap();
+    f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+        call.version, call.grant.expires_at_unix_ms).unwrap();
+    let before = rows(&f.store);
+    for at in [call.grant.expires_at_unix_ms, funding.request.limits.expires_at_unix_ms] {
+        assert!(f.store.adaptive_funded_review_recovery_source(&operator, &f.grant.project_id,
+            f.grant.session_id, call.grant.review_id, at).is_err());
+    }
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn funded_recovery_http_metadata_is_small_and_rejects_full_snapshot_fields() {
+    let (_, request, _) = recovery_fixture();
+    let body = serde_json::to_value(&request).unwrap();
+    assert!(serde_json::to_vec(&request).unwrap().len() < 4096);
+    assert!(serde_json::to_vec(&request.source).unwrap().len() < 2048);
+    for field in ["project", "session", "calls", "funding"] {
+        assert!(body["source"].get(field).is_none());
+        let mut injected = body.clone();
+        injected["source"][field] = serde_json::json!({"payload": "x".repeat(256 * 1024)});
+        assert!(serde_json::from_value::<crate::AdaptiveFundedReviewRecoveryRequestV1>(injected).is_err());
+    }
+}
+
+#[test]
+fn funded_recovery_compact_metadata_is_recomputed_before_verifier() {
+    let (f, request, at) = recovery_fixture();
+    let before = rows(&f.store);
+    for field in ["funding_receipt_digest", "review_history_digest", "session_digest", "project_digest"] {
+        let mut body = serde_json::to_value(&request).unwrap();
+        body["source"][field] = serde_json::json!("f".repeat(64));
+        let mut changed: crate::AdaptiveFundedReviewRecoveryRequestV1 = serde_json::from_value(body).unwrap();
+        changed.source_digest = changed.source.canonical_digest().unwrap();
+        assert!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+            &changed, &f.grant, &f.context, at,
+            |_, _| panic!("client metadata reached verifier without fresh equality")).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+}
+
+#[test]
+fn funded_recovery_receipt_stores_only_exact_history_member_references() {
+    let (f, request, at) = recovery_fixture();
+    let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, recovery_evidence).unwrap().1;
+    let body = serde_json::to_value(&receipt).unwrap();
+    assert_eq!(receipt.review_members.len(), usize::from(request.source.review_count));
+    for member in body["review_members"].as_array().unwrap() {
+        assert_eq!(member.as_object().unwrap().len(), 3);
+        assert!(member.get("context").is_none());
+        assert!(member.get("grant").is_none());
+    }
+    assert!(body["request"]["source"].get("calls").is_none());
+    let external = Connection::open(&f.path).unwrap();
+    external.execute("DELETE FROM company_entities WHERE entity_kind='adaptive_leadership_review_call'
+        AND entity_id=?1", [request.source.retired_review_id.to_string()]).unwrap();
+    assert!(f.store.adaptive_funded_review_recovery(&f.leader.tenant_id, &receipt.receipt_key).is_err());
+}
+
+#[test]
+fn funded_recovery_fresh_rust_getter_returns_validated_unconsumed_snapshots() {
+    let (f, request, at) = recovery_fixture();
+    let before = rows(&f.store);
+    assert!(f.store.adaptive_funded_review_recovery_historical_verification_source(
+        &f.leader.tenant_id, &request.source.receipt_key().unwrap()).unwrap().is_none());
+    let source = f.store.adaptive_funded_review_recovery_verification_source(&funding_operator(&f),
+        &f.grant.project_id, f.grant.session_id, request.source.retired_review_id, at).unwrap();
+    assert_eq!(source.source, *request.source);
+    assert_eq!(*source.session, session(&f));
+    assert_eq!(source.calls.len(), usize::from(request.source.review_count));
+    assert_eq!(source.funding.receipt_digest().unwrap(), request.source.funding_receipt_digest);
+    assert_eq!(rows(&f.store), before);
+    f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &request, &f.grant, &f.context, at, recovery_evidence).unwrap();
+    assert!(f.store.adaptive_funded_review_recovery_verification_source(&funding_operator(&f),
+        &f.grant.project_id, f.grant.session_id, request.source.retired_review_id, at).is_err());
+}
+
+#[test]
+fn funded_recovery_historical_rust_getter_preserves_exact_snapshot_after_adoption_or_expiry() {
+    for adopt in [false, true] {
+        let (f, request, at) = recovery_fixture();
+        let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+            &request, &f.grant, &f.context, at, recovery_evidence).unwrap().1;
+        let call = f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+            receipt.grant_template.review_id).unwrap().unwrap();
+        if adopt {
+            let dispatched = f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), at + 1).unwrap();
+            f.store.complete_adaptive_leadership_review_call(&f.leader,
+                &continued(&dispatched, at + 2, 1), at + 2).unwrap();
+        } else {
+            f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+                call.version, call.grant.expires_at_unix_ms).unwrap();
+        }
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        let before = rows(&reopened);
+        let historical = reopened.adaptive_funded_review_recovery_historical_verification_source(
+            &f.leader.tenant_id, &receipt.receipt_key).unwrap().unwrap();
+        assert_eq!(historical.source, *request.source);
+        assert_eq!(*historical.project, receipt.context.source_project);
+        assert_eq!(*historical.session, receipt.context.source_session);
+        assert_eq!(historical.calls.len(), receipt.review_members.len());
+        for (call, member) in historical.calls.iter().zip(&receipt.review_members) {
+            assert_eq!(call.grant.review_id, member.review_id);
+            assert_eq!(call.version, member.version);
+            assert_eq!(canonical_sha256("sentinel.workflow.adaptive-leadership-call.v1", call).unwrap(), member.digest);
+        }
+        assert_eq!(rows(&reopened), before);
+        assert!(reopened.adaptive_funded_review_recovery_verification_source(&funding_operator(&f),
+            &f.grant.project_id, f.grant.session_id, request.source.retired_review_id,
+            call.grant.expires_at_unix_ms + 1).is_err());
+        let external = Connection::open(&f.path).unwrap();
+        external.execute("DELETE FROM company_events WHERE event_type='adaptive_funded_review_recovery_issued'", []).unwrap();
+        assert!(reopened.adaptive_funded_review_recovery_historical_verification_source(
+            &f.leader.tenant_id, &receipt.receipt_key).is_err());
+    }
+}
+
 pub(super) fn fund(f: &Fixture, now: u64) -> AdaptiveWorkFundingReceiptV1 {
     fund_with_windows(f, now, 3)
 }

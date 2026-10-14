@@ -603,7 +603,7 @@ fn require_budget_source_uncached(
         return Ok(());
     };
     let source = &context.source_session;
-    if !matches!(grant.schema_version, 3..=5)
+    if !matches!(grant.schema_version, 3..=6)
         || (grant.schema_version == 3 && grant.recovery_epoch.is_some())
         || (grant.schema_version == 4
             && grant
@@ -679,7 +679,7 @@ fn require_planning_policy(
         || planning.grant.catalog_digest != call.grant.catalog_digest
         || planning.grant.token_policy != call.grant.token_policy
         || call.grant.max_duration_ms > planning.grant.max_duration_ms
-        || (matches!(call.grant.schema_version, 2..=5)
+        || (matches!(call.grant.schema_version, 2..=6)
             && (call.context.source_session.grant.provider != planning.grant.provider
                 || call.context.source_session.grant.model != planning.grant.model
                 || call.context.source_session.grant.catalog_digest
@@ -724,7 +724,7 @@ fn validate_continuation(
     {
         return Err(unauthorized());
     }
-    if matches!(call.grant.schema_version, 4 | 5) && authorization.local_adoption.is_some() {
+    if matches!(call.grant.schema_version, 4..=6) && authorization.local_adoption.is_some() {
         return Err(unauthorized());
     }
     if let Some(adoption) = &authorization.local_adoption {
@@ -801,7 +801,7 @@ fn validate_continuation(
         || authorization.source != expected_source
         || authorization.additional_model_calls != *additional_model_calls
         || (call.grant.resume_policy.is_none()
-            && !matches!(call.grant.schema_version, 3..=5)
+            && !matches!(call.grant.schema_version, 3..=6)
             && *additional_model_calls > current.grant.max_calls)
         || *additional_model_calls > model_ceiling
         || source
@@ -832,9 +832,9 @@ fn validate_continuation(
         || (authorization.local_adoption.is_none()
             && authorization.issued_at_ms >= call.grant.expires_at_unix_ms)
         || (call.grant.resume_policy.is_none()
-            && !matches!(call.grant.schema_version, 3..=5)
+            && !matches!(call.grant.schema_version, 3..=6)
             && authorization.issued_at_ms < source.active_deadline_ms())
-        || (matches!(call.grant.schema_version, 3..=5)
+        || (matches!(call.grant.schema_version, 3..=6)
             && (authorization.issued_at_ms < source.updated_at_ms
                 || !matches!(source.cursor, AdaptiveCursorV1::ReadyForModel)
                 || !source.model_window_exhausted_at(authorization.issued_at_ms)))
@@ -879,7 +879,7 @@ fn require_subject_time(
     if let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) =
         &call.grant.subject
     {
-        if !matches!(call.grant.schema_version, 3..=5)
+        if !matches!(call.grant.schema_version, 3..=6)
             || now_ms < budget.observed_at_ms
             || now_ms < call.context.source_session.updated_at_ms
             || !call
@@ -935,7 +935,7 @@ fn commit_continuation_allowance(
     )?;
     if prior.allowance_id == allowance.allowance_id
         || (call.grant.resume_policy.is_none()
-            && !matches!(call.grant.schema_version, 3..=5)
+            && !matches!(call.grant.schema_version, 3..=6)
             && allowance.grant.max_calls > prior.grant.max_calls)
         || (call.grant.resume_policy.is_none()
             && call.grant.work_funding.is_none()
@@ -1037,7 +1037,7 @@ fn require_adaptive_allowance_source(
         .subscription_call
         .as_ref()
         .ok_or_else(unauthorized)?;
-    if !matches!(call.grant.schema_version, 2..=5)
+    if !matches!(call.grant.schema_version, 2..=6)
         || prior.dispatch.is_some()
         || prior.allowance_id == call.allowance_id
         || prior.grant.work_item_id != call.grant.work_item_id
@@ -1096,7 +1096,7 @@ pub(super) fn validate_governed_allowance_receipt(
     receipt.validate_entity()?;
     let authorization = receipt.continuation.as_ref().ok_or_else(unauthorized)?;
     if receipt.version != 3
-        || !matches!(receipt.grant.schema_version, 2..=5)
+        || !matches!(receipt.grant.schema_version, 2..=6)
         || receipt.grant.subject.is_none()
         || receipt.retired_at_unix_ms.is_some()
         || *allowance
@@ -1340,7 +1340,7 @@ impl CompanyEntity for ExpiredAdaptiveContinuationRetirementV1 {
         self.review.validate_entity()?;
         let authorization = self.result.continuation.as_ref().ok_or_else(corrupt)?;
         if self.schema_version != 1
-            || !matches!(self.review.grant.schema_version, 2..=5)
+            || !matches!(self.review.grant.schema_version, 2..=6)
             || self.review.version != 4
             || self.review.retired_at_unix_ms.is_none()
             || self.review.decision.is_some()
@@ -1452,7 +1452,7 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
             || self.operation_id.is_nil()
             || self.allowance_id == self.grant.review_id.to_string()
             || self.allowance_id == self.context.source_session.grant.provider_allowance_id
-            || (matches!(self.grant.schema_version, 2..=5)
+            || (matches!(self.grant.schema_version, 2..=6)
                 && self.allowance_id == self.context.source_session.active_provider_allowance_id())
             || self.created_at_unix_ms == 0
             || self.grant_issued_at_unix_ms < self.created_at_unix_ms
@@ -1786,7 +1786,7 @@ impl WorkflowStore {
         validate_identifier(allowance_id)?;
         if leader != &grant.leadership_principal
             || operation_id.is_nil()
-            || grant.schema_version == 4
+            || matches!(grant.schema_version, 4 | 6)
         {
             return Err(unauthorized());
         }
@@ -1817,7 +1817,7 @@ impl WorkflowStore {
                 return Ok(prior);
             }
             if prior.dispatch.is_some()
-                || matches!(prior.grant.schema_version, 2..=5)
+                || matches!(prior.grant.schema_version, 2..=6)
                 || prior.decision.is_some()
                 || prior.retired_at_unix_ms.is_some()
                 || now_ms < prior.grant.expires_at_unix_ms
@@ -1903,6 +1903,13 @@ impl WorkflowStore {
         };
         if let Some(epoch) = &grant.work_funding {
             epoch.validate()?;
+            if grant.schema_version == 6 {
+                super::adaptive_funded_review_recovery::require_membership(
+                    transaction,
+                    grant,
+                    Some(&normalized_context),
+                )?;
+            }
             let binding = &epoch.binding;
             let source = &context.source_session;
             // Completed recovery and extension history remains part of the
@@ -1919,15 +1926,17 @@ impl WorkflowStore {
                     .as_ref()
                     .map_or(0, |state| state.authorizations.len())
                     >= usize::from(binding.limits.total_window_ceiling)
-                || existing.iter().any(|call| {
-                    call.grant
-                        .work_funding
-                        .as_ref()
-                        .is_some_and(|prior| prior.same_epoch(epoch))
-                        && (call.grant.expected_session_version >= grant.expected_session_version
-                            || (source.model_calls <= call.context.source_session.model_calls
-                                && source.tool_calls <= call.context.source_session.tool_calls))
-                })
+                || (grant.schema_version != 6
+                    && existing.iter().any(|call| {
+                        call.grant
+                            .work_funding
+                            .as_ref()
+                            .is_some_and(|prior| prior.same_epoch(epoch))
+                            && (call.grant.expected_session_version
+                                >= grant.expected_session_version
+                                || (source.model_calls <= call.context.source_session.model_calls
+                                    && source.tool_calls <= call.context.source_session.tool_calls))
+                    }))
             {
                 return Err(transition());
             }
@@ -2194,7 +2203,7 @@ impl WorkflowStore {
             &result.review_id.to_string(),
         )?
         .ok_or_else(not_found)?;
-        if leader != &call.grant.leadership_principal || !matches!(call.grant.schema_version, 2..=5)
+        if leader != &call.grant.leadership_principal || !matches!(call.grant.schema_version, 2..=6)
         {
             return Err(unauthorized());
         }
@@ -2371,7 +2380,7 @@ impl WorkflowStore {
             return Err(unauthorized());
         }
         if explicit_expiry
-            && (!matches!(call.grant.schema_version, 2..=5)
+            && (!matches!(call.grant.schema_version, 2..=6)
                 || call.grant.subject.is_none()
                 || now_ms < call.grant.expires_at_unix_ms)
         {
@@ -2422,7 +2431,7 @@ impl WorkflowStore {
         {
             return Err(transition());
         }
-        let expired_subject = matches!(call.grant.schema_version, 2..=5)
+        let expired_subject = matches!(call.grant.schema_version, 2..=6)
             && call.grant.subject.is_some()
             && (call.dispatch.is_none() || explicit_expiry)
             && now_ms >= call.grant.expires_at_unix_ms;
@@ -2560,6 +2569,9 @@ impl WorkflowStore {
             }
             return Ok(call);
         }
+        if let Some(epoch) = &call.grant.work_funding {
+            super::adaptive_work_funding::require_fresh_epoch_eligibility(&transaction, epoch)?;
+        }
         if let Some(event) = audit {
             require_local_adoption_audit(&call, result, event, now_ms)?;
         }
@@ -2589,7 +2601,7 @@ impl WorkflowStore {
             )?;
         }
         recovery::require_epoch_completion(&transaction, &call, result)?;
-        if matches!(call.grant.schema_version, 2..=5)
+        if matches!(call.grant.schema_version, 2..=6)
             && result.continuation.is_none()
             && now_ms >= call.grant.expires_at_unix_ms
         {
