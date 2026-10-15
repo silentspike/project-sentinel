@@ -141,6 +141,130 @@ fn replacement_history_cut_reuses_one_scan_without_crossing_historical_boundarie
 }
 
 #[test]
+fn replacement_history_cut_shares_cold_and_warm_event_owners_with_single_raw_charge() {
+    let (f, old, now) = expired_fixture(true);
+    let request = draft(&f, &old, now);
+    f.store.authorize_adaptive_work_funding_expired_replacement(
+        &funding_operator(&f), &request, now, evidence).unwrap();
+    let calls = f.store.adaptive_leadership_review_calls(&f.leader.tenant_id,
+        f.grant.session_id).unwrap();
+    let expected = (calls.len(), canonical_sha256(
+        "sentinel.workflow.adaptive-resume-review-history.v1", &calls).unwrap());
+    let connection = f.store.connection.lock().unwrap();
+    let sequence: i64 = connection.query_row(
+        "SELECT sequence FROM company_events WHERE event_type='adaptive_work_funding_expired_replacement_issued'",
+        [], |row| row.get(0)).unwrap();
+    let mut statement = connection.prepare(
+        "SELECT sequence,length(payload) FROM company_events WHERE tenant_id=?1
+         AND event_type GLOB 'adaptive_leadership_review_*' AND sequence<?2 ORDER BY sequence").unwrap();
+    let events = statement.query_map(params![f.leader.tenant_id.0, sequence],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .unwrap().collect::<Result<Vec<_>, _>>().unwrap().into_iter()
+        .map(|(sequence, bytes)| (u64::try_from(sequence).unwrap(), usize::try_from(bytes).unwrap()))
+        .collect::<Vec<_>>();
+    assert!(!events.is_empty());
+    let payload_bytes: usize = events.iter().map(|(_, bytes)| bytes).sum();
+    let cut = crate::domain_store::adaptive_work_funding::historical_review_cut;
+    let mut previous_totals = None;
+    for owners_first in [false, true] {
+        let (result, failures) = validation_scope::with_validation_failures(|| {
+            validation_scope::with_scope(&connection, || {
+                let mut copies = 0;
+                if owners_first {
+                    for (sequence, _) in &events {
+                        crate::domain_store::company_event_shape_with_observer(
+                            &connection, *sequence, |_| copies += 1)?.unwrap();
+                    }
+                    assert_eq!(copies, events.len());
+                }
+                assert_eq!(cut(&connection, &f.leader.tenant_id, f.grant.session_id, sequence)?, expected);
+                assert_eq!(validation_scope::validations("event-shape"), events.len());
+                let before = copies;
+                for (sequence, _) in &events {
+                    crate::domain_store::company_event_shape_with_observer(
+                        &connection, *sequence, |_| copies += 1)?.unwrap();
+                }
+                assert_eq!(copies, before);
+                assert_eq!(cut(&connection, &f.leader.tenant_id, f.grant.session_id, sequence)?, expected);
+                assert_eq!(validation_scope::validations("event-shape"), events.len());
+                assert_eq!(validation_scope::validations("replacement-review-history"), 1);
+                // Capture exact accounting without allocating a large fixture.
+                validation_scope::charge_bytes(&connection, 64 * 1024 * 1024)
+            })
+        });
+        assert_eq!(result.unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert_eq!(failures.len(), 1);
+        let failure = &failures[0];
+        assert_eq!(failure.reason, validation_scope::ValidationFailureReason::BytesLimit);
+        assert_eq!(failure.attempted_bytes, Some(64 * 1024 * 1024));
+        let owner = failure.top_contributors.iter().find(|entry| entry.domain == Some("event-shape")).unwrap();
+        let history = failure.top_contributors.iter().find(|entry| entry.domain == Some("replacement-review-history")).unwrap();
+        assert_eq!(owner.totals.body, payload_bytes);
+        // A cold owner also pays retained row serialization, unlike the old raw-only scan.
+        assert!(owner.totals.result > payload_bytes);
+        assert_eq!(history.totals.body, 0);
+        if let Some(previous) = previous_totals {
+            assert_eq!(failure.charge_totals, previous);
+        }
+        previous_totals = Some(failure.charge_totals);
+        assert_eq!(validation_scope::validations("event-shape"), 0);
+        validation_scope::with_scope(&connection, || {
+            assert_eq!(cut(&connection, &f.leader.tenant_id, f.grant.session_id, sequence)?, expected);
+            assert_eq!(validation_scope::validations("event-shape"), events.len());
+            Ok(())
+        }).unwrap();
+    }
+}
+
+#[test]
+fn replacement_history_cut_invalidates_shared_owners_and_rolls_back_corruption() {
+    let (f, old, now) = expired_fixture(false);
+    let request = draft(&f, &old, now);
+    f.store.authorize_adaptive_work_funding_expired_replacement(
+        &funding_operator(&f), &request, now, evidence).unwrap();
+    let mut connection = f.store.connection.lock().unwrap();
+    let transaction = connection.transaction().unwrap();
+    let sequence: i64 = transaction.query_row(
+        "SELECT sequence FROM company_events WHERE event_type='adaptive_work_funding_expired_replacement_issued'",
+        [], |row| row.get(0)).unwrap();
+    let historical: i64 = transaction.query_row(
+        "SELECT min(sequence) FROM company_events WHERE event_type GLOB 'adaptive_leadership_review_*'",
+        [], |row| row.get(0)).unwrap();
+    let cut = crate::domain_store::adaptive_work_funding::historical_review_cut;
+    let expected = cut(&transaction, &f.leader.tenant_id, f.grant.session_id, sequence).unwrap();
+    // Even a row claiming an unrelated session must be decoded, not filtered out.
+    let malformed = serde_json::to_vec(&serde_json::json!({
+        "grant": {"session_id": Uuid::new_v4()}
+    })).unwrap();
+    let result = validation_scope::with_scope(&transaction, || {
+        assert_eq!(cut(&transaction, &f.leader.tenant_id, f.grant.session_id, sequence)?, expected);
+        let owners = validation_scope::validations("event-shape");
+        validation_scope::before_write(&transaction)?;
+        transaction.execute("UPDATE company_events SET payload=?1 WHERE sequence=?2",
+            params![malformed, historical])?;
+        let error = cut(&transaction, &f.leader.tenant_id, f.grant.session_id, sequence).unwrap_err();
+        assert_eq!(validation_scope::validations("event-shape"), owners + 1);
+        Err::<(), _>(error)
+    });
+    assert_eq!(result.unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    assert_eq!(validation_scope::validations("event-shape"), 0);
+    // The failed scope rolls back its write while leaving the caller's transaction usable.
+    validation_scope::with_scope(&transaction, || {
+        assert_eq!(cut(&transaction, &f.leader.tenant_id, f.grant.session_id, sequence)?, expected);
+        assert!(validation_scope::validations("event-shape") > 0);
+        Ok(())
+    }).unwrap();
+    transaction.rollback().unwrap();
+    drop(connection);
+    let external = Connection::open(&f.path).unwrap();
+    external.execute("UPDATE company_events SET payload_digest=?1 WHERE sequence=?2",
+        params!["f".repeat(64), historical]).unwrap();
+    // Ownership reuse does not replace the independent sealed-relation/checksum proof.
+    assert_eq!(f.store.adaptive_work_funding_expired_replacement(&f.leader.tenant_id,
+        &request.source.replacement_key().unwrap()).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+}
+
+#[test]
 fn expired_reviewed_funding_replacement_requires_proof_for_every_schema5_and_schema6_review() {
     let (f, old, now) = expired_fixture(true);
     let request = draft(&f, &old, now);

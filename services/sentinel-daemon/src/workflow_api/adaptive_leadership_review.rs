@@ -2037,17 +2037,31 @@ impl WorkflowApi {
             return Err("leader authority changed");
         }
         self.validate_company_employee(&leader.principal)?;
-        let current_project = self
-            .store
-            .company_project(&leader.principal.tenant_id, &call.grant.project_id)
-            .map_err(|_| "leadership current project unavailable")?
-            .ok_or("leadership current project missing")?;
-        if call.grant.subject.is_some() {
-            let source = self
+        let (current_project, source) = if call.grant.subject.is_some() {
+            let snapshot = self
                 .store
-                .adaptive_session_for_authority(&call.grant.assignee_authority)
+                .adaptive_project_snapshot(
+                    &leader.principal.tenant_id,
+                    &call.grant.project_id,
+                    &call.grant.work_item_id,
+                    call.grant.assignee_authority.agent_id,
+                )
+                .map_err(|_| "leadership current project unavailable")?
+                .ok_or("leadership current project missing")?;
+            let source = snapshot
+                .session_for_authority(&call.grant.assignee_authority)
                 .map_err(|_| "leadership source unavailable")?
                 .ok_or("leadership source missing")?;
+            (snapshot.project().clone(), Some(source))
+        } else {
+            let project = self
+                .store
+                .company_project(&leader.principal.tenant_id, &call.grant.project_id)
+                .map_err(|_| "leadership current project unavailable")?
+                .ok_or("leadership current project missing")?;
+            (project, None)
+        };
+        if let Some(source) = source {
             if current_project != call.context.source_project
                 || source != call.context.source_session
             {
@@ -6965,6 +6979,145 @@ pub(crate) mod tests {
                 .unwrap(),
             Some(context.source.source_session)
         );
+    }
+
+    #[test]
+    fn leadership_acceptance_uses_one_paired_source_read_for_subjects() {
+        let source = include_str!("adaptive_leadership_review.rs");
+        let acceptance = source
+            .split("pub(super) fn accept_leadership_review_fenced(")
+            .nth(1)
+            .unwrap();
+        let reads = acceptance
+            .split("self.validate_company_employee(&leader.principal)?;")
+            .nth(1)
+            .unwrap()
+            .split("let current_authority =")
+            .next()
+            .unwrap();
+        assert!(reads.contains("if call.grant.subject.is_some()"));
+        assert_eq!(reads.matches(".adaptive_project_snapshot(").count(), 1);
+        assert_eq!(reads.matches(".session_for_authority(").count(), 1);
+        assert_eq!(reads.matches(".company_project(").count(), 1);
+        assert!(!reads.contains(".adaptive_session_for_authority("));
+        assert!(reads.contains("current_project != call.context.source_project"));
+        assert!(reads.contains("source != call.context.source_session"));
+        assert!(acceptance.contains(".snapshot_for_admission("));
+    }
+
+    #[test]
+    fn leadership_acceptance_paired_snapshot_preserves_source_outcomes() {
+        for change in ["complete", "stale", "source-corrupt", "project-missing"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("company.sqlite");
+            let events = temp.path().join("events.sqlite");
+            let (api, context) = schema2_expiry_fixture(&path, &events);
+            let (id, digest) = register_expiry_dispatch(&api, &context, false);
+            let mut completion = make_completion(&context, "keep_blocked");
+            let mut decision: AdaptiveLeadershipReviewDecisionV1 =
+                serde_json::from_str(&completion.content).unwrap();
+            decision.schema_version = context.binding.grant.schema_version;
+            decision.validate(&context.source.evidence_refs).unwrap();
+            decision.validate_subject(&context.binding.grant).unwrap();
+            completion.content = serde_json::to_string(&decision).unwrap();
+            persist(&api, &completion, &context, &id, &digest, true);
+            if change == "stale" {
+                record_independent_decision(&api, &context.source.source_project);
+            } else if matches!(change, "source-corrupt" | "project-missing") {
+                let connection = sentinel_limbo::rusqlite::Connection::open(&path).unwrap();
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE workflow_adaptive_heads SET version=version+1 WHERE session_id=?1",
+                            [context.binding.grant.session_id.to_string()],
+                        )
+                        .unwrap(),
+                    1,
+                );
+                if change == "project-missing" {
+                    assert_eq!(
+                        connection
+                            .execute(
+                                "DELETE FROM company_entities WHERE entity_kind='project' AND tenant_id=?1 AND entity_id=?2",
+                                sentinel_limbo::rusqlite::params![
+                                    context.binding.grant.leadership_principal.tenant_id.0,
+                                    context.binding.grant.project_id.0,
+                                ],
+                            )
+                            .unwrap(),
+                        1,
+                    );
+                }
+            }
+            let before = discovery_state(&path, &events);
+            let accepted = api.accept_leadership_review_at(
+                &completion,
+                &context,
+                &id,
+                &digest,
+                context.binding.issued_at_ms + 2,
+            );
+            match change {
+                "source-corrupt" | "project-missing" => {
+                    assert_eq!(
+                        accepted,
+                        Err(if change == "project-missing" {
+                            "leadership current project missing"
+                        } else {
+                            "leadership source unavailable"
+                        }),
+                    );
+                    assert_eq!(discovery_state(&path, &events), before);
+                }
+                "stale" => {
+                    accepted.unwrap();
+                    let retired = expiry_review(&api, &context);
+                    assert!(retired.retired_at_unix_ms.is_some());
+                    assert!(retired.decision.is_none());
+                    assert_eq!(
+                        api.event_store
+                            .as_ref()
+                            .unwrap()
+                            .get_llm_completion(&id)
+                            .unwrap()
+                            .unwrap()
+                            .last_error
+                            .as_deref(),
+                        Some("leadership_review_stale"),
+                    );
+                    api.accept_leadership_review_at(
+                        &completion,
+                        &context,
+                        &id,
+                        &digest,
+                        context.binding.grant.expires_at_unix_ms + 1,
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    accepted.unwrap();
+                    assert!(expiry_review(&api, &context).decision.is_some());
+                    let committed = discovery_state(&path, &events);
+                    api.accept_leadership_review_at(
+                        &completion,
+                        &context,
+                        &id,
+                        &digest,
+                        context.binding.grant.expires_at_unix_ms + 1,
+                    )
+                    .unwrap();
+                    assert_eq!(discovery_state(&path, &events), committed);
+                    assert_eq!(
+                        api.store
+                            .adaptive_session_for_authority(
+                                &context.binding.grant.assignee_authority,
+                            )
+                            .unwrap(),
+                        Some(context.source.source_session),
+                    );
+                }
+            }
+        }
     }
 
     #[test]

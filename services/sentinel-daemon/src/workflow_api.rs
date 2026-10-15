@@ -36,6 +36,9 @@ mod adaptive_review_epoch;
 #[path = "workflow_api/tests/budget_window.rs"]
 mod budget_window_tests;
 mod company_reconciliation_worker;
+#[cfg(all(test, feature = "llm"))]
+#[path = "workflow_api/tests/completion_priority.rs"]
+mod completion_priority_tests;
 #[cfg(feature = "llm")]
 mod funded_review_recovery;
 pub(crate) use company_reconciliation_worker::CompanyReconciliationWorker;
@@ -3360,6 +3363,16 @@ struct ReconciliationStatus {
     last_error: Option<String>,
 }
 
+#[cfg(feature = "llm")]
+struct CompletionAdoptionIntent<'a>(&'a AtomicUsize);
+
+#[cfg(feature = "llm")]
+impl Drop for CompletionAdoptionIntent<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct WorkflowApi {
     core: Arc<ProductWorkflowCore>,
     delivery: Option<Arc<ProductDeliveryCore>>,
@@ -3371,6 +3384,7 @@ pub struct WorkflowApi {
     mutation_fence: RwLock<()>,
     #[cfg(feature = "llm")]
     provider_recovery_pending: AtomicBool,
+    completion_adoption_pending: AtomicUsize,
     #[cfg(feature = "llm")]
     provider_admission: Arc<RwLock<bool>>,
     #[cfg(feature = "llm")]
@@ -3427,16 +3441,30 @@ impl WorkflowApi {
     fn try_background_mutation_read(
         &self,
     ) -> std::sync::TryLockResult<std::sync::RwLockReadGuard<'_, ()>> {
-        if self.provider_recovery_is_pending() {
+        if self.background_work_should_yield() {
             return Err(TryLockError::WouldBlock);
         }
         let guard = self.mutation_fence.try_read()?;
         // Close the intent/read race. Existing owners finish their current
-        // durable step; only a new background pass yields to recovery.
-        if self.provider_recovery_is_pending() {
+        // durable step; a new pass yields to recovery or stored model results.
+        if self.background_work_should_yield() {
             return Err(TryLockError::WouldBlock);
         }
         Ok(guard)
+    }
+
+    // Scheduling intent only: an existing reader finishes its durable step,
+    // then releases the same fence before starting another background phase.
+    fn background_work_should_yield(&self) -> bool {
+        self.provider_recovery_is_pending()
+            || self.completion_adoption_pending.load(Ordering::Acquire) > 0
+    }
+
+    #[cfg(feature = "llm")]
+    fn completion_adoption_intent(&self) -> CompletionAdoptionIntent<'_> {
+        self.completion_adoption_pending
+            .fetch_add(1, Ordering::AcqRel);
+        CompletionAdoptionIntent(&self.completion_adoption_pending)
     }
 
     fn provider_recovery_is_pending(&self) -> bool {
@@ -3619,6 +3647,7 @@ impl WorkflowApi {
             mutation_fence: RwLock::new(()),
             #[cfg(feature = "llm")]
             provider_recovery_pending: AtomicBool::new(false),
+            completion_adoption_pending: AtomicUsize::new(0),
             #[cfg(feature = "llm")]
             provider_admission: Arc::new(RwLock::new(true)),
             #[cfg(feature = "llm")]
@@ -3676,6 +3705,7 @@ impl WorkflowApi {
             mutation_fence: RwLock::new(()),
             #[cfg(feature = "llm")]
             provider_recovery_pending: AtomicBool::new(false),
+            completion_adoption_pending: AtomicUsize::new(0),
             #[cfg(feature = "llm")]
             provider_admission: Arc::new(RwLock::new(false)),
             #[cfg(feature = "llm")]
@@ -5513,7 +5543,7 @@ impl WorkflowApi {
     ) -> Result<bool, WorkflowError> {
         let yielded = std::cell::Cell::new(false);
         let should_stop = || {
-            yielded.set(yielded.get() || should_stop() || self.provider_recovery_is_pending());
+            yielded.set(yielded.get() || should_stop() || self.background_work_should_yield());
             yielded.get()
         };
         if !self.enabled || !self.model_work_enabled || should_stop() {
@@ -5602,7 +5632,7 @@ impl WorkflowApi {
         }
         let yielded = std::cell::Cell::new(false);
         let should_stop = || {
-            yielded.set(yielded.get() || should_stop() || self.provider_recovery_is_pending());
+            yielded.set(yielded.get() || should_stop() || self.background_work_should_yield());
             yielded.get()
         };
         let _batch = match self.reconciliation_fence.try_lock() {
@@ -6564,6 +6594,7 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         request_id: &str,
         request_digest: &str,
     ) -> Result<(), &'static str> {
+        let _intent = self.completion_adoption_intent();
         match &completion.context {
             model_execution::ModelExecutionContext::AdaptiveLeadershipReview(context) => {
                 self.accept_leadership_review(completion, context, request_id, request_digest)
