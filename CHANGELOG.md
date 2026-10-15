@@ -1,5 +1,10 @@
 # Changelog
 
+- Evaluate replacement review-history cuts in one pinned tenant scan and retain
+  only per-cut counts and digests. Preserve complete typed decoding, exact
+  historical ordering, independent relation validation, write invalidation and
+  the unchanged 64 MiB validation limit (#856).
+
 - Cache validated review membership as IDs rather than a duplicate full review
   collection. Reuse the same typed entity owners within one pinned scope while
   retaining complete tenant inventory validation, ordering, cardinality checks,
