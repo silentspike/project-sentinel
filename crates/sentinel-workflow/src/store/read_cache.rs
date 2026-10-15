@@ -1022,6 +1022,10 @@ mod tests {
     use std::hash::{BuildHasherDefault, Hasher};
     use std::mem::size_of_val;
 
+    mod issue856_canonical_content_native {
+        include!("read_cache_canonical_content_native.rs");
+    }
+
     fn unique_chunk_payload(size: usize, row: u64) -> Vec<u8> {
         let mut payload = vec![0_u8; size];
         for (index, chunk) in payload.chunks_mut(INPUT_CHUNK_BYTES).enumerate() {
