@@ -2559,6 +2559,12 @@ impl WorkflowStore {
         validate_digest(&result.model_response_digest)?;
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Share continuation preflight proofs, never the post-write journal verification.
+        let mut preflight = result
+            .continuation
+            .as_ref()
+            .map(|_| validation_scope::enter(&transaction))
+            .transpose()?;
         let mut call: AdaptiveLeadershipReviewCallV1 = get_entity(
             &transaction,
             &leader.tenant_id,
@@ -2584,6 +2590,9 @@ impl WorkflowStore {
                 pending.resolution_event_id = None;
                 pending.continuation = None;
                 require_local_adoption_audit(&pending, result, event, now_ms)?;
+            }
+            if let Some(scope) = preflight.take() {
+                scope.finish()?;
             }
             return Ok(call);
         }
@@ -2660,6 +2669,9 @@ impl WorkflowStore {
                 &call.grant.assignee_authority,
                 now_ms,
             )?;
+            if let Some(scope) = preflight.take() {
+                scope.finish()?;
+            }
             if call.grant.work_funding.is_some() {
                 require_funding_authorization_membership(
                     &transaction,
@@ -2716,6 +2728,7 @@ impl WorkflowStore {
             }
             require_current_source(&transaction, &call)?;
         }
+        drop(preflight);
         call.decision = Some(result.decision.clone());
         call.model_response_digest = Some(result.model_response_digest.clone());
         call.resolution_event_id = result.resolution_event_id;
@@ -3352,6 +3365,10 @@ mod tests {
     }
     mod work_funding_tests {
         include!("adaptive_leadership_review/work_funding_tests.rs");
+
+        mod completion_validation_tests {
+            include!("adaptive_leadership_review/completion_validation_tests.rs");
+        }
     }
     mod recovery_tests {
         include!("adaptive_leadership_review/recovery_tests.rs");

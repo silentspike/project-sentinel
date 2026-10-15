@@ -7,6 +7,10 @@ use sentinel_workflow::{
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[path = "adaptive_work_funding/review_snapshot_tests.rs"]
+mod review_snapshot_tests;
+
 // Public drafts carry a digest instead of private source/authority. A typed
 // request is also accepted, but its caller-supplied source is never trusted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,14 +177,19 @@ impl WorkflowApi {
         epoch.validate().map_err(|_| "work funding epoch invalid")?;
         // This typed read validates the store's funding-review membership leaf
         // and issuance event, not just the descriptive receipt's shape.
-        let stored = self
+        let check_current = call.decision.is_none() && call.retired_at_unix_ms.is_none();
+        let (stored, receipt, current_review) = self
             .store
-            .adaptive_leadership_review_call(
+            .adaptive_work_funding_review_snapshot(
                 &call.grant.leadership_principal.tenant_id,
                 call.grant.review_id,
+                call.grant.session_id,
+                epoch.receipt.request.operation_id,
+                call.grant.expected_session_version,
+                check_current,
             )
-            .map_err(|_| "work funding review membership unavailable")?
-            .ok_or("work funding review membership missing")?;
+            .map_err(|_| "work funding review membership unavailable")?;
+        let stored = stored.ok_or("work funding review membership missing")?;
         if stored.grant != call.grant
             || stored.context != call.context
             || stored.operation_id != call.operation_id
@@ -189,13 +198,7 @@ impl WorkflowApi {
         {
             return Err("work funding sealed review membership changed");
         }
-        let receipt = self
-            .store
-            .adaptive_work_funding(
-                &call.grant.leadership_principal.tenant_id,
-                call.grant.session_id,
-                epoch.receipt.request.operation_id,
-            )
+        let receipt = receipt
             .map_err(|_| "work funding receipt unavailable")?
             .ok_or("work funding receipt missing")?;
         let source = &receipt.request.source.resume_source;
@@ -218,24 +221,9 @@ impl WorkflowApi {
         {
             return Err("work funding review membership changed");
         }
-        if call.decision.is_none() && call.retired_at_unix_ms.is_none() {
-            let calls = self
-                .store
-                .adaptive_leadership_review_calls(
-                    &call.grant.leadership_principal.tenant_id,
-                    call.grant.session_id,
-                )
-                .map_err(|_| "work funding current reviews unavailable")?;
-            let current: Vec<_> = calls
-                .iter()
-                .filter(|candidate| {
-                    candidate.decision.is_none()
-                        && candidate.retired_at_unix_ms.is_none()
-                        && candidate.grant.expected_session_version
-                            == call.grant.expected_session_version
-                })
-                .collect();
-            if current.len() != 1 || current[0].grant.review_id != call.grant.review_id {
+        if check_current {
+            let current = current_review.map_err(|_| "work funding current reviews unavailable")?;
+            if current != Some(call.grant.review_id) {
                 return Err("work funding current review is ambiguous");
             }
         }
