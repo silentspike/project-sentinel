@@ -1519,6 +1519,7 @@ pub mod bridge {
         ) {
             return;
         }
+        drop(entry);
         let entry = current;
         let completed: CompletedLlmResponse = match serde_json::from_str(&entry.payload) {
             Ok(completed) => completed,

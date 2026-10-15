@@ -7,6 +7,12 @@
   Share fresh post-continuation proofs only until the next allowance write;
   never carry pre-write proofs across mutations. Retain durable claims, owner
   binding, corruption detection, fixed budgets and retryable failures (#856).
+  Yield background reconciliation at existing durable boundaries while stored
+  model responses await adoption, rather than making them wait for a complete
+  company scan. Keep the same fences, authorization and failure accounting.
+  Decode historical review cuts from shared event owners instead of reading
+  and charging duplicate raw payloads; preserve complete history and the fixed
+  validation budget as real task histories grow.
 
 - Batch funding-review evidence reads in one validated snapshot and reuse
   continuation preflight proofs only until the first write. Retain fresh
