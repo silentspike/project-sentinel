@@ -97,6 +97,50 @@ fn expired_reviewed_funding_replacement_issues_only_normal_pending_capacity() {
 }
 
 #[test]
+fn replacement_history_cut_reuses_one_scan_without_crossing_historical_boundaries() {
+    let (f, old, now) = expired_fixture(false);
+    let request = draft(&f, &old, now);
+    let replacement = f.store.authorize_adaptive_work_funding_expired_replacement(
+        &funding_operator(&f), &request, now, evidence).unwrap().1;
+    let mut calls = f.store.adaptive_leadership_review_calls(&f.leader.tenant_id,
+        f.grant.session_id).unwrap();
+    let first_digest = canonical_sha256("sentinel.workflow.adaptive-resume-review-history.v1", &calls).unwrap();
+    let mut connection = f.store.connection.lock().unwrap();
+    let transaction = connection.transaction().unwrap();
+    let first: i64 = transaction.query_row("SELECT sequence FROM company_events WHERE event_type=?1",
+        ["adaptive_work_funding_expired_replacement_issued"], |row| row.get(0)).unwrap();
+    // Synthetic later rows exercise discovery only; they are not relation proofs.
+    calls[0].version += 1;
+    calls[0].updated_at_unix_ms += 1;
+    append_event(&transaction, &f.leader, Uuid::new_v4(), &"a".repeat(64),
+        Some(&f.grant.project_id), "adaptive_leadership_review_retired", &calls[0], now + 1).unwrap();
+    let mut later = replacement;
+    later.request.funding_request.operation_id = Uuid::new_v4();
+    append_event(&transaction, &funding_operator(&f), later.request.funding_request.operation_id,
+        &"b".repeat(64), Some(&f.grant.project_id),
+        "adaptive_work_funding_expired_replacement_issued", &later, now + 2).unwrap();
+    let second: i64 = transaction.query_row("SELECT max(sequence) FROM company_events", [], |row| row.get(0)).unwrap();
+    let second_digest = canonical_sha256("sentinel.workflow.adaptive-resume-review-history.v1", &calls).unwrap();
+    assert_ne!(first_digest, second_digest);
+    let cut = crate::domain_store::adaptive_work_funding::historical_review_cut;
+    validation_scope::with_scope(&transaction, || {
+        assert_eq!(cut(&transaction, &f.leader.tenant_id, f.grant.session_id, first)?, (calls.len(), first_digest.clone()));
+        assert_eq!(cut(&transaction, &f.leader.tenant_id, f.grant.session_id, second)?, (calls.len(), second_digest.clone()));
+        assert_eq!(validation_scope::validations("replacement-review-history"), 1);
+        Ok(())
+    }).unwrap();
+    validation_scope::with_scope(&transaction, || {
+        assert_eq!(cut(&transaction, &f.leader.tenant_id, f.grant.session_id, second)?, (calls.len(), second_digest.clone()));
+        assert_eq!(cut(&transaction, &f.leader.tenant_id, Uuid::new_v4(), first).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        // A snapshot-local write invalidates the inventory; no stale cut may survive.
+        transaction.execute("UPDATE company_events SET payload=?1 WHERE sequence=?2", params![b"{}".as_slice(), second - 1])?;
+        assert_eq!(cut(&transaction, &f.leader.tenant_id, f.grant.session_id, first).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        Ok(())
+    }).unwrap();
+    transaction.rollback().unwrap();
+}
+
+#[test]
 fn expired_reviewed_funding_replacement_requires_proof_for_every_schema5_and_schema6_review() {
     let (f, old, now) = expired_fixture(true);
     let request = draft(&f, &old, now);

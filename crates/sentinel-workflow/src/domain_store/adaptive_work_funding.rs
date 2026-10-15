@@ -9,6 +9,16 @@ use crate::{
 
 mod expired_replacement;
 
+#[cfg(test)]
+pub(super) fn historical_review_cut(
+    connection: &Connection,
+    tenant: &TenantId,
+    session_id: Uuid,
+    sequence: i64,
+) -> Result<(usize, String), WorkflowError> {
+    expired_replacement::historical_review_cut(connection, tenant, session_id, sequence)
+}
+
 pub(super) fn with_recovery_publication<T>(
     transaction: &Transaction<'_>,
     grant: &AdaptiveLeadershipReviewGrantV1,
