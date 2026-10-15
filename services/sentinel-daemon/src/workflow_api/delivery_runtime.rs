@@ -444,17 +444,23 @@ impl WorkflowDeliveryIntegration {
         )
     }
 
+    fn agreement(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+    ) -> Result<sentinel_workflow::AgreementV1, DeliveryError> {
+        self.workflow
+            .company_agreement(&project.tenant_id, &project.agreement_id)
+            .map_err(workflow_error)?
+            .ok_or_else(|| DeliveryError::NotFound("workflow agreement".to_string()))
+    }
+
     fn participant_inventory(
         &self,
         project: &sentinel_workflow::ProjectV1,
+        agreement: &sentinel_workflow::AgreementV1,
     ) -> Result<Vec<PrincipalV1>, DeliveryError> {
         let tenant_id = project.tenant_id.0.as_str();
-        let agreement = self
-            .workflow
-            .company_agreement(&project.tenant_id, &project.agreement_id)
-            .map_err(workflow_error)?
-            .ok_or_else(|| DeliveryError::NotFound("workflow agreement".to_string()))?;
-        let mut principal_ids = BTreeSet::from([agreement.accepted_by]);
+        let mut principal_ids = BTreeSet::from([agreement.accepted_by.clone()]);
         principal_ids.extend(
             project
                 .governance
@@ -490,23 +496,21 @@ impl WorkflowDeliveryIntegration {
     }
 
     fn validate_project_query(
-        &self,
         query: &CandidateAuthorityQueryV1,
-    ) -> Result<sentinel_workflow::ProjectV1, DeliveryError> {
-        let project = self.project(&query.tenant_id, &query.project.id)?;
-        let agreement = self
-            .workflow
-            .company_agreement(&project.tenant_id, &project.agreement_id)
-            .map_err(workflow_error)?
-            .ok_or_else(|| DeliveryError::NotFound("workflow agreement".to_string()))?;
+        project: &sentinel_workflow::ProjectV1,
+        agreement: &sentinel_workflow::AgreementV1,
+    ) -> Result<(), DeliveryError> {
         let expected_agreement = VersionedRefV1 {
-            id: agreement.agreement_id,
+            id: agreement.agreement_id.clone(),
             generation: 1,
-            digest: ContentDigest::parse(agreement.proposal_digest)?,
+            digest: ContentDigest::parse(agreement.proposal_digest.clone())?,
         };
-        if query.project != Self::expected_project_ref(&project)?
+        if query.tenant_id != project.tenant_id.0
+            || agreement.tenant_id != project.tenant_id
+            || agreement.agreement_id != project.agreement_id
+            || query.project != Self::expected_project_ref(project)?
             || query.agreement != expected_agreement
-            || query.work_items_digest != Self::expected_work_items_digest(&project)?
+            || query.work_items_digest != Self::expected_work_items_digest(project)?
             || project.lifecycle_state != ProjectLifecycleStateV1::DeliveryCandidate
             || project
                 .work_items
@@ -517,7 +521,28 @@ impl WorkflowDeliveryIntegration {
                 "workflow project is not the exact current delivery candidate".to_string(),
             ));
         }
-        Ok(project)
+        Ok(())
+    }
+
+    fn candidate_authority_from_validated(
+        &self,
+        query: &CandidateAuthorityQueryV1,
+        project: &sentinel_workflow::ProjectV1,
+        agreement: &sentinel_workflow::AgreementV1,
+    ) -> Result<CandidateAuthoritySnapshotV1, DeliveryError> {
+        Self::validate_project_query(query, project, agreement)?;
+        CandidateAuthoritySnapshotV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            authority_generation: DELIVERY_AUTHORITY_GENERATION,
+            agreement: query.agreement.clone(),
+            project: query.project.clone(),
+            work_items_digest: query.work_items_digest.clone(),
+            current_candidate_generation: project.version.saturating_add(1),
+            current_candidate_digest: query.candidate_digest.clone(),
+            participant_principals: self.participant_inventory(project, agreement)?,
+            snapshot_digest: ContentDigest::zero(),
+        }
+        .seal()
     }
 
     fn push_node<T: serde::Serialize>(
@@ -568,19 +593,9 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
         &self,
         query: &CandidateAuthorityQueryV1,
     ) -> Result<CandidateAuthoritySnapshotV1, DeliveryError> {
-        let project = self.validate_project_query(query)?;
-        CandidateAuthoritySnapshotV1 {
-            schema_version: DELIVERY_SCHEMA_V1,
-            authority_generation: DELIVERY_AUTHORITY_GENERATION,
-            agreement: query.agreement.clone(),
-            project: query.project.clone(),
-            work_items_digest: query.work_items_digest.clone(),
-            current_candidate_generation: project.version.saturating_add(1),
-            current_candidate_digest: query.candidate_digest.clone(),
-            participant_principals: self.participant_inventory(&project)?,
-            snapshot_digest: ContentDigest::zero(),
-        }
-        .seal()
+        let project = self.project(&query.tenant_id, &query.project.id)?;
+        let agreement = self.agreement(&project)?;
+        self.candidate_authority_from_validated(query, &project, &agreement)
     }
 
     fn workflow_lineage(
@@ -608,7 +623,11 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             work_items_digest,
             candidate_digest: query.candidate.digest.clone(),
         };
-        let authority = self.candidate_authority(&candidate_query)?;
+        // Reuse only this operation's fully validated rows. The service still
+        // acquires independent before/after candidate and principal authority.
+        let agreement = self.agreement(&project)?;
+        let authority =
+            self.candidate_authority_from_validated(&candidate_query, &project, &agreement)?;
         if query.authority_identity_digest != authority.snapshot_digest
             || query.candidate.generation != project.version.saturating_add(1)
         {
@@ -616,11 +635,6 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
                 "workflow lineage authority changed".to_string(),
             ));
         }
-        let agreement = self
-            .workflow
-            .company_agreement(&project.tenant_id, &project.agreement_id)
-            .map_err(workflow_error)?
-            .ok_or_else(|| DeliveryError::NotFound("workflow agreement".to_string()))?;
         let request = self
             .workflow
             .company_customer_request(&project.tenant_id, &agreement.request_id)
@@ -679,7 +693,7 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
                 to_ordinal: work_node,
             });
         }
-        for participant in self.participant_inventory(&project)? {
+        for participant in &authority.participant_principals {
             let participant_node = Self::push_node(
                 &mut nodes,
                 WorkflowLineageKindV1::Participant,
@@ -687,7 +701,7 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
                 participant.authority_generation,
                 participant.roles.iter().next().cloned(),
                 "workflow-participant",
-                &participant,
+                participant,
             )?;
             edges.push(WorkflowLineageEdgeV1 {
                 from_ordinal: project_node,
@@ -2275,6 +2289,623 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "llm")]
+    fn lineage_apply(
+        api: &super::super::WorkflowApi,
+        actor: &str,
+        command: CompanyWorkflowCommandV1,
+    ) -> CompanyWorkflowResponseV1 {
+        api.store
+            .apply_company_command(
+                &api.principals.principal(actor).unwrap().principal,
+                uuid::Uuid::new_v4(),
+                &command,
+                1_800_000_000_000,
+            )
+            .unwrap()
+            .response
+    }
+
+    #[cfg(feature = "llm")]
+    fn lineage_fixture() -> (
+        tempfile::TempDir,
+        WorkflowDeliveryIntegration,
+        CandidateAuthorityQueryV1,
+    ) {
+        use super::super::model_work;
+        use sentinel_workflow::{
+            ParticipantBindingV1, ProposalBindingV1, ProposalGovernanceV1,
+            QualityGateReceiptBindingV1, WorkOutputReceiptV1, WorkTransitionReceiptV1,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let api = model_work::configured_test_api(&temp.path().join("workflow.sqlite"));
+        let CompanyWorkflowResponseV1::CustomerRequest(request) = lineage_apply(
+            &api,
+            "customer",
+            CompanyWorkflowCommandV1::SubmitCustomerRequest {
+                summary_ref: "delivery-read-reuse".into(),
+                desired_outcome: "static-website".into(),
+                constraints: vec![],
+            },
+        ) else {
+            panic!("customer request")
+        };
+        lineage_apply(
+            &api,
+            "sales",
+            CompanyWorkflowCommandV1::QualifyCustomerRequest {
+                request_id: request.request_id.clone(),
+                expected_version: request.version,
+                reason_ref: "bounded-delivery-fixture".into(),
+            },
+        );
+        let profile = model_work::test_context().authority;
+        let work_profile = sentinel_workflow::WorkProfileBindingV1 {
+            profile_id: profile.profile_id,
+            generation: profile.profile_generation,
+            digest: api
+                .authority
+                .as_ref()
+                .unwrap()
+                .workbench_profile_digest
+                .clone(),
+        };
+        let participants = [
+            (5, "pm", CompanyRoleV1::ProjectManager),
+            (6, "developer-6", CompanyRoleV1::Developer),
+            (8, "qa", CompanyRoleV1::Qa),
+            (9, "release-manager", CompanyRoleV1::ReleaseManager),
+        ]
+        .into_iter()
+        .map(|(id, principal_id, role)| ParticipantBindingV1 {
+            agent_id: AgentId(id),
+            principal_id: principal_id.into(),
+            role,
+            specialties: BTreeSet::from(["web_development".into()]),
+            reports_to: (id != 5).then_some(AgentId(5)),
+            profile: work_profile.clone(),
+        })
+        .collect();
+        let CompanyWorkflowResponseV1::Proposal(proposal) = lineage_apply(
+            &api,
+            "sales",
+            CompanyWorkflowCommandV1::CreateProposal {
+                request_id: request.request_id.clone(),
+                expected_version: request.version + 1,
+                binding: ProposalBindingV1 {
+                    scope: "static-site".into(),
+                    deliverables: vec!["source-tree".into()],
+                    exclusions: vec!["deployment".into()],
+                    acceptance_criteria: vec!["independent-qa".into()],
+                    assumptions: vec![],
+                    cost_ceiling_micros: 100,
+                    provider_cost_ceilings_micros: BTreeMap::from([("local-loop".into(), 100)]),
+                    governance: ProposalGovernanceV1 {
+                        owner: AgentId(5),
+                        participants,
+                        project_profile: sentinel_workflow::WorkProfileBindingV1 {
+                            profile_id: "web-project-v1".into(),
+                            generation: 1,
+                            digest: api
+                                .authority
+                                .as_ref()
+                                .unwrap()
+                                .project_profile_digest
+                                .clone(),
+                        },
+                    },
+                    expires_at_unix_ms: 1_800_000_060_000,
+                },
+            },
+        ) else {
+            panic!("proposal")
+        };
+        let CompanyWorkflowResponseV1::AgreementProject { mut project, .. } = lineage_apply(
+            &api,
+            "customer",
+            CompanyWorkflowCommandV1::AcceptProposal {
+                request_id: request.request_id,
+                expected_version: request.version + 2,
+                proposal_id: proposal.proposal_id,
+                proposal_digest: proposal.proposal_digest,
+            },
+        ) else {
+            panic!("agreement")
+        };
+        let mut spec = model_work::test_context().task;
+        spec.owner = AgentId(6);
+        spec.budget_micros = 100;
+        for command in [
+            CompanyWorkflowCommandV1::PlanWorkGraph {
+                project_id: project.project_id.clone(),
+                expected_version: project.version,
+                items: vec![spec.clone()],
+            },
+            CompanyWorkflowCommandV1::ActivateProject {
+                project_id: project.project_id.clone(),
+                expected_version: project.version + 1,
+                reason_ref: "accepted".into(),
+            },
+            CompanyWorkflowCommandV1::AssignWork {
+                project_id: project.project_id.clone(),
+                expected_version: project.version + 2,
+                work_item_id: spec.work_item_id.clone(),
+                agent_id: AgentId(6),
+                organization_generation: 1,
+                organization_digest: "b".repeat(64),
+                reason_ref: "assigned".into(),
+            },
+        ] {
+            let CompanyWorkflowResponseV1::Project(next) = lineage_apply(&api, "pm", command)
+            else {
+                panic!("work graph")
+            };
+            project = next;
+        }
+        for to_state in [
+            CompanyWorkStateV1::InProgress,
+            CompanyWorkStateV1::InReview,
+            CompanyWorkStateV1::Done,
+        ] {
+            let work = &project.work_items[&spec.work_item_id];
+            let done = to_state == CompanyWorkStateV1::Done;
+            let receipt = WorkTransitionReceiptV1 {
+                schema_version: 1,
+                project_id: project.project_id.clone(),
+                work_item_id: spec.work_item_id.clone(),
+                expected_project_version: project.version,
+                expected_work_version: work.version,
+                expected_assignment_version: work.assignments.last().unwrap().assignment_version,
+                from_state: work.state,
+                to_state,
+                output_receipts: if to_state == CompanyWorkStateV1::InProgress {
+                    vec![]
+                } else {
+                    spec.outputs
+                        .iter()
+                        .map(|output| WorkOutputReceiptV1 {
+                            name: output.name.clone(),
+                            contract_generation: output.contract_generation,
+                            contract_digest: output.contract_digest.clone(),
+                            content_digest: "e".repeat(64),
+                        })
+                        .collect()
+                },
+                gate_receipt: done.then(|| QualityGateReceiptBindingV1 {
+                    gate_id: spec.quality_gate.gate_id.clone(),
+                    generation: spec.quality_gate.generation,
+                    gate_digest: spec.quality_gate.digest.clone(),
+                    subject_digest: "f".repeat(64),
+                    passed: true,
+                }),
+                phase_a_evidence_digest: "a".repeat(64),
+                reason_ref: "Synthetic store fixture evidence, not runtime evidence".into(),
+                occurred_at_unix_ms: 1_800_000_000_000,
+            };
+            let CompanyWorkflowResponseV1::Project(next) = lineage_apply(
+                &api,
+                if done { "qa" } else { "developer-6" },
+                CompanyWorkflowCommandV1::ApplyWorkTransition {
+                    project_id: project.project_id.clone(),
+                    expected_version: project.version,
+                    receipt,
+                },
+            ) else {
+                panic!("work transition")
+            };
+            project = next;
+        }
+        assert_eq!(
+            project.lifecycle_state,
+            ProjectLifecycleStateV1::DeliveryCandidate
+        );
+        let (qa_profile, qa_digest) = WorkbenchProfile::load(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../config/workbench-profiles/web-qa-v1.toml")
+                .canonicalize()
+                .unwrap(),
+        )
+        .unwrap();
+        let integration = WorkflowDeliveryIntegration::new(
+            api.store.clone(),
+            api.principals.clone(),
+            qa_profile,
+            qa_digest,
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            None,
+            ProjectProfileCatalog::embedded(),
+        );
+        let query = CandidateAuthorityQueryV1 {
+            tenant_id: project.tenant_id.0.clone(),
+            agreement: VersionedRefV1 {
+                id: project.agreement_id.clone(),
+                generation: 1,
+                digest: ContentDigest::parse(project.agreement_digest.clone()).unwrap(),
+            },
+            project: WorkflowDeliveryIntegration::expected_project_ref(&project).unwrap(),
+            work_items_digest: WorkflowDeliveryIntegration::expected_work_items_digest(&project)
+                .unwrap(),
+            candidate_digest: digest("delivery-reuse-candidate"),
+        };
+        (temp, integration, query)
+    }
+
+    #[cfg(feature = "llm")]
+    fn lineage_query(
+        integration: &WorkflowDeliveryIntegration,
+        candidate: &CandidateAuthorityQueryV1,
+    ) -> WorkflowLineageQueryV1 {
+        let authority = integration.candidate_authority(candidate).unwrap();
+        WorkflowLineageQueryV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            tenant_id: candidate.tenant_id.clone(),
+            project: candidate.project.clone(),
+            candidate: VersionedRefV1 {
+                id: "delivery-reuse-candidate".into(),
+                generation: authority.current_candidate_generation,
+                digest: candidate.candidate_digest.clone(),
+            },
+            authority_generation: authority.authority_generation,
+            authority_identity_digest: authority.snapshot_digest,
+            query_digest: ContentDigest::zero(),
+        }
+        .seal()
+        .unwrap()
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn delivery_read_reuse_preserves_exact_store_backed_graph_and_digests() {
+        let (_temp, integration, candidate) = lineage_fixture();
+        let project = integration
+            .project(&candidate.tenant_id, &candidate.project.id)
+            .unwrap();
+        let agreement = integration.agreement(&project).unwrap();
+        let request = integration
+            .workflow
+            .company_customer_request(&project.tenant_id, &agreement.request_id)
+            .unwrap()
+            .unwrap();
+        let participants = [
+            ("customer", AuthorityRole::Customer),
+            ("developer-6", AuthorityRole::Developer),
+            ("qa", AuthorityRole::Qa),
+            ("release-manager", AuthorityRole::ReleaseManager),
+        ]
+        .into_iter()
+        .map(|(id, role)| PrincipalV1 {
+            tenant_id: candidate.tenant_id.clone(),
+            principal_id: id.into(),
+            authority_generation: 1,
+            roles: BTreeSet::from([role]),
+        })
+        .collect::<Vec<_>>();
+        let authority = CandidateAuthoritySnapshotV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            authority_generation: DELIVERY_AUTHORITY_GENERATION,
+            agreement: candidate.agreement.clone(),
+            project: candidate.project.clone(),
+            work_items_digest: candidate.work_items_digest.clone(),
+            current_candidate_generation: project.version + 1,
+            current_candidate_digest: candidate.candidate_digest.clone(),
+            participant_principals: participants.clone(),
+            snapshot_digest: ContentDigest::zero(),
+        }
+        .seal()
+        .unwrap();
+        assert_eq!(
+            integration.candidate_authority(&candidate).unwrap(),
+            authority
+        );
+        assert_eq!(
+            integration
+                .candidate_authority_from_validated(&candidate, &project, &agreement)
+                .unwrap(),
+            authority
+        );
+        let query = lineage_query(&integration, &candidate);
+        let mut nodes = vec![];
+        // Independent legacy wire inventory: no adapter push_node or participant mapper.
+        let values = [
+            (
+                WorkflowLineageKindV1::CustomerRequest,
+                WorkflowLineageStateV1::Approved,
+                request.version,
+                Some(AuthorityRole::Customer),
+                ContentDigest::of_domain("workflow-request", 1, &request).unwrap(),
+            ),
+            (
+                WorkflowLineageKindV1::Agreement,
+                WorkflowLineageStateV1::Approved,
+                1,
+                Some(AuthorityRole::Customer),
+                ContentDigest::of_domain("workflow-agreement", 1, &agreement).unwrap(),
+            ),
+            (
+                WorkflowLineageKindV1::Project,
+                WorkflowLineageStateV1::Completed,
+                project.version,
+                None,
+                ContentDigest::of_domain("workflow-project", 1, &project).unwrap(),
+            ),
+        ];
+        for (kind, state, generation, participant_role, digest) in values {
+            nodes.push(WorkflowLineageNodeV1 {
+                node_ordinal: nodes.len() as u32 + 1,
+                kind,
+                state,
+                generation,
+                participant_role,
+                digest,
+            });
+        }
+        let work = project.work_items.values().next().unwrap();
+        nodes.push(WorkflowLineageNodeV1 {
+            node_ordinal: 4,
+            kind: WorkflowLineageKindV1::WorkItem,
+            state: WorkflowLineageStateV1::Completed,
+            generation: work.version,
+            participant_role: Some(AuthorityRole::Developer),
+            digest: ContentDigest::of_domain("workflow-work-item", 1, work).unwrap(),
+        });
+        for participant in participants {
+            nodes.push(WorkflowLineageNodeV1 {
+                node_ordinal: nodes.len() as u32 + 1,
+                kind: WorkflowLineageKindV1::Participant,
+                state: WorkflowLineageStateV1::Active,
+                generation: participant.authority_generation,
+                participant_role: participant.roles.iter().next().cloned(),
+                digest: ContentDigest::of_domain("workflow-participant", 1, &participant).unwrap(),
+            });
+        }
+        let mut edges = vec![
+            WorkflowLineageEdgeV1 {
+                from_ordinal: 1,
+                to_ordinal: 2,
+            },
+            WorkflowLineageEdgeV1 {
+                from_ordinal: 2,
+                to_ordinal: 3,
+            },
+        ];
+        edges.extend((4..=8).map(|to_ordinal| WorkflowLineageEdgeV1 {
+            from_ordinal: 3,
+            to_ordinal,
+        }));
+        let expected = WorkflowLineageSnapshotV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            server_redacted: true,
+            tenant_id: query.tenant_id.clone(),
+            project: query.project.clone(),
+            candidate: query.candidate.clone(),
+            authority_generation: query.authority_generation,
+            authority_identity_digest: query.authority_identity_digest.clone(),
+            query_digest: query.query_digest.clone(),
+            snapshot_generation: project.version,
+            nodes,
+            edges,
+            snapshot_digest: ContentDigest::zero(),
+        }
+        .seal()
+        .unwrap();
+        for _ in 0..2 {
+            let actual = integration.workflow_lineage(&query).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn delivery_read_reuse_rejects_stale_query_and_loaded_row_bindings() {
+        let (_temp, integration, candidate) = lineage_fixture();
+        let project = integration
+            .project(&candidate.tenant_id, &candidate.project.id)
+            .unwrap();
+        let agreement = integration.agreement(&project).unwrap();
+        for mismatch in [
+            "project-version",
+            "project-digest",
+            "agreement-id",
+            "agreement-version",
+            "agreement-digest",
+            "work-items",
+            "tenant",
+        ] {
+            let mut changed = candidate.clone();
+            match mismatch {
+                "project-version" => changed.project.generation += 1,
+                "project-digest" => changed.project.digest = digest("stale-project"),
+                "agreement-id" => changed.agreement.id.push_str("-foreign"),
+                "agreement-version" => changed.agreement.generation += 1,
+                "agreement-digest" => changed.agreement.digest = digest("stale-agreement"),
+                "work-items" => changed.work_items_digest = digest("stale-work-items"),
+                "tenant" => changed.tenant_id = "foreign-tenant".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                integration.candidate_authority(&changed).is_err(),
+                "{mismatch}"
+            );
+            assert!(
+                matches!(
+                    integration.candidate_authority_from_validated(&changed, &project, &agreement),
+                    Err(DeliveryError::StaleEvidence(_))
+                ),
+                "{mismatch}"
+            );
+        }
+        for mismatch in [
+            "agreement-tenant",
+            "agreement-id",
+            "project-lifecycle",
+            "unfinished-work",
+        ] {
+            let mut project = project.clone();
+            let mut agreement = agreement.clone();
+            match mismatch {
+                "agreement-tenant" => {
+                    agreement.tenant_id = TenantId::parse("foreign-tenant").unwrap()
+                }
+                "agreement-id" => agreement.agreement_id.push_str("-foreign"),
+                "project-lifecycle" => project.lifecycle_state = ProjectLifecycleStateV1::Active,
+                "unfinished-work" => {
+                    project.work_items.values_mut().next().unwrap().state =
+                        CompanyWorkStateV1::InReview
+                }
+                _ => unreachable!(),
+            }
+            let mut changed = candidate.clone();
+            changed.project = WorkflowDeliveryIntegration::expected_project_ref(&project).unwrap();
+            changed.work_items_digest =
+                WorkflowDeliveryIntegration::expected_work_items_digest(&project).unwrap();
+            assert!(
+                matches!(
+                    integration.candidate_authority_from_validated(&changed, &project, &agreement),
+                    Err(DeliveryError::StaleEvidence(_))
+                ),
+                "{mismatch}"
+            );
+        }
+        let query = lineage_query(&integration, &candidate);
+        for mismatch in [
+            "schema",
+            "authority-generation",
+            "query-digest",
+            "candidate-generation",
+            "candidate-digest",
+            "authority-identity",
+        ] {
+            let mut changed = query.clone();
+            match mismatch {
+                "schema" => changed.schema_version += 1,
+                "authority-generation" => changed.authority_generation += 1,
+                "query-digest" => changed.query_digest = digest("stale-query"),
+                "candidate-generation" => changed.candidate.generation += 1,
+                "candidate-digest" => changed.candidate.digest = digest("stale-candidate"),
+                "authority-identity" => {
+                    changed.authority_identity_digest = digest("stale-authority")
+                }
+                _ => unreachable!(),
+            }
+            if mismatch != "query-digest" {
+                changed = changed.seal().unwrap();
+            }
+            assert!(
+                matches!(
+                    integration.workflow_lineage(&changed),
+                    Err(DeliveryError::StaleEvidence(_))
+                ),
+                "{mismatch}"
+            );
+        }
+        assert!(integration.workflow_lineage(&query).is_ok());
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn delivery_read_reuse_does_not_retain_participant_authority_between_calls() {
+        let (_temp, mut integration, candidate) = lineage_fixture();
+        let query = lineage_query(&integration, &candidate);
+        let expected = integration.workflow_lineage(&query).unwrap();
+        let original = integration.principals.clone();
+        for mismatch in ["missing", "role", "tenant", "generation"] {
+            let mut principals = PrincipalAuthenticator {
+                by_credential_digest: original.by_credential_digest.clone(),
+                by_principal_id: original.by_principal_id.clone(),
+            };
+            if mismatch == "missing" {
+                principals.by_principal_id.remove("qa");
+            } else {
+                let qa = &mut principals.by_principal_id.get_mut("qa").unwrap().principal;
+                match mismatch {
+                    "role" => qa.role = CompanyRoleV1::ProjectManager,
+                    "tenant" => qa.tenant_id = TenantId::parse("foreign-tenant").unwrap(),
+                    "generation" => qa.authority_generation += 1,
+                    _ => unreachable!(),
+                }
+            }
+            integration.principals = Arc::new(principals);
+            if mismatch == "generation" {
+                assert_ne!(
+                    integration
+                        .candidate_authority(&candidate)
+                        .unwrap()
+                        .snapshot_digest,
+                    query.authority_identity_digest
+                );
+                assert!(matches!(
+                    integration.workflow_lineage(&query),
+                    Err(DeliveryError::StaleEvidence(_))
+                ));
+                assert!(integration
+                    .workflow_lineage(&lineage_query(&integration, &candidate))
+                    .is_ok());
+            } else {
+                assert!(matches!(
+                    integration.candidate_authority(&candidate),
+                    Err(DeliveryError::AuthorityDenied(_))
+                ));
+                assert!(matches!(
+                    integration.workflow_lineage(&query),
+                    Err(DeliveryError::AuthorityDenied(_))
+                ));
+            }
+            integration.principals = original.clone();
+            assert_eq!(integration.workflow_lineage(&query).unwrap(), expected);
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn delivery_read_reuse_rechecks_current_project_after_a_durable_append() {
+        let (_temp, integration, candidate) = lineage_fixture();
+        let query = lineage_query(&integration, &candidate);
+        let before = integration.workflow_lineage(&query).unwrap();
+        integration
+            .workflow
+            .apply_company_command(
+                &integration.principals.principal("pm").unwrap().principal,
+                uuid::Uuid::new_v4(),
+                &CompanyWorkflowCommandV1::RecordDecision {
+                    project_id: ProjectId::parse(&candidate.project.id).unwrap(),
+                    expected_version: candidate.project.generation,
+                    work_item_id: None,
+                    choice_ref: "retain-completed-delivery".into(),
+                    rationale_ref: "new-authoritative-decision".into(),
+                },
+                1_800_000_000_001,
+            )
+            .unwrap();
+        assert!(matches!(
+            integration.candidate_authority(&candidate),
+            Err(DeliveryError::StaleEvidence(_))
+        ));
+        assert!(matches!(
+            integration.workflow_lineage(&query),
+            Err(DeliveryError::StaleEvidence(_))
+        ));
+        let project = integration
+            .project(&candidate.tenant_id, &candidate.project.id)
+            .unwrap();
+        let mut fresh = candidate;
+        fresh.project = WorkflowDeliveryIntegration::expected_project_ref(&project).unwrap();
+        let after = integration
+            .workflow_lineage(&lineage_query(&integration, &fresh))
+            .unwrap();
+        assert_eq!(after.snapshot_generation, before.snapshot_generation + 1);
+        assert_ne!(after.snapshot_digest, before.snapshot_digest);
+        assert_eq!(
+            after.nodes.last().unwrap().kind,
+            WorkflowLineageKindV1::Decision
+        );
+    }
 
     #[test]
     fn qa_evaluator_is_pinned_to_actual_script_bytes() {
