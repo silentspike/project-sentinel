@@ -522,7 +522,10 @@ impl WorkflowStore {
     ) -> Result<Option<AdaptiveFundedReviewRecoveryReceiptV1>, WorkflowError> {
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        receipt_in_connection(&transaction, tenant, receipt_key)
+        let scope = validation_scope::enter(&transaction)?;
+        let receipt = receipt_in_connection(&transaction, tenant, receipt_key)?;
+        scope.finish()?;
+        Ok(receipt)
     }
 
     /// Rust-only reconstruction of the immutable issuance snapshot. This remains
@@ -591,6 +594,8 @@ impl WorkflowStore {
         )?;
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Share stable read proofs only until publication starts mutating rows.
+        let scope = validation_scope::enter(&transaction)?;
         let mut normalized_context = context.clone();
         normalized_context.evidence_refs.sort();
         let key = request.source.receipt_key()?;
@@ -614,6 +619,7 @@ impl WorkflowStore {
                 &prior.grant_template.review_id.to_string(),
             )?
             .ok_or_else(corrupt)?;
+            scope.finish()?;
             return Ok((true, prior));
         }
         let orphan: bool = transaction.query_row(
@@ -670,6 +676,7 @@ impl WorkflowStore {
             "sentinel.workflow.adaptive-leadership-context.v1",
             &(&grant, &normalized_context),
         )?;
+        scope.finish()?;
         adaptive_work_funding::insert_funding_review_membership(
             &transaction,
             &grant,
