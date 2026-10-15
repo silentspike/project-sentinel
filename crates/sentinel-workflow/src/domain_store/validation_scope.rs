@@ -1,6 +1,8 @@
 use std::any::{Any, TypeId};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -37,6 +39,7 @@ pub(crate) enum ValidationFailureReason {
     MissingScope,
     WriteDuringValidation,
     CacheTypeMismatch,
+    InvalidBodyHandoff,
     ValidationError,
     ScopeError,
     Unwind,
@@ -123,6 +126,7 @@ struct State {
     depth: usize,
     poisoned: bool,
     reuse: bool,
+    body_frames: Vec<Rc<BodyFrame>>,
     #[cfg(test)]
     validations: BTreeMap<&'static str, usize>,
     #[cfg(test)]
@@ -473,6 +477,7 @@ pub(crate) fn enter(connection: &Connection) -> Result<Scope<'_>, WorkflowError>
             depth: 0,
             poisoned: false,
             reuse: true,
+            body_frames: Vec::new(),
             #[cfg(test)]
             validations: BTreeMap::new(),
             #[cfg(test)]
@@ -705,11 +710,189 @@ pub(crate) fn before_write(connection: &Connection) -> Result<(), WorkflowError>
     })
 }
 
+struct BodyFrame {
+    connection: usize,
+    changes: i64,
+    depth: usize,
+    result_type: TypeId,
+    charged: Cell<Option<usize>>,
+    consumed: Cell<bool>,
+}
+
+/// A single pre-copy charge for owned bytes retained unchanged in this memo's
+/// result. Not a refund for temporary parsing buffers or unrelated validation.
+/// Only `precharge_body` constructs tokens; they cannot be cloned or serialized.
+pub(crate) struct ProvisionalBody<T> {
+    frame: Rc<BodyFrame>,
+    bytes: usize,
+    result_type: PhantomData<fn() -> T>,
+}
+
+struct BodyFrameGuard(Rc<BodyFrame>);
+
+fn invalid_body_handoff(state: &mut State) -> WorkflowError {
+    #[cfg(test)]
+    record_failure(
+        Some(&mut *state),
+        ValidationFailureReason::InvalidBodyHandoff,
+        None,
+        None,
+    );
+    state.poisoned = true;
+    corrupt()
+}
+
+impl Drop for BodyFrameGuard {
+    fn drop(&mut self) {
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let Some(state) = active.as_mut() else { return };
+            let is_current = state
+                .body_frames
+                .last()
+                .is_some_and(|frame| Rc::ptr_eq(frame, &self.0));
+            if is_current {
+                let _ = state.body_frames.pop();
+            } else {
+                let _ = invalid_body_handoff(state);
+            }
+            if std::thread::panicking() {
+                #[cfg(test)]
+                record_failure(
+                    Some(&mut *state),
+                    ValidationFailureReason::Unwind,
+                    None,
+                    None,
+                );
+                state.poisoned = true;
+            }
+        });
+    }
+}
+
+impl BodyFrameGuard {
+    fn enter<T: 'static>(connection: &Connection) -> Result<Self, WorkflowError> {
+        synchronize(connection)?;
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let state = active.as_mut().ok_or_else(corrupt)?;
+            // Each frame belongs to one admitted memo miss. Rc identity binds
+            // its exact typed key and scope, even across nested/successor scopes.
+            let frame = Rc::new(BodyFrame {
+                connection: state.connection,
+                changes: state.changes,
+                depth: state.depth,
+                result_type: TypeId::of::<T>(),
+                charged: Cell::new(None),
+                consumed: Cell::new(false),
+            });
+            state.body_frames.push(Rc::clone(&frame));
+            Ok(Self(frame))
+        })
+    }
+
+    fn consume<T: 'static>(
+        &self,
+        connection: &Connection,
+        token: Option<ProvisionalBody<T>>,
+        result_bytes: usize,
+    ) -> Result<usize, WorkflowError> {
+        synchronize(connection)?;
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let state = active.as_mut().ok_or_else(corrupt)?;
+            if !state
+                .body_frames
+                .last()
+                .is_some_and(|frame| Rc::ptr_eq(frame, &self.0))
+                || state.connection != self.0.connection
+                || state.changes != self.0.changes
+                || state.depth != self.0.depth
+                || self.0.result_type != TypeId::of::<T>()
+                || self.0.consumed.get()
+            {
+                return Err(invalid_body_handoff(state));
+            }
+            match (self.0.charged.get(), token) {
+                (None, None) => {
+                    self.0.consumed.set(true);
+                    Ok(result_bytes)
+                }
+                (Some(bytes), Some(token))
+                    if Rc::ptr_eq(&token.frame, &self.0) && token.bytes == bytes =>
+                {
+                    // The original body charge stays in the monotone counter.
+                    // Only the previously uncharged full-result remainder is new.
+                    self.0.consumed.set(true);
+                    Ok(result_bytes.saturating_sub(bytes))
+                }
+                _ => Err(invalid_body_handoff(state)),
+            }
+        })
+    }
+}
+
+/// Charge before copying an owned body that the result will retain unchanged.
+/// Exactly one token is allowed per `memoize_precharged` miss, at its own depth.
+pub(crate) fn precharge_body<T: 'static>(
+    connection: &Connection,
+    bytes: usize,
+) -> Result<ProvisionalBody<T>, WorkflowError> {
+    synchronize(connection)?;
+    let frame = ACTIVE.with(|active| {
+        let mut active = active.borrow_mut();
+        let state = active.as_mut().ok_or_else(corrupt)?;
+        let Some(frame) = state.body_frames.last().cloned() else {
+            return Err(invalid_body_handoff(state));
+        };
+        if frame.connection != state.connection
+            || frame.changes != state.changes
+            || frame.depth != state.depth
+            || frame.result_type != TypeId::of::<T>()
+            || frame.charged.get().is_some()
+        {
+            return Err(invalid_body_handoff(state));
+        }
+        Ok(frame)
+    })?;
+    charge_bytes(connection, bytes)?;
+    frame.charged.set(Some(bytes));
+    Ok(ProvisionalBody {
+        frame,
+        bytes,
+        result_type: PhantomData,
+    })
+}
+
 pub(crate) fn memoize<T: Clone + Serialize + 'static>(
     connection: &Connection,
     domain: &'static str,
     input: &impl Serialize,
     validate: impl FnOnce() -> Result<T, WorkflowError>,
+) -> Result<T, WorkflowError> {
+    memoize_inner(connection, domain, input, false, || {
+        validate().map(|value| (value, None))
+    })
+}
+
+/// Retain the same complete proof as `memoize`, transferring a typed pre-copy
+/// ownership charge into its full serialized result once. Temporary raw/decoded
+/// overlap must continue to use ordinary `memoize` and `charge_bytes`.
+pub(crate) fn memoize_precharged<T: Clone + Serialize + 'static>(
+    connection: &Connection,
+    domain: &'static str,
+    input: &impl Serialize,
+    validate: impl FnOnce() -> Result<(T, Option<ProvisionalBody<T>>), WorkflowError>,
+) -> Result<T, WorkflowError> {
+    memoize_inner(connection, domain, input, true, validate)
+}
+
+fn memoize_inner<T: Clone + Serialize + 'static>(
+    connection: &Connection,
+    domain: &'static str,
+    input: &impl Serialize,
+    precharged: bool,
+    validate: impl FnOnce() -> Result<(T, Option<ProvisionalBody<T>>), WorkflowError>,
 ) -> Result<T, WorkflowError> {
     with_scope(connection, || {
         synchronize(connection)?;
@@ -782,9 +965,18 @@ pub(crate) fn memoize<T: Clone + Serialize + 'static>(
                 key.2.len().saturating_add(256),
                 ValidationChargePhase::Key,
             )?;
-            let value = validate()?;
+            let frame = if precharged {
+                Some(BodyFrameGuard::enter::<T>(connection)?)
+            } else {
+                None
+            };
+            let (value, token) = validate()?;
             synchronize(connection)?;
             let bytes = serialized_json_size(&value).map_err(|_| persistence())?;
+            let bytes = match frame.as_ref() {
+                Some(frame) => frame.consume(connection, token, bytes)?,
+                None => bytes,
+            };
             #[cfg(not(test))]
             charge_bytes(connection, bytes)?;
             #[cfg(test)]
@@ -875,6 +1067,10 @@ pub(crate) fn validations(domain: &'static str) -> usize {
             .unwrap_or(0)
     })
 }
+
+#[cfg(test)]
+#[path = "validation_scope/issue856_owned_body_handoff_tests.rs"]
+mod issue856_owned_body_handoff_tests;
 
 #[cfg(test)]
 mod tests {

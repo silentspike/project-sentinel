@@ -917,7 +917,7 @@ fn company_event_owner_invalidates_on_write_and_next_scope_without_authorizing_l
 
 #[test]
 fn company_event_owner_charges_before_copy_and_retains_full_utf8_row_not_pointer() {
-    for boundary in ["body", "result", "invalid-utf8"] {
+    for boundary in ["body", "result", "exact-fit", "invalid-utf8"] {
         let (_root, store, expected) = leaf_fixture();
         let connection = store.connection.lock().unwrap();
         let sequence: i64 = connection
@@ -957,16 +957,38 @@ fn company_event_owner_charges_before_copy_and_retains_full_utf8_row_not_pointer
                     )?,
                     "result" => validation_scope::charge_bytes(
                         &connection,
-                        BYTE_LIMIT - key_bytes - payload_bytes - row_bytes + 1,
+                        BYTE_LIMIT - key_bytes - row_bytes + 1,
+                    )?,
+                    "exact-fit" => validation_scope::charge_bytes(
+                        &connection,
+                        BYTE_LIMIT - key_bytes - row_bytes,
                     )?,
                     _ => {}
                 }
-                company_event_shape_with_observer(&connection, sequence, |_| {
+                let owner = company_event_shape_with_observer(&connection, sequence, |_| {
                     copies.set(copies.get() + 1);
-                })
-                .map(|_| ())
+                })?
+                .unwrap();
+                if boundary == "exact-fit" {
+                    let repeated =
+                        company_event_shape_with_observer(&connection, sequence, |_| {
+                            panic!("warm owner must not copy or recharge its body");
+                        })?
+                        .unwrap();
+                    assert!(std::sync::Arc::ptr_eq(&owner.0, &repeated.0));
+                    assert_eq!(encode(&*owner)?, encode(&row)?);
+                    assert_eq!(validation_scope::validations("event-shape"), 1);
+                }
+                Ok(())
             })
         });
+        if boundary == "exact-fit" {
+            result.unwrap();
+            assert!(failures.is_empty());
+            assert_eq!(copies.get(), 1);
+            assert!(connection.is_autocommit());
+            continue;
+        }
         assert_eq!(
             result.unwrap_err().code,
             WorkflowErrorCode::CorruptStore,
@@ -1007,8 +1029,8 @@ fn company_event_owner_charges_before_copy_and_retains_full_utf8_row_not_pointer
                     failure.charge_phase,
                     Some(validation_scope::ValidationChargePhase::Result)
                 );
-                assert_eq!(failure.attempted_bytes, Some(row_bytes));
-                assert_eq!(failure.bytes, BYTE_LIMIT - row_bytes + 1);
+                assert_eq!(failure.attempted_bytes, Some(row_bytes - payload_bytes));
+                assert_eq!(failure.bytes, BYTE_LIMIT - (row_bytes - payload_bytes) + 1);
                 assert_eq!(shape.totals.body, payload_bytes);
             }
             _ => {
@@ -1029,4 +1051,107 @@ fn company_event_owner_charges_before_copy_and_retains_full_utf8_row_not_pointer
         );
         assert!(connection.is_autocommit());
     }
+}
+
+#[test]
+fn company_event_owner_rejects_changes_between_precharge_and_copy_and_rolls_back() {
+    for damage in ["longer-body", "same-size-body", "deleted"] {
+        let (_root, store, expected) = leaf_fixture();
+        let connection = store.connection.lock().unwrap();
+        let sequence: i64 = connection
+            .query_row(
+                "SELECT sequence FROM company_events WHERE event_type=?1 AND operation_id=?2",
+                params![expected.event_type, expected.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sequence = stored_u64(sequence).unwrap();
+        let original = read_company_event_row(&connection, sequence)
+            .unwrap()
+            .unwrap();
+        let mut payload = original.payload.clone();
+        if damage == "longer-body" {
+            payload.push(b' ');
+        } else {
+            payload[0] = b' ';
+        }
+        let copies = Cell::new(0);
+        let result = company_event_shape_with_observer(&connection, sequence, |bytes| {
+            copies.set(copies.get() + 1);
+            assert_eq!(bytes, original.payload.len());
+            let changed = if damage == "deleted" {
+                connection.execute(
+                    "DELETE FROM company_events WHERE sequence=?1",
+                    [sql_u64(sequence).unwrap()],
+                )
+            } else {
+                connection.execute(
+                    "UPDATE company_events SET payload=?1 WHERE sequence=?2",
+                    params![&payload, sql_u64(sequence).unwrap()],
+                )
+            };
+            assert_eq!(changed.unwrap(), 1);
+        });
+        assert_eq!(
+            result.err().unwrap().code,
+            WorkflowErrorCode::CorruptStore,
+            "{damage}"
+        );
+        assert_eq!(copies.get(), 1);
+        assert!(connection.is_autocommit());
+        assert_eq!(
+            encode(
+                &read_company_event_row(&connection, sequence)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            encode(&original).unwrap()
+        );
+        validation_scope::with_scope(&connection, || require_leaf(&connection, &expected)).unwrap();
+    }
+}
+
+#[test]
+fn company_event_owner_missing_and_non_blob_rows_never_copy() {
+    let (_root, store, expected) = leaf_fixture();
+    let connection = store.connection.lock().unwrap();
+    validation_scope::with_scope(&connection, || {
+        assert!(company_event_shape_with_observer(&connection, 0, |_| {
+            panic!("missing row must not copy or precharge a body");
+        })?
+        .is_none());
+        assert!(company_event_shape_with_observer(&connection, 0, |_| {
+            panic!("cached missing row must not copy");
+        })?
+        .is_none());
+        assert_eq!(validation_scope::validations("event-shape"), 1);
+        Ok(())
+    })
+    .unwrap();
+    let sequence: i64 = connection
+        .query_row(
+            "SELECT sequence FROM company_events WHERE event_type=?1 AND operation_id=?2",
+            params![expected.event_type, expected.operation_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE company_events SET payload='not-a-blob' WHERE sequence=?1",
+                [sequence],
+            )
+            .unwrap(),
+        1
+    );
+    let result =
+        company_event_shape_with_observer(&connection, stored_u64(sequence).unwrap(), |_| {
+            panic!("non-blob row must fail before copying");
+        });
+    assert_eq!(
+        result.err().unwrap().code,
+        WorkflowErrorCode::PersistenceFailure
+    );
+    assert!(connection.is_autocommit());
 }

@@ -1,5 +1,15 @@
 # Changelog
 
+- Share immutable validated read results without cloning their complete payloads,
+  preserve full retention accounting and exact database-input invalidation, and
+  reuse one source snapshot within each adaptive admission gate. Recheck fresh
+  authority, clocks and effect ownership at every dispatch boundary. Derive
+  leadership acceptance authority from its already validated project rather
+  than rereading the same source. Keep original work, funding usage and durable
+  recovery evidence intact. Charge a shared event payload before copying and
+  transfer that same owned-byte charge into the complete memoized result once;
+  retain fixed proof limits, overflow rejection and all other accounting (#856).
+
 - Validate funded-recovery NoIO against its authenticated issuance-event cut,
   preserving complete history checks without treating later authorized work as
   an earlier dispatch. Adopt an exact retained ordinary funded leadership

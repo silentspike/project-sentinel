@@ -198,6 +198,7 @@ pub mod bridge {
         }
 
         /// One fresh proof may certify both bindings within this gate, never across gates.
+        /// `Some(())` also certifies full dispatch validation of the exact immutable context.
         fn validate_prepared_provider_model_context(
             &self,
             _expected: &ProviderExecutionAuthority,
@@ -1742,12 +1743,62 @@ pub mod bridge {
         Ok(())
     }
 
+    // Borrows one immutable context only for the current admission gate. This is
+    // shape evidence, not permission to skip the next gate's fresh authorization.
+    struct ValidatedProviderModelContext<'a> {
+        context: &'a ModelWorkContext,
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        static MODEL_GATE_SHAPE_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    impl<'a> ValidatedProviderModelContext<'a> {
+        fn validate(context: &'a ModelWorkContext, now_ms: u64) -> Result<Self, &'static str> {
+            #[cfg(test)]
+            MODEL_GATE_SHAPE_VALIDATIONS.with(|count| count.set(count.get() + 1));
+            context.validate_dispatch(now_ms)?;
+            Ok(Self { context })
+        }
+
+        fn recheck_clock(&self, now_ms: u64) -> Result<(), &'static str> {
+            // Mirror only validate_dispatch's time-dependent predicates; the
+            // remaining checks were proved for this exact immutable borrow.
+            match self.context {
+                ModelWorkContext::Adaptive(context) => context.validate_dispatch_clock(now_ms),
+                ModelWorkContext::AdaptiveLeadershipReview(context) => {
+                    if now_ms < context.binding.issued_at_ms
+                        || now_ms >= context.binding.grant.expires_at_unix_ms
+                    {
+                        return Err("leadership grant expired or mismatched");
+                    }
+                    Ok(())
+                }
+                // Keep other context kinds on their existing validator; only the
+                // measured adaptive paths share immutable validation evidence.
+                _ => self.context.validate_dispatch(now_ms),
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn validate_unreserved_provider_authority(
         resolver: Option<&dyn ProviderUsageAuthorityResolver>,
         expected: Option<&ProviderExecutionAuthority>,
         agent_id: AgentId,
         model_work: Option<&ModelWorkContext>,
     ) -> Result<(), String> {
+        validate_unreserved_provider_authority_gate(resolver, expected, agent_id, model_work)
+            .map(|_| ())
+    }
+
+    fn validate_unreserved_provider_authority_gate<'a>(
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        expected: Option<&ProviderExecutionAuthority>,
+        agent_id: AgentId,
+        model_work: Option<&'a ModelWorkContext>,
+    ) -> Result<Option<ValidatedProviderModelContext<'a>>, String> {
         if let (Some(resolver), Some(expected), Some(context)) = (resolver, expected, model_work) {
             if expected.agent_id() != agent_id {
                 return Err("provider usage authority returned another agent".to_owned());
@@ -1757,7 +1808,7 @@ pub mod bridge {
                     .validate_prepared_provider_model_context(expected, context)?
                     .is_some()
             {
-                return Ok(());
+                return Ok(Some(ValidatedProviderModelContext { context }));
             }
         }
         validate_current_provider_usage_authority(resolver, expected, agent_id)
@@ -1798,15 +1849,15 @@ pub mod bridge {
         cancelled: &impl Fn() -> bool,
     ) -> Result<(), String> {
         let validation =
-            validate_unreserved_provider_authority(resolver, expected, agent_id, model_work)
-                .and_then(|()| {
+            validate_unreserved_provider_authority_gate(resolver, expected, agent_id, model_work)
+                .and_then(|proof| {
                     if cancelled() {
                         return Err("provider dispatch cancelled before binding".to_owned());
                     }
-                    if let Some(context) = model_work {
-                        context.validate_dispatch(unix_now_ms())?;
+                    if let Some(proof) = proof {
+                        proof.recheck_clock(unix_now_ms())?;
                         if let Some(reservation) =
-                            model_reservation(context, request_id, request_digest)?
+                            model_reservation(proof.context, request_id, request_digest)?
                         {
                             store
                                 .bind_model_reservation(&reservation)
@@ -1829,16 +1880,17 @@ pub mod bridge {
         Ok(())
     }
 
-    fn validate_model_work_context(
+    fn validate_model_work_context<'a>(
         resolver: Option<&dyn ProviderUsageAuthorityResolver>,
-        expected: Option<&ModelWorkContext>,
-    ) -> Result<(), String> {
+        expected: Option<&'a ModelWorkContext>,
+    ) -> Result<Option<ValidatedProviderModelContext<'a>>, String> {
         if let Some(expected) = expected {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| "model work clock is unavailable")?
                 .as_millis();
-            expected.validate_dispatch(
+            let proof = ValidatedProviderModelContext::validate(
+                expected,
                 u64::try_from(now_ms).map_err(|_| "model work clock overflow")?,
             )?;
             let current = resolver
@@ -1847,9 +1899,10 @@ pub mod bridge {
             if current.as_ref() != Some(expected) {
                 return Err("model work authority changed during provider I/O".to_owned());
             }
-            expected.validate_dispatch(unix_now_ms())?;
+            proof.recheck_clock(unix_now_ms())?;
+            return Ok(Some(proof));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn initial_model_work_context(
@@ -2895,18 +2948,21 @@ pub mod bridge {
             if cancelled() { return; }
             let resolver = dependencies.preparation.config.provider_usage_authority.as_deref();
             let started = Instant::now();
-            let authority = validate_unreserved_provider_authority(
-                resolver, call.usage_authority.as_ref(), agent, call.model_work.as_ref(),
-            );
-            let fresh = authority.is_ok() && !cancelled()
-                && call.model_work.as_ref().is_none_or(|context| context.validate_dispatch(unix_now_ms()).is_ok());
-            log_owned_provider_phase(agent, &call.request_id, "unreserved_authority", started.elapsed(), fresh);
-            if !fresh {
-                if let Err(error) = authority {
-                    warn!(request_id = %call.request_id, error, "Provider request reauthorization failed before reservation");
+            let fresh = {
+                let authority = validate_unreserved_provider_authority_gate(
+                    resolver, call.usage_authority.as_ref(), agent, call.model_work.as_ref(),
+                );
+                let fresh = authority.as_ref().is_ok_and(|proof| !cancelled()
+                    && proof.as_ref().is_none_or(|proof| proof.recheck_clock(unix_now_ms()).is_ok()));
+                if !fresh {
+                    if let Err(error) = authority {
+                        warn!(request_id = %call.request_id, error, "Provider request reauthorization failed before reservation");
+                    }
                 }
-                return;
-            }
+                fresh
+            };
+            log_owned_provider_phase(agent, &call.request_id, "unreserved_authority", started.elapsed(), fresh);
+            if !fresh { return; }
             lifetime.outcome = Some(ProviderOutcomeGuard::new(
                 Arc::clone(&dependencies.preparation.event_store),
                 Arc::clone(&dependencies.preparation.active_requests),
@@ -6681,6 +6737,198 @@ pub mod bridge {
             }
         }
 
+        fn adaptive_admission_gate_contexts(root: &std::path::Path) -> [ModelWorkContext; 2] {
+            let (api, adaptive, _) = crate::workflow_api::model_work::configured_adaptive_test_api(
+                &root.join("adaptive-company.sqlite"),
+                &root.join("adaptive-events.sqlite"),
+            );
+            let adaptive = api
+                .model_work_context(&ProviderExecutionAuthority::Adaptive(Box::new(adaptive)))
+                .unwrap()
+                .unwrap();
+            let (_, leadership) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
+                &root.join("leadership-company.sqlite"),
+                &root.join("leadership-events.sqlite"),
+            );
+            [
+                adaptive,
+                ModelWorkContext::AdaptiveLeadershipReview(Box::new(leadership)),
+            ]
+        }
+
+        #[test]
+        fn adaptive_admission_gates_share_shape_but_not_fresh_authority() {
+            let dir = tempfile::tempdir().unwrap();
+            for context in adaptive_admission_gate_contexts(dir.path()) {
+                let expected = context.binding();
+                let mut resolver = ExactValidationResolver::new(context.clone());
+                MODEL_GATE_SHAPE_VALIDATIONS.with(|count| count.set(0));
+                {
+                    let proof = validate_unreserved_provider_authority_gate(
+                        Some(&resolver),
+                        Some(&expected),
+                        expected.agent_id(),
+                        Some(&context),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    for _ in 0..8 {
+                        proof.recheck_clock(unix_now_ms()).unwrap();
+                    }
+                    MODEL_GATE_SHAPE_VALIDATIONS.with(|count| assert_eq!(count.get(), 1));
+                }
+                assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 1);
+
+                let store = EventStore::open(":memory:").unwrap();
+                let id = expected.request_id();
+                let digest = "a".repeat(64);
+                assert!(store
+                    .reserve_request(&id, &digest, &expected.agent_id().to_string())
+                    .unwrap());
+                validate_pre_dispatch_provider_authority(
+                    &store,
+                    Some(&resolver),
+                    Some(&expected),
+                    expected.agent_id(),
+                    &id,
+                    &digest,
+                    Some(&context),
+                )
+                .unwrap();
+                MODEL_GATE_SHAPE_VALIDATIONS.with(|count| assert_eq!(count.get(), 2));
+                assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 2);
+                assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 2);
+
+                resolver.result = Ok(false);
+                assert!(validate_pre_dispatch_provider_authority(
+                    &store,
+                    Some(&resolver),
+                    Some(&expected),
+                    expected.agent_id(),
+                    &id,
+                    &digest,
+                    Some(&context),
+                )
+                .unwrap_err()
+                .contains("provider usage authority changed"));
+                assert!(store.get_completion(&id).unwrap().is_none());
+                assert!(!store.has_operation(&format!("llm_usage_{id}")).unwrap());
+                MODEL_GATE_SHAPE_VALIDATIONS.with(|count| assert_eq!(count.get(), 2));
+                assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 3);
+                assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 2);
+                assert_eq!(resolver.selection_calls.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[test]
+        fn adaptive_admission_shape_proof_preserves_exact_clock_bounds() {
+            let dir = tempfile::tempdir().unwrap();
+            for context in adaptive_admission_gate_contexts(dir.path()) {
+                let (issued, expires) = match &context {
+                    ModelWorkContext::Adaptive(value) => (0, value.binding.grant.deadline_ms),
+                    ModelWorkContext::AdaptiveLeadershipReview(value) => (
+                        value.binding.issued_at_ms,
+                        value.binding.grant.expires_at_unix_ms,
+                    ),
+                    _ => panic!("adaptive fixture"),
+                };
+                MODEL_GATE_SHAPE_VALIDATIONS.with(|count| count.set(0));
+                let proof = ValidatedProviderModelContext::validate(&context, issued).unwrap();
+                for now in [
+                    0,
+                    issued.saturating_sub(1),
+                    issued,
+                    expires - 1,
+                    expires,
+                    expires.saturating_add(1),
+                    u64::MAX,
+                ] {
+                    assert_eq!(proof.recheck_clock(now), context.validate_dispatch(now));
+                }
+                MODEL_GATE_SHAPE_VALIDATIONS.with(|count| assert_eq!(count.get(), 1));
+            }
+        }
+
+        #[test]
+        fn adaptive_admission_shape_proof_rejects_tampering_and_cross_binding() {
+            let dir = tempfile::tempdir().unwrap();
+            for context in adaptive_admission_gate_contexts(dir.path()) {
+                let expected = context.binding();
+                let mut resolver = ExactValidationResolver::new(context.clone());
+                match &mut resolver.context {
+                    ModelWorkContext::Adaptive(value) => value.task.objective.push_str(" changed"),
+                    ModelWorkContext::AdaptiveLeadershipReview(value) => {
+                        value.source.source_project.version += 1;
+                    }
+                    _ => panic!("adaptive fixture"),
+                }
+                assert_eq!(
+                    validate_unreserved_provider_authority(
+                        Some(&resolver),
+                        Some(&expected),
+                        expected.agent_id(),
+                        Some(&context),
+                    ),
+                    Err("model work authority changed during provider I/O".into())
+                );
+
+                let mut invalid = context.clone();
+                match &mut invalid {
+                    ModelWorkContext::Adaptive(value) => {
+                        value.binding.effect_id = uuid::Uuid::nil()
+                    }
+                    ModelWorkContext::AdaptiveLeadershipReview(value) => {
+                        value.binding.reservation_id.push_str("-tampered");
+                    }
+                    _ => panic!("adaptive fixture"),
+                }
+                let invalid_binding = invalid.binding();
+                let invalid_resolver = ExactValidationResolver::new(invalid.clone());
+                assert!(validate_unreserved_provider_authority(
+                    Some(&invalid_resolver),
+                    Some(&invalid_binding),
+                    invalid_binding.agent_id(),
+                    Some(&invalid),
+                )
+                .is_err());
+                assert_eq!(invalid_resolver.context_calls.load(Ordering::SeqCst), 0);
+
+                for change_tenant in [false, true] {
+                    let mut foreign = expected.clone();
+                    match &mut foreign {
+                        ProviderExecutionAuthority::Adaptive(value) => {
+                            if change_tenant {
+                                value.grant.authority.tenant_id =
+                                    sentinel_workflow::TenantId::parse("other-tenant").unwrap();
+                            } else {
+                                value.grant.session_id = uuid::Uuid::new_v4();
+                            }
+                        }
+                        ProviderExecutionAuthority::AdaptiveLeadershipReview(value) => {
+                            if change_tenant {
+                                value.grant.assignee_authority.tenant_id =
+                                    sentinel_workflow::TenantId::parse("other-tenant").unwrap();
+                            } else {
+                                value.grant.session_id = uuid::Uuid::new_v4();
+                            }
+                        }
+                        _ => panic!("adaptive fixture"),
+                    }
+                    let resolver = ExactValidationResolver::new(context.clone());
+                    assert!(validate_unreserved_provider_authority(
+                        Some(&resolver),
+                        Some(&foreign),
+                        foreign.agent_id(),
+                        Some(&context),
+                    )
+                    .unwrap_err()
+                    .contains("provider usage authority changed"));
+                    assert_eq!(resolver.context_calls.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
+
         struct PreparedGateResolver {
             legacy: ExactValidationResolver,
             result: Mutex<Result<Option<()>, String>>,
@@ -6734,6 +6982,7 @@ pub mod bridge {
                     result: Mutex::new(Ok(handled)),
                     calls: std::sync::atomic::AtomicUsize::new(0),
                 };
+                MODEL_GATE_SHAPE_VALIDATIONS.with(|count| count.set(0));
                 validate_unreserved_provider_authority(
                     Some(&resolver),
                     Some(&expected),
@@ -6742,6 +6991,8 @@ pub mod bridge {
                 )
                 .unwrap();
                 assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+                MODEL_GATE_SHAPE_VALIDATIONS
+                    .with(|count| assert_eq!(count.get(), usize::from(handled.is_none())));
                 assert_eq!(
                     resolver.legacy.validation_calls.load(Ordering::SeqCst),
                     usize::from(handled.is_none())
@@ -6767,6 +7018,8 @@ pub mod bridge {
                 )
                 .unwrap();
                 assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+                MODEL_GATE_SHAPE_VALIDATIONS
+                    .with(|count| assert_eq!(count.get(), 2 * usize::from(handled.is_none())));
                 assert!(store.get_completion(&id).unwrap().is_some());
                 *resolver.result.lock().unwrap() = Err("fresh authority changed".into());
                 assert_eq!(

@@ -11,6 +11,323 @@ thread_local! {
     static ACQUISITIONS: std::cell::Cell<[usize; 5]> = const {
         std::cell::Cell::new([0; 5])
     };
+    static MODEL_PREPARATION_READS: std::cell::Cell<[usize; 3]> = const {
+        std::cell::Cell::new([0; 3])
+    };
+    static AFTER_PREPARATION_CALLBACKS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(in crate::workflow_api::model_execution) fn record_model_preparation_read(phase: &str) {
+    let index = match phase {
+        "preparation_snapshot" => 0,
+        "post_callback_snapshot" => 1,
+        "final_freshness_snapshot" => 2,
+        _ => return,
+    };
+    MODEL_PREPARATION_READS.with(|counts| {
+        let mut next = counts.get();
+        next[index] += 1;
+        counts.set(next);
+    });
+}
+
+pub(in crate::workflow_api::model_execution) fn after_preparation_callbacks() {
+    let callback = AFTER_PREPARATION_CALLBACKS.with(|slot| slot.borrow_mut().take());
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
+#[test]
+fn paired_adaptive_gate_removes_duplicate_snapshot_and_preserves_bytes_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let events = temp.path().join("events.sqlite");
+    let (api, expected, _) = configured_adaptive_test_api(&path, &events);
+    let context = api.prepare_adaptive_model(&expected).unwrap();
+    let authority = ProviderExecutionAuthority::Adaptive(Box::new(expected));
+    let envelope = ModelExecutionContext::Adaptive(Box::new(context));
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    let before = discovery_state(&path, &events);
+
+    MODEL_PREPARATION_READS.with(|counts| counts.set([0; 3]));
+    EXACT_ADAPTIVE_READ_COUNTS.with(|counts| counts.set((0, 0, 0)));
+    assert_eq!(api.validate_provider_usage_authority(&authority), Ok(true));
+    assert_eq!(
+        api.model_work_context(&authority).unwrap(),
+        Some(envelope.clone())
+    );
+    assert_eq!(
+        MODEL_PREPARATION_READS.with(|counts| counts.get()),
+        [1, 1, 1]
+    );
+    assert_eq!(
+        EXACT_ADAPTIVE_READ_COUNTS.with(|counts| counts.get()),
+        (1, 1, 1)
+    );
+
+    MODEL_PREPARATION_READS.with(|counts| counts.set([0; 3]));
+    EXACT_ADAPTIVE_READ_COUNTS.with(|counts| counts.set((0, 0, 0)));
+    for gate in 1..=2 {
+        assert_eq!(
+            api.validate_prepared_provider_model_context(&authority, &envelope),
+            Ok(Some(())),
+        );
+        assert_eq!(
+            MODEL_PREPARATION_READS.with(|counts| counts.get()),
+            [0, gate, gate]
+        );
+        assert_eq!(
+            EXACT_ADAPTIVE_READ_COUNTS.with(|counts| counts.get()),
+            (gate, gate, gate)
+        );
+        assert_eq!(serde_json::to_vec(&envelope).unwrap(), bytes);
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+    let mut changed = envelope.clone();
+    let ModelExecutionContext::Adaptive(context) = &mut changed else {
+        panic!("adaptive fixture");
+    };
+    context.task.objective.push_str(" changed saved context");
+    assert_eq!(
+        api.validate_prepared_provider_model_context(&authority, &changed),
+        Err("model work authority changed during provider I/O".into()),
+    );
+    assert_eq!(discovery_state(&path, &events), before);
+}
+
+#[test]
+fn shared_adaptive_read_payloads_are_reused_but_complete_keys_stay_separate() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let events = temp.path().join("events.sqlite");
+    let (api, expected, _) = configured_adaptive_test_api(&path, &events);
+    let scope = &expected.grant.authority;
+    let read_project = |work: &WorkItemId| {
+        api.store
+            .adaptive_project_snapshot_shared(
+                &scope.tenant_id,
+                &scope.project_id,
+                work,
+                scope.agent_id,
+            )
+            .unwrap()
+    };
+    let first = read_project(&scope.work_item_id);
+    let second = read_project(&scope.work_item_id);
+    assert!(Arc::ptr_eq(&first, &second));
+    let foreign = read_project(&WorkItemId::parse("another-work").unwrap());
+    assert!(!Arc::ptr_eq(&first, &foreign));
+    let read_model = |effect| {
+        api.store
+            .adaptive_model_preparation_read_snapshot_shared(
+                expected.grant.session_id,
+                expected.session_version,
+                effect,
+                scope,
+            )
+            .unwrap()
+    };
+    let first = read_model(expected.effect_id);
+    let second = read_model(expected.effect_id);
+    assert!(Arc::ptr_eq(&first, &second));
+    let foreign = read_model(Uuid::new_v4());
+    assert!(!Arc::ptr_eq(&first, &foreign));
+    assert!(foreign
+        .as_ref()
+        .as_ref()
+        .unwrap()
+        .working_memory_source()
+        .is_err());
+}
+
+#[test]
+fn paired_adaptive_gate_reacquires_corrupt_project_and_head_after_warm_read() {
+    for project_error in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, expected, _) = configured_adaptive_test_api(&path, &events);
+        let context = api.prepare_adaptive_model(&expected).unwrap();
+        assert_eq!(
+            api.validate_prepared_adaptive_model_context(&expected, &context),
+            Ok(())
+        );
+        if project_error {
+            rusqlite::Connection::open(&path).unwrap().execute(
+                "UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind='project'",
+                [],
+            ).unwrap();
+        } else {
+            corrupt_head(&path, expected.grant.session_id);
+        }
+        let before = discovery_state(&path, &events);
+        assert_eq!(
+            api.validate_prepared_adaptive_model_context(&expected, &context),
+            Err(format!(
+                "provider usage reauthorization failed: {}",
+                if project_error {
+                    "adaptive exact project unavailable"
+                } else {
+                    "adaptive exact session unavailable"
+                }
+            )),
+        );
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+}
+
+#[test]
+fn paired_adaptive_gate_rechecks_runtime_and_principals_after_warm_read() {
+    for change in 0..3 {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (mut api, expected, _) = configured_adaptive_test_api(&path, &events);
+        let context = api.prepare_adaptive_model(&expected).unwrap();
+        api.validate_prepared_adaptive_model_context(&expected, &context)
+            .unwrap();
+        let authority = Arc::make_mut(api.authority.as_mut().unwrap());
+        match change {
+            0 => authority.workbench_profile_digest = "0".repeat(64),
+            1 => authority.principals = Arc::new(PrincipalAuthenticator::default()),
+            _ => {
+                for agent in &mut authority.runtime_health.write().unwrap().agents {
+                    if agent.agent_id == expected.grant.authority.agent_id.0 {
+                        agent.expected_active = false;
+                    }
+                }
+            }
+        }
+        let before = discovery_state(&path, &events);
+        assert!(api
+            .validate_prepared_adaptive_model_context(&expected, &context)
+            .is_err());
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+}
+
+#[test]
+fn paired_adaptive_gate_rejects_post_callback_mutation_without_holding_store_lock() {
+    for external in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, expected, _) = configured_adaptive_test_api(&path, &events);
+        let context = api.prepare_adaptive_model(&expected).unwrap();
+        api.validate_prepared_adaptive_model_context(&expected, &context)
+            .unwrap();
+        let store = Arc::clone(&api.store);
+        let binding = expected.clone();
+        let database = path.clone();
+        AFTER_PREPARATION_CALLBACKS.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                if external {
+                    corrupt_head(&database, binding.grant.session_id);
+                } else {
+                    store
+                        .advance_adaptive_session(
+                            binding.grant.session_id,
+                            binding.session_version,
+                            Uuid::new_v4(),
+                            &AdaptiveTransitionV1::ClaimModel {
+                                effect: AdaptiveEffectV1 {
+                                    id: binding.effect_id,
+                                    request_digest: "a".repeat(64),
+                                },
+                                previous_observation_digest: None,
+                            },
+                            &binding.grant.authority,
+                            now_unix_ms(),
+                        )
+                        .unwrap();
+                }
+            }));
+        });
+        assert_eq!(
+            api.validate_prepared_adaptive_model_context(&expected, &context),
+            Err("adaptive recovery feedback unavailable".into()),
+        );
+        assert!(AFTER_PREPARATION_CALLBACKS.with(|slot| slot.borrow().is_none()));
+        let before = discovery_state(&path, &events);
+        assert!(api
+            .validate_prepared_adaptive_model_context(&expected, &context)
+            .is_err());
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+}
+
+#[test]
+fn paired_adaptive_gate_rejects_unknown_model_outcomes_without_releasing_effect() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let events = temp.path().join("events.sqlite");
+    let (api, expected, limbo) = configured_adaptive_test_api(&path, &events);
+    let context = api.prepare_adaptive_model(&expected).unwrap();
+    api.validate_prepared_adaptive_model_context(&expected, &context)
+        .unwrap();
+    let effect = AdaptiveEffectV1 {
+        id: expected.effect_id,
+        request_digest: "a".repeat(64),
+    };
+    let pending = api
+        .store
+        .advance_adaptive_session(
+            expected.grant.session_id,
+            expected.session_version,
+            Uuid::new_v4(),
+            &AdaptiveTransitionV1::ClaimModel {
+                effect: effect.clone(),
+                previous_observation_digest: None,
+            },
+            &expected.grant.authority,
+            now_unix_ms(),
+        )
+        .unwrap()
+        .1;
+    let id = expected.request_id();
+    limbo
+        .reserve_llm_request(
+            &id,
+            &effect.request_digest,
+            &expected.grant.authority.agent_id.to_string(),
+        )
+        .unwrap();
+    assert!(limbo
+        .mark_llm_provider_outcome_unknown(
+            &id,
+            &effect.request_digest,
+            "UnknownOutcome: provider_transport_deadline_elapsed",
+        )
+        .unwrap());
+    for mark_domain_unknown in [false, true] {
+        if mark_domain_unknown {
+            api.store
+                .advance_adaptive_session(
+                    expected.grant.session_id,
+                    pending.version,
+                    Uuid::new_v4(),
+                    &AdaptiveTransitionV1::MarkUnknown {
+                        effect: effect.clone(),
+                    },
+                    &expected.grant.authority,
+                    now_unix_ms(),
+                )
+                .unwrap();
+        }
+        let before = discovery_state(&path, &events);
+        assert_eq!(
+            api.validate_prepared_adaptive_model_context(&expected, &context),
+            Err("provider usage authority changed during provider I/O".into()),
+        );
+        assert_eq!(discovery_state(&path, &events), before);
+        assert_eq!(
+            limbo.get_llm_completion(&id).unwrap().unwrap().status,
+            "failed"
+        );
+    }
 }
 
 pub(in crate::workflow_api::model_execution) fn record_acquisition(cohort: &str) {
