@@ -5905,7 +5905,7 @@ mod local_adoption_tests;
 
 #[cfg(test)]
 mod issue856_funded_local_adoption_tests {
-    include!("event_store/issue856_funded_local_adoption_tests.rs");
+    include!("event_store/tests/issue856_funded_local_adoption_tests.rs");
 }
 
 #[cfg(test)]
