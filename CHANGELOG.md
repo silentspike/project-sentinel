@@ -1,5 +1,12 @@
 # Changelog
 
+- Batch funding-review evidence reads in one validated snapshot and reuse
+  continuation preflight proofs only until the first write. Retain fresh
+  post-write journal validation, complete history and corruption checks, fixed
+  proof budgets, durable usage and idempotent completion. Measure enqueue,
+  usage, admission, authority-fence wait, audit, commit and cleanup separately
+  instead of attributing the full response-adoption path to storage (#856).
+
 - Evaluate replacement review-history cuts in one pinned tenant scan and retain
   only per-cut counts and digests. Preserve complete typed decoding, exact
   historical ordering, independent relation validation, write invalidation and

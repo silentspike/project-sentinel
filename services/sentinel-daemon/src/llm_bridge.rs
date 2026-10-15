@@ -1447,6 +1447,24 @@ pub mod bridge {
             || digest == format!("{:x}", Sha256::digest(model_work.content.as_bytes()))
     }
 
+    pub(crate) fn observe_completion_stage<T, E>(
+        request_id: &str,
+        stage: &'static str,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let started = Instant::now();
+        let result = action();
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        info!(
+            request_id,
+            stage,
+            elapsed_us,
+            succeeded = result.is_ok(),
+            "Owned completion stage finished"
+        );
+        result
+    }
+
     fn recover_completion<S: CompletionStore>(
         store: &S,
         entry: LlmCompletionEntry,
@@ -1502,11 +1520,13 @@ pub mod bridge {
         }
 
         if entry.status == "pending_usage" {
-            if let Err(error) = store.persist_usage(
-                &entry.request_id,
-                &entry.request_digest,
-                &completed.usage_event,
-            ) {
+            if let Err(error) = observe_completion_stage(&entry.request_id, "usage", || {
+                store.persist_usage(
+                    &entry.request_id,
+                    &entry.request_digest,
+                    &completed.usage_event,
+                )
+            }) {
                 match store.record_failure(
                     &entry.request_id,
                     &entry.request_digest,
@@ -1534,11 +1554,17 @@ pub mod bridge {
         // Admission is durable and idempotent by provider request. Retry it before
         // claiming the legacy channel actions, without repeating provider I/O.
         if let Some(model_work) = &completed.model_work {
-            let result = resolver
-                .ok_or("model work resolver unavailable")
-                .and_then(|resolver| {
-                    resolver.admit_model_work(model_work, &entry.request_id, &entry.request_digest)
-                });
+            let result = observe_completion_stage(&entry.request_id, "admission", || {
+                resolver
+                    .ok_or("model work resolver unavailable")
+                    .and_then(|resolver| {
+                        resolver.admit_model_work(
+                            model_work,
+                            &entry.request_id,
+                            &entry.request_digest,
+                        )
+                    })
+            });
             if let Err(reason) = result {
                 let _ = store.record_failure(
                     &entry.request_id,
@@ -1551,7 +1577,9 @@ pub mod bridge {
             }
         }
 
-        let claimed = match store.claim_actions(&entry.request_id, &entry.request_digest) {
+        let claimed = match observe_completion_stage(&entry.request_id, "claim", || {
+            store.claim_actions(&entry.request_id, &entry.request_digest)
+        }) {
             Ok(claimed) => claimed,
             Err(error) => {
                 error!(request_id = %entry.request_id, error = %error, "Failed to claim completed LLM actions");
@@ -1578,7 +1606,9 @@ pub mod bridge {
                 return;
             }
         }
-        if let Err(error) = store.complete_actions(&entry.request_id, &entry.request_digest) {
+        if let Err(error) = observe_completion_stage(&entry.request_id, "complete", || {
+            store.complete_actions(&entry.request_id, &entry.request_digest)
+        }) {
             error!(
                 request_id = %entry.request_id,
                 error = %error,
@@ -1924,8 +1954,12 @@ pub mod bridge {
             model_response_digest,
             model_work: model_completion,
         };
-        let payload = serde_json::to_string(&completed).map_err(|error| error.to_string())?;
-        if let Err(error) = store.enqueue_completion(request_id, request_digest, &payload) {
+        let payload =
+            observe_completion_stage(request_id, "encode", || serde_json::to_string(&completed))
+                .map_err(|error| error.to_string())?;
+        if let Err(error) = observe_completion_stage(request_id, "enqueue", || {
+            store.enqueue_completion(request_id, request_digest, &payload)
+        }) {
             if let Some(context) = model_work {
                 if matches!(
                     context,
@@ -1948,10 +1982,10 @@ pub mod bridge {
             }
             return Err(error.to_string());
         }
-        let entry = store
-            .get_completion(request_id)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("durable LLM completion {request_id} disappeared"))?;
+        let entry =
+            observe_completion_stage(request_id, "load", || store.get_completion(request_id))
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("durable LLM completion {request_id} disappeared"))?;
         recover_completion(store, entry, action_tx, max_attempts, authority_resolver);
         Ok(())
     }
@@ -4189,6 +4223,22 @@ pub mod bridge {
         use super::*;
 
         include!("llm_bridge/tests/owned_pipeline.rs");
+
+        #[test]
+        fn completion_stage_observation_preserves_results_and_runs_once() {
+            let mut calls = 0;
+            let value = observe_completion_stage("fixture", "enqueue", || {
+                calls += 1;
+                Ok::<_, &'static str>(17)
+            });
+            assert_eq!(value, Ok(17));
+            let failure = observe_completion_stage("fixture", "admission", || {
+                calls += 1;
+                Err::<(), _>("retained for recovery")
+            });
+            assert_eq!(failure, Err("retained for recovery"));
+            assert_eq!(calls, 2);
+        }
 
         #[test]
         fn coalesced_queue_age_uses_actual_selected_tick_not_inflight_history() {

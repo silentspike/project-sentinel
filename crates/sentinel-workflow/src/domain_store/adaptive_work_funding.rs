@@ -863,7 +863,7 @@ fn reviewed_funding_ids_with_observer(
         }
         {
             let mut statement = connection.prepare(
-                "SELECT entity_kind,entity_id,version,payload,payload_digest FROM company_entities
+                "SELECT entity_kind,entity_id FROM company_entities
                  WHERE tenant_id=?1 AND entity_kind IN
                  ('adaptive_work_funding_review','adaptive_leadership_review_call')
                  ORDER BY entity_kind,entity_id LIMIT 4097",
@@ -872,35 +872,13 @@ fn reviewed_funding_ids_with_observer(
             while let Some(row) = rows.next()? {
                 let kind: String = row.get(0)?;
                 let id: String = row.get(1)?;
-                let version: i64 = row.get(2)?;
-                let value = row.get_ref(3)?;
-                let rusqlite::types::ValueRef::Blob(payload) = value else {
-                    return Err(rusqlite::Error::InvalidColumnType(
-                        3,
-                        "payload".into(),
-                        value.data_type(),
-                    )
-                    .into());
-                };
-                let digest: String = row.get(4)?;
-                // Charge the borrowed BLOB before any Rust-owned payload copy.
-                validation_scope::charge_bytes(connection, payload.len())?;
-                before_payload_copy("entity", payload.len());
-                let payload = payload.to_vec();
-                if !constant_time_eq(
-                    &digest,
-                    &bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?,
-                ) {
-                    return Err(corrupt());
-                }
                 let funding_id = if kind == REVIEW_KIND {
-                    let leaf: FundingReviewLeaf = decode(&payload)?;
+                    let leaf: FundingReviewLeaf =
+                        entity_shape_with_observer(connection, tenant, &kind, &id, |len| {
+                            before_payload_copy("entity", len)
+                        })?
+                        .ok_or_else(corrupt)?;
                     leaf.validate_entity()?;
-                    if leaf.row_binding()
-                        != (tenant, kind.as_str(), id.as_str(), stored_u64(version)?)
-                    {
-                        return Err(corrupt());
-                    }
                     Some(
                         require_review_binding(&leaf.grant)?
                             .binding
@@ -908,13 +886,12 @@ fn reviewed_funding_ids_with_observer(
                             .clone(),
                     )
                 } else {
-                    let call: AdaptiveLeadershipReviewCallV1 = decode(&payload)?;
+                    let call: AdaptiveLeadershipReviewCallV1 =
+                        entity_shape_with_observer(connection, tenant, &kind, &id, |len| {
+                            before_payload_copy("entity", len)
+                        })?
+                        .ok_or_else(corrupt)?;
                     call.validate_entity()?;
-                    if call.row_binding()
-                        != (tenant, kind.as_str(), id.as_str(), stored_u64(version)?)
-                    {
-                        return Err(corrupt());
-                    }
                     call.grant
                         .work_funding
                         .map(|epoch| epoch.binding.funding_id)
@@ -1307,6 +1284,121 @@ pub(super) fn require_fresh_funding_review_source(
 }
 
 impl WorkflowStore {
+    /// Reads persisted funding-review evidence in one validated SQL snapshot.
+    /// The final value is the sole active review for the selected session version,
+    /// or None when the check is skipped, empty or ambiguous. It is not authority.
+    /// Deferred receipt/history errors preserve the caller's comparison order and
+    /// never become reusable read-cache proofs.
+    #[allow(clippy::type_complexity)]
+    pub fn adaptive_work_funding_review_snapshot(
+        &self,
+        tenant: &TenantId,
+        review_id: Uuid,
+        session_id: Uuid,
+        funding_operation_id: Uuid,
+        expected_session_version: u64,
+        check_current: bool,
+    ) -> Result<
+        (
+            Option<AdaptiveLeadershipReviewCallV1>,
+            Result<Option<AdaptiveWorkFundingReceiptV1>, WorkflowError>,
+            Result<Option<Uuid>, WorkflowError>,
+        ),
+        WorkflowError,
+    > {
+        type DeferredError = (WorkflowErrorCode, bool, &'static str);
+        type Proof = (
+            Option<AdaptiveLeadershipReviewCallV1>,
+            Result<Option<AdaptiveWorkFundingReceiptV1>, DeferredError>,
+            Result<Option<Uuid>, DeferredError>,
+        );
+
+        tenant.validate()?;
+        if review_id.is_nil() {
+            return Err(invalid("invalid leadership review identity"));
+        }
+        let query_key = serde_json::to_vec(&(
+            tenant,
+            review_id,
+            session_id,
+            funding_operation_id,
+            expected_session_version,
+            check_current,
+        ))
+        .map_err(|_| persistence())?;
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        let (review, receipt, current) = self.validated_read_snapshot_if(
+            &mut connection,
+            "work-funding-review",
+            &query_key,
+            |snapshot| -> Result<Proof, WorkflowError> {
+                let scope = validation_scope::enter(snapshot)?;
+                let review = get_entity(
+                    snapshot,
+                    tenant,
+                    "adaptive_leadership_review_call",
+                    &review_id.to_string(),
+                )?;
+                if review.is_none() {
+                    scope.finish()?;
+                    return Ok((review, Ok(None), Ok(None)));
+                }
+                // Deferred failures drop this scope (rolling back its savepoint)
+                // and fail the retention predicate instead of caching partial proofs.
+                let receipt =
+                    match read_funding_leaf(snapshot, tenant, session_id, funding_operation_id) {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            return Ok((
+                                review,
+                                Err((error.code, error.retryable, error.message)),
+                                Ok(None),
+                            ));
+                        }
+                    };
+                if receipt.is_none() || !check_current {
+                    scope.finish()?;
+                    return Ok((review, Ok(receipt), Ok(None)));
+                }
+                // Validate the full bounded inventory before filtering, including
+                // historical and unrelated-session rows in this tenant.
+                let calls = match adaptive_leadership_review::calls_for_session(
+                    snapshot, tenant, session_id,
+                ) {
+                    Ok(calls) => calls,
+                    Err(error) => {
+                        return Ok((
+                            review,
+                            Ok(receipt),
+                            Err((error.code, error.retryable, error.message)),
+                        ));
+                    }
+                };
+                let mut matching = calls.iter().filter(|candidate| {
+                    candidate.decision.is_none()
+                        && candidate.retired_at_unix_ms.is_none()
+                        && candidate.grant.expected_session_version == expected_session_version
+                });
+                let current = matching.next().map(|call| call.grant.review_id);
+                let current = if matching.next().is_none() {
+                    current
+                } else {
+                    None
+                };
+                scope.finish()?;
+                Ok((review, Ok(receipt), Ok(current)))
+            },
+            |(_, receipt, current)| receipt.is_ok() && current.is_ok(),
+        )?;
+        Ok((
+            review,
+            receipt
+                .map_err(|(code, retryable, message)| WorkflowError::new(code, retryable, message)),
+            current
+                .map_err(|(code, retryable, message)| WorkflowError::new(code, retryable, message)),
+        ))
+    }
+
     /// Selects a proposed or already adopted epoch for one fresh real review.
     /// Refusal, retirement and expiry on the same head never generate a reroll.
     pub fn adaptive_work_funding_for_review(
@@ -1986,10 +2078,15 @@ mod review_payload_budget_tests {
             .unwrap()
             .unwrap();
         let owner_bytes = encode(&sequence).unwrap().len() + 256 + encode(&event).unwrap().len();
+        let entity_owner_bytes = encode(&(tenant, REVIEW_KIND, &leaf.membership_id))
+            .unwrap()
+            .len()
+            + 256
+            + encode(&Some(&leaf)).unwrap().len();
         validation_scope::with_scope(&connection, || {
             validation_scope::charge_bytes(
                 &connection,
-                ARENA_BYTES - proof_bytes - 2 * payload_bytes - owner_bytes,
+                ARENA_BYTES - proof_bytes - 2 * payload_bytes - owner_bytes - entity_owner_bytes,
             )?;
             let mut copies = Vec::new();
             let used = reviewed_funding_ids_with_observer(&connection, tenant, |kind, bytes| {
@@ -2000,6 +2097,17 @@ mod review_payload_budget_tests {
                 copies,
                 vec![("entity", payload_bytes), ("event", payload_bytes)]
             );
+            let mut extra_copies = 0;
+            let retained: FundingReviewLeaf = entity_shape_with_observer(
+                &connection,
+                tenant,
+                REVIEW_KIND,
+                &leaf.membership_id,
+                |_| extra_copies += 1,
+            )?
+            .ok_or_else(corrupt)?;
+            assert!(retained == leaf);
+            assert_eq!(extra_copies, 0);
             assert_eq!(
                 require_never_reviewed_funding(&connection, receipt)
                     .unwrap_err()
@@ -2037,5 +2145,86 @@ mod review_payload_budget_tests {
         );
         assert_eq!(copies, 0);
         assert!(connection.is_autocommit());
+    }
+
+    mod entity_owner_reuse_tests {
+        use super::*;
+
+        #[test]
+        fn scan_first_and_owner_first_share_shapes_and_reject_changed_checksum() {
+            for owner_first in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let store =
+                    WorkflowStore::open(directory.path().join("shared-review.sqlite")).unwrap();
+                let mut connection = store.connection.lock().unwrap();
+                let leaf = review_leaf();
+                let tenant = &leaf.grant.leadership_principal.tenant_id;
+                store_review(&mut connection, &leaf);
+                let expected = BTreeSet::from([leaf
+                    .grant
+                    .work_funding
+                    .as_ref()
+                    .unwrap()
+                    .binding
+                    .funding_id
+                    .clone()]);
+                let payload_bytes = encode(&leaf).unwrap().len();
+                validation_scope::with_scope(&connection, || {
+                    let mut owner_copies = 0;
+                    if owner_first {
+                        let owner: FundingReviewLeaf =
+                            entity_shape(&connection, tenant, REVIEW_KIND, &leaf.membership_id)?
+                                .ok_or_else(corrupt)?;
+                        owner.validate_entity()?;
+                    }
+                    let mut copies = Vec::new();
+                    let used =
+                        reviewed_funding_ids_with_observer(&connection, tenant, |kind, bytes| {
+                            copies.push((kind, bytes))
+                        })?;
+                    assert_eq!(used, expected);
+                    let expected_copies = if owner_first {
+                        vec![("event", payload_bytes)]
+                    } else {
+                        vec![("entity", payload_bytes), ("event", payload_bytes)]
+                    };
+                    assert_eq!(copies, expected_copies);
+                    assert_eq!(validation_scope::validations("entity-shape"), 1);
+                    let owner: FundingReviewLeaf = entity_shape_with_observer(
+                        &connection,
+                        tenant,
+                        REVIEW_KIND,
+                        &leaf.membership_id,
+                        |_| owner_copies += 1,
+                    )?
+                    .ok_or_else(corrupt)?;
+                    assert!(owner == leaf);
+                    assert_eq!(owner_copies, 0);
+                    assert_eq!(
+                        reviewed_funding_ids_with_observer(&connection, tenant, |kind, bytes| {
+                            copies.push((kind, bytes));
+                        })?,
+                        expected
+                    );
+                    assert_eq!(copies, expected_copies);
+                    connection.execute(
+                        "UPDATE company_entities SET payload_digest='invalid'
+                         WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3",
+                        params![tenant.0, REVIEW_KIND, leaf.membership_id],
+                    )?;
+                    let mut invalidated_copies = Vec::new();
+                    let error =
+                        reviewed_funding_ids_with_observer(&connection, tenant, |kind, bytes| {
+                            invalidated_copies.push((kind, bytes))
+                        })
+                        .unwrap_err();
+                    assert_eq!(error.code, WorkflowErrorCode::CorruptStore);
+                    assert_eq!(invalidated_copies, vec![("entity", payload_bytes)]);
+                    Ok(())
+                })
+                .unwrap();
+                assert!(connection.is_autocommit());
+            }
+        }
     }
 }
