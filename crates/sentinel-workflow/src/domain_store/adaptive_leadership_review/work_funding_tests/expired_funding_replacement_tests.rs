@@ -873,6 +873,204 @@ fn expired_reviewed_funding_replacement_deleted_successor_review_leaf_denies_loo
     assert_missing_successor_publication_denied(false);
 }
 
+fn schema6_successor_publication_fixture() -> (Fixture, AdaptiveLeadershipReviewCallV1) {
+    let (mut f, old, now) = expired_fixture(false);
+    let request = draft(&f, &old, now);
+    let operator = funding_operator(&f);
+    f.store.authorize_adaptive_work_funding_expired_replacement(
+        &operator, &request, now, evidence).unwrap();
+    let epoch = f.store.adaptive_work_funding_for_review(&operator.tenant_id,
+        f.grant.session_id, now).unwrap().unwrap();
+    budget_context(&mut f, now, "publication-scope-successor");
+    bind(&mut f, &epoch.receipt, epoch.binding.ordinal);
+    let call = issue(&f, now).unwrap();
+    let at = call.grant.expires_at_unix_ms;
+    f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+        call.version, at).unwrap();
+    let source = f.store.adaptive_funded_review_recovery_source(&operator,
+        &f.grant.project_id, f.grant.session_id, call.grant.review_id, at).unwrap();
+    budget_context(&mut f, at, "publication-scope-schema6");
+    bind(&mut f, &epoch.receipt, source.ordinal);
+    f.grant.expires_at_unix_ms = at + WINDOW_MS;
+    let retry_request = crate::AdaptiveFundedReviewRecoveryRequestV1 {
+        schema_version: 1, operation_id: Uuid::new_v4(),
+        source_digest: source.canonical_digest().unwrap(), source: Box::new(source),
+        release: request.release, proof_digest: "f".repeat(64),
+        reason_ref: "publication-scope-no-io-recovery".into(),
+        expires_at_unix_ms: f.grant.expires_at_unix_ms,
+    };
+    let (_, retry) = f.store.authorize_adaptive_funded_review_recovery(&operator,
+        &retry_request, &f.grant, &f.context, at, recovery_evidence).unwrap();
+    let call = f.store.adaptive_leadership_review_call(&operator.tenant_id,
+        retry.bound_grant().unwrap().review_id).unwrap().unwrap();
+    (f, call)
+}
+
+#[test]
+fn schema6_publication_shares_initial_reads_and_invalidates_at_actual_write() {
+    use crate::domain_store::adaptive_work_funding::{
+        require_epoch_receipt, with_recovery_publication,
+    };
+
+    let (f, call) = schema6_successor_publication_fixture();
+    let epoch = call.grant.work_funding.as_ref().unwrap();
+    let context_digest = call.context_digest().unwrap();
+    let mut connection = f.store.connection.lock().unwrap();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+    // Retain the exact membership and events, as at the real publication boundary.
+    transaction.execute("DELETE FROM company_entities WHERE tenant_id=?1
+        AND entity_kind='adaptive_leadership_review_call' AND entity_id=?2",
+        params![f.leader.tenant_id.0, call.review_key]).unwrap();
+    assert_eq!(require_epoch_receipt(&transaction, epoch).unwrap_err().code,
+        WorkflowErrorCode::CorruptStore);
+    with_recovery_publication(&transaction, &call.grant, &context_digest,
+        call.operation_id, call.grant_issued_at_unix_ms, || {
+            require_epoch_receipt(&transaction, epoch)?;
+            let entities = validation_scope::validations("entity");
+            let traces = validation_scope::validations("unused-funding-review-traces");
+            assert!(entities > 0 && traces > 0);
+            require_epoch_receipt(&transaction, epoch)?;
+            assert_eq!(validation_scope::validations("entity"), entities);
+            assert_eq!(validation_scope::validations("unused-funding-review-traces"), traces);
+            put_entity(&transaction, &f.leader.tenant_id, "adaptive_leadership_review_call",
+                &call.review_key, call.version, &call)?;
+            require_epoch_receipt(&transaction, epoch)?;
+            assert!(validation_scope::validations("entity") > entities);
+            assert!(validation_scope::validations("unused-funding-review-traces") > traces);
+            Ok(())
+        }).unwrap();
+    assert_eq!(validation_scope::validations("entity"), 0);
+    require_epoch_receipt(&transaction, epoch).unwrap();
+    // A later operation cannot reuse either publication or post-publication proofs.
+    transaction.execute("DELETE FROM company_entities WHERE tenant_id=?1
+        AND entity_kind='adaptive_leadership_review_call' AND entity_id=?2",
+        params![f.leader.tenant_id.0, call.review_key]).unwrap();
+    assert_eq!(require_epoch_receipt(&transaction, epoch).unwrap_err().code,
+        WorkflowErrorCode::CorruptStore);
+    transaction.rollback().unwrap();
+}
+
+#[test]
+fn schema6_publication_scopes_do_not_leak_exception_after_return_error_or_unwind() {
+    use crate::domain_store::adaptive_work_funding::{
+        require_epoch_receipt, with_recovery_publication,
+    };
+
+    let (f, call) = schema6_successor_publication_fixture();
+    let epoch = call.grant.work_funding.as_ref().unwrap();
+    let context_digest = call.context_digest().unwrap();
+    let mut connection = f.store.connection.lock().unwrap();
+    for enclosing in [false, true] {
+        for outcome in ["return", "error", "unwind"] {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+            transaction.execute("DELETE FROM company_entities WHERE tenant_id=?1
+                AND entity_kind='adaptive_leadership_review_call' AND entity_id=?2",
+                params![f.leader.tenant_id.0, call.review_key]).unwrap();
+            let mut outer = enclosing.then(|| validation_scope::enter(&transaction).unwrap());
+            let sequence: i64 = transaction.query_row(
+                "SELECT min(sequence) FROM company_events WHERE tenant_id=?1",
+                [&f.leader.tenant_id.0], |row| row.get(0)).unwrap();
+            let sequence = u64::try_from(sequence).unwrap();
+            if enclosing {
+                crate::domain_store::company_event_shape(&transaction, sequence).unwrap().unwrap();
+                assert_eq!(validation_scope::validations("event-shape"), 1);
+            }
+            let reached_outcome = std::cell::Cell::new(false);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_recovery_publication(&transaction, &call.grant, &context_digest,
+                    call.operation_id, call.grant_issued_at_unix_ms, || {
+                        let before = validation_scope::validations("event-shape");
+                        for _ in 0..2 {
+                            crate::domain_store::company_event_shape(&transaction, sequence)?
+                                .ok_or_else(corrupt)?;
+                        }
+                        // Enclosing proofs are cleared and stay non-reusable; an
+                        // owned publication scope shares only its own initial reads.
+                        assert_eq!(validation_scope::validations("event-shape"),
+                            before + if enclosing { 2 } else { 1 });
+                        require_epoch_receipt(&transaction, epoch)?;
+                        let entities = validation_scope::validations("entity");
+                        require_epoch_receipt(&transaction, epoch)?;
+                        if enclosing {
+                            assert!(validation_scope::validations("entity") > entities);
+                        } else {
+                            assert_eq!(validation_scope::validations("entity"), entities);
+                        }
+                        reached_outcome.set(true);
+                        match outcome {
+                            "error" => Err(transition()),
+                            "unwind" => panic!("controlled publication scope unwind"),
+                            _ => Ok(()),
+                        }
+                    })
+            }));
+            assert!(reached_outcome.get(), "callback did not reach {outcome}; enclosing={enclosing}");
+            match (outcome, result) {
+                ("unwind", Err(_)) => {}
+                ("error", Ok(Err(error))) => assert_eq!(error.code, transition().code),
+                ("return", Ok(Err(error))) => {
+                    // Successful callback is insufficient: post-publication must
+                    // reject the still-missing call after clearing the exception.
+                    assert_eq!(error.code, WorkflowErrorCode::CorruptStore);
+                }
+                (outcome, result) => panic!("unexpected {outcome} result: {result:?}"),
+            }
+            assert_eq!(require_epoch_receipt(&transaction, epoch).unwrap_err().code,
+                WorkflowErrorCode::CorruptStore);
+            // A different leaf cannot borrow the exact publication exception.
+            let invoked = std::cell::Cell::new(false);
+            assert!(with_recovery_publication(&transaction, &call.grant, &context_digest,
+                Uuid::new_v4(), call.grant_issued_at_unix_ms, || {
+                    invoked.set(true);
+                    let error = require_epoch_receipt(&transaction, epoch).unwrap_err();
+                    assert_eq!(error.code, WorkflowErrorCode::CorruptStore);
+                    Err::<(), _>(error)
+                }).is_err());
+            assert!(invoked.get());
+            put_entity(&transaction, &f.leader.tenant_id, "adaptive_leadership_review_call",
+                &call.review_key, call.version, &call).unwrap();
+            // Both guards must be usable again, even after caught callback unwinds.
+            with_recovery_publication(&transaction, &call.grant, &context_digest,
+                call.operation_id, call.grant_issued_at_unix_ms, || {
+                    require_epoch_receipt(&transaction, epoch)
+                }).unwrap();
+            if let Some(scope) = outer.take() {
+                scope.finish().unwrap();
+            }
+            drop(outer);
+            assert_eq!(validation_scope::validations("entity"), 0);
+            transaction.rollback().unwrap();
+        }
+    }
+}
+
+#[test]
+fn schema6_publication_invalidation_failure_clears_guard_before_scope_entry() {
+    use crate::domain_store::adaptive_work_funding::with_recovery_publication;
+
+    let (f, _, _) = expired_fixture(true);
+    let call = f.store.adaptive_leadership_review_calls(&f.leader.tenant_id,
+        f.grant.session_id).unwrap().into_iter().find(|call| call.grant.schema_version == 6).unwrap();
+    let context_digest = call.context_digest().unwrap();
+    let mut connection = f.store.connection.lock().unwrap();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+    let invoked = std::cell::Cell::new(false);
+    // Publication cannot invalidate proofs from inside a read-only validator.
+    let error = validation_scope::memoize(&transaction, "publication-read-only-probe", &(), || {
+        with_recovery_publication(&transaction, &call.grant, &context_digest,
+            call.operation_id, call.grant_issued_at_unix_ms, || {
+                invoked.set(true);
+                Ok(())
+            })
+    }).unwrap_err();
+    assert_eq!(error.code, WorkflowErrorCode::CorruptStore);
+    assert!(!invoked.get());
+    assert_eq!(validation_scope::validations("publication-read-only-probe"), 0);
+    with_recovery_publication(&transaction, &call.grant, &context_digest,
+        call.operation_id, call.grant_issued_at_unix_ms, || Ok(())).unwrap();
+    transaction.rollback().unwrap();
+}
+
 #[test]
 fn expired_reviewed_funding_replacement_schema6_publication_error_and_unwind_clear_exception() {
     let (f, _, _) = expired_fixture(true);
