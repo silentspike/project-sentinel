@@ -769,6 +769,9 @@ impl WorkflowApi {
             {
                 continue;
             }
+            if source.review_has_prior_adoption(call) {
+                continue;
+            }
             let id = call.request_id();
             self.validate_funded_request_no_io(&id, guard)?;
         }

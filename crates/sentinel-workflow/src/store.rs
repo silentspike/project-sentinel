@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -337,6 +337,48 @@ impl WorkflowStore {
         )
     }
 
+    /// Share immutable validated data, not a current authority or freshness decision.
+    /// Retained hits still prove the complete inputs and SQLite integrity in a
+    /// fresh snapshot. Callers must supply every stable validator input in the key.
+    /// Neither validation nor retention may memoize clock-dependent eligibility.
+    #[cfg(test)]
+    pub(crate) fn validated_read_snapshot_shared<T: Serialize + Send + Sync + 'static>(
+        &self,
+        connection: &mut Connection,
+        domain: &'static str,
+        query_key: &[u8],
+        validate: impl FnOnce(&Connection) -> Result<T, WorkflowError>,
+    ) -> Result<Arc<T>, WorkflowError> {
+        self.validated_read_snapshot_shared_if(connection, domain, query_key, validate, |_| true)
+    }
+
+    pub(crate) fn validated_read_snapshot_shared_if<T: Serialize + Send + Sync + 'static>(
+        &self,
+        connection: &mut Connection,
+        domain: &'static str,
+        query_key: &[u8],
+        validate: impl FnOnce(&Connection) -> Result<T, WorkflowError>,
+        retain: impl Fn(&T) -> bool,
+    ) -> Result<Arc<T>, WorkflowError> {
+        self.with_validated_read_snapshot(
+            connection,
+            domain,
+            |cache, snapshot, eligible| match cache {
+                Some(cache) => cache.read_shared_keyed_if(
+                    snapshot,
+                    eligible,
+                    domain,
+                    query_key,
+                    || validate(snapshot),
+                    retain,
+                ),
+                None => validate(snapshot).map(Arc::new),
+            },
+            read_cache::diagnostics_enabled(),
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn validated_read_snapshot_observed<T: Clone + Serialize + Send + 'static>(
         &self,
@@ -345,6 +387,37 @@ impl WorkflowStore {
         query_key: &[u8],
         validate: impl FnOnce(&Connection) -> Result<T, WorkflowError>,
         retain: impl Fn(&T) -> bool,
+        observe: bool,
+        observed: Option<&mut SnapshotDiagnostic>,
+    ) -> Result<T, WorkflowError> {
+        self.with_validated_read_snapshot(
+            connection,
+            domain,
+            |cache, snapshot, eligible| match cache {
+                Some(cache) => cache.read_keyed_if(
+                    snapshot,
+                    eligible,
+                    domain,
+                    query_key,
+                    || validate(snapshot),
+                    retain,
+                ),
+                None => validate(snapshot),
+            },
+            observe,
+            observed,
+        )
+    }
+
+    fn with_validated_read_snapshot<T>(
+        &self,
+        connection: &mut Connection,
+        domain: &'static str,
+        read: impl FnOnce(
+            Option<&mut read_cache::ReadCache>,
+            &Connection,
+            bool,
+        ) -> Result<T, WorkflowError>,
         observe: bool,
         observed: Option<&mut SnapshotDiagnostic>,
     ) -> Result<T, WorkflowError> {
@@ -365,17 +438,7 @@ impl WorkflowStore {
                 diagnostic.setup = started.elapsed();
             }
             let snapshot = snapshot?;
-            let value = match cache.as_mut() {
-                Some(cache) => cache.read_keyed_if(
-                    &snapshot,
-                    eligible,
-                    domain,
-                    query_key,
-                    || validate(&snapshot),
-                    retain,
-                ),
-                None => validate(&snapshot),
-            };
+            let value = read(cache.as_deref_mut(), &snapshot, eligible);
             let started = diagnostic.as_ref().map(|_| Instant::now());
             let value = match value {
                 Ok(value) => {
@@ -2740,6 +2803,7 @@ mod tests {
         let changes: i64 = connection
             .query_row("SELECT total_changes()", [], |row| row.get(0))
             .unwrap();
+        assert_eq!(changes, 0);
         let store = super::WorkflowStore {
             connection: std::sync::Mutex::new(connection),
             validated_reads: std::sync::Mutex::new(super::read_cache::ReadCache::default()),
@@ -2750,7 +2814,6 @@ mod tests {
             .as_millis()
             .try_into()
             .unwrap();
-        let started = std::time::Instant::now();
         let mode = std::env::var("SENTINEL_DIAGNOSTIC_MODE")
             .unwrap_or_else(|_| "replacement_source".into());
         assert!(matches!(
@@ -2760,66 +2823,132 @@ mod tests {
                 | "funding_review_reads"
                 | "adaptive_health_inventory"
         ));
+        let repeat = std::env::var_os("SENTINEL_DIAGNOSTIC_REPEAT")
+            .map(|value| {
+                value
+                    .into_string()
+                    .expect("repeat must be an integer in 1..=3")
+                    .parse::<usize>()
+                    .expect("repeat must be an integer in 1..=3")
+            })
+            .unwrap_or(1);
+        assert!((1..=3).contains(&repeat), "repeat must be in 1..=3");
+        assert!(
+            repeat == 1 || mode == "adaptive_health_inventory",
+            "repeat is supported only for adaptive_health_inventory"
+        );
         if mode == "funding_review_reads" {
-            diagnose_funding_review_reads(&store, &operator);
+            let result = diagnose_funding_review_reads(&store, &operator);
             let connection = store.connection.lock().unwrap();
             assert!(connection.is_readonly("main").unwrap());
             let after: i64 = connection
                 .query_row("SELECT total_changes()", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(after, changes);
+            assert!(
+                result.is_ok(),
+                "funding review read failed; error_code={:?} retryable={:?}; see phase metadata",
+                result.as_ref().err().map(|error| error.code),
+                result.as_ref().err().map(|error| error.retryable),
+            );
             return;
         }
-        let (result, failures) =
-            crate::domain_store::validation_scope::with_validation_failures(|| {
-                if mode == "adaptive_health_inventory" {
-                    return store
-                        .adaptive_health_inventory()
-                        .map(|_| true)
-                        .map_err(|error| match error {
-                            super::AdaptiveHealthReadError::Projects(error)
-                            | super::AdaptiveHealthReadError::Sessions(error) => error,
-                        });
-                }
-                if mode == "funding_review_selection" {
-                    return store
-                        .adaptive_work_funding_for_review(
-                            &operator.tenant_id,
+        if mode == "adaptive_health_inventory" {
+            let _ = store.take_read_cache_diagnostics();
+        }
+        for pass in 1..=repeat {
+            let started = std::time::Instant::now();
+            let (result, failures) =
+                crate::domain_store::validation_scope::with_validation_failures(|| {
+                    if mode == "adaptive_health_inventory" {
+                        return store
+                            .adaptive_health_inventory()
+                            .map(|_| true)
+                            .map_err(|error| match error {
+                                super::AdaptiveHealthReadError::Projects(error)
+                                | super::AdaptiveHealthReadError::Sessions(error) => error,
+                            });
+                    }
+                    if mode == "funding_review_selection" {
+                        return store
+                            .adaptive_work_funding_for_review(
+                                &operator.tenant_id,
+                                source.session_id,
+                                now,
+                            )
+                            .map(|selected| selected.is_some());
+                    }
+                    store
+                        .adaptive_work_funding_expired_replacement_verification_source(
+                            &operator,
+                            &source.project_id,
                             source.session_id,
+                            &source.old_funding_receipt_digest,
                             now,
                         )
-                        .map(|selected| selected.is_some());
+                        .map(|_| true)
+                });
+            {
+                let connection = store.connection.lock().unwrap();
+                let after: i64 = connection
+                    .query_row("SELECT total_changes()", [], |row| row.get(0))
+                    .unwrap();
+                assert!(connection.is_readonly("main").unwrap());
+                assert_eq!(after, 0);
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "READ_ONLY_FUNDING_DIAGNOSTIC mode={} selected={:?} elapsed_ms={} error_code={:?} failures={:?} writes=0",
+                mode,
+                result.as_ref().ok(),
+                elapsed.as_millis(),
+                result.as_ref().err().map(|error| error.code),
+                failures,
+            );
+            if mode == "adaptive_health_inventory" {
+                let records = store.take_read_cache_diagnostics();
+                eprintln!(
+                    "READ_ONLY_HEALTH_PASS pass={pass} repeat={repeat} elapsed_us={} read_cache_records={} total_changes=0",
+                    elapsed.as_micros(),
+                    records.len(),
+                );
+                for record in records {
+                    eprintln!("READ_ONLY_HEALTH_DETAIL pass={pass} {record}");
                 }
-                store
-                    .adaptive_work_funding_expired_replacement_verification_source(
-                        &operator,
-                        &source.project_id,
-                        source.session_id,
-                        &source.old_funding_receipt_digest,
-                        now,
-                    )
-                    .map(|_| true)
-            });
-        let connection = store.connection.lock().unwrap();
-        let after: i64 = connection
-            .query_row("SELECT total_changes()", [], |row| row.get(0))
-            .unwrap();
-        assert!(connection.is_readonly("main").unwrap());
-        assert_eq!(after, changes);
-        eprintln!(
-            "READ_ONLY_FUNDING_DIAGNOSTIC mode={} selected={:?} elapsed_ms={} error_code={:?} failures={:?} writes=0",
-            mode,
-            result.as_ref().ok(),
-            started.elapsed().as_millis(),
-            result.as_ref().err().map(|error| error.code),
-            failures,
-        );
+            }
+        }
     }
 
     fn diagnose_funding_review_reads(
         store: &super::WorkflowStore,
         operator: &crate::AuthenticatedCompanyPrincipalV1,
-    ) {
+    ) -> Result<(), crate::WorkflowError> {
+        fn phase<T>(
+            store: &super::WorkflowStore,
+            phase: &'static str,
+            read: impl FnOnce() -> Result<T, crate::WorkflowError>,
+        ) -> Result<T, crate::WorkflowError> {
+            let started = std::time::Instant::now();
+            let (result, failures) =
+                crate::domain_store::validation_scope::with_validation_failures(read);
+            let elapsed = started.elapsed();
+            let records = store.take_read_cache_diagnostics();
+            eprintln!(
+                "READ_ONLY_COMPLETION_PHASE phase={phase} succeeded={} elapsed_us={} error_code={:?} retryable={:?} read_cache_records={} validation_failure_count={} first_failure={:?}",
+                result.is_ok(),
+                elapsed.as_micros(),
+                result.as_ref().err().map(|error| error.code),
+                result.as_ref().err().map(|error| error.retryable),
+                records.len(),
+                failures.len(),
+                failures.first(),
+            );
+            for record in records {
+                eprintln!("READ_ONLY_COMPLETION_DETAIL phase={phase} {record}");
+            }
+            result
+        }
+
         let review_id = uuid::Uuid::parse_str(
             &std::env::var("SENTINEL_DIAGNOSTIC_REVIEW_ID")
                 .expect("explicit existing review identity required"),
@@ -2834,10 +2963,18 @@ mod tests {
                 .unwrap()
         };
         let before = version();
-        let call = store
-            .adaptive_leadership_review_call(&operator.tenant_id, review_id)
-            .unwrap()
-            .expect("existing review required");
+        let _ = store.take_read_cache_diagnostics();
+        let call = phase(store, "source_review", || {
+            store
+                .adaptive_leadership_review_call(&operator.tenant_id, review_id)?
+                .ok_or_else(|| {
+                    crate::WorkflowError::new(
+                        crate::WorkflowErrorCode::NotFound,
+                        false,
+                        "diagnostic source review not found",
+                    )
+                })
+        })?;
         let epoch = call
             .grant
             .work_funding
@@ -2860,53 +2997,81 @@ mod tests {
             }
         };
         store.validated_reads.lock().unwrap().clear();
-        let _ = store.take_read_cache_diagnostics();
         let started = std::time::Instant::now();
-        let legacy_review = store
-            .adaptive_leadership_review_call(tenant, review_id)
-            .unwrap();
-        let legacy_receipt = store
-            .adaptive_work_funding(
+        let legacy_review = phase(store, "legacy_review", || {
+            store.adaptive_leadership_review_call(tenant, review_id)
+        });
+        let legacy_receipt = phase(store, "legacy_receipt", || {
+            store.adaptive_work_funding(
                 tenant,
                 call.grant.session_id,
                 epoch.receipt.request.operation_id,
             )
-            .unwrap();
-        let legacy_current = current_id(
+        });
+        let legacy_current = phase(store, "legacy_current", || {
             store
                 .adaptive_leadership_review_calls(tenant, call.grant.session_id)
-                .unwrap(),
-        );
+                .map(current_id)
+        });
         let legacy_us = started.elapsed().as_micros();
-        let legacy_diagnostics = store.take_read_cache_diagnostics();
         store.validated_reads.lock().unwrap().clear();
         let started = std::time::Instant::now();
-        let (batch_review, batch_receipt, batch_current) = store
-            .adaptive_work_funding_review_snapshot(
+        let batch = phase(store, "batch", || {
+            let result = store.adaptive_work_funding_review_snapshot(
                 tenant,
                 review_id,
                 call.grant.session_id,
                 epoch.receipt.request.operation_id,
                 call.grant.expected_session_version,
                 true,
-            )
-            .unwrap();
+            );
+            if let Ok((_, receipt, current)) = &result {
+                eprintln!(
+                    "READ_ONLY_COMPLETION_BATCH_RECEIPT succeeded={} error_code={:?} retryable={:?}",
+                    receipt.is_ok(),
+                    receipt.as_ref().err().map(|error| error.code),
+                    receipt.as_ref().err().map(|error| error.retryable),
+                );
+                eprintln!(
+                    "READ_ONLY_COMPLETION_BATCH_CURRENT succeeded={} error_code={:?} retryable={:?}",
+                    current.is_ok(),
+                    current.as_ref().err().map(|error| error.code),
+                    current.as_ref().err().map(|error| error.retryable),
+                );
+            }
+            result
+        });
         let batch_us = started.elapsed().as_micros();
-        let batch_diagnostics = store.take_read_cache_diagnostics();
-        assert_eq!(batch_review, legacy_review);
-        assert_eq!(batch_receipt.unwrap(), legacy_receipt);
-        assert_eq!(batch_current.unwrap(), legacy_current);
+        let identical = match (&legacy_review, &legacy_receipt, &legacy_current, &batch) {
+            (
+                Ok(review),
+                Ok(receipt),
+                Ok(current),
+                Ok((batch_review, Ok(batch_receipt), Ok(batch_current))),
+            ) => {
+                Some(review == batch_review && receipt == batch_receipt && current == batch_current)
+            }
+            _ => None,
+        };
         assert_eq!(
             version(),
             before,
             "database changed; no matched comparison claimed"
         );
-        eprintln!("READ_ONLY_COMPLETION_READS legacy_us={legacy_us} batch_us={batch_us} identical=true writes=0");
-        for (path, rows) in [("legacy", legacy_diagnostics), ("batch", batch_diagnostics)] {
-            for record in rows {
-                eprintln!("READ_ONLY_COMPLETION_DETAIL path={path} {record}");
-            }
-        }
+        let comparison = match identical {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unavailable",
+        };
+        eprintln!("READ_ONLY_COMPLETION_READS legacy_us={legacy_us} batch_us={batch_us} identical={comparison} writes=0");
+        let _ = legacy_review?;
+        let _ = legacy_receipt?;
+        let _ = legacy_current?;
+        let (_, receipt, current) = batch?;
+        let _ = receipt?;
+        let _ = current?;
+        assert_eq!(identical, Some(true), "validated read results differ");
+        Ok(())
     }
 
     use std::collections::BTreeSet;
@@ -3033,6 +3198,91 @@ mod tests {
         assert!(result.is_err());
         assert!(connection.is_autocommit());
         assert!(format!("{:?}", store.validated_reads.lock().unwrap()).contains("views: 0"));
+    }
+
+    #[test]
+    fn issue856_shared_snapshot_retains_non_clone_payload_and_cleans_up() {
+        #[derive(Serialize)]
+        struct NonClonePayload {
+            data: String,
+        }
+
+        let store = WorkflowStore::open(":memory:").unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let first = store
+            .validated_read_snapshot_shared(&mut connection, "shared", b"complete", |_| {
+                Ok(NonClonePayload {
+                    data: "saved data".to_owned(),
+                })
+            })
+            .unwrap();
+        let second = store
+            .validated_read_snapshot_shared::<NonClonePayload>(
+                &mut connection,
+                "shared",
+                b"complete",
+                |_| panic!("reuse immutable data after the complete proof"),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(second.data, "saved data");
+        assert!(connection.is_autocommit());
+        let failure = store.validated_read_snapshot_shared(
+            &mut connection,
+            "shared-cleanup",
+            &[],
+            |snapshot| {
+                snapshot.execute_batch("ROLLBACK")?;
+                Ok(7_u64)
+            },
+        );
+        assert!(failure.is_err());
+        assert!(connection.is_autocommit());
+        assert!(format!("{:?}", store.validated_reads.lock().unwrap()).contains("views: 0"));
+        assert_eq!(first.data, "saved data");
+    }
+
+    #[test]
+    fn issue856_shared_snapshot_outer_transaction_write_and_deferred_proofs_are_not_retained() {
+        let store = WorkflowStore::open(":memory:").unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        connection.execute_batch("BEGIN").unwrap();
+        for _ in 0..2 {
+            let value = store
+                .validated_read_snapshot_shared(&mut connection, "outer", &[], |_| Ok(7_u64))
+                .unwrap();
+            assert_eq!(*value, 7);
+            assert!(!connection.is_autocommit());
+            assert!(format!("{:?}", store.validated_reads.lock().unwrap()).contains("views: 0"));
+        }
+        connection.execute_batch("ROLLBACK").unwrap();
+        let error = store
+            .validated_read_snapshot_shared(&mut connection, "write", &[], |snapshot| {
+                snapshot.execute("UPDATE workflow_schema_meta SET schema_version=2", [])?;
+                Ok(7_u64)
+            })
+            .unwrap_err();
+        assert_eq!(error.code, corrupt_store().code);
+        let version: i64 = connection
+            .query_row(
+                "SELECT schema_version FROM workflow_schema_meta",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 3);
+        let value = store
+            .validated_read_snapshot_shared_if(
+                &mut connection,
+                "deferred",
+                &[],
+                |_| Ok(7_u64),
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(*value, 7);
+        assert!(format!("{:?}", store.validated_reads.lock().unwrap()).contains("views: 0"));
+        assert!(connection.is_autocommit());
     }
 
     #[test]

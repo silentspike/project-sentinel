@@ -54,6 +54,50 @@ impl AdaptiveModelPreparationReadSnapshot {
 }
 
 impl WorkflowStore {
+    /// The existing scoped project/head proof, shared without cloning its payload.
+    /// Runtime permission and clock-dependent admission remain the caller's job.
+    pub fn adaptive_project_snapshot_shared(
+        &self,
+        tenant_id: &crate::TenantId,
+        project_id: &crate::ProjectId,
+        work_item_id: &crate::WorkItemId,
+        agent_id: crate::AgentId,
+    ) -> Result<std::sync::Arc<Option<AdaptiveProjectReadSnapshot>>, WorkflowError> {
+        tenant_id.validate()?;
+        project_id.validate()?;
+        let query_key = encode(&(tenant_id, project_id, work_item_id, agent_id))?;
+        let mut connection = self.lock()?;
+        self.validated_read_snapshot_shared_if(
+            &mut connection,
+            "adaptive-project-scope",
+            &query_key,
+            |tx| {
+                let Some(project) = crate::domain_store::validated_company_project_in_snapshot(
+                    tx, tenant_id, project_id,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let heads =
+                    scoped_adaptive_heads(tx, tenant_id, project_id, work_item_id, agent_id)
+                        .map_err(|error| DeferredHeadReadError {
+                            code: error.code,
+                            retryable: error.retryable,
+                            message: error.message,
+                        });
+                Ok(Some(AdaptiveProjectReadSnapshot {
+                    project,
+                    work_item_id: work_item_id.clone(),
+                    agent_id,
+                    heads,
+                }))
+            },
+            |view: &Option<AdaptiveProjectReadSnapshot>| {
+                view.as_ref().is_none_or(|snapshot| snapshot.heads.is_ok())
+            },
+        )
+    }
+
     /// Each scope keeps its old replay budget; only compact projections are retained.
     pub fn adaptive_progress_read_batch(
         &self,
@@ -112,51 +156,13 @@ impl WorkflowStore {
             "adaptive-model-preparation",
             &key,
             |tx| {
-                let scope = crate::domain_store::validation_scope::enter(tx)?;
-                let mut collected = None;
-                let Some((session, _, feedback)) =
-                    load_with_working_memory(tx, session_id, provider_version, &mut collected)?
-                else {
-                    scope.finish()?;
-                    return Ok(None);
-                };
-                authorize(&session.grant, current)?;
-                require_head(tx, &session)?;
-                // The exact current head was authenticated above. Reuse its replayed
-                // feedback, including ModelRejected's derived feedback semantics.
-                let recovery_feedback = Ok(recovery_feedback_from_loaded(&session, feedback));
-                let memory = working_memory_source_from_loaded(
+                model_preparation_read_snapshot_on_connection(
                     tx,
-                    &session,
+                    session_id,
                     provider_version,
                     effect_id,
-                    collected,
-                );
-                // Optional assembly errors cannot hide a valid legacy retained context.
-                // A failed arena is discarded before reading an independent project.
-                let working_memory_source = match memory {
-                    Ok(source) => {
-                        scope.finish()?;
-                        Ok(source)
-                    }
-                    Err(error) => {
-                        drop(scope);
-                        Err(DeferredHeadReadError::capture(error))
-                    }
-                };
-                let project = crate::domain_store::validated_company_project_in_snapshot(
-                    tx,
-                    &current.tenant_id,
-                    &current.project_id,
+                    current,
                 )
-                .and_then(|value| value.ok_or_else(not_found))
-                .map_err(DeferredHeadReadError::capture);
-                Ok(Some(AdaptiveModelPreparationReadSnapshot {
-                    session,
-                    project,
-                    recovery_feedback,
-                    working_memory_source,
-                }))
             },
             |value| {
                 value
@@ -165,6 +171,87 @@ impl WorkflowStore {
             },
         )
     }
+
+    /// Shared immutable SQL facts; current execution authority is never retained here.
+    pub fn adaptive_model_preparation_read_snapshot_shared(
+        &self,
+        session_id: Uuid,
+        provider_version: u64,
+        effect_id: Uuid,
+        current: &RuntimeAuthoritySnapshotV1,
+    ) -> Result<std::sync::Arc<Option<AdaptiveModelPreparationReadSnapshot>>, WorkflowError> {
+        current.validate()?;
+        let key = encode(&(session_id, provider_version, effect_id, current))?;
+        let mut connection = self.lock()?;
+        self.validated_read_snapshot_shared_if(
+            &mut connection,
+            "adaptive-model-preparation",
+            &key,
+            |tx| {
+                model_preparation_read_snapshot_on_connection(
+                    tx,
+                    session_id,
+                    provider_version,
+                    effect_id,
+                    current,
+                )
+            },
+            |value| {
+                value
+                    .as_ref()
+                    .is_none_or(AdaptiveModelPreparationReadSnapshot::retainable)
+            },
+        )
+    }
+}
+
+fn model_preparation_read_snapshot_on_connection(
+    tx: &Connection,
+    session_id: Uuid,
+    provider_version: u64,
+    effect_id: Uuid,
+    current: &RuntimeAuthoritySnapshotV1,
+) -> Result<Option<AdaptiveModelPreparationReadSnapshot>, WorkflowError> {
+    let scope = crate::domain_store::validation_scope::enter(tx)?;
+    let mut collected = None;
+    let Some((session, _, feedback)) =
+        load_with_working_memory(tx, session_id, provider_version, &mut collected)?
+    else {
+        scope.finish()?;
+        return Ok(None);
+    };
+    authorize(&session.grant, current)?;
+    require_head(tx, &session)?;
+    // The exact current head was authenticated above. Reuse its replayed
+    // feedback, including ModelRejected's derived feedback semantics.
+    let recovery_feedback = Ok(recovery_feedback_from_loaded(&session, feedback));
+    let memory =
+        working_memory_source_from_loaded(tx, &session, provider_version, effect_id, collected);
+    // Optional assembly errors cannot hide a valid legacy retained context.
+    // A failed arena is discarded before reading an independent project.
+    let working_memory_source = match memory {
+        Ok(source) => {
+            scope.finish()?;
+            Ok(source)
+        }
+        Err(error) => {
+            drop(scope);
+            Err(DeferredHeadReadError::capture(error))
+        }
+    };
+    let project = crate::domain_store::validated_company_project_in_snapshot(
+        tx,
+        &current.tenant_id,
+        &current.project_id,
+    )
+    .and_then(|value| value.ok_or_else(not_found))
+    .map_err(DeferredHeadReadError::capture);
+    Ok(Some(AdaptiveModelPreparationReadSnapshot {
+        session,
+        project,
+        recovery_feedback,
+        working_memory_source,
+    }))
 }
 
 pub(super) fn recovery_feedback_from_loaded(

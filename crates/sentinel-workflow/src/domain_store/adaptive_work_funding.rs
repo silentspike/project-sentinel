@@ -761,6 +761,128 @@ pub(super) fn require_never_dispatched_funding(
     require_pre_recovery_funding_history(connection, epoch, None)
 }
 
+pub(super) fn recovery_uses_adopted_epoch(
+    source: &crate::AdaptiveSessionV1,
+    epoch: &AdaptiveWorkFundingEpochV1,
+) -> bool {
+    source
+        .active_work_funding()
+        .is_some_and(|active| active.same_epoch(epoch))
+}
+
+pub(super) fn recovery_prior_adopted_call(
+    source: &crate::AdaptiveSessionV1,
+    call: &AdaptiveLeadershipReviewCallV1,
+) -> bool {
+    call.version == 3
+        && call.retired_at_unix_ms.is_none()
+        && call.continuation.as_ref().is_some_and(|authorization| {
+            authorization.source_session_version < source.version
+                && authorization.session_id == source.grant.session_id
+                && call.grant.assignee_authority == source.grant.authority
+                && call.context.source_session.grant == source.grant
+                && source
+                    .continuation
+                    .as_ref()
+                    .is_some_and(|state| state.authorizations.contains(authorization))
+        })
+}
+
+impl crate::AdaptiveFundedReviewRecoveryVerificationSourceV1 {
+    /// Classification only: the source must come from the store's authenticated
+    /// frozen journal. All other reviews still require physical NoIO checks.
+    pub fn review_has_prior_adoption(&self, call: &AdaptiveLeadershipReviewCallV1) -> bool {
+        call.grant.work_funding.as_ref().is_some_and(|epoch| {
+            epoch.receipt == *self.funding
+                && recovery_uses_adopted_epoch(&self.session, epoch)
+                && recovery_prior_adopted_call(&self.session, call)
+        })
+    }
+}
+
+/// The selected expired review remains NoIO; earlier committed work is history,
+/// authenticated by the exact journal prefix rather than relabeled as unused.
+pub(super) fn require_funded_recovery_source_history(
+    connection: &Connection,
+    epoch: &AdaptiveWorkFundingEpochV1,
+    source: &crate::AdaptiveSessionV1,
+) -> Result<(), WorkflowError> {
+    if !recovery_uses_adopted_epoch(source, epoch) {
+        return require_never_dispatched_funding(connection, epoch);
+    }
+    let key = canonical_sha256(
+        "sentinel.workflow.funded-recovery-source-history.v1",
+        &(epoch, source),
+    )?;
+    validation_scope::memoize(connection, "funded-recovery-source-history", &key, || {
+        crate::store::adaptive::require_funding_journal_source(connection, epoch, source)?;
+        require_pre_recovery_funding_history_uncached(connection, epoch, None, Some(source))
+    })
+}
+
+fn recovery_prior_authorization(
+    source: Option<&crate::AdaptiveSessionV1>,
+    authorization: &AdaptiveContinuationAuthorizationV1,
+    sequence: u64,
+    cut: Option<u64>,
+) -> bool {
+    source.is_some_and(|source| {
+        authorization.source_session_version < source.version
+            && cut.is_none_or(|cut| sequence < cut)
+            && source
+                .continuation
+                .as_ref()
+                .is_some_and(|state| state.authorizations.contains(authorization))
+    })
+}
+
+fn recovery_prior_trace(
+    connection: &Connection,
+    source: Option<&crate::AdaptiveSessionV1>,
+    call: &AdaptiveLeadershipReviewCallV1,
+    sequence: u64,
+    cut: Option<u64>,
+) -> Result<bool, WorkflowError> {
+    let Some(source) = source else {
+        return Ok(false);
+    };
+    if cut.is_some_and(|cut| sequence >= cut) {
+        return Ok(false);
+    }
+    let Some(authorization) = source.continuation.as_ref().and_then(|state| {
+        state.authorizations.iter().find(|authorization| {
+            authorization.review_id == call.grant.review_id
+                && authorization.operation_id == call.operation_id
+                && authorization.source_session_version == call.grant.expected_session_version
+                && authorization.work_funding == call.grant.work_funding
+        })
+    }) else {
+        return Ok(false);
+    };
+    let completed: AdaptiveLeadershipReviewCallV1 = entity_shape(
+        connection,
+        &call.grant.leadership_principal.tenant_id,
+        "adaptive_leadership_review_call",
+        &call.review_key,
+    )?
+    .ok_or_else(corrupt)?;
+    completed.validate_entity().map_err(|_| corrupt())?;
+    Ok(recovery_prior_adopted_call(source, &completed)
+        && completed.continuation.as_ref() == Some(authorization)
+        && completed.grant == call.grant
+        && completed.context == call.context
+        && completed.operation_id == call.operation_id
+        && completed.allowance_id == call.allowance_id
+        && completed.grant_issued_at_unix_ms == call.grant_issued_at_unix_ms
+        && call.updated_at_unix_ms <= completed.updated_at_unix_ms
+        && match call.version {
+            1 => true,
+            2 => call.dispatch == completed.dispatch,
+            3 => call == &completed,
+            _ => false,
+        })
+}
+
 // The designated tuple ends with issuance time and the sequence of the fully
 // validated recovery issuance event. This boundary proves history, not authority.
 pub(super) fn require_pre_recovery_funding_history(
@@ -774,11 +896,25 @@ pub(super) fn require_pre_recovery_funding_history(
         u64,
     )>,
 ) -> Result<(), WorkflowError> {
+    let prior_session = designated.and_then(|(_, context, _, _, _)| {
+        recovery_uses_adopted_epoch(&context.source_session, epoch)
+            .then_some(&context.source_session)
+    });
     validation_scope::memoize(
         connection,
         "funded-recovery-history",
         &(epoch, designated),
-        || require_pre_recovery_funding_history_uncached(connection, epoch, designated),
+        || {
+            if let Some(source) = prior_session {
+                crate::store::adaptive::require_funding_journal_source(connection, epoch, source)?;
+            }
+            require_pre_recovery_funding_history_uncached(
+                connection,
+                epoch,
+                designated,
+                prior_session,
+            )
+        },
     )
 }
 
@@ -792,6 +928,7 @@ fn require_pre_recovery_funding_history_uncached(
         u64,
         u64,
     )>,
+    prior_session: Option<&crate::AdaptiveSessionV1>,
 ) -> Result<(), WorkflowError> {
     let tenant = &epoch.receipt.request.source.resume_source.tenant_id;
     // Validate all sealed review traces before filtering by funding identity.
@@ -817,9 +954,6 @@ fn require_pre_recovery_funding_history_uncached(
             .as_ref()
             .is_some_and(|prior| prior.same_epoch(epoch))
         {
-            let Some((grant, _, operation, issued, cut)) = designated else {
-                return Err(transition());
-            };
             // Sealed adoption already proved this issuance event unique and
             // authentic. Use its sequence, never payload time alone, as the cut.
             let sequence: i64 = connection.query_row(
@@ -832,6 +966,17 @@ fn require_pre_recovery_funding_history_uncached(
                 ],
                 |row| row.get(0),
             )?;
+            if recovery_prior_authorization(
+                prior_session,
+                &leaf.authorization,
+                stored_u64(sequence)?,
+                designated.map(|(_, _, _, _, cut)| cut),
+            ) {
+                continue;
+            }
+            let Some((grant, _, operation, issued, cut)) = designated else {
+                return Err(transition());
+            };
             let original = leaf.authorization.review_id == grant.review_id
                 && leaf.authorization.operation_id == operation
                 && leaf.authorization.issued_at_ms >= issued
@@ -878,6 +1023,12 @@ fn require_pre_recovery_funding_history_uncached(
                 .work_funding
                 .as_ref()
                 .is_some_and(|prior| prior.same_epoch(epoch))
+                && !recovery_prior_authorization(
+                    prior_session,
+                    &leaf.authorization,
+                    sequence,
+                    designated.map(|(_, _, _, _, cut)| cut),
+                )
                 && !designated.is_some_and(|(grant, _, operation, issued, cut)| {
                     (leaf.authorization.review_id == grant.review_id
                         && leaf.authorization.operation_id == operation
@@ -942,6 +1093,15 @@ fn require_pre_recovery_funding_history_uncached(
                 .as_ref()
                 .is_some_and(|prior| prior.same_epoch(epoch))
             {
+                if recovery_prior_trace(
+                    connection,
+                    prior_session,
+                    &call,
+                    sequence,
+                    designated.map(|(_, _, _, _, cut)| cut),
+                )? {
+                    continue;
+                }
                 if let Some((grant, _, _, issued, cut)) = designated {
                     if sequence > cut {
                         if call.grant_issued_at_unix_ms < issued

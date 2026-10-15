@@ -49,8 +49,14 @@ advancement without granting new authority or rewinding the session.
 A funded recovery receipt describes the state at its authenticated issuance
 event, not a permanent ban on later work using the same funding. The store
 verifies that exact event before using its sequence as the historical boundary.
-Fresh issuance without a historical boundary still requires the complete
-undispatched history.
+Fresh issuance without a historical boundary validates the complete history.
+An unused funding epoch still requires that whole epoch to be undispatched.
+An already adopted epoch may recover one expired, retired and undispatched
+review on its later exact head. Earlier genuine adoptions must match the
+authenticated frozen journal prefix and sealed events; they are not relabeled
+as NoIO. The selected review and every other non-adopted review retain physical
+provider-history checks. Refusal, unknown dispatch and ordinary same-head
+reroll remain forbidden. Counters, funding limits and expiry never reset.
 
 Later reviews and adoptions do not invalidate an earlier truthful receipt.
 They must follow its event sequence, be issued no earlier, and reference a
@@ -66,6 +72,19 @@ invalidate reuse; caller-owned transactions cannot publish reusable proofs.
 Fresh credentials, runtime authority, clocks, limits and serving evidence are
 not cached. After writes, budget checks start with fresh proof state rather
 than retaining pre-write permission.
+
+Validated SQL results may share immutable owners across reads only while the
+complete database-input proof matches. The cache charges the full payload,
+not just the shared pointer. Within one admission gate, immutable context
+shape and source facts are checked once; current credentials, runtime state,
+clocks and effect ownership are still checked at each independent gate.
+
+An event payload is charged before copying and then retained unchanged inside
+its immutable row owner. A typed, single-use handoff makes that charge part of
+the complete memoized-result charge, rather than counting the same allocation
+twice. The counter never decreases. Connection, snapshot, memo identity and
+result type must still match; missing tokens, writes and overflow fail closed.
+The fixed proof limit and independent raw/decoded allocation charges remain.
 
 ## Funded Retained Response Adoption
 
