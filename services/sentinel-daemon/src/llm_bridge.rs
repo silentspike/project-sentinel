@@ -4284,7 +4284,7 @@ pub mod bridge {
         include!("llm_bridge/tests/owned_pipeline.rs");
 
         mod completion_recovery_tests {
-            include!("llm_bridge/completion_recovery_tests.rs");
+            include!("llm_bridge/tests/completion_recovery.rs");
         }
 
         #[test]
