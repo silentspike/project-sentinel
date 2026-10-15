@@ -44,6 +44,71 @@ fund inspection alone, so leadership must explicitly budget useful subsequent
 work. Exact committed replay returns the original receipt after later head
 advancement without granting new authority or rewinding the session.
 
+## Funded Historical Boundaries
+
+A funded recovery receipt describes the state at its authenticated issuance
+event, not a permanent ban on later work using the same funding. The store
+verifies that exact event before using its sequence as the historical boundary.
+Fresh issuance without a historical boundary still requires the complete
+undispatched history.
+
+Later reviews and adoptions do not invalidate an earlier truthful receipt.
+They must follow its event sequence, be issued no earlier, and reference a
+strictly later session version. The complete bounded inventory and sealed event
+contents are still checked. Backdated traces, a reused original head, changed
+historical members or missing issuance evidence remain failures. This historical
+classification grants no current authority and does not make an unknown outcome
+safe to repeat.
+
+Historical policy, funding and recovery reads use the existing bounded cache
+only while its complete SQL input proof is unchanged. Local or external writes
+invalidate reuse; caller-owned transactions cannot publish reusable proofs.
+Fresh credentials, runtime authority, clocks, limits and serving evidence are
+not cached. After writes, budget checks start with fresh proof state rather
+than retaining pre-write permission.
+
+## Funded Retained Response Adoption
+
+A real model response can be durable while local admission fails. It is not
+an undispatched request, and recovery must not bill another model call to
+recreate its decision. The existing authenticated
+`/operator/workflow/adaptive-local-adoptions` endpoint has a funded request
+schema 2 for the exact known terminal admission failure. Legacy request schema
+1 keeps its original permanent-epoch binding and serialized representation.
+
+The funded request has no legacy epoch binding. Its dedicated funding binding
+names the exact funding ID, receipt digest and complete binding digest. The
+server derives the decision from the saved schema-5 response and verifies its
+dispatch, payload, context, durable usage, source head, original leader and
+current assignee authority. A caller cannot supply a replacement answer.
+The recognized failure is `work funding current reviews unavailable`, with
+five exhausted local admission attempts; arbitrary failures and unknown
+provider outcomes are not eligible.
+
+Authorization preserves the model-selected call count and window. One local
+issuance clock and its deadline are persisted. The entire window must fit
+inside the original funding expiry and the existing call, review and window
+ceilings. Neither expiry nor consumed usage is extended or refunded. Exact
+replay returns the original authority before fresh-issuance checks and never
+renews its clock.
+
+The saved row remains failed until the exact audited domain continuation
+commits. Final disposition compares its original owner, request and payload,
+retains attempts and accounting, and cannot issue provider I/O. Crash recovery
+reuses the same audit and domain receipts. Source drift or local expiry retires
+the operation rather than inventing a continuation. Funded local audit payloads
+use schema 3; legacy local payloads retain schema 2 and ordinary payloads retain
+schema 1 under the existing outer event contract.
+
+Old binaries do not understand funded local-adoption authority. Preserve the
+pre-adoption release and data boundary, but do not perform a binary-only
+downgrade after a schema-2 authority or its continuation has committed. A
+snapshot restore must not erase subsequent customer work or external effects;
+after such effects, preserve the durable ledgers and repair forward instead.
+
+Source and unit evidence do not prove that an employee resumed, completed QA
+or delivered an artifact. Those remain separate live acceptance requirements.
+
 ## Working Memory And Accounting Reconsideration
 
 Employee model contexts include a private, bounded projection of the same
@@ -198,6 +263,16 @@ source Git SHA, manifest digest and Gateway binary digest, and a canonical
 attestation or a substitute for review, gates and live health readback.
 Changed or unprotected evidence blocks fresh issuance and dispatch/adoption.
 Historical exact issuance replay does not require new serving authority.
+
+Funded local adoption uses a separate protected
+`/etc/sentinel/adaptive-funded-local-adoption-repair.json` attestation with
+purpose `adaptive-funded-local-adoption-repair` and repair contract
+`funded-review-history-cut-v1`. It binds the installed and serving daemon,
+release manifest, Gateway and protected exact-release gate evidence. A legacy
+Gateway schema-repair marker or a NoIO witness cannot substitute for this
+daemon repair. This is local root-attested deployment evidence, not remote
+attestation; actual review, CI, build, installation and health evidence must
+support it.
 
 ## Diagnostic Is Not Outcome
 

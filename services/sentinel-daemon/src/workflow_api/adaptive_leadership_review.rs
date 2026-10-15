@@ -1924,7 +1924,8 @@ impl WorkflowApi {
             .map_err(|_| "local adoption authority unavailable")?;
         let locally_failed = local_adoption.as_ref().is_some_and(|record| {
             stored.status == "failed"
-                && stored.last_error.as_deref() == Some("continuation audit invalid")
+                && stored.last_error.as_deref()
+                    == Some(record.request.original_completion_error.as_str())
                 && record.request.payload_digest
                     == sentinel_common::sha256_hex(stored.payload.as_bytes())
                 && record.request.request_digest == request_digest

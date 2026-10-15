@@ -5,10 +5,49 @@ use super::*;
 use sentinel_workflow::{
     adaptive_leadership_local_adoption_source_call_digest,
     adaptive_leadership_recovery_project_digest, adaptive_leadership_recovery_session_digest,
-    AdaptiveLeadershipLocalAdoptionRequestV1, AdaptiveLeadershipReviewDecisionKindV1,
+    AdaptiveLeadershipLocalAdoptionFundingBindingV2, AdaptiveLeadershipLocalAdoptionRequestV1,
+    AdaptiveLeadershipReviewDecisionKindV1,
 };
 
+const FUNDED_LOCAL_ADOPTION_ERROR: &str = "work funding current reviews unavailable";
+
 impl WorkflowApi {
+    pub(super) fn verify_current_funded_local_adoption_release(
+        &self,
+        call: &sentinel_workflow::AdaptiveLeadershipReviewCallV1,
+    ) -> Result<(), &'static str> {
+        let Some(adoption) = self
+            .store
+            .adaptive_leadership_local_adoption(
+                &call.grant.leadership_principal.tenant_id,
+                call.grant.review_id,
+            )
+            .map_err(|_| "funded local adoption authority unavailable")?
+        else {
+            return Ok(());
+        };
+        adoption
+            .validate_funded_against(call)
+            .map_err(|_| "funded local adoption call authority invalid")?;
+        let issuer = self
+            .principals
+            .principal(&adoption.issuer_principal.principal_id)
+            .ok_or("funded local adoption issuer missing")?;
+        if issuer.principal != adoption.issuer_principal
+            || issuer.execution_authority != adoption.issuer_authority
+        {
+            return Err("funded local adoption issuer authority changed");
+        }
+        self.validate_work_funding_operator(&issuer)
+            .map_err(|_| "funded local adoption issuer authority changed")?;
+        if adaptive_recovery_release::verified_current_funded_local_adoption_repair()?
+            != (adoption.request.release, adoption.request.repair_digest)
+        {
+            return Err("funded local adoption installed repair changed");
+        }
+        Ok(())
+    }
+
     pub(super) fn reconcile_retired_leadership_adoption(
         &self,
         call: &sentinel_workflow::AdaptiveLeadershipReviewCallV1,
@@ -50,6 +89,16 @@ impl WorkflowApi {
             .get_llm_completion(&record.request.request_id)
             .map_err(|_| "retired local adoption disposition unavailable")?
         {
+            let failure_matches = if record.request.is_funded() {
+                row.attempt_count == 5
+                    && (row.last_error.as_deref() == Some(FUNDED_LOCAL_ADOPTION_ERROR)
+                        || row.last_error.as_deref() == Some("leadership_review_stale"))
+            } else {
+                matches!(
+                    row.last_error.as_deref(),
+                    Some("continuation audit invalid" | "leadership_review_stale")
+                )
+            };
             if row.status != "failed"
                 || row.request_digest != record.request.request_digest
                 || sentinel_common::sha256_hex(row.payload.as_bytes())
@@ -62,10 +111,7 @@ impl WorkflowApi {
                             .ok_or("retired local adoption leader missing")?
                             .to_string(),
                     )
-                || !matches!(
-                    row.last_error.as_deref(),
-                    Some("continuation audit invalid" | "leadership_review_stale")
-                )
+                || !failure_matches
             {
                 return Err("retired local adoption disposition changed");
             }
@@ -73,15 +119,58 @@ impl WorkflowApi {
                 &sentinel_common::canonical_json(call)
                     .map_err(|_| "retired local adoption receipt encoding invalid")?,
             );
-            events
-                .retire_known_leadership_local_adoption(
+            let result = if record.request.is_funded() {
+                events.retire_known_funded_leadership_local_adoption(
                     &record.request.request_id,
                     &record.request.request_digest,
                     &record.request.payload_digest,
                     &record.adoption_key,
                     &digest,
                 )
-                .map_err(|_| "retired local adoption disposition failed")?;
+            } else {
+                events.retire_known_leadership_local_adoption(
+                    &record.request.request_id,
+                    &record.request.request_digest,
+                    &record.request.payload_digest,
+                    &record.adoption_key,
+                    &digest,
+                )
+            };
+            result.map_err(|_| "retired local adoption disposition failed")?;
+        } else if record.request.is_funded() {
+            let receipt = events
+                .event_by_operation_id(&format!(
+                    "llm_local_adoption_retired_{}",
+                    record.request.request_id,
+                ))
+                .map_err(|_| "retired local adoption cleanup receipt unavailable")?
+                .ok_or("retired local adoption cleanup receipt missing")?;
+            let digest = sentinel_common::sha256_hex(
+                &sentinel_common::canonical_json(call)
+                    .map_err(|_| "retired local adoption receipt encoding invalid")?,
+            );
+            let expected = serde_json::json!({"schema_version":2,
+                "request_id":record.request.request_id,"request_digest":record.request.request_digest,
+                "payload_digest":record.request.payload_digest,"adoption_key":record.adoption_key,
+                "domain_receipt_digest":digest,"original_completion_error":FUNDED_LOCAL_ADOPTION_ERROR});
+            if receipt.event_type != "llm_completion_local_adoption_retired"
+                || receipt.schema_version != 2
+                || receipt.aggregate_id
+                    != call
+                        .grant
+                        .leadership_principal
+                        .agent_id
+                        .ok_or("retired local adoption leader missing")?
+                        .to_string()
+                || receipt.correlation_id != record.request.request_id
+                || receipt.causation_id.is_some()
+                || receipt.compensation_type != "none"
+                || serde_json::from_str::<serde_json::Value>(&receipt.payload)
+                    .map_err(|_| "retired local adoption cleanup receipt invalid")?
+                    != expected
+            {
+                return Err("retired local adoption cleanup receipt changed");
+            }
         }
         Ok(())
     }
@@ -134,9 +223,28 @@ impl WorkflowApi {
                 .event_by_operation_id(&format!("llm_local_adoption_{}", record.request.request_id))
                 .map_err(|_| "local adoption cleanup receipt unavailable")?
                 .ok_or("local adoption cleanup receipt missing")?;
-            let expected = serde_json::json!({"request_id":record.request.request_id,
+            let mut expected = serde_json::json!({"request_id":record.request.request_id,
                 "request_digest":record.request.request_digest,"payload_digest":record.request.payload_digest,
                 "adoption_key":record.adoption_key,"domain_receipt_digest":digest});
+            if record.request.is_funded() {
+                expected["schema_version"] = serde_json::json!(2);
+                expected["original_completion_error"] =
+                    serde_json::json!(FUNDED_LOCAL_ADOPTION_ERROR);
+                if receipt.schema_version != 2
+                    || receipt.aggregate_id
+                        != call
+                            .grant
+                            .leadership_principal
+                            .agent_id
+                            .ok_or("local adoption leader missing")?
+                            .to_string()
+                    || receipt.correlation_id != record.request.request_id
+                    || receipt.causation_id.is_some()
+                    || receipt.compensation_type != "none"
+                {
+                    return Err("local adoption cleanup receipt changed");
+                }
+            }
             if receipt.event_type != "llm_completion_locally_adopted"
                 || serde_json::from_str::<serde_json::Value>(&receipt.payload)
                     .map_err(|_| "local adoption cleanup receipt invalid")?
@@ -150,6 +258,13 @@ impl WorkflowApi {
             || record.request.payload_digest != sentinel_common::sha256_hex(row.payload.as_bytes())
         {
             return Err("local adoption response changed during recovery");
+        }
+        if record.request.is_funded()
+            && (!matches!(row.status.as_str(), "failed" | "action_claimed")
+                || row.attempt_count != 5
+                || row.last_error.as_deref() != Some(FUNDED_LOCAL_ADOPTION_ERROR))
+        {
+            return Err("funded local adoption failure changed during recovery");
         }
         let payload: serde_json::Value =
             serde_json::from_str(&row.payload).map_err(|_| "local adoption payload invalid")?;
@@ -191,15 +306,24 @@ impl WorkflowApi {
             &sentinel_common::canonical_json(&completed)
                 .map_err(|_| "local adoption receipt encoding invalid")?,
         );
-        events
-            .finish_known_leadership_local_adoption(
+        let result = if record.request.is_funded() {
+            events.finish_known_funded_leadership_local_adoption(
                 &record.request.request_id,
                 &record.request.request_digest,
                 &record.request.payload_digest,
                 &record.adoption_key,
                 &digest,
             )
-            .map_err(|_| "local adoption completion cleanup failed")?;
+        } else {
+            events.finish_known_leadership_local_adoption(
+                &record.request.request_id,
+                &record.request.request_digest,
+                &record.request.payload_digest,
+                &record.adoption_key,
+                &digest,
+            )
+        };
+        result.map_err(|_| "local adoption completion cleanup failed")?;
         Ok(call.decision.is_none())
     }
 
@@ -215,6 +339,14 @@ impl WorkflowApi {
             .adaptive_leadership_review_call(&operator.principal.tenant_id, review_id)
             .map_err(|_| "local adoption call unavailable")?
             .ok_or("local adoption call missing")?;
+        if call.grant.schema_version == 5 {
+            return self.funded_local_adoption_candidate(
+                operator,
+                &call,
+                operation_id,
+                expires_at_unix_ms,
+            );
+        }
         if call.decision.is_some() || call.retired_at_unix_ms.is_some() || call.version != 2 {
             return Err("local adoption call is not pending dispatched review");
         }
@@ -378,9 +510,12 @@ impl WorkflowApi {
             work_item_id: call.grant.work_item_id.clone(),
             session_id: call.grant.session_id,
             review_id,
-            epoch_digest: epoch
-                .canonical_digest()
-                .map_err(|_| "local adoption epoch digest invalid")?,
+            epoch_digest: Some(
+                epoch
+                    .canonical_digest()
+                    .map_err(|_| "local adoption epoch digest invalid")?,
+            ),
+            funded_binding: None,
             original_call_digest: adaptive_leadership_local_adoption_source_call_digest(&call)
                 .map_err(|_| "local adoption call digest invalid")?,
             project_digest: adaptive_leadership_recovery_project_digest(&project)
@@ -414,6 +549,190 @@ impl WorkflowApi {
         request
             .validate(&operator.principal, now)
             .map_err(|_| "local adoption request invalid")?;
+        Ok(request)
+    }
+
+    fn funded_local_adoption_candidate(
+        &self,
+        operator: &BoundPrincipal,
+        call: &sentinel_workflow::AdaptiveLeadershipReviewCallV1,
+        operation_id: Uuid,
+        expires_at_unix_ms: Option<u64>,
+    ) -> Result<AdaptiveLeadershipLocalAdoptionRequestV1, &'static str> {
+        self.validate_work_funding_operator(operator)
+            .map_err(|_| "funded local adoption operator authority changed")?;
+        if call.schema_version != 5
+            || call.grant.schema_version != 5
+            || call.version != 2
+            || call.decision.is_some()
+            || call.retired_at_unix_ms.is_some()
+            || call.grant.recovery_epoch.is_some()
+            || call.grant.resume_policy.is_some()
+            || call.grant.funded_review_recovery.is_some()
+        {
+            return Err("funded local adoption call is not pending ordinary funded review");
+        }
+        let epoch = call
+            .grant
+            .work_funding
+            .as_ref()
+            .ok_or("funded local adoption funding missing")?;
+        let funded_binding = AdaptiveLeadershipLocalAdoptionFundingBindingV2::from_epoch(epoch)
+            .map_err(|_| "funded local adoption binding invalid")?;
+        let funding = self
+            .store
+            .adaptive_work_funding(
+                &operator.principal.tenant_id,
+                call.grant.session_id,
+                epoch.receipt.request.operation_id,
+            )
+            .map_err(|_| "funded local adoption funding unavailable")?
+            .ok_or("funded local adoption funding not durable")?;
+        if funding != epoch.receipt {
+            return Err("funded local adoption funding changed");
+        }
+        let dispatch = call
+            .dispatch
+            .as_ref()
+            .ok_or("funded local adoption dispatch missing")?;
+        let events = self
+            .event_store
+            .as_ref()
+            .ok_or("local adoption EventStore missing")?;
+        let row = events
+            .get_llm_completion(&dispatch.request_id)
+            .map_err(|_| "local adoption response unavailable")?
+            .ok_or("local adoption response missing")?;
+        if row.status != "failed"
+            || row.last_error.as_deref() != Some(FUNDED_LOCAL_ADOPTION_ERROR)
+            || row.attempt_count != 5
+        {
+            return Err("funded local adoption response is not an exact known local failure");
+        }
+        // This verifies the exact saved context, response digest and durable usage.
+        // No operator-supplied decision, accounting substitute or provider retry.
+        let (completion, usage) = self.verified_retained_leadership_completion(call, &row)?;
+        if usage.timestamp_ms < dispatch.dispatched_at_unix_ms
+            || usage.timestamp_ms > call.grant.expires_at_unix_ms
+        {
+            return Err("funded local adoption original response time changed");
+        }
+        let decision = super::adaptive_leadership_review::parse_decision(
+            &completion.content,
+            &call.context.evidence_refs,
+        )?;
+        decision
+            .validate_subject(&call.grant)
+            .map_err(|_| "funded local adoption decision subject invalid")?;
+        let AdaptiveLeadershipReviewDecisionKindV1::Continue {
+            window_ms,
+            additional_model_calls,
+            ..
+        } = &decision.decision
+        else {
+            return Err("funded local adoption has no continuation decision");
+        };
+        let project = self
+            .store
+            .company_project(&operator.principal.tenant_id, &call.grant.project_id)
+            .map_err(|_| "local adoption project unavailable")?
+            .ok_or("local adoption project missing")?;
+        let current = self
+            .authority
+            .as_ref()
+            .ok_or("local adoption runtime missing")?
+            .snapshot_for_admission(
+                &project.tenant_id,
+                &project.project_id,
+                &call.grant.work_item_id,
+                call.grant.assignee_authority.agent_id,
+                false,
+            )
+            .map_err(|_| "local adoption assignee unavailable")?;
+        let session = self
+            .store
+            .adaptive_session(call.grant.session_id, &current)
+            .map_err(|_| "local adoption session unavailable")?
+            .ok_or("local adoption session missing")?;
+        if project != call.context.source_project
+            || session != call.context.source_session
+            || current != call.grant.assignee_authority
+        {
+            return Err("local adoption source changed");
+        }
+        call.validate_continuation_source()
+            .map_err(|_| "local adoption allowance source invalid")?;
+        let leader = self
+            .principals
+            .principal(&call.grant.leadership_principal.principal_id)
+            .ok_or("local adoption leader unavailable")?;
+        if leader.principal != call.grant.leadership_principal
+            || leader.execution_authority != call.grant.leadership_authority
+        {
+            return Err("local adoption leader authority changed");
+        }
+        self.validate_company_employee(&leader.principal)?;
+        let (release, repair_digest) =
+            adaptive_recovery_release::verified_current_funded_local_adoption_repair()?;
+        let now = now_unix_ms();
+        let deadline = now
+            .checked_add(*window_ms)
+            .ok_or("local adoption clock overflow")?;
+        // The full saved window must fit. Never clamp either the window or count.
+        if deadline > epoch.binding.limits.expires_at_unix_ms {
+            return Err("funded local adoption full window exceeds funding expiry");
+        }
+        call.continuation_allowance(now, deadline, *additional_model_calls)
+            .map_err(|_| "funded local adoption continuation exceeds funding limits")?;
+        let request = AdaptiveLeadershipLocalAdoptionRequestV1 {
+            schema_version: 2,
+            operation_id,
+            tenant_id: project.tenant_id.clone(),
+            project_id: project.project_id.clone(),
+            work_item_id: call.grant.work_item_id.clone(),
+            session_id: call.grant.session_id,
+            review_id: call.grant.review_id,
+            epoch_digest: None,
+            funded_binding: Some(funded_binding),
+            original_call_digest: adaptive_leadership_local_adoption_source_call_digest(call)
+                .map_err(|_| "local adoption call digest invalid")?,
+            project_digest: adaptive_leadership_recovery_project_digest(&project)
+                .map_err(|_| "local adoption project digest invalid")?,
+            session_digest: adaptive_leadership_recovery_session_digest(&session)
+                .map_err(|_| "local adoption session digest invalid")?,
+            session_head_digest: self
+                .store
+                .adaptive_session_head_digest(call.grant.session_id, &current)
+                .map_err(|_| "local adoption head unavailable")?
+                .ok_or("local adoption head missing")?,
+            request_id: dispatch.request_id.clone(),
+            request_digest: dispatch.request_digest.clone(),
+            context_digest: dispatch.context_digest.clone(),
+            payload_digest: sentinel_common::sha256_hex(row.payload.as_bytes()),
+            model_response_digest: sentinel_common::sha256_hex(completion.content.as_bytes()),
+            usage_event_digest: sentinel_common::sha256_hex(
+                &sentinel_common::canonical_json(&usage)
+                    .map_err(|_| "local adoption usage digest invalid")?,
+            ),
+            original_completion_error: FUNDED_LOCAL_ADOPTION_ERROR.into(),
+            completion_attempts: row.attempt_count,
+            release,
+            repair_digest,
+            expires_at_unix_ms: expires_at_unix_ms.unwrap_or(deadline),
+            decision,
+        };
+        // Pure exact-call and cap validation; only the store persists its one fixed clock.
+        let proposed = sentinel_workflow::AdaptiveLeadershipLocalAdoptionV1 {
+            adoption_key: request.key().map_err(|_| "local adoption key invalid")?,
+            request: request.clone(),
+            issuer_principal: operator.principal.clone(),
+            issuer_authority: operator.execution_authority.clone(),
+            issued_at_unix_ms: now,
+            continuation_deadline_ms: deadline,
+        };
+        proposed
+            .validate_funded_against(call)
+            .map_err(|_| "funded local adoption request invalid")?;
         Ok(request)
     }
 
@@ -457,7 +776,7 @@ impl WorkflowApi {
                 Ok(Some(record)) => {
                     return json(
                         200,
-                        &serde_json::json!({"schema_version":1,
+                        &serde_json::json!({"schema_version":record.request.schema_version,
                     "adoption_key":record.adoption_key,"review_id":record.request.review_id,
                     "replayed":true,"receipt_kind":"local_adoption_authorized_not_completed"}),
                     )
@@ -468,7 +787,7 @@ impl WorkflowApi {
             match self.local_adoption_candidate(principal, review, Uuid::new_v4(), None) {
                 Ok(request) => json(
                     200,
-                    &serde_json::json!({"schema_version":1,"requires_explicit_submission":true,"request":request}),
+                    &serde_json::json!({"schema_version":request.schema_version,"requires_explicit_submission":true,"request":request}),
                 ),
                 Err(reason) => json_error(409, "adaptive_recovery_conflict", reason, false),
             }
@@ -497,7 +816,7 @@ impl WorkflowApi {
                     ) {
                         Ok((replayed, record)) => json(
                             200,
-                            &serde_json::json!({"schema_version":1,
+                            &serde_json::json!({"schema_version":record.request.schema_version,
                         "adoption_key":record.adoption_key,"review_id":record.request.review_id,
                         "replayed":replayed,"receipt_kind":"local_adoption_authorized_not_completed"}),
                         ),
@@ -531,7 +850,7 @@ impl WorkflowApi {
             ) {
                 Ok((replayed, record)) => json(
                     200,
-                    &serde_json::json!({"schema_version":1,
+                    &serde_json::json!({"schema_version":record.request.schema_version,
                     "adoption_key":record.adoption_key,"review_id":record.request.review_id,
                     "replayed":replayed,"receipt_kind":"local_adoption_authorized_not_completed"}),
                 ),
@@ -544,6 +863,10 @@ impl WorkflowApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod funded_local_adoption_tests {
+        include!("adaptive_local_adoption/tests/funded_local_adoption_tests.rs");
+    }
 
     use super::super::adaptive_continuation_tests::{
         fixture_schema2_recovery_source, fixture_schema2_recovery_source_with_current_allowance,

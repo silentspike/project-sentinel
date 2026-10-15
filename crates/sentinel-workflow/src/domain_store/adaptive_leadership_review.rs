@@ -246,12 +246,16 @@ fn local_adoption_audit_proposal(
 ) -> Result<sentinel_common::AppendProposalV2, WorkflowError> {
     use sentinel_common::{AuthorityKindV1, AuthorityRefV1, CausalContextV1};
     let authorization = result.continuation.as_ref().ok_or_else(transition)?;
-    authorization
+    let adoption = authorization
         .local_adoption
         .as_ref()
         .ok_or_else(transition)?;
+    if adoption.request.is_funded() {
+        adoption.validate_funded_against(call)?;
+        call.validate_completion_proposal(result)?;
+    }
     let payload = sentinel_common::canonical_json(&LocalAdoptionContinuationAudit {
-        schema_version: 2,
+        schema_version: if adoption.request.is_funded() { 3 } else { 2 },
         call: call.clone(),
         result: result.clone(),
     })
@@ -346,7 +350,15 @@ fn require_local_adoption_audit(
     event.validate_seals().map_err(|_| transition())?;
     let audit: LocalAdoptionContinuationAudit =
         serde_json::from_slice(&event.payload).map_err(|_| transition())?;
-    if audit.schema_version != 2 || audit.call != *call || audit.result != *result {
+    let funded = result
+        .continuation
+        .as_ref()
+        .and_then(|authorization| authorization.local_adoption.as_deref())
+        .is_some_and(|adoption| adoption.request.is_funded());
+    if audit.schema_version != (if funded { 3 } else { 2 })
+        || audit.call != *call
+        || audit.result != *result
+    {
         return Err(transition());
     }
     let proposal = WorkflowStore::local_adoption_continuation_audit_proposal(call, result)?;
@@ -742,7 +754,12 @@ fn validate_continuation(
     {
         return Err(unauthorized());
     }
-    if matches!(call.grant.schema_version, 4..=6) && authorization.local_adoption.is_some() {
+    if matches!(call.grant.schema_version, 4..=6)
+        && authorization
+            .local_adoption
+            .as_ref()
+            .is_some_and(|adoption| call.grant.schema_version != 5 || !adoption.request.is_funded())
+    {
         return Err(unauthorized());
     }
     if let Some(adoption) = &authorization.local_adoption {
@@ -1743,24 +1760,28 @@ impl WorkflowStore {
         connection: &Connection,
         call: &AdaptiveLeadershipReviewCallV1,
     ) -> Result<(), WorkflowError> {
-        if call.grant.work_funding.is_some() {
-            require_funding_review_membership(
-                connection,
-                &call.grant,
-                &call.context_digest()?,
-                call.operation_id,
-            )?;
-            require_budget_source(connection, &call.grant, &call.context)
-        } else if call.grant.resume_policy.is_some() {
-            require_resume_review_membership(
-                connection,
-                &call.grant,
-                &call.context_digest()?,
-                call.operation_id,
-            )
-        } else {
-            require_budget_source(connection, &call.grant, &call.context)
-        }
+        // Membership and budget validation overlap on the full journal. After an
+        // allowance write, share only fresh proofs within this read-only composition.
+        validation_scope::with_scope(connection, || {
+            if call.grant.work_funding.is_some() {
+                require_funding_review_membership(
+                    connection,
+                    &call.grant,
+                    &call.context_digest()?,
+                    call.operation_id,
+                )?;
+                require_budget_source(connection, &call.grant, &call.context)
+            } else if call.grant.resume_policy.is_some() {
+                require_resume_review_membership(
+                    connection,
+                    &call.grant,
+                    &call.context_digest()?,
+                    call.operation_id,
+                )
+            } else {
+                require_budget_source(connection, &call.grant, &call.context)
+            }
+        })
     }
 
     /// Build the shared local-adoption audit proposal; this is not proof of a durable append.
@@ -3377,8 +3398,16 @@ mod tests {
     mod work_funding_tests {
         include!("adaptive_leadership_review/work_funding_tests.rs");
 
+        mod issue856_funded_local_adoption_tests {
+            include!("adaptive_leadership_review/issue856_funded_local_adoption_tests.rs");
+        }
+
         mod completion_validation_tests {
             include!("adaptive_leadership_review/completion_validation_tests.rs");
+        }
+
+        mod issue856_authority_source_sharing_tests {
+            include!("adaptive_leadership_review/issue856_authority_source_sharing_tests.rs");
         }
     }
     mod recovery_tests {
@@ -6438,7 +6467,8 @@ mod tests {
             work_item_id: f.grant.work_item_id.clone(),
             session_id: f.grant.session_id,
             review_id: call.grant.review_id,
-            epoch_digest: "b".repeat(64),
+            epoch_digest: Some("b".repeat(64)),
+            funded_binding: None,
             original_call_digest: crate::adaptive_leadership_local_adoption_source_call_digest(
                 &call,
             )

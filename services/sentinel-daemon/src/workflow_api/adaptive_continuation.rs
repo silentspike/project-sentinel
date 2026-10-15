@@ -26,12 +26,12 @@ fn validate_audit(payload: &[u8]) -> Result<(), EventContractError> {
     let audit: ContinuationAudit = serde_json::from_slice(payload).map_err(|_| invalid())?;
     let continuation = audit.result.continuation.as_ref().ok_or_else(invalid)?;
     let call = &audit.call;
-    if audit.schema_version
-        != (if continuation.local_adoption.is_some() {
-            2
-        } else {
-            1
-        })
+    let expected_schema = match continuation.local_adoption.as_deref() {
+        Some(adoption) if adoption.request.is_funded() => 3,
+        Some(_) => 2,
+        None => 1,
+    };
+    if audit.schema_version != expected_schema
         || call.decision.is_some()
         || call.retired_at_unix_ms.is_some()
         || audit.result.review_id != call.grant.review_id

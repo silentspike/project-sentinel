@@ -18,6 +18,34 @@ impl CompanyEntity for AdaptiveLeadershipLocalAdoptionV1 {
     }
 
     fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
+        if self.request.is_funded() {
+            let count: i64 = connection.query_row(
+                "SELECT count(*) FROM (SELECT sequence FROM company_events
+                 WHERE tenant_id=?1 AND event_type=?2 AND (operation_id=?3
+                 OR json_extract(payload,'$.adoption_key')=?4) LIMIT 2)",
+                params![
+                    self.request.tenant_id.0,
+                    EVENT,
+                    self.request.operation_id.to_string(),
+                    self.adoption_key
+                ],
+                |row| row.get(0),
+            )?;
+            if count != 1 {
+                return Err(corrupt());
+            }
+            return super::adaptive_resume_policy::require_leaf_event(
+                connection,
+                &self.request.tenant_id,
+                &self.request.project_id,
+                EVENT,
+                self.request.operation_id,
+                &self.request.canonical_digest()?,
+                &self.issuer_principal,
+                self.issued_at_unix_ms,
+                self,
+            );
+        }
         let rows = {
             let mut statement = connection.prepare(
                 "SELECT payload,payload_digest,operation_digest,authority_binding_digest,created_at_ms
@@ -75,6 +103,17 @@ pub(super) fn require_local_adoption(
     if stored != *adoption {
         return Err(unauthorized());
     }
+    if adoption.request.is_funded() {
+        adoption.validate_funded_against(call)?;
+        // The call's persisted view can itself be validating this authority.
+        // Use the sealed funding-review leaf rather than recursively loading it.
+        return super::adaptive_work_funding::require_funding_review_membership_leaf(
+            connection,
+            &call.grant,
+            &call.context_digest()?,
+            call.operation_id,
+        );
+    }
     let epoch: AdaptiveLeadershipRecoveryEpochV1 = get_entity(
         connection,
         &adoption.request.tenant_id,
@@ -89,6 +128,42 @@ pub(super) fn require_local_adoption(
 }
 
 impl WorkflowStore {
+    pub(crate) fn require_funded_local_adoption(
+        connection: &Connection,
+        call: &AdaptiveLeadershipReviewCallV1,
+        adoption: &AdaptiveLeadershipLocalAdoptionV1,
+    ) -> Result<(), WorkflowError> {
+        if !adoption.request.is_funded() {
+            return Err(unauthorized());
+        }
+        require_local_adoption(connection, call, adoption)
+    }
+
+    pub(crate) fn require_funded_adoption_authority(
+        connection: &Connection,
+        authorization: &crate::AdaptiveContinuationAuthorizationV1,
+    ) -> Result<(), WorkflowError> {
+        let adoption = authorization
+            .local_adoption
+            .as_deref()
+            .ok_or_else(unauthorized)?;
+        if !adoption.request.is_funded() {
+            return Err(unauthorized());
+        }
+        authorization.validate()?;
+        let stored: AdaptiveLeadershipLocalAdoptionV1 = get_entity(
+            connection,
+            &adoption.request.tenant_id,
+            KIND,
+            &adoption.adoption_key,
+        )?
+        .ok_or_else(unauthorized)?;
+        if stored != *adoption {
+            return Err(unauthorized());
+        }
+        Ok(())
+    }
+
     pub fn adaptive_leadership_local_adoption(
         &self,
         tenant: &TenantId,
@@ -154,13 +229,22 @@ impl WorkflowStore {
             &request.review_id.to_string(),
         )?
         .ok_or_else(not_found)?;
-        let epoch: AdaptiveLeadershipRecoveryEpochV1 = get_entity(
-            &transaction,
-            &request.tenant_id,
-            "adaptive_leadership_recovery_epoch",
-            &adaptive_leadership_recovery_epoch_key(&request.tenant_id, request.session_id)?,
-        )?
-        .ok_or_else(not_found)?;
+        let legacy_epoch: Option<AdaptiveLeadershipRecoveryEpochV1> = if request.is_funded() {
+            None
+        } else {
+            Some(
+                get_entity(
+                    &transaction,
+                    &request.tenant_id,
+                    "adaptive_leadership_recovery_epoch",
+                    &adaptive_leadership_recovery_epoch_key(
+                        &request.tenant_id,
+                        request.session_id,
+                    )?,
+                )?
+                .ok_or_else(not_found)?,
+            )
+        };
         let crate::AdaptiveLeadershipReviewDecisionKindV1::Continue { window_ms, .. } =
             &request.decision.decision
         else {
@@ -179,7 +263,24 @@ impl WorkflowStore {
             issued_at_unix_ms: now_ms,
             continuation_deadline_ms: now_ms.checked_add(*window_ms).ok_or_else(transition)?,
         };
-        record.validate_against(&epoch, &call)?;
+        if request.is_funded() {
+            record.validate_funded_against(&call)?;
+            let epoch = call
+                .grant
+                .work_funding
+                .as_deref()
+                .ok_or_else(unauthorized)?;
+            super::adaptive_work_funding::require_fresh_epoch_eligibility(&transaction, epoch)?;
+            super::adaptive_work_funding::require_funding_review_membership_leaf(
+                &transaction,
+                &call.grant,
+                &call.context_digest()?,
+                call.operation_id,
+            )?;
+            super::adaptive_work_funding::require_fresh_funding_review_source(&transaction, &call)?;
+        } else {
+            record.validate_against(legacy_epoch.as_ref().ok_or_else(not_found)?, &call)?;
+        }
         let project: ProjectV1 = get_entity(
             &transaction,
             &request.tenant_id,
