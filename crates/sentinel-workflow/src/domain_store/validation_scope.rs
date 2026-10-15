@@ -710,11 +710,18 @@ pub(crate) fn before_write(connection: &Connection) -> Result<(), WorkflowError>
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyHandoffKind {
+    OwnedUnchanged,
+    BorrowedSqliteDecoded,
+}
+
 struct BodyFrame {
     connection: usize,
     changes: i64,
     depth: usize,
     result_type: TypeId,
+    kind: BodyHandoffKind,
     charged: Cell<Option<usize>>,
     consumed: Cell<bool>,
 }
@@ -726,6 +733,20 @@ pub(crate) struct ProvisionalBody<T> {
     frame: Rc<BodyFrame>,
     bytes: usize,
     result_type: PhantomData<fn() -> T>,
+}
+
+/// One pre-decode charge for a borrowed SQLite BLOB converted into a single
+/// retained decoded owner. It carries no input bytes, permission, or validation
+/// result and cannot be cloned, serialized, or used as an unchanged-body token.
+pub(crate) struct ProvisionalDecodedBody<T> {
+    frame: Rc<BodyFrame>,
+    bytes: usize,
+    result_type: PhantomData<fn() -> T>,
+}
+
+enum BodyToken<T> {
+    OwnedUnchanged(ProvisionalBody<T>),
+    BorrowedSqliteDecoded(ProvisionalDecodedBody<T>),
 }
 
 struct BodyFrameGuard(Rc<BodyFrame>);
@@ -771,7 +792,10 @@ impl Drop for BodyFrameGuard {
 }
 
 impl BodyFrameGuard {
-    fn enter<T: 'static>(connection: &Connection) -> Result<Self, WorkflowError> {
+    fn enter<T: 'static>(
+        connection: &Connection,
+        kind: BodyHandoffKind,
+    ) -> Result<Self, WorkflowError> {
         synchronize(connection)?;
         ACTIVE.with(|active| {
             let mut active = active.borrow_mut();
@@ -783,6 +807,7 @@ impl BodyFrameGuard {
                 changes: state.changes,
                 depth: state.depth,
                 result_type: TypeId::of::<T>(),
+                kind,
                 charged: Cell::new(None),
                 consumed: Cell::new(false),
             });
@@ -794,7 +819,7 @@ impl BodyFrameGuard {
     fn consume<T: 'static>(
         &self,
         connection: &Connection,
-        token: Option<ProvisionalBody<T>>,
+        token: Option<BodyToken<T>>,
         result_bytes: usize,
     ) -> Result<usize, WorkflowError> {
         synchronize(connection)?;
@@ -813,13 +838,25 @@ impl BodyFrameGuard {
             {
                 return Err(invalid_body_handoff(state));
             }
+            let token = token.map(|token| match token {
+                BodyToken::OwnedUnchanged(token) => {
+                    (token.frame, token.bytes, BodyHandoffKind::OwnedUnchanged)
+                }
+                BodyToken::BorrowedSqliteDecoded(token) => (
+                    token.frame,
+                    token.bytes,
+                    BodyHandoffKind::BorrowedSqliteDecoded,
+                ),
+            });
             match (self.0.charged.get(), token) {
                 (None, None) => {
                     self.0.consumed.set(true);
                     Ok(result_bytes)
                 }
-                (Some(bytes), Some(token))
-                    if Rc::ptr_eq(&token.frame, &self.0) && token.bytes == bytes =>
+                (Some(bytes), Some((frame, token_bytes, kind)))
+                    if Rc::ptr_eq(&frame, &self.0)
+                        && token_bytes == bytes
+                        && kind == self.0.kind =>
                 {
                     // The original body charge stays in the monotone counter.
                     // Only the previously uncharged full-result remainder is new.
@@ -838,6 +875,37 @@ pub(crate) fn precharge_body<T: 'static>(
     connection: &Connection,
     bytes: usize,
 ) -> Result<ProvisionalBody<T>, WorkflowError> {
+    let frame = charge_body_frame::<T>(connection, bytes, BodyHandoffKind::OwnedUnchanged)?;
+    Ok(ProvisionalBody {
+        frame,
+        bytes,
+        result_type: PhantomData,
+    })
+}
+
+/// Precharge a BLOB borrowed directly from `rusqlite::Row::get_ref`, before
+/// decoding it into the memo's one retained owner. The caller must not create
+/// or retain an owned raw-input buffer. This is not an exemption for owned
+/// raw/decoded overlap, entity views, or any other parsing/validation work.
+/// Only `memoize_borrowed_sqlite_decoded` frames accept this token.
+pub(crate) fn precharge_borrowed_sqlite_decoded<T: 'static>(
+    connection: &Connection,
+    blob: &[u8],
+) -> Result<ProvisionalDecodedBody<T>, WorkflowError> {
+    let bytes = blob.len();
+    let frame = charge_body_frame::<T>(connection, bytes, BodyHandoffKind::BorrowedSqliteDecoded)?;
+    Ok(ProvisionalDecodedBody {
+        frame,
+        bytes,
+        result_type: PhantomData,
+    })
+}
+
+fn charge_body_frame<T: 'static>(
+    connection: &Connection,
+    bytes: usize,
+    kind: BodyHandoffKind,
+) -> Result<Rc<BodyFrame>, WorkflowError> {
     synchronize(connection)?;
     let frame = ACTIVE.with(|active| {
         let mut active = active.borrow_mut();
@@ -849,6 +917,7 @@ pub(crate) fn precharge_body<T: 'static>(
             || frame.changes != state.changes
             || frame.depth != state.depth
             || frame.result_type != TypeId::of::<T>()
+            || frame.kind != kind
             || frame.charged.get().is_some()
         {
             return Err(invalid_body_handoff(state));
@@ -857,11 +926,7 @@ pub(crate) fn precharge_body<T: 'static>(
     })?;
     charge_bytes(connection, bytes)?;
     frame.charged.set(Some(bytes));
-    Ok(ProvisionalBody {
-        frame,
-        bytes,
-        result_type: PhantomData,
-    })
+    Ok(frame)
 }
 
 pub(crate) fn memoize<T: Clone + Serialize + 'static>(
@@ -870,29 +935,61 @@ pub(crate) fn memoize<T: Clone + Serialize + 'static>(
     input: &impl Serialize,
     validate: impl FnOnce() -> Result<T, WorkflowError>,
 ) -> Result<T, WorkflowError> {
-    memoize_inner(connection, domain, input, false, || {
+    memoize_inner(connection, domain, input, None, || {
         validate().map(|value| (value, None))
     })
 }
 
 /// Retain the same complete proof as `memoize`, transferring a typed pre-copy
-/// ownership charge into its full serialized result once. Temporary raw/decoded
-/// overlap must continue to use ordinary `memoize` and `charge_bytes`.
+/// ownership charge into its full serialized result once. Independent owned
+/// raw/decoded buffers must use ordinary `memoize` and `charge_bytes`.
 pub(crate) fn memoize_precharged<T: Clone + Serialize + 'static>(
     connection: &Connection,
     domain: &'static str,
     input: &impl Serialize,
     validate: impl FnOnce() -> Result<(T, Option<ProvisionalBody<T>>), WorkflowError>,
 ) -> Result<T, WorkflowError> {
-    memoize_inner(connection, domain, input, true, validate)
+    memoize_inner(
+        connection,
+        domain,
+        input,
+        Some(BodyHandoffKind::OwnedUnchanged),
+        || validate().map(|(value, token)| (value, token.map(BodyToken::OwnedUnchanged))),
+    )
+}
+
+/// Memoize one decoded owner sourced directly from a borrowed SQLite BLOB.
+/// Precharge the input before decode, then add the uncharged full serialized
+/// result remainder: total body/result cost is max(input bytes, result bytes),
+/// never a refund. Keys and all other validation charges remain additive.
+/// Missing rows return `(None, None)`; a charged token must always be returned.
+/// Only the journal-entry reader qualifies; owned raw buffers and entity paths
+/// must keep their existing accounting. No historical or authority check may
+/// be replaced by this ownership handoff.
+/// This is a logical byte-accounting policy, not a duplicate-allocation fix or
+/// an RSS/CPU bound. Owned input buffers, independent decoded copies, and nested
+/// proofs remain separately charged; the unchanged-body API is unaffected.
+pub(crate) fn memoize_borrowed_sqlite_decoded<T: Clone + Serialize + 'static>(
+    connection: &Connection,
+    domain: &'static str,
+    input: &impl Serialize,
+    validate: impl FnOnce() -> Result<(T, Option<ProvisionalDecodedBody<T>>), WorkflowError>,
+) -> Result<T, WorkflowError> {
+    memoize_inner(
+        connection,
+        domain,
+        input,
+        Some(BodyHandoffKind::BorrowedSqliteDecoded),
+        || validate().map(|(value, token)| (value, token.map(BodyToken::BorrowedSqliteDecoded))),
+    )
 }
 
 fn memoize_inner<T: Clone + Serialize + 'static>(
     connection: &Connection,
     domain: &'static str,
     input: &impl Serialize,
-    precharged: bool,
-    validate: impl FnOnce() -> Result<(T, Option<ProvisionalBody<T>>), WorkflowError>,
+    precharged: Option<BodyHandoffKind>,
+    validate: impl FnOnce() -> Result<(T, Option<BodyToken<T>>), WorkflowError>,
 ) -> Result<T, WorkflowError> {
     with_scope(connection, || {
         synchronize(connection)?;
@@ -965,8 +1062,8 @@ fn memoize_inner<T: Clone + Serialize + 'static>(
                 key.2.len().saturating_add(256),
                 ValidationChargePhase::Key,
             )?;
-            let frame = if precharged {
-                Some(BodyFrameGuard::enter::<T>(connection)?)
+            let frame = if let Some(kind) = precharged {
+                Some(BodyFrameGuard::enter::<T>(connection, kind)?)
             } else {
                 None
             };
@@ -1071,6 +1168,10 @@ pub(crate) fn validations(domain: &'static str) -> usize {
 #[cfg(test)]
 #[path = "validation_scope/issue856_owned_body_handoff_tests.rs"]
 mod issue856_owned_body_handoff_tests;
+
+#[cfg(test)]
+#[path = "validation_scope/issue856_borrowed_owner_tests.rs"]
+mod issue856_borrowed_owner_tests;
 
 #[cfg(test)]
 mod tests {
