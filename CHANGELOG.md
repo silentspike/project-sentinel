@@ -1,5 +1,13 @@
 # Changelog
 
+- Share stable funded-review recovery proofs during authorization and immutable
+  receipt lookup. End read-proof sharing before publication, retain fresh
+  post-write verification and prevent publication-only proofs from escaping
+  their temporary authority. Preserve complete history, corruption checks,
+  fixed budgets, normal review accounting and exact replay. Record bounded,
+  public-safe recovery phase timings and fixed rejection reasons so admission
+  delays are distinguishable from durable storage work (#856).
+
 - Coalesce simultaneous durable completion recovery for the same request and
   store instance without serializing unrelated work. Refresh the exact stored
   response before admission so stale recovery batches do not repeat expensive

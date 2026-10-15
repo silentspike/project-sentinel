@@ -43,6 +43,324 @@ fn recovery_evidence(source: &crate::AdaptiveFundedReviewRecoveryVerificationSou
     })
 }
 
+fn assert_recovery_prewrite_proofs(
+    counts: &std::collections::BTreeMap<&'static str, usize>,
+    version: u64,
+) {
+    for domain in ["adaptive-journal", "review-inventory", "funding-inventory",
+        "funding-supersession"]
+    {
+        assert_eq!(counts.get(domain), Some(&1), "pre-write {domain}");
+    }
+    let entries = usize::try_from(version).unwrap();
+    assert_eq!(counts.get("adaptive-journal-entry"), Some(&entries));
+    assert_eq!(counts.get("adaptive-journal-step"), Some(&entries));
+    assert!(counts.values().sum::<usize>() <= 16_384);
+}
+
+#[test]
+fn funded_recovery_authorizer_shares_stable_prewrite_proofs_with_retained_overlap() {
+    let (mut f, request, at) = recovery_fixture();
+    let source = f.store.adaptive_funded_review_recovery_verification_source(
+        &funding_operator(&f), &f.grant.project_id, f.grant.session_id,
+        request.source.retired_review_id, at,
+    ).unwrap();
+    let retained_bytes = encode(&source.calls).unwrap();
+    let before_session = session(&f);
+    // The adopted continuation and the expired funded review retain overlapping
+    // journal prefixes; issuance must validate them once without removing either.
+    assert!(source.calls.len() >= 2);
+    assert!(source.calls.iter().any(|call| call.continuation.is_some()
+        && call.context.source_session.version < before_session.version));
+    assert!(source.calls.iter().any(|call| call.grant.review_id == request.source.retired_review_id
+        && call.retired_at_unix_ms == Some(at) && call.dispatch.is_none()));
+    f.store = WorkflowStore::open(&f.path).unwrap();
+    let ((issued, scopes), failures) = validation_scope::with_validation_failures(|| {
+        validation_scope::with_completed_validations(|| {
+            f.store.authorize_adaptive_funded_review_recovery(
+                &funding_operator(&f), &request, &f.grant, &f.context, at,
+                |actual, request| {
+                    assert_eq!(actual.source, source.source);
+                    assert_eq!(actual.project, source.project);
+                    assert_eq!(actual.session, source.session);
+                    assert_eq!(actual.funding, source.funding);
+                    assert_eq!(encode(&actual.calls)?, retained_bytes);
+                    for domain in ["adaptive-journal", "review-inventory", "funding-inventory",
+                        "funding-supersession"]
+                    {
+                        assert_eq!(validation_scope::validations(domain), 1, "verifier {domain}");
+                    }
+                    let mut evidence = recovery_evidence(actual, request)?;
+                    evidence.verified_at_unix_ms = at;
+                    Ok(evidence)
+                },
+            )
+        })
+    });
+    assert!(failures.is_empty(), "issuance validation failures: {failures:?}");
+    let (replayed, receipt) = issued.unwrap();
+    assert!(!replayed);
+    assert_recovery_prewrite_proofs(&scopes[0], before_session.version);
+    assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+    assert_eq!(session(&f), before_session);
+    let bound = receipt.bound_grant().unwrap();
+    assert_eq!(bound.schema_version, 6);
+    assert_eq!(bound.work_funding.as_ref().unwrap().binding.ordinal, source.source.ordinal);
+    assert_eq!(source.source.ordinal, source.source.review_count + 1);
+    assert_eq!(bound.work_funding.as_ref().unwrap().binding.limits,
+        f.grant.work_funding.as_ref().unwrap().binding.limits);
+    let mut calls = f.store.adaptive_leadership_review_calls(
+        &f.leader.tenant_id, f.grant.session_id,
+    ).unwrap();
+    assert_eq!(calls.len(), source.calls.len() + 1);
+    let retry = calls.iter().find(|call| call.grant.review_id == bound.review_id).unwrap();
+    assert_eq!(retry.grant, bound);
+    assert!(retry.dispatch.is_none() && retry.decision.is_none());
+    let context_digest = retry.context_digest().unwrap();
+    calls.retain(|call| call.grant.review_id != bound.review_id);
+    assert_eq!(encode(&calls).unwrap(), retained_bytes);
+    let connection = f.store.connection.lock().unwrap();
+    require_funding_review_membership(
+        &connection, &bound, &context_digest, request.operation_id,
+    ).unwrap();
+    assert!(connection.is_autocommit());
+}
+
+#[test]
+fn funded_recovery_authorizer_failed_verifier_drops_proofs_before_external_history_change() {
+    let (f, request, at) = recovery_fixture();
+    let before = rows(&f.store);
+    for _ in 0..2 {
+        let (failed, scopes) = validation_scope::with_completed_validations(|| {
+            f.store.authorize_adaptive_funded_review_recovery(
+                &funding_operator(&f), &request, &f.grant, &f.context, at, |_, _| {
+                    assert_eq!(validation_scope::validations("adaptive-journal"), 1);
+                    assert_eq!(validation_scope::validations("funding-inventory"), 1);
+                    Err(transition())
+                },
+            )
+        });
+        assert_eq!(failed.unwrap_err().code, transition().code);
+        assert!(scopes.is_empty(), "failed pre-write arena must not complete");
+        assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+        assert_eq!(rows(&f.store), before);
+        assert!(f.store.connection.lock().unwrap().is_autocommit());
+    }
+    let external = Connection::open(&f.path).unwrap();
+    assert!(external.execute(
+        "UPDATE workflow_operations SET request_digest='invalid'
+         WHERE operation_namespace=?1 AND operation_id='00000000000000000001'",
+        [format!("adaptive-session-v1:{}", f.grant.session_id)],
+    ).unwrap() > 0);
+    let damaged = rows(&f.store);
+    let failed = f.store.authorize_adaptive_funded_review_recovery(
+        &funding_operator(&f), &request, &f.grant, &f.context, at,
+        |_, _| panic!("external history corruption reached verifier"),
+    );
+    assert_eq!(failed.unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    assert_eq!(rows(&f.store), damaged);
+    assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+    assert!(f.store.connection.lock().unwrap().is_autocommit());
+}
+
+#[test]
+fn funded_recovery_authorizer_postwrite_damage_rolls_back_and_retry_rebuilds_proofs() {
+    for target in ["journal", "membership-event", "event-abort"] {
+        let (f, request, at) = recovery_fixture();
+        let before_session = session(&f);
+        let damage = match target {
+            "journal" => format!(
+                "UPDATE workflow_operations SET request_digest='invalid'
+                 WHERE operation_namespace='adaptive-session-v1:{}'
+                 AND operation_id='00000000000000000001';", f.grant.session_id,
+            ),
+            "membership-event" => "DELETE FROM company_events
+                WHERE event_type='adaptive_work_funding_review_issued';".into(),
+            "event-abort" => "SELECT RAISE(ABORT,'reject recovery publication');".into(),
+            _ => unreachable!(),
+        };
+        let external = Connection::open(&f.path).unwrap();
+        external.execute_batch(&format!(
+            "CREATE TRIGGER damage_recovery_publication AFTER INSERT ON company_events
+             WHEN NEW.event_type='adaptive_funded_review_recovery_issued'
+             BEGIN {damage} END;",
+        )).unwrap();
+        let before = rows(&f.store);
+        let (failed, scopes) = validation_scope::with_completed_validations(|| {
+            f.store.authorize_adaptive_funded_review_recovery(
+                &funding_operator(&f), &request, &f.grant, &f.context, at, recovery_evidence,
+            )
+        });
+        let error = failed.unwrap_err();
+        if target != "event-abort" {
+            assert_eq!(error.code, WorkflowErrorCode::CorruptStore, "{target}");
+        }
+        assert_recovery_prewrite_proofs(&scopes[0], before_session.version);
+        assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+        assert_eq!(rows(&f.store), before, "{target}");
+        assert_eq!(session(&f), before_session);
+        assert!(f.store.connection.lock().unwrap().is_autocommit());
+        external.execute_batch("DROP TRIGGER damage_recovery_publication").unwrap();
+        let (retried, scopes) = validation_scope::with_completed_validations(|| {
+            f.store.authorize_adaptive_funded_review_recovery(
+                &funding_operator(&f), &request, &f.grant, &f.context, at, recovery_evidence,
+            )
+        });
+        assert!(!retried.unwrap().0);
+        assert_recovery_prewrite_proofs(&scopes[0], before_session.version);
+        assert_eq!(session(&f), before_session);
+        assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+    }
+}
+
+#[test]
+fn funded_recovery_authorizer_expired_replay_revalidates_external_retained_history() {
+    let (mut f, request, at) = recovery_fixture();
+    let receipt = f.store.authorize_adaptive_funded_review_recovery(
+        &funding_operator(&f), &request, &f.grant, &f.context, at, recovery_evidence,
+    ).unwrap().1;
+    let receipt_bytes = encode(&receipt).unwrap();
+    f.store = WorkflowStore::open(&f.path).unwrap();
+    let before = rows(&f.store);
+    let (replayed, scopes) = validation_scope::with_completed_validations(|| {
+        f.store.authorize_adaptive_funded_review_recovery(
+            &funding_operator(&f), &request, &f.grant, &f.context,
+            request.expires_at_unix_ms + 1,
+            |_, _| panic!("expired immutable replay must not reverify"),
+        )
+    });
+    let (replay, retained) = replayed.unwrap();
+    assert!(replay);
+    assert_eq!(encode(&retained).unwrap(), receipt_bytes);
+    assert_eq!(scopes.len(), 1);
+    assert_eq!(scopes[0].get("adaptive-journal"), Some(&1));
+    assert_eq!(rows(&f.store), before);
+    let external = Connection::open(&f.path).unwrap();
+    assert_eq!(external.execute(
+        "DELETE FROM company_entities WHERE entity_kind='adaptive_leadership_review_call'
+         AND entity_id=?1", [request.source.retired_review_id.to_string()],
+    ).unwrap(), 1);
+    let damaged = rows(&f.store);
+    for _ in 0..2 {
+        let failed = f.store.authorize_adaptive_funded_review_recovery(
+            &funding_operator(&f), &request, &f.grant, &f.context,
+            request.expires_at_unix_ms + 1,
+            |_, _| panic!("damaged replay must not reverify or issue"),
+        );
+        assert_eq!(failed.unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert_eq!(rows(&f.store), damaged);
+        assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+        assert!(f.store.connection.lock().unwrap().is_autocommit());
+    }
+}
+
+#[test]
+#[ignore = "Explicit existing-database recovery read diagnostic; not issuance or acceptance"]
+fn diagnose_existing_funded_recovery_prewrite_reads_read_only() {
+    use std::io::Read;
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Metadata {
+        issuer: AuthenticatedCompanyPrincipalV1,
+        request: crate::AdaptiveFundedReviewRecoveryRequestV1,
+    }
+
+    let path = std::env::var_os("SENTINEL_DIAGNOSTIC_READ_ONLY_DB")
+        .expect("explicit existing database required");
+    let metadata_path = std::env::var_os("SENTINEL_DIAGNOSTIC_RECOVERY_METADATA")
+        .expect("explicit recovery metadata required");
+    const MAX_METADATA_BYTES: u64 = 256 * 1024;
+    let info = std::fs::symlink_metadata(&metadata_path).unwrap();
+    assert!(info.file_type().is_file() && info.len() <= MAX_METADATA_BYTES);
+    let mut bytes = Vec::new();
+    std::fs::File::open(metadata_path).unwrap().take(MAX_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes).unwrap();
+    assert_eq!(u64::try_from(bytes.len()).unwrap(), info.len());
+    let metadata: Metadata = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| panic!("invalid bounded recovery metadata"));
+    assert!(metadata.issuer.validate().is_ok());
+    let source = &metadata.request.source;
+    assert!(source.tenant_id == metadata.issuer.tenant_id && source.review_count < 128);
+    assert!(metadata.request.source_digest == source.canonical_digest().unwrap());
+    let mut connection = Connection::open_with_flags(
+        path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ).unwrap();
+    connection.pragma_update(None, "query_only", true).unwrap();
+    connection.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert!(connection.is_readonly("main").unwrap());
+    let data_version: i64 = connection.query_row("PRAGMA data_version", [], |row| row.get(0)).unwrap();
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap().as_millis().try_into().unwrap();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred).unwrap();
+    let changes: i64 = transaction.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+    // The authorizer's retained-history read set, without BEGIN IMMEDIATE, verifier,
+    // eligibility claims or publication. Both passes use the same SQLite snapshot.
+    let reads = || -> Result<String, WorkflowError> {
+        crate::adaptive_resume_policy::require_resume_policy_operator(
+            &metadata.issuer, &metadata.issuer.tenant_id,
+        )?;
+        let prior: Option<crate::AdaptiveFundedReviewRecoveryReceiptV1> = get_entity(
+            &transaction, &metadata.issuer.tenant_id, "adaptive_funded_review_recovery",
+            &source.receipt_key()?,
+        )?;
+        if prior.is_some() { return Err(transition()); }
+        let orphan: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM company_events WHERE tenant_id=?1
+             AND event_type='adaptive_funded_review_recovery_issued'
+             AND (operation_id=?2 OR json_extract(payload,'$.receipt_key')=?3))",
+            params![metadata.issuer.tenant_id.0, metadata.request.operation_id.to_string(),
+                source.receipt_key()?], |row| row.get(0),
+        )?;
+        if orphan { return Err(corrupt()); }
+        let (fresh, session) = adaptive_resume_policy::fresh_resume_source(
+            &transaction, &metadata.issuer.tenant_id, &source.project_id,
+            source.session_id, now_ms, None,
+        )?;
+        let project: ProjectV1 = get_entity(
+            &transaction, &metadata.issuer.tenant_id, "project", &source.project_id.0,
+        )?.ok_or_else(not_found)?;
+        let calls = calls_for_session(&transaction, &metadata.issuer.tenant_id, source.session_id)?;
+        let old = calls.iter().find(|call| call.grant.review_id == source.retired_review_id)
+            .ok_or_else(not_found)?;
+        let epoch = old.grant.work_funding.as_ref().ok_or_else(transition)?;
+        adaptive_work_funding::require_epoch_receipt(&transaction, epoch)?;
+        adaptive_work_funding::require_never_dispatched_funding(&transaction, epoch)?;
+        canonical_sha256("sentinel.workflow.recovery-read-diagnostic.v1",
+            &(fresh, session, project, calls))
+    };
+    let mut fingerprints = Vec::new();
+    for shared in [false, true] {
+        let started = std::time::Instant::now();
+        let ((result, scopes), failures) = validation_scope::with_validation_failures(|| {
+            validation_scope::with_completed_validations(|| {
+                if shared { validation_scope::with_scope(&transaction, reads) } else { reads() }
+            })
+        });
+        let elapsed_us = started.elapsed().as_micros();
+        let journals: usize = scopes.iter()
+            .map(|scope| scope.get("adaptive-journal").copied().unwrap_or(0)).sum();
+        let nodes: usize = scopes.iter().flat_map(|scope| scope.values()).sum();
+        eprintln!("READ_ONLY_RECOVERY_PREWRITE_READS read_set_only=true shared={shared} elapsed_us={elapsed_us} ok={} scopes={} journal_proofs={journals} nodes={nodes} error_code={:?} failures={failures:?} writes=0",
+            result.is_ok(), scopes.len(), result.as_ref().err().map(|error| error.code));
+        fingerprints.push(result.ok());
+    }
+    let fingerprints_equal = match fingerprints.as_slice() {
+        [Some(separate), Some(shared)] => Some(separate == shared),
+        _ => None,
+    };
+    assert!(fingerprints_equal != Some(false), "read sets must remain identical");
+    let after: i64 = transaction.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+    assert_eq!(after, changes);
+    transaction.rollback().unwrap();
+    let after_version: i64 = connection.query_row("PRAGMA data_version", [], |row| row.get(0)).unwrap();
+    assert_eq!(after_version, data_version, "database changed during diagnostic");
+    assert!(connection.is_readonly("main").unwrap() && connection.is_autocommit());
+    eprintln!("READ_ONLY_RECOVERY_PREWRITE_RESULT read_set_only=true equal_success={} fingerprints_equal={fingerprints_equal:?} full_issuance=false eligibility_claim=false full_path_speedup_claim=false writes=0",
+        fingerprints_equal == Some(true));
+}
+
 #[test]
 fn funded_recovery_durable_gate_evidence_is_exact_immutable_and_normally_charged() {
     let (f, request, at) = recovery_fixture();
