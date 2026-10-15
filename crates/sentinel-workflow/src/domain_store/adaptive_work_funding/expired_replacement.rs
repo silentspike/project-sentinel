@@ -61,12 +61,11 @@ pub(super) fn with_recovery_publication<T>(
         Ok(())
     })?;
     let guard = RecoveryPublicationGuard;
-    let result = validation_scope::with_scope(connection, || {
-        // Publication-bound proofs must not survive the temporary exception,
-        // including when an enclosing scope exists and publication fails.
-        validation_scope::before_write(connection)?;
-        publish()
-    });
+    // An enclosing scope must not retain publication-bound proofs, even on
+    // failure. Otherwise a fresh scope can share reads until the first write
+    // and is finished or dropped before the temporary exception is cleared.
+    validation_scope::before_write(connection)?;
+    let result = validation_scope::with_scope(connection, publish);
     drop(guard);
     let result = result?;
     validation_scope::with_scope(connection, || {
