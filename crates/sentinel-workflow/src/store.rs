@@ -2755,8 +2755,18 @@ mod tests {
             .unwrap_or_else(|_| "replacement_source".into());
         assert!(matches!(
             mode.as_str(),
-            "replacement_source" | "funding_review_selection"
+            "replacement_source" | "funding_review_selection" | "funding_review_reads"
         ));
+        if mode == "funding_review_reads" {
+            diagnose_funding_review_reads(&store, &operator);
+            let connection = store.connection.lock().unwrap();
+            assert!(connection.is_readonly("main").unwrap());
+            let after: i64 = connection
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(after, changes);
+            return;
+        }
         let (result, failures) =
             crate::domain_store::validation_scope::with_validation_failures(|| {
                 if mode == "funding_review_selection" {
@@ -2792,6 +2802,99 @@ mod tests {
             result.as_ref().err().map(|error| error.code),
             failures,
         );
+    }
+
+    fn diagnose_funding_review_reads(
+        store: &super::WorkflowStore,
+        operator: &crate::AuthenticatedCompanyPrincipalV1,
+    ) {
+        let review_id = uuid::Uuid::parse_str(
+            &std::env::var("SENTINEL_DIAGNOSTIC_REVIEW_ID")
+                .expect("explicit existing review identity required"),
+        )
+        .unwrap();
+        let version = || -> i64 {
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = version();
+        let call = store
+            .adaptive_leadership_review_call(&operator.tenant_id, review_id)
+            .unwrap()
+            .expect("existing review required");
+        let epoch = call
+            .grant
+            .work_funding
+            .as_ref()
+            .expect("funded review required");
+        let tenant = &operator.tenant_id;
+        assert_eq!(tenant, &call.grant.leadership_principal.tenant_id);
+        let current_id = |calls: Vec<crate::AdaptiveLeadershipReviewCallV1>| {
+            let mut matching = calls.iter().filter(|candidate| {
+                candidate.decision.is_none()
+                    && candidate.retired_at_unix_ms.is_none()
+                    && candidate.grant.expected_session_version
+                        == call.grant.expected_session_version
+            });
+            let current = matching.next().map(|candidate| candidate.grant.review_id);
+            if matching.next().is_none() {
+                current
+            } else {
+                None
+            }
+        };
+        store.validated_reads.lock().unwrap().clear();
+        let _ = store.take_read_cache_diagnostics();
+        let started = std::time::Instant::now();
+        let legacy_review = store
+            .adaptive_leadership_review_call(tenant, review_id)
+            .unwrap();
+        let legacy_receipt = store
+            .adaptive_work_funding(
+                tenant,
+                call.grant.session_id,
+                epoch.receipt.request.operation_id,
+            )
+            .unwrap();
+        let legacy_current = current_id(
+            store
+                .adaptive_leadership_review_calls(tenant, call.grant.session_id)
+                .unwrap(),
+        );
+        let legacy_us = started.elapsed().as_micros();
+        let legacy_diagnostics = store.take_read_cache_diagnostics();
+        store.validated_reads.lock().unwrap().clear();
+        let started = std::time::Instant::now();
+        let (batch_review, batch_receipt, batch_current) = store
+            .adaptive_work_funding_review_snapshot(
+                tenant,
+                review_id,
+                call.grant.session_id,
+                epoch.receipt.request.operation_id,
+                call.grant.expected_session_version,
+                true,
+            )
+            .unwrap();
+        let batch_us = started.elapsed().as_micros();
+        let batch_diagnostics = store.take_read_cache_diagnostics();
+        assert_eq!(batch_review, legacy_review);
+        assert_eq!(batch_receipt.unwrap(), legacy_receipt);
+        assert_eq!(batch_current.unwrap(), legacy_current);
+        assert_eq!(
+            version(),
+            before,
+            "database changed; no matched comparison claimed"
+        );
+        eprintln!("READ_ONLY_COMPLETION_READS legacy_us={legacy_us} batch_us={batch_us} identical=true writes=0");
+        for (path, rows) in [("legacy", legacy_diagnostics), ("batch", batch_diagnostics)] {
+            for record in rows {
+                eprintln!("READ_ONLY_COMPLETION_DETAIL path={path} {record}");
+            }
+        }
     }
 
     use std::collections::BTreeSet;
