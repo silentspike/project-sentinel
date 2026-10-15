@@ -85,6 +85,21 @@ pub(super) fn with_recovery_publication<T>(
         {
             return Err(corrupt());
         }
+        let selected = call.grant.work_funding.as_ref().ok_or_else(corrupt)?;
+        require_epoch_receipt(connection, selected)?;
+        let mut checked = BTreeSet::from([selected.receipt.receipt_digest()?]);
+        // Sealed prefix replay authenticates these bindings without traversing
+        // their successor relations. Restore every distinct full check here,
+        // after publication and outside the temporary historical context.
+        if let Some(state) = &call.context.source_session.continuation {
+            for authorization in &state.authorizations {
+                if let Some(epoch) = &authorization.work_funding {
+                    if checked.insert(epoch.receipt.receipt_digest()?) {
+                        require_epoch_receipt(connection, epoch)?;
+                    }
+                }
+            }
+        }
         Ok(())
     })?;
     Ok(result)
