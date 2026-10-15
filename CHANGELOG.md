@@ -1,5 +1,11 @@
 # Changelog
 
+- Reuse canonical SHA-256 results only for identical serialized content,
+  encoding and domain. Bound JSON retention inside the existing content-cache
+  budget without displacing numeric-payload entries; stream oversized values
+  unchanged and recompute on contention or poisoning. Preserve persisted hash
+  bytes, serializer failures, full source validation and fresh authority (#856).
+
 - Bound leadership model input by its rendered decision view rather than
   duplicated internal authority envelopes. Preserve complete validated source
   history and private evidence, expose immutable history references and exact
