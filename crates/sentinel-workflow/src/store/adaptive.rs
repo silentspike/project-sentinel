@@ -2451,19 +2451,34 @@ pub(crate) fn require_funding_journal_source(
     if source.version == 0 || source.version > MAX_JOURNAL_ENTRIES as u64 {
         return Err(corrupt_store());
     }
-    let prefix = crate::domain_store::validation_scope::memoize(
-        connection,
-        "adaptive-funding-journal-prefix",
-        &(source.grant.session_id, source.version),
-        || {
-            replay_journal(
-                connection,
-                source.grant.session_id,
-                None,
-                Some(source.version),
-            )
-        },
-    )?
+    let key = (source.grant.session_id, source.version);
+    let replay = || {
+        replay_journal(
+            connection,
+            source.grant.session_id,
+            None,
+            Some(source.version),
+        )
+    };
+    let prefix = if let Some(binding) =
+        crate::domain_store::adaptive_work_funding::historical_journal_proof_binding(
+            connection,
+            source.grant.session_id,
+        ) {
+        crate::domain_store::validation_scope::memoize(
+            connection,
+            "adaptive-funding-journal-prefix",
+            &(key, binding),
+            replay,
+        )
+    } else {
+        crate::domain_store::validation_scope::memoize(
+            connection,
+            "adaptive-funding-journal-prefix",
+            &key,
+            replay,
+        )
+    }?
     .ok_or_else(not_found)?;
     if prefix.0 != *source {
         return Err(authority_conflict());
@@ -3157,104 +3172,118 @@ fn require_journal_step(
     let entry = &stored.0.entry;
     // Replay supplies an already-validated predecessor prefix, not an isolated
     // row. Digest-bound step proofs cannot manufacture membership or authority.
-    crate::domain_store::validation_scope::memoize(
-        connection,
-        "adaptive-journal-step",
-        &(
-            entry.session.grant.session_id,
-            entry.session.version,
-            &stored.0.digest,
-            previous.map(|prior| &prior.0.digest),
-        ),
-        || {
-            let expected = match previous {
-                None if entry.previous_digest.is_none() && entry.command.is_none() => {
-                    if let Some(inherited) = &entry.recovery_feedback {
-                        inherited.validate().map_err(|_| corrupt_store())?;
-                        if inherited.count == 0
-                            || inherited.previous_session_id == entry.session.grant.session_id
-                        {
-                            return Err(corrupt_store());
-                        }
-                    }
-                    let mut initial = AdaptiveSessionV1::initial(entry.session.grant.clone())
-                        .map_err(|_| corrupt_store())?;
-                    if entry.session.updated_at_ms < initial.grant.created_at_ms
-                        || entry.session.updated_at_ms >= initial.grant.deadline_ms
+    let key = (
+        entry.session.grant.session_id,
+        entry.session.version,
+        &stored.0.digest,
+        previous.map(|prior| &prior.0.digest),
+    );
+    let validate = || {
+        let expected = match previous {
+            None if entry.previous_digest.is_none() && entry.command.is_none() => {
+                if let Some(inherited) = &entry.recovery_feedback {
+                    inherited.validate().map_err(|_| corrupt_store())?;
+                    if inherited.count == 0
+                        || inherited.previous_session_id == entry.session.grant.session_id
                     {
                         return Err(corrupt_store());
                     }
-                    initial.updated_at_ms = entry.session.updated_at_ms;
-                    Ok(initial)
                 }
-                Some(prior)
-                    if entry.previous_digest.as_ref() == Some(&prior.0.digest)
-                        && entry.recovery_feedback.is_none() =>
+                let mut initial = AdaptiveSessionV1::initial(entry.session.grant.clone())
+                    .map_err(|_| corrupt_store())?;
+                if entry.session.updated_at_ms < initial.grant.created_at_ms
+                    || entry.session.updated_at_ms >= initial.grant.deadline_ms
                 {
-                    let prior = &prior.0.entry.session;
-                    if let Some(AdaptiveTransitionV1::ContinueGoverned { authorization }) =
-                        &entry.command
-                    {
-                        if authorization.resume_policy.is_some() {
-                            require_resume_authorization_membership(
+                    return Err(corrupt_store());
+                }
+                initial.updated_at_ms = entry.session.updated_at_ms;
+                Ok(initial)
+            }
+            Some(prior)
+                if entry.previous_digest.as_ref() == Some(&prior.0.digest)
+                    && entry.recovery_feedback.is_none() =>
+            {
+                let prior = &prior.0.entry.session;
+                if let Some(AdaptiveTransitionV1::ContinueGoverned { authorization }) =
+                    &entry.command
+                {
+                    if authorization.resume_policy.is_some() {
+                        require_resume_authorization_membership(
+                            connection,
+                            authorization,
+                            &prior.grant.authority,
+                        )?;
+                    }
+                    if let Some(epoch) = &authorization.work_funding {
+                        require_funding_authorization_membership(
+                            connection,
+                            authorization,
+                            &prior.grant.authority,
+                        )?;
+                        require_work_funding_anchor(connection, epoch, prior)?;
+                        if let Some(adoption) = authorization.local_adoption.as_deref() {
+                            WorkflowStore::require_funded_adoption_authority(
                                 connection,
                                 authorization,
-                                &prior.grant.authority,
                             )?;
-                        }
-                        if let Some(epoch) = &authorization.work_funding {
-                            require_funding_authorization_membership(
-                                connection,
-                                authorization,
-                                &prior.grant.authority,
-                            )?;
-                            require_work_funding_anchor(connection, epoch, prior)?;
-                            if let Some(adoption) = authorization.local_adoption.as_deref() {
-                                WorkflowStore::require_funded_adoption_authority(
-                                    connection,
-                                    authorization,
-                                )?;
-                                if entry.previous_digest.as_deref()
-                                    != Some(adoption.request.session_head_digest.as_str())
-                                    || adoption.request.session_digest
-                                        != crate::adaptive_leadership_recovery_session_digest(
-                                            prior,
-                                        )?
-                                {
-                                    return Err(corrupt_store());
-                                }
+                            if entry.previous_digest.as_deref()
+                                != Some(adoption.request.session_head_digest.as_str())
+                                || adoption.request.session_digest
+                                    != crate::adaptive_leadership_recovery_session_digest(prior)?
+                            {
+                                return Err(corrupt_store());
                             }
                         }
                     }
-                    if let Some(AdaptiveTransitionV1::ResumeRejectedModel {
-                        disposition_operation_id,
-                        ..
-                    }) = &entry.command
-                    {
-                        let record = read_rejected_model_disposition(
-                            connection,
-                            entry.session.grant.session_id,
-                            *disposition_operation_id,
-                        )?
-                        .ok_or_else(corrupt_store)?;
-                        if record.response != entry.session {
-                            return Err(corrupt_store());
-                        }
-                    }
-                    prior.transition(
-                        entry.command.as_ref().ok_or_else(corrupt_store)?,
-                        entry.session.updated_at_ms,
-                    )
                 }
-                _ => return Err(corrupt_store()),
+                if let Some(AdaptiveTransitionV1::ResumeRejectedModel {
+                    disposition_operation_id,
+                    ..
+                }) = &entry.command
+                {
+                    let record = read_rejected_model_disposition(
+                        connection,
+                        entry.session.grant.session_id,
+                        *disposition_operation_id,
+                    )?
+                    .ok_or_else(corrupt_store)?;
+                    if record.response != entry.session {
+                        return Err(corrupt_store());
+                    }
+                }
+                prior.transition(
+                    entry.command.as_ref().ok_or_else(corrupt_store)?,
+                    entry.session.updated_at_ms,
+                )
             }
-            .map_err(|_| corrupt_store())?;
-            if expected != entry.session {
-                return Err(corrupt_store());
-            }
-            Ok(())
-        },
-    )
+            _ => return Err(corrupt_store()),
+        }
+        .map_err(|_| corrupt_store())?;
+        if expected != entry.session {
+            return Err(corrupt_store());
+        }
+        Ok(())
+    };
+    if let Some(binding) =
+        crate::domain_store::adaptive_work_funding::historical_journal_proof_binding(
+            connection,
+            entry.session.grant.session_id,
+        )
+    {
+        crate::domain_store::validation_scope::memoize(
+            connection,
+            "adaptive-journal-step",
+            &(key, binding),
+            validate,
+        )
+    } else {
+        crate::domain_store::validation_scope::memoize(
+            connection,
+            "adaptive-journal-step",
+            &key,
+            validate,
+        )
+    }
 }
 
 fn replay_journal(

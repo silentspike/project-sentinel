@@ -1,5 +1,490 @@
 use super::*;
 
+fn replacement_adopted_recovery_fixture() -> (
+    Fixture,
+    AdaptiveLeadershipReviewCallV1,
+    AdaptiveLeadershipReviewCallV1,
+    crate::AdaptiveFundedReviewRecoveryRequestV1,
+    u64,
+) {
+    let (mut f, old_funding, issued) = funded_fixture();
+    let old = issue(&f, issued).unwrap();
+    f.store.expire_adaptive_leadership_review_call(
+        &f.leader, old.grant.review_id, old.version, old.grant.expires_at_unix_ms,
+    ).unwrap();
+    let now = old_funding.request.limits.expires_at_unix_ms + 1;
+    let operator = funding_operator(&f);
+    let draft = f.store.adaptive_work_funding_expired_replacement_draft(
+        &operator, &f.grant.project_id, f.grant.session_id,
+        &crate::AdaptiveWorkFundingExpiredReplacementDraftV1 {
+            old_funding_receipt_digest: old_funding.receipt_digest().unwrap(),
+            operation_id: Uuid::new_v4(),
+            reason_ref: "replacement-before-genuine-adopted-recovery".into(),
+            limits: AdaptiveWorkFundingLimitsV1 {
+                additional_model_calls: 8,
+                additional_tool_calls: 8,
+                additional_reviews: 4,
+                additional_windows: 3,
+                max_window_ms: WINDOW_MS,
+                max_call_duration_ms: f.context.source_session.grant.max_call_duration_ms,
+                dispatch_margin_ms: crate::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+                expires_at_unix_ms: now + 3_600_000,
+            },
+            release: crate::AdaptiveRecoveryReleaseV1 {
+                schema_version: 1,
+                source_git_sha: "a".repeat(40),
+                release_manifest_digest: "b".repeat(64),
+                gateway_binary_digest: "c".repeat(64),
+            },
+            proof_digest: "d".repeat(64),
+        }, now,
+    ).unwrap();
+    let (_, replacement) = f.store.authorize_adaptive_work_funding_expired_replacement(
+        &operator, &draft, now, |source, request| {
+            Ok(crate::AdaptiveWorkFundingExpiredReplacementEvidenceV1 {
+                source_digest: source.source.canonical_digest()?,
+                proof_digest: request.proof_digest.clone(),
+                verified_at_unix_ms: now,
+                per_review: source.review_members.iter().map(|member| {
+                    let call = source.calls.iter().find(|call|
+                        call.grant.review_id == member.review_id).unwrap();
+                    crate::AdaptiveWorkFundingExpiredReplacementReviewEvidenceV1 {
+                        member: member.clone(),
+                        proof_digest: "e".repeat(64),
+                        release: request.release.clone(),
+                        no_io: crate::AdaptiveFundedReviewNoIoV1::UndispatchedAtDurableProviderGate {
+                            request_id: call.request_id(),
+                        },
+                    }
+                }).collect(),
+            })
+        },
+    ).unwrap();
+    let funding = f.store.adaptive_work_funding(
+        &operator.tenant_id, f.grant.session_id, draft.funding_request.operation_id,
+    ).unwrap().unwrap();
+    assert!(funding.request.source.expired_reviewed_replacement.is_some());
+    assert_eq!(funding.funding_id, replacement.new_funding_id);
+    let base = funding.request.source.resume_source.base_review_count;
+    budget_context(&mut f, now, "replacement-epoch-first-real-continue");
+    bind(&mut f, &funding, base + 1);
+    let first = dispatch(&f, now);
+    let completed = f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &continued(&first, now + 2, 5), now + 2,
+    ).unwrap();
+    let adopted = session(&f);
+    assert_eq!(adopted.active_work_funding().unwrap().receipt, funding);
+    assert!(adopted.continuation.as_ref().unwrap().authorizations.iter().any(|authorization|
+        completed.continuation.as_ref() == Some(authorization)));
+
+    let progressed = observe_budget_inspection(&f, adopted.clone(), now + 3);
+    assert!(progressed.version > adopted.version);
+    assert!(progressed.model_calls > adopted.model_calls);
+    assert!(progressed.tool_calls > adopted.tool_calls);
+    let review_at = progressed.active_deadline_ms();
+    budget_context(&mut f, review_at, "replacement-epoch-later-ordinary-review");
+    bind(&mut f, &funding, base + 2);
+    let ordinary = issue(&f, review_at).unwrap();
+    assert_eq!(ordinary.grant.schema_version, 5);
+    let at = ordinary.grant.expires_at_unix_ms;
+    let retired = f.store.expire_adaptive_leadership_review_call(
+        &f.leader, ordinary.grant.review_id, ordinary.version, at,
+    ).unwrap();
+    let source = f.store.adaptive_funded_review_recovery_source(
+        &operator, &f.grant.project_id, f.grant.session_id, retired.grant.review_id, at,
+    ).unwrap();
+    assert_eq!(source.expected_session_version, progressed.version);
+    assert_eq!(source.funding_receipt_digest, funding.receipt_digest().unwrap());
+    assert_eq!(source.ordinal, base + 3);
+    budget_context(&mut f, at, "replacement-adopted-epoch-selected-schema6");
+    bind(&mut f, &funding, source.ordinal);
+    f.grant.expires_at_unix_ms = at + WINDOW_MS;
+    let request = crate::AdaptiveFundedReviewRecoveryRequestV1 {
+        schema_version: 1,
+        operation_id: Uuid::new_v4(),
+        source_digest: source.canonical_digest().unwrap(),
+        source: Box::new(source),
+        release: draft.release.clone(),
+        proof_digest: "f".repeat(64),
+        reason_ref: "replacement-adoption-then-selected-review-recovery".into(),
+        expires_at_unix_ms: f.grant.expires_at_unix_ms,
+    };
+    (f, completed, retired, request, at)
+}
+
+#[test]
+fn replacement_adopted_epoch_schema6_publication_discriminates_validation_failure() {
+    let (f, completed, retired, request, at) = replacement_adopted_recovery_fixture();
+    let operator = funding_operator(&f);
+    let progressed = session(&f);
+    let funding = f.grant.work_funding.as_ref().unwrap().receipt.clone();
+    let before = rows(&f.store);
+    let callback = std::cell::Cell::new(false);
+    let (result, failures) = validation_scope::with_validation_failures(|| {
+        f.store.authorize_adaptive_funded_review_recovery(
+            &operator, &request, &f.grant, &f.context, at, |fresh, request| {
+                assert!(fresh.review_has_prior_adoption(&completed));
+                assert!(!fresh.review_has_prior_adoption(&retired));
+                let evidence = recovery_evidence(fresh, request)?;
+                callback.set(true);
+                Ok(evidence)
+            },
+        )
+    });
+    assert!(callback.get(), "failed before verifier callback: {failures:#?}");
+    let (replayed, receipt) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            assert_eq!(rows(&f.store), before, "publication failure must roll back every row");
+            assert!(f.store.connection.lock().unwrap().is_autocommit());
+            panic!("replacement-adopted schema6 publication failed after callback: code={:?}; first_failure={:#?}; all_failures={:#?}",
+                error.code, failures.first(), failures);
+        }
+    };
+    assert!(!replayed);
+    assert!(failures.is_empty(), "successful publication retained validation failures: {failures:#?}");
+    assert_eq!(session(&f), progressed);
+    assert_eq!(f.store.adaptive_leadership_review_call(
+        &operator.tenant_id, completed.grant.review_id,
+    ).unwrap(), Some(completed));
+    assert_eq!(f.store.adaptive_leadership_review_call(
+        &operator.tenant_id, retired.grant.review_id,
+    ).unwrap(), Some(retired));
+    let grant = receipt.bound_grant().unwrap();
+    assert_eq!(grant.schema_version, 6);
+    assert_eq!(grant.work_funding.as_ref().unwrap().receipt, funding);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    let published = rows(&reopened);
+    assert_eq!(reopened.adaptive_session(f.grant.session_id, &f.grant.assignee_authority)
+        .unwrap(), Some(progressed));
+    assert_eq!(reopened.authorize_adaptive_funded_review_recovery(
+        &operator, &request, &f.grant, &f.context, at,
+        |_, _| panic!("immutable publication replay must not reverify"),
+    ).unwrap(), (true, receipt));
+    assert_eq!(rows(&reopened), published);
+}
+
+#[test]
+fn replacement_adopted_epoch_postwrite_history_corruption_rolls_back_and_retry_revalidates() {
+    use crate::domain_store::adaptive_work_funding::historical_journal_proof_binding;
+
+    for (damage, final_write) in [
+        ("root", false), ("continue", false), ("selected-head", false),
+        ("adoption", false), ("selected", false), ("replacement", false),
+        ("selected-head", true), ("adoption", true), ("replacement", true),
+    ] {
+        let (f, completed, retired, request, at) = replacement_adopted_recovery_fixture();
+        let journal_key = match damage {
+            "root" => 1,
+            "continue" => completed.continuation.as_ref().unwrap().source_session_version + 1,
+            _ => request.source.expected_session_version,
+        };
+        let mutation = match damage {
+            "root" | "continue" | "selected-head" => format!(
+                "UPDATE workflow_operations SET request_digest='invalid' WHERE operation_namespace='adaptive-session-v1:{}' AND operation_id='{:020}';",
+                f.grant.session_id, journal_key),
+            "adoption" => format!(
+                "UPDATE company_events SET payload_digest='invalid' WHERE event_type='adaptive_work_funding_adopted' AND operation_id='{}';",
+                completed.operation_id),
+            "selected" => format!(
+                "UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind='adaptive_leadership_review_call' AND entity_id='{}';",
+                retired.review_key),
+            _ => "UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind='adaptive_work_funding_expired_replacement';".into(),
+        };
+        let event = if final_write {
+            "adaptive_leadership_review_authorized"
+        } else {
+            "adaptive_funded_review_recovery_issued"
+        };
+        f.store.connection.lock().unwrap().execute_batch(&format!(
+            "CREATE TRIGGER damage_replacement_adopted_recovery AFTER INSERT ON company_events
+             WHEN NEW.event_type='{event}'
+             BEGIN {mutation} END;"
+        )).unwrap();
+        let before = rows(&f.store);
+        let callback = std::cell::Cell::new(false);
+        let (result, failures) = validation_scope::with_validation_failures(|| {
+            f.store.authorize_adaptive_funded_review_recovery(
+                &funding_operator(&f), &request, &f.grant, &f.context, at,
+                |source, request| {
+                    let evidence = recovery_evidence(source, request)?;
+                    callback.set(true);
+                    Ok(evidence)
+                },
+            )
+        });
+        assert!(callback.get(), "{damage}/{final_write}: must test postwrite validation");
+        assert_eq!(result.unwrap_err().code, WorkflowErrorCode::CorruptStore, "{damage}/{final_write}: {failures:#?}");
+        assert!(!failures.iter().any(|failure| matches!(failure.reason,
+            validation_scope::ValidationFailureReason::Visiting
+                | validation_scope::ValidationFailureReason::BytesLimit)), "{damage}: {failures:#?}");
+        assert_eq!(rows(&f.store), before, "{damage}: complete rollback");
+        {
+            let connection = f.store.connection.lock().unwrap();
+            assert!(connection.is_autocommit());
+            assert!(historical_journal_proof_binding(&connection, f.grant.session_id).is_none());
+            connection.execute_batch("DROP TRIGGER damage_replacement_adopted_recovery").unwrap();
+        }
+        let receipt = issue_adopted_recovery(&f, &request, at);
+        assert_eq!(receipt.request, request);
+        assert_eq!(f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+            completed.grant.review_id).unwrap(), Some(completed));
+    }
+}
+
+#[test]
+fn replacement_adopted_epoch_prior_replacement_corruption_during_successor_publication_rolls_back() {
+    for damage in ["relation-row", "relation-event"] {
+        let (mut f, completed_a, _, unused_a_request, now) = replacement_adopted_recovery_fixture();
+        let funding_a = f.grant.work_funding.as_ref().unwrap().receipt.clone();
+        let replacement_key = funding_a.request.source.expired_reviewed_replacement
+            .as_ref().unwrap().replacement_key.clone();
+        let source_a = session(&f);
+        let operator = funding_operator(&f);
+        let funding_b = fund(&f, now);
+        assert_eq!(funding_b.request.source.predecessor_receipt_digest,
+            Some(funding_a.receipt_digest().unwrap()));
+        assert!(funding_b.request.source.expired_reviewed_replacement.is_none());
+        budget_context(&mut f, now, "successor-B-after-authentic-replacement-A-adoption");
+        bind(&mut f, &funding_b, funding_b.request.source.resume_source.base_review_count + 1);
+        let first_b = dispatch(&f, now);
+        let completed_b = f.store.complete_adaptive_leadership_review_call(
+            &f.leader, &continued(&first_b, now + 2, 5), now + 2,
+        ).unwrap();
+        let progressed = observe_budget_inspection(&f, session(&f), now + 3);
+        assert!(progressed.model_calls > source_a.model_calls);
+        assert!(progressed.tool_calls > source_a.tool_calls);
+        let review_at = progressed.active_deadline_ms();
+        budget_context(&mut f, review_at, "ordinary-B-after-A-and-B-authentic-adoptions");
+        bind(&mut f, &funding_b, funding_b.request.source.resume_source.base_review_count + 2);
+        let ordinary = issue(&f, review_at).unwrap();
+        let at = ordinary.grant.expires_at_unix_ms;
+        let retired = f.store.expire_adaptive_leadership_review_call(
+            &f.leader, ordinary.grant.review_id, ordinary.version, at,
+        ).unwrap();
+        let source = f.store.adaptive_funded_review_recovery_source(
+            &operator, &f.grant.project_id, f.grant.session_id, retired.grant.review_id, at,
+        ).unwrap();
+        assert_eq!(source.funding_receipt_digest, funding_b.receipt_digest().unwrap());
+        budget_context(&mut f, at, "schema6-B-retains-authentic-replacement-A-history");
+        bind(&mut f, &funding_b, source.ordinal);
+        f.grant.expires_at_unix_ms = at + WINDOW_MS;
+        let request = crate::AdaptiveFundedReviewRecoveryRequestV1 {
+            schema_version: 1,
+            operation_id: Uuid::new_v4(),
+            source_digest: source.canonical_digest().unwrap(),
+            source: Box::new(source),
+            release: unused_a_request.release,
+            proof_digest: "e".repeat(64),
+            reason_ref: "B-selected-recovery-preserves-earlier-adopted-replacement-A".into(),
+            expires_at_unix_ms: f.grant.expires_at_unix_ms,
+        };
+        let history = progressed.continuation.as_ref().unwrap();
+        assert_eq!(history.authorizations.iter().filter(|authorization|
+            authorization.work_funding.is_some()).count(), 2);
+        assert!(history.authorizations.contains(completed_a.continuation.as_ref().unwrap()));
+        assert!(history.authorizations.contains(completed_b.continuation.as_ref().unwrap()));
+        let mutation = if damage == "relation-row" {
+            format!("UPDATE company_entities SET payload_digest='invalid'
+                WHERE tenant_id='{}' AND entity_kind='adaptive_work_funding_expired_replacement'
+                AND entity_id='{}';", operator.tenant_id.0, replacement_key)
+        } else {
+            format!("UPDATE company_events SET payload_digest='invalid'
+                WHERE tenant_id='{}' AND event_type='adaptive_work_funding_expired_replacement_issued'
+                AND operation_id='{}';", operator.tenant_id.0, funding_a.request.operation_id)
+        };
+        f.store.connection.lock().unwrap().execute_batch(&format!(
+            "CREATE TRIGGER damage_prior_adopted_replacement AFTER INSERT ON company_events
+             WHEN NEW.event_type='adaptive_leadership_review_authorized'
+             BEGIN {mutation} END;"
+        )).unwrap();
+        let before = rows(&f.store);
+        let callback = std::cell::Cell::new(false);
+        let (result, failures) = validation_scope::with_validation_failures(|| {
+            f.store.authorize_adaptive_funded_review_recovery(
+                &operator, &request, &f.grant, &f.context, at, |source, request| {
+                    let evidence = recovery_evidence(source, request)?;
+                    callback.set(true);
+                    Ok(evidence)
+                },
+            )
+        });
+        assert!(callback.get(), "{damage}: fresh checks must succeed before staged corruption");
+        assert_eq!(result.unwrap_err().code, WorkflowErrorCode::CorruptStore, "{damage}: {failures:#?}");
+        assert!(!failures.iter().any(|failure| matches!(failure.reason,
+            validation_scope::ValidationFailureReason::Visiting
+                | validation_scope::ValidationFailureReason::BytesLimit)), "{damage}: {failures:#?}");
+        assert_eq!(rows(&f.store), before, "{damage}: the entire B publication must roll back");
+        {
+            let connection = f.store.connection.lock().unwrap();
+            assert!(connection.is_autocommit());
+            assert!(crate::domain_store::adaptive_work_funding::historical_journal_proof_binding(
+                &connection, f.grant.session_id).is_none());
+            connection.execute_batch("DROP TRIGGER damage_prior_adopted_replacement").unwrap();
+        }
+        let receipt = issue_adopted_recovery(&f, &request, at);
+        assert_eq!(receipt.bound_grant().unwrap().work_funding.as_ref().unwrap().receipt, funding_b);
+        assert_eq!(session(&f), progressed);
+        for (funding, completed) in [(&funding_a, &completed_a), (&funding_b, &completed_b)] {
+            assert_eq!(f.store.adaptive_work_funding(&operator.tenant_id, f.grant.session_id,
+                funding.request.operation_id).unwrap(), Some(funding.clone()));
+            assert_eq!(f.store.adaptive_leadership_review_call(&operator.tenant_id,
+                completed.grant.review_id).unwrap(), Some(completed.clone()));
+        }
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        let published = rows(&reopened);
+        assert_eq!(reopened.authorize_adaptive_funded_review_recovery(
+            &operator, &request, &f.grant, &f.context, at,
+            |_, _| panic!("intact A-to-B replay must not refresh proof or issue again"),
+        ).unwrap(), (true, receipt));
+        assert_eq!(rows(&reopened), published);
+    }
+}
+
+#[test]
+fn replacement_adopted_epoch_publication_error_and_unwind_cannot_leave_exception_or_proof() {
+    use crate::domain_store::adaptive_work_funding::{
+        historical_journal_proof_binding, require_epoch_receipt, with_recovery_publication,
+    };
+
+    let (f, _, _, request, at) = replacement_adopted_recovery_fixture();
+    let receipt = issue_adopted_recovery(&f, &request, at);
+    let grant = receipt.bound_grant().unwrap();
+    let call = f.store.adaptive_leadership_review_call(
+        &f.leader.tenant_id, grant.review_id,
+    ).unwrap().unwrap();
+    let before = rows(&f.store);
+    let mut connection = f.store.connection.lock().unwrap();
+    for outcome in ["error", "unwind", "return-missing"] {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        tx.execute("DELETE FROM company_entities WHERE entity_kind='adaptive_leadership_review_call' AND entity_id=?1",
+            [&call.review_key]).unwrap();
+        let reached = std::cell::Cell::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_recovery_publication(&tx, &grant, &call.context_digest().unwrap(),
+                call.operation_id, call.grant_issued_at_unix_ms, || {
+                    require_epoch_receipt(&tx, grant.work_funding.as_ref().unwrap())?;
+                    assert!(historical_journal_proof_binding(&tx, grant.session_id).is_none());
+                    reached.set(true);
+                    match outcome {
+                        "error" => Err(unauthorized()),
+                        "unwind" => panic!("controlled replacement-adopted publication unwind"),
+                        _ => Ok(()),
+                    }
+                })
+        }));
+        assert!(reached.get(), "{outcome}");
+        match result {
+            Err(_) => assert_eq!(outcome, "unwind"),
+            Ok(result) => assert!(result.is_err(), "{outcome}: missing publication must fail"),
+        }
+        assert!(historical_journal_proof_binding(&tx, grant.session_id).is_none());
+        assert_eq!(require_epoch_receipt(&tx, grant.work_funding.as_ref().unwrap())
+            .unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        tx.rollback().unwrap();
+    }
+    drop(connection);
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(f.store.adaptive_funded_review_recovery(&f.leader.tenant_id,
+        &receipt.receipt_key).unwrap(), Some(receipt));
+}
+
+#[test]
+fn replacement_adopted_epoch_historical_proof_is_scoped_and_not_an_ordinary_step_proof() {
+    use crate::domain_store::adaptive_work_funding::{
+        historical_journal_proof_binding, observe_recovery_journal_source,
+    };
+
+    let (f, _, _, request, at) = replacement_adopted_recovery_fixture();
+    let receipt = issue_adopted_recovery(&f, &request, at);
+    let before = rows(&f.store);
+    let mut connection = f.store.connection.lock().unwrap();
+    let other = Connection::open(&f.path).unwrap();
+    for outcome in ["return", "error", "unwind"] {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let reached = std::cell::Cell::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validation_scope::with_scope(&tx, || {
+                observe_recovery_journal_source(&tx, &receipt, || {
+                    assert!(historical_journal_proof_binding(&tx, f.grant.session_id).is_some());
+                    assert!(historical_journal_proof_binding(&tx, Uuid::new_v4()).is_none());
+                    assert!(historical_journal_proof_binding(&other, f.grant.session_id).is_none());
+                    reached.set(true);
+                    match outcome {
+                        "error" => Err(unauthorized()),
+                        "unwind" => panic!("controlled exact historical proof unwind"),
+                        _ => Ok(()),
+                    }
+                })?;
+                assert!(historical_journal_proof_binding(&tx, f.grant.session_id).is_none());
+                let sealed_steps = validation_scope::validations("adaptive-journal-step");
+                assert!(sealed_steps > 0);
+                crate::store::adaptive::require_funding_journal_source(&tx,
+                    receipt.grant_template.work_funding.as_ref().unwrap(),
+                    &receipt.context.source_session)?;
+                assert!(validation_scope::validations("adaptive-journal-step") > sealed_steps,
+                    "sealed historical proofs must not certify ordinary full-membership steps");
+                Ok(())
+            })
+        }));
+        assert!(reached.get(), "{outcome}");
+        match result {
+            Err(_) => assert_eq!(outcome, "unwind"),
+            Ok(result) => assert_eq!(result.is_ok(), outcome == "return"),
+        }
+        assert!(historical_journal_proof_binding(&tx, f.grant.session_id).is_none());
+        tx.rollback().unwrap();
+    }
+    drop(connection);
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn replacement_adopted_epoch_exact_prefix_and_warm_external_corruption_are_revalidated() {
+    use crate::domain_store::adaptive_work_funding::{
+        historical_journal_proof_binding, require_recovery_journal_source,
+    };
+
+    let (f, _, _, request, at) = replacement_adopted_recovery_fixture();
+    let receipt = issue_adopted_recovery(&f, &request, at);
+    let before = rows(&f.store);
+    let mut false_source = receipt.clone();
+    false_source.context.source_session.continuation.as_mut().unwrap().authorizations
+        .iter_mut().find(|authorization| authorization.work_funding.is_some()).unwrap()
+        .operation_id = Uuid::new_v4();
+    {
+        let connection = f.store.connection.lock().unwrap();
+        let (result, failures) = validation_scope::with_validation_failures(|| {
+            require_recovery_journal_source(&connection, &false_source)
+        });
+        assert_eq!(result.unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert!(!failures.iter().any(|failure|
+            failure.reason == validation_scope::ValidationFailureReason::Visiting), "{failures:#?}");
+        assert!(historical_journal_proof_binding(&connection, f.grant.session_id).is_none());
+    }
+    assert_eq!(rows(&f.store), before);
+    for _ in 0..2 {
+        assert_eq!(f.store.adaptive_funded_review_recovery(&f.leader.tenant_id,
+            &receipt.receipt_key).unwrap(), Some(receipt.clone()));
+    }
+    let external = Connection::open(&f.path).unwrap();
+    assert_eq!(external.execute(
+        "UPDATE workflow_operations SET request_digest='invalid' WHERE operation_namespace=?1 AND operation_id=?2",
+        params![format!("adaptive-session-v1:{}", f.grant.session_id),
+            format!("{:020}", request.source.expected_session_version)],
+    ).unwrap(), 1);
+    let corrupted = rows(&f.store);
+    for _ in 0..2 {
+        assert_eq!(f.store.adaptive_funded_review_recovery(&f.leader.tenant_id,
+            &receipt.receipt_key).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert_eq!(f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+            &request, &f.grant, &f.context, at,
+            |_, _| panic!("corrupt historical replay must not reach fresh verifier"),
+        ).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    }
+    assert_eq!(rows(&f.store), corrupted);
+}
+
 fn adopted_head() -> (Fixture, AdaptiveWorkFundingReceiptV1, u64) {
     let (mut f, funding, now) = funded_fixture();
     let first = dispatch(&f, now);

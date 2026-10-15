@@ -7543,6 +7543,10 @@ fn put_entity<T: Serialize>(
 trait CompanyEntity {
     fn row_binding(&self) -> (&TenantId, &'static str, &str, u64);
     fn validate_entity(&self) -> Result<(), WorkflowError>;
+    fn validate_full(&self, connection: &Connection) -> Result<(), WorkflowError> {
+        self.validate_entity()?;
+        self.validate_persisted(connection)
+    }
     fn load_shape(
         connection: &Connection,
         tenant_id: &TenantId,
@@ -7682,10 +7686,7 @@ fn get_entity<T: DeserializeOwned + Serialize + Clone + CompanyEntity + 'static>
             validation_scope::memoize(connection, "entity", &(tenant_id, kind, id), || {
                 let value = T::load_shape(connection, tenant_id, kind, id)?;
                 if let Some(value) = &value {
-                    value.validate_entity().map_err(|_| corrupt())?;
-                    value
-                        .validate_persisted(connection)
-                        .map_err(|_| corrupt())?;
+                    value.validate_full(connection).map_err(|_| corrupt())?;
                 }
                 let present = value.is_some();
                 loaded = Some(value);

@@ -1494,6 +1494,43 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
     }
 
     fn validate_entity(&self) -> Result<(), WorkflowError> {
+        self.validate_entity_with_context_digest(&mut || self.context_digest())
+    }
+
+    fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
+        self.validate_persisted_with_context_digest(connection, &mut || self.context_digest())
+    }
+
+    fn validate_full(&self, connection: &Connection) -> Result<(), WorkflowError> {
+        self.validate_full_with_context_digest(connection, || self.context_digest())
+    }
+}
+
+impl AdaptiveLeadershipReviewCallV1 {
+    fn validate_full_with_context_digest(
+        &self,
+        connection: &Connection,
+        mut compute: impl FnMut() -> Result<String, WorkflowError>,
+    ) -> Result<(), WorkflowError> {
+        // Both phases borrow this exact immutable call. Compute only at the
+        // original first use, preserving short-circuit and error precedence.
+        let mut digest: Option<String> = None;
+        let mut context_digest = || {
+            if let Some(digest) = &digest {
+                return Ok(digest.clone());
+            }
+            let computed = compute()?;
+            digest = Some(computed.clone());
+            Ok(computed)
+        };
+        self.validate_entity_with_context_digest(&mut context_digest)?;
+        self.validate_persisted_with_context_digest(connection, &mut context_digest)
+    }
+
+    fn validate_entity_with_context_digest(
+        &self,
+        context_digest: &mut impl FnMut() -> Result<String, WorkflowError>,
+    ) -> Result<(), WorkflowError> {
         self.grant.validate(self.grant_issued_at_unix_ms)?;
         self.context.validate(&self.grant)?;
         validate_project(&self.context.source_project)?;
@@ -1541,7 +1578,7 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
             validate_digest(&dispatch.request_digest)?;
             validate_digest(&dispatch.context_digest)?;
             if dispatch.request_id != self.request_id()
-                || dispatch.context_digest != self.context_digest()?
+                || dispatch.context_digest != context_digest()?
                 || dispatch.dispatched_at_unix_ms < self.grant_issued_at_unix_ms
                 || dispatch.dispatched_at_unix_ms >= self.grant.expires_at_unix_ms
                 || dispatch.dispatched_at_unix_ms > self.updated_at_unix_ms
@@ -1584,7 +1621,11 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
         Ok(())
     }
 
-    fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
+    fn validate_persisted_with_context_digest(
+        &self,
+        connection: &Connection,
+        context_digest: &mut impl FnMut() -> Result<String, WorkflowError>,
+    ) -> Result<(), WorkflowError> {
         if let Some(adoption) = self
             .continuation
             .as_ref()
@@ -1598,7 +1639,7 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
             require_funding_review_membership(
                 connection,
                 &self.grant,
-                &self.context_digest()?,
+                &context_digest()?,
                 self.operation_id,
             )?;
             if let Some(authorization) = &self.continuation {
@@ -1614,7 +1655,7 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
             require_resume_review_membership(
                 connection,
                 &self.grant,
-                &self.context_digest()?,
+                &context_digest()?,
                 self.operation_id,
             )?;
             return super::adaptive_accounting_reconsideration::require_designated_review(
@@ -2776,6 +2817,10 @@ impl WorkflowStore {
 #[cfg(test)]
 mod tests {
     include!("adaptive_leadership_review/tests.rs");
+
+    mod issue856_local_context_digest_tests {
+        include!("adaptive_leadership_review/issue856_local_context_digest_tests.rs");
+    }
 
     #[test]
     fn budget_source_memo_key_binds_full_grant_and_context_without_retaining_them() {
