@@ -6383,6 +6383,13 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         expected: &model_execution::ProviderExecutionAuthority,
         context: &model_execution::ModelExecutionContext,
     ) -> Result<Option<()>, String> {
+        if let model_execution::ProviderExecutionAuthority::Adaptive(binding) = expected {
+            let model_execution::ModelExecutionContext::Adaptive(context) = context else {
+                return Ok(None);
+            };
+            self.validate_prepared_adaptive_model_context(binding, context)?;
+            return Ok(Some(()));
+        }
         let model_execution::ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) =
             expected
         else {

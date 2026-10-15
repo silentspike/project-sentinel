@@ -86,6 +86,7 @@ fn exact_adaptive_snapshot_rejects_scope_grant_and_effect_tampering_without_writ
     let path = temp.path().join("company.sqlite");
     let events = temp.path().join("events.sqlite");
     let (api, expected, _) = super::super::model_work::configured_adaptive_test_api(&path, &events);
+    let context = api.prepare_adaptive_model(&expected).unwrap();
     let before = super::super::adaptive_leadership_review::tests::discovery_state(&path, &events);
     for field in [
         "schema",
@@ -152,6 +153,15 @@ fn exact_adaptive_snapshot_rejects_scope_grant_and_effect_tampering_without_writ
             } else {
                 Ok(None)
             },
+            "{field}",
+        );
+        assert_eq!(
+            api.validate_prepared_adaptive_model_context(&changed, &context),
+            Err(if matches!(field, "tenant" | "project") {
+                "provider usage reauthorization failed: adaptive exact project missing".into()
+            } else {
+                "provider usage authority changed during provider I/O".into()
+            }),
             "{field}",
         );
         assert_eq!(
@@ -416,8 +426,13 @@ fn exact_adaptive_read_sources_do_not_reenter_fresh_mutating_acquisitions() {
         .split("fn adaptive_provider_authority_inner(")
         .next()
         .unwrap();
-    for read in [exact, reserved] {
-        assert_eq!(read.matches(".adaptive_project_snapshot(").count(), 1);
+    for (read, shared) in [(exact, true), (reserved, false)] {
+        let acquisition = if shared {
+            ".adaptive_project_snapshot_shared("
+        } else {
+            ".adaptive_project_snapshot("
+        };
+        assert_eq!(read.matches(acquisition).count(), 1);
         assert_eq!(read.matches(".snapshot_from_validated_project(").count(), 1);
         assert_eq!(read.matches(".session_for_authority(").count(), 1);
         assert!(!read.contains(".snapshot_for_admission("));
@@ -426,13 +441,21 @@ fn exact_adaptive_read_sources_do_not_reenter_fresh_mutating_acquisitions() {
         assert!(!read.contains(".adaptive_provider_authority_from_binding_inner("));
         assert!(!read.contains(".adaptive_provider_authority_for_exact_binding("));
         let compact: String = read.split_whitespace().collect();
-        assert!(compact.contains("Some(session),false,true"));
-        assert!(
-            read.find("drop(snapshot)").unwrap()
-                < read
-                    .find("self.evaluate_adaptive_provider_binding(")
-                    .unwrap()
-        );
+        if shared {
+            assert!(compact.contains("Some(session.clone()),false,true"));
+            assert!(read.contains("Option<ExactAdaptiveProviderSource>"));
+            assert!(source
+                .contains("snapshot: Arc<Option<sentinel_workflow::AdaptiveProjectReadSnapshot>>"));
+            assert!(!read.contains("let project = project.clone()"));
+        } else {
+            assert!(compact.contains("Some(session),false,true"));
+            assert!(
+                read.find("drop(snapshot)").unwrap()
+                    < read
+                        .find("self.evaluate_adaptive_provider_binding(")
+                        .unwrap()
+            );
+        }
     }
     assert!(reserved.contains(".company_projects()"));
     let normal = source

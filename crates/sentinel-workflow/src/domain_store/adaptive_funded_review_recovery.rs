@@ -10,6 +10,69 @@ use crate::{
 const KIND: &str = "adaptive_funded_review_recovery";
 const EVENT: &str = "adaptive_funded_review_recovery_issued";
 
+pub(super) fn require_recovery_journal_head(
+    connection: &Connection,
+    receipt: &AdaptiveFundedReviewRecoveryReceiptV1,
+) -> Result<(), WorkflowError> {
+    let session = &receipt.context.source_session;
+    let epoch = receipt
+        .grant_template
+        .work_funding
+        .as_ref()
+        .ok_or_else(corrupt)?;
+    crate::store::adaptive::require_funding_journal_source(connection, epoch, session)?;
+    // Prefix replay authenticated this exact version's bytes and digest. Read
+    // only its scalar digest in the same snapshot, not a later current head.
+    let digest: String = connection.query_row(
+        "SELECT request_digest FROM workflow_operations
+         WHERE operation_namespace=?1 AND operation_id=?2",
+        params![
+            format!("adaptive-session-v1:{}", session.grant.session_id),
+            format!("{:020}", session.version)
+        ],
+        |row| row.get(0),
+    )?;
+    if digest != receipt.request.source.session_head_digest {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
+fn recovery_anchor_matches(
+    session: &crate::AdaptiveSessionV1,
+    project: &ProjectV1,
+    epoch: &crate::AdaptiveWorkFundingEpochV1,
+    head_digest: &str,
+) -> bool {
+    let anchor = &epoch.receipt.request.source.resume_source;
+    if adaptive_work_funding::recovery_uses_adopted_epoch(session, epoch) {
+        // The immutable funding anchor remains in the journal; recovery binds
+        // the selected expired review's later head, never a replacement grant.
+        // Persisted validation separately checks its exact journal entry digest.
+        session.version > anchor.expected_session_version
+            && project.version >= anchor.expected_project_version
+            && session.grant.authority == anchor.assignee_authority
+            && session.model_calls >= anchor.base_model_calls
+            && session.tool_calls >= anchor.base_tool_calls
+            && session.funded_model_call_ceiling() == epoch.binding.limits.total_model_call_ceiling
+            && session.funded_tool_call_ceiling() == epoch.binding.limits.total_tool_call_ceiling
+    } else {
+        anchor.expected_session_version == session.version
+            && anchor.expected_project_version == project.version
+            && anchor.head_entry_digest == head_digest
+            && anchor.base_model_calls == session.model_calls
+            && anchor.base_tool_calls == session.tool_calls
+            && !session.continuation.as_ref().is_some_and(|state| {
+                state.authorizations.iter().any(|authorization| {
+                    authorization
+                        .work_funding
+                        .as_ref()
+                        .is_some_and(|prior| prior.same_epoch(epoch))
+                })
+            })
+    }
+}
+
 fn review_members(
     calls: &[AdaptiveLeadershipReviewCallV1],
 ) -> Result<Vec<AdaptiveFundedReviewRecoveryMemberV1>, WorkflowError> {
@@ -113,7 +176,7 @@ fn source_in_connection(
         .ok_or_else(not_found)?;
     let epoch = old.grant.work_funding.as_ref().ok_or_else(transition)?;
     adaptive_work_funding::require_epoch_receipt(connection, epoch)?;
-    adaptive_work_funding::require_never_dispatched_funding(connection, epoch)?;
+    adaptive_work_funding::require_funded_recovery_source_history(connection, epoch, &session)?;
     let funding = &epoch.receipt;
     let anchor = &funding.request.source.resume_source;
     let ordinal = fresh
@@ -122,6 +185,11 @@ fn source_in_connection(
         .ok_or_else(transition)?;
     if old.grant.schema_version != 5
         || old.grant.funded_review_recovery.is_some()
+        || old.dispatch.is_some()
+        || old.decision.is_some()
+        || old.model_response_digest.is_some()
+        || old.continuation.is_some()
+        || old.resolution_event_id.is_some()
         || old.context.source_project != project
         || old.context.source_session != session
         || old
@@ -136,16 +204,13 @@ fn source_in_connection(
         || session.model_calls >= epoch.binding.limits.total_model_call_ceiling
         || session.tool_calls >= epoch.binding.limits.total_tool_call_ceiling
         || fresh.base_window_count >= epoch.binding.limits.total_window_ceiling
-        || session.continuation.as_ref().is_some_and(|state| {
-            state.authorizations.iter().any(|auth| {
-                auth.work_funding
-                    .as_ref()
-                    .is_some_and(|prior| prior.same_epoch(epoch))
-            })
-        })
+        || calls
+            .iter()
+            .any(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
         || calls.iter().any(|call| {
             call.grant.work_funding.as_ref().is_some_and(|prior| {
                 prior.same_epoch(epoch)
+                    && !adaptive_work_funding::recovery_prior_adopted_call(&session, call)
                     && (call.grant.schema_version != 5
                         || call.dispatch.is_some()
                         || call.decision.is_some()
@@ -155,14 +220,11 @@ fn source_in_connection(
                         || call.retired_at_unix_ms.is_none())
             })
         })
-        || anchor.expected_session_version != session.version
-        || anchor.expected_project_version != project.version
+        || !recovery_anchor_matches(&session, &project, epoch, &fresh.head_entry_digest)
         || anchor.root_entry_digest != fresh.root_entry_digest
-        || anchor.head_entry_digest != fresh.head_entry_digest
-        || anchor.project_payload_digest != fresh.project_payload_digest
-        || anchor.continuation_history_digest != fresh.continuation_history_digest
-        || anchor.base_model_calls != session.model_calls
-        || anchor.base_tool_calls != session.tool_calls
+        || (!adaptive_work_funding::recovery_uses_adopted_epoch(&session, epoch)
+            && (anchor.project_payload_digest != fresh.project_payload_digest
+                || anchor.continuation_history_digest != fresh.continuation_history_digest))
     {
         return Err(transition());
     }
@@ -218,7 +280,6 @@ impl CompanyEntity for AdaptiveFundedReviewRecoveryReceiptV1 {
         grant.validate(self.issued_at_unix_ms)?;
         self.context.validate(grant)?;
         let epoch = grant.work_funding.as_ref().ok_or_else(corrupt)?;
-        let anchor = &epoch.receipt.request.source.resume_source;
         let limits = &epoch.binding.limits;
         let mut seen = BTreeSet::new();
         for member in &self.review_members {
@@ -280,20 +341,11 @@ impl CompanyEntity for AdaptiveFundedReviewRecoveryReceiptV1 {
             || source.ordinal > limits.total_review_ceiling
             || !matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
             || !session.model_window_exhausted_at(self.issued_at_unix_ms)
-            || anchor.expected_session_version != session.version
-            || anchor.expected_project_version != project.version
-            || anchor.head_entry_digest != source.session_head_digest
-            || anchor.base_model_calls != session.model_calls
-            || anchor.base_tool_calls != session.tool_calls
+            || !recovery_anchor_matches(session, project, epoch, &source.session_head_digest)
             || session.model_calls >= limits.total_model_call_ceiling
             || session.tool_calls >= limits.total_tool_call_ceiling
             || session.continuation.as_ref().is_some_and(|state| {
                 state.authorizations.len() >= usize::from(limits.total_window_ceiling)
-                    || state.authorizations.iter().any(|auth| {
-                        auth.work_funding
-                            .as_ref()
-                            .is_some_and(|prior| prior.same_epoch(epoch))
-                    })
             })
             || self
                 .issued_at_unix_ms
@@ -340,6 +392,7 @@ impl CompanyEntity for AdaptiveFundedReviewRecoveryReceiptV1 {
             .work_funding
             .as_ref()
             .ok_or_else(corrupt)?;
+        require_recovery_journal_head(connection, self)?;
         for member in &self.review_members {
             let stored = load_member(
                 connection,
@@ -352,6 +405,10 @@ impl CompanyEntity for AdaptiveFundedReviewRecoveryReceiptV1 {
                 .work_funding
                 .as_ref()
                 .is_some_and(|prior| prior.same_epoch(epoch))
+                && !adaptive_work_funding::recovery_prior_adopted_call(
+                    &self.context.source_session,
+                    &stored,
+                )
                 && (stored.grant.schema_version != 5
                     || stored.dispatch.is_some()
                     || stored.decision.is_some()
@@ -364,6 +421,11 @@ impl CompanyEntity for AdaptiveFundedReviewRecoveryReceiptV1 {
             }
             if stored.grant.review_id == source.retired_review_id {
                 if stored.grant.schema_version != 5
+                    || stored.dispatch.is_some()
+                    || stored.decision.is_some()
+                    || stored.model_response_digest.is_some()
+                    || stored.continuation.is_some()
+                    || stored.resolution_event_id.is_some()
                     || stored
                         .grant
                         .work_funding

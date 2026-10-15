@@ -11,6 +11,10 @@ mod issue856_recovery_continuation_tests {
 mod issue856_recovery_history_cut_tests {
     include!("work_funding_tests/recovery_history_cut_tests.rs");
 }
+
+mod issue856_adopted_epoch_recovery_tests {
+    include!("work_funding_tests/tests/adopted_epoch_recovery.rs");
+}
 use crate::{AdaptiveWorkFundingEpochV1, AdaptiveWorkFundingLimitsV1, AdaptiveWorkFundingReceiptV1};
 
 const WINDOW_MS: u64 = 180_000;

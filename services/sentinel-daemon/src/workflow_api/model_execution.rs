@@ -214,6 +214,8 @@ struct AdaptiveContextReadPhase {
 
 impl AdaptiveContextReadPhase {
     fn start(phase: &'static str) -> Self {
+        #[cfg(test)]
+        tests::read_cohorts::record_model_preparation_read(phase);
         Self {
             phase,
             started: std::time::Instant::now(),
@@ -561,17 +563,31 @@ pub struct AdaptiveModelContext {
     pub(super) working_memory: Option<working_memory::AdaptiveWorkingMemoryV1>,
 }
 
+struct ExactAdaptiveProviderSource {
+    authority: AdaptiveProviderAuthority,
+    snapshot: Arc<Option<sentinel_workflow::AdaptiveProjectReadSnapshot>>,
+    session: AdaptiveSessionV1,
+}
+
 fn is_false(value: &bool) -> bool {
     !value
 }
 
 impl AdaptiveModelContext {
+    pub(crate) fn validate_dispatch_clock(&self, now_ms: u64) -> Result<(), &'static str> {
+        if now_ms >= self.binding.grant.deadline_ms {
+            return Err("adaptive model context is stale or unsupported");
+        }
+        Ok(())
+    }
+
     pub fn validate_dispatch(&self, now_ms: u64) -> Result<(), &'static str> {
         let grant = &self.binding.grant;
         grant
             .authority
             .validate()
             .map_err(|_| "adaptive authority is invalid")?;
+        self.validate_dispatch_clock(now_ms)?;
         if self.binding.schema_version != 3
             || self.binding.effect_id.is_nil()
             || self.binding.session_version == 0
@@ -582,7 +598,6 @@ impl AdaptiveModelContext {
                 self.task.required_role,
                 CompanyRoleV1::Designer | CompanyRoleV1::Developer
             )
-            || now_ms >= grant.deadline_ms
         {
             return Err("adaptive model context is stale or unsupported");
         }
@@ -1890,18 +1905,29 @@ impl WorkflowApi {
         &self,
         expected: &AdaptiveProviderAuthority,
     ) -> Result<Option<AdaptiveProviderAuthority>, &'static str> {
+        self.adaptive_provider_authority_for_exact_binding_with_source(expected)
+            .map(|source| source.map(|source| source.authority))
+    }
+
+    fn adaptive_provider_authority_for_exact_binding_with_source(
+        &self,
+        expected: &AdaptiveProviderAuthority,
+    ) -> Result<Option<ExactAdaptiveProviderSource>, &'static str> {
         let scope = &expected.grant.authority;
         #[cfg(test)]
         tests::record_exact_adaptive_snapshot();
-        let snapshot = self
+        let source = self
             .store
-            .adaptive_project_snapshot(
+            .adaptive_project_snapshot_shared(
                 &scope.tenant_id,
                 &scope.project_id,
                 &scope.work_item_id,
                 scope.agent_id,
             )
-            .map_err(|_| "adaptive exact project unavailable")?
+            .map_err(|_| "adaptive exact project unavailable")?;
+        let snapshot = source
+            .as_ref()
+            .as_ref()
             .ok_or("adaptive exact project missing")?;
         let project = snapshot.project();
         let Some(binding) = select_provider_usage_binding(
@@ -1948,17 +1974,57 @@ impl WorkflowApi {
         if session.effective_grant() != expected.grant {
             return Ok(None);
         }
-        let project = project.clone();
-        drop(snapshot);
         let (actual, _) = self.evaluate_adaptive_provider_binding(
             binding,
-            &project,
+            project,
             current,
-            Some(session),
+            Some(session.clone()),
             false,
             true,
         )?;
-        Ok(actual.filter(|actual| actual == expected))
+        Ok(actual.filter(|actual| actual == expected).map(|authority| {
+            ExactAdaptiveProviderSource {
+                authority,
+                snapshot: source,
+                session,
+            }
+        }))
+    }
+
+    pub(super) fn validate_prepared_adaptive_model_context(
+        &self,
+        binding: &AdaptiveProviderAuthority,
+        expected: &AdaptiveModelContext,
+    ) -> Result<(), String> {
+        let source = self
+            .adaptive_provider_authority_for_exact_binding_with_source(binding)
+            .map_err(|reason| format!("provider usage reauthorization failed: {reason}"))?
+            .ok_or("provider usage authority changed during provider I/O")?;
+        let project = source
+            .snapshot
+            .as_ref()
+            .as_ref()
+            .ok_or("provider usage authority changed during provider I/O")?
+            .project();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "model work clock is unavailable")?
+            .as_millis();
+        expected.validate_dispatch(u64::try_from(now).map_err(|_| "model work clock overflow")?)?;
+        if &expected.binding != binding {
+            return Err("model work authority changed during provider I/O".to_owned());
+        }
+        #[cfg(test)]
+        tests::record_adaptive_preparation();
+        // Only this gate reuses the owned SQL facts. Runtime authority is checked
+        // again below; callbacks retain their independent post-read proofs.
+        let current =
+            self.prepare_adaptive_model_from_validated_source(binding, &source.session, project)?;
+        if &current != expected {
+            return Err("model work authority changed during provider I/O".to_owned());
+        }
+        expected.validate_dispatch_clock(now_unix_ms())?;
+        Ok(())
     }
 
     pub(super) fn adaptive_provider_authority_for_reserved_session(
@@ -2366,16 +2432,16 @@ impl WorkflowApi {
             return Err("adaptive provider schema is invalid");
         }
         // Each store phase returns owned facts, never a connection/read guard.
-        let preparation = {
+        let preparation_source = {
             let _phase = AdaptiveContextReadPhase::start("preparation_snapshot");
-            let result = self.store.adaptive_model_preparation_read_snapshot(
+            let result = self.store.adaptive_model_preparation_read_snapshot_shared(
                 binding.grant.session_id,
                 binding.session_version,
                 binding.effect_id,
                 &binding.grant.authority,
             );
             match result {
-                Ok(Some(snapshot)) => snapshot,
+                Ok(snapshot) if snapshot.as_ref().is_some() => snapshot,
                 outcome => {
                     // Preserve authority-before-session diagnostics on failures,
                     // without adding another project read to successful preparation.
@@ -2391,16 +2457,29 @@ impl WorkflowApi {
                         )
                         .map_err(|_| "adaptive session unavailable")?;
                     return Err(match outcome {
-                        Ok(None) => "adaptive session missing",
+                        Ok(_) => "adaptive session missing",
                         _ => "adaptive session unavailable",
                     });
                 }
             }
         };
+        let preparation = preparation_source
+            .as_ref()
+            .as_ref()
+            .ok_or("adaptive session missing")?;
         let session = preparation.session();
         let project = preparation
             .project()
             .map_err(|_| "adaptive session unavailable")?;
+        self.prepare_adaptive_model_from_validated_source(binding, session, project)
+    }
+
+    fn prepare_adaptive_model_from_validated_source(
+        &self,
+        binding: &AdaptiveProviderAuthority,
+        session: &AdaptiveSessionV1,
+        project: &sentinel_workflow::ProjectV1,
+    ) -> Result<AdaptiveModelContext, &'static str> {
         let current = self
             .authority
             .as_ref()
@@ -2498,18 +2577,23 @@ impl WorkflowApi {
         let correction = self.model_work_correction(project, &work.spec.work_item_id)?;
         // Private observation/artifact callbacks may have changed persisted policy
         // or session state. Start a new SQL phase before consuming feedback.
-        let post_callback = {
+        #[cfg(test)]
+        tests::read_cohorts::after_preparation_callbacks();
+        let post_callback_source = {
             let _phase = AdaptiveContextReadPhase::start("post_callback_snapshot");
             self.store
-                .adaptive_model_preparation_read_snapshot(
+                .adaptive_model_preparation_read_snapshot_shared(
                     binding.grant.session_id,
                     binding.session_version,
                     binding.effect_id,
                     &binding.grant.authority,
                 )
                 .map_err(|_| "adaptive recovery feedback unavailable")?
-                .ok_or("adaptive recovery feedback unavailable")?
         };
+        let post_callback = post_callback_source
+            .as_ref()
+            .as_ref()
+            .ok_or("adaptive recovery feedback unavailable")?;
         let schema_retry_feedback = {
             let fresh_project = post_callback
                 .project()
@@ -2686,16 +2770,18 @@ impl WorkflowApi {
         session: &AdaptiveSessionV1,
         project: &sentinel_workflow::ProjectV1,
     ) -> Result<(), &'static str> {
-        let snapshot = self
+        #[cfg(test)]
+        tests::read_cohorts::record_model_preparation_read("final_freshness_snapshot");
+        let source = self
             .store
-            .adaptive_project_snapshot(
+            .adaptive_project_snapshot_shared(
                 &binding.grant.authority.tenant_id,
                 &binding.grant.authority.project_id,
                 &binding.grant.authority.work_item_id,
                 binding.grant.authority.agent_id,
             )
-            .map_err(|_| "adaptive session unavailable")?
-            .ok_or("adaptive session missing")?;
+            .map_err(|_| "adaptive session unavailable")?;
+        let snapshot = source.as_ref().as_ref().ok_or("adaptive session missing")?;
         if snapshot.project() != project {
             return Err("adaptive session authority changed");
         }
@@ -2721,7 +2807,7 @@ impl WorkflowApi {
         {
             return Err("adaptive session authority changed");
         }
-        drop(snapshot);
+        drop(source);
         if let Some(epoch) = session.active_work_funding() {
             let receipt = self
                 .store

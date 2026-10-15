@@ -322,10 +322,8 @@ impl CompanyEntity for SealedRecovery {
             .work_funding
             .as_ref()
             .ok_or_else(corrupt)?;
-        crate::store::adaptive::require_funding_journal_source(
-            connection,
-            epoch,
-            &receipt.context.source_session,
+        super::super::adaptive_funded_review_recovery::require_recovery_journal_head(
+            connection, receipt,
         )?;
         if sealed_funding(connection, tenant, &epoch.receipt.funding_id)? != epoch.receipt {
             return Err(corrupt());
@@ -351,6 +349,7 @@ impl CompanyEntity for SealedRecovery {
                 .work_funding
                 .as_ref()
                 .is_some_and(|prior| prior.same_epoch(epoch))
+                && !recovery_prior_adopted_call(&receipt.context.source_session, &call)
             {
                 require_retired(&call, receipt.issued_at_unix_ms)?;
                 if call.grant.schema_version != 5 {
@@ -358,11 +357,13 @@ impl CompanyEntity for SealedRecovery {
                 }
             }
             if member.review_id == source.retired_review_id {
+                require_retired(&call, receipt.issued_at_unix_ms)?;
                 if call
                     .grant
                     .work_funding
                     .as_ref()
                     .is_none_or(|prior| !prior.same_epoch(epoch))
+                    || call.grant.schema_version != 5
                     || call.context.source_project != receipt.context.source_project
                     || call.context.source_session != receipt.context.source_session
                 {

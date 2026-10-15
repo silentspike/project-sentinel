@@ -648,6 +648,22 @@ struct ResultProof {
     last_used: u64,
 }
 
+// Serialize the full payload for retention accounting, without requiring
+// serde's optional Arc support or cloning the validated payload itself.
+struct SharedRead<T>(Arc<T>);
+
+impl<T> Clone for SharedRead<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T: Serialize> Serialize for SharedRead<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ReadCache {
     inputs: Option<Inputs>,
@@ -747,13 +763,59 @@ impl ReadCache {
         validate: impl FnOnce() -> Result<T, WorkflowError>,
         retain: impl Fn(&T) -> bool,
     ) -> Result<T, WorkflowError> {
-        let mut diagnostic = diagnostics_enabled().then(|| ReadDiagnostic::new(self));
-        let result = self.read_inner(
+        self.read_keyed_if_sized(
             connection,
             eligible,
             (domain, query_key),
             validate,
             retain,
+            size_of::<T>(),
+        )
+    }
+
+    pub(super) fn read_shared_keyed_if<T: Serialize + Send + Sync + 'static>(
+        &mut self,
+        connection: &Connection,
+        eligible: bool,
+        domain: &'static str,
+        query_key: &[u8],
+        validate: impl FnOnce() -> Result<T, WorkflowError>,
+        retain: impl Fn(&T) -> bool,
+    ) -> Result<Arc<T>, WorkflowError> {
+        self.read_keyed_if_sized(
+            connection,
+            eligible,
+            (domain, query_key),
+            || validate().map(|value| SharedRead(Arc::new(value))),
+            |value| retain(value.0.as_ref()),
+            size_of::<SharedRead<T>>()
+                + size_of::<T>()
+                + 2 * size_of::<usize>()
+                + align_of::<T>().max(align_of::<usize>())
+                - 1,
+        )
+        .map(|value| value.0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_keyed_if_sized<T: Clone + Serialize + Send + 'static>(
+        &mut self,
+        connection: &Connection,
+        eligible: bool,
+        view: (&'static str, &[u8]),
+        validate: impl FnOnce() -> Result<T, WorkflowError>,
+        retain: impl Fn(&T) -> bool,
+        inline_bytes: usize,
+    ) -> Result<T, WorkflowError> {
+        let (domain, _) = view;
+        let mut diagnostic = diagnostics_enabled().then(|| ReadDiagnostic::new(self));
+        let result = self.read_inner(
+            connection,
+            eligible,
+            view,
+            validate,
+            retain,
+            inline_bytes,
             &mut diagnostic,
         );
         if result.is_err() {
@@ -769,6 +831,7 @@ impl ReadCache {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_inner<T: Clone + Serialize + Send + 'static>(
         &mut self,
         connection: &Connection,
@@ -776,6 +839,7 @@ impl ReadCache {
         view: (&'static str, &[u8]),
         validate: impl FnOnce() -> Result<T, WorkflowError>,
         retain: impl Fn(&T) -> bool,
+        inline_bytes: usize,
         diagnostic: &mut Option<ReadDiagnostic>,
     ) -> Result<T, WorkflowError> {
         let (domain, query_key) = view;
@@ -896,7 +960,10 @@ impl ReadCache {
             })
             .ok()
             .and_then(|bytes| {
-                bytes.checked_add(size_of::<T>() + size_of::<ResultProof>() + key.2.len())
+                bytes
+                    .checked_add(inline_bytes)?
+                    .checked_add(size_of::<ResultProof>())?
+                    .checked_add(key.2.len())
             });
             if let Some(diagnostic) = diagnostic.as_mut() {
                 diagnostic.candidate_bytes = size.unwrap_or(0);
@@ -1177,12 +1244,259 @@ mod tests {
             view,
             validate,
             |_| true,
+            size_of::<T>(),
             &mut diagnostic,
         );
         if result.is_err() {
             cache.clear();
         }
         (result, diagnostic)
+    }
+
+    #[derive(Debug)]
+    struct SharedPayload {
+        payload: String,
+        clones: Arc<AtomicU64>,
+        serializations: Arc<AtomicU64>,
+    }
+
+    impl Clone for SharedPayload {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::Relaxed);
+            Self {
+                payload: self.payload.clone(),
+                clones: Arc::clone(&self.clones),
+                serializations: Arc::clone(&self.serializations),
+            }
+        }
+    }
+
+    impl Serialize for SharedPayload {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.serializations.fetch_add(1, Ordering::Relaxed);
+            self.payload.serialize(serializer)
+        }
+    }
+
+    #[test]
+    fn issue856_shared_read_reuses_allocation_without_payload_clone_or_reserialization() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut cache = ReadCache::default();
+        let clones = Arc::new(AtomicU64::new(0));
+        let serializations = Arc::new(AtomicU64::new(0));
+        let mut first = cache
+            .read_shared_keyed_if(
+                &snapshot,
+                true,
+                "shared-fixture",
+                b"complete-key",
+                || {
+                    Ok(SharedPayload {
+                        payload: "x".repeat(256 * 1024),
+                        clones: Arc::clone(&clones),
+                        serializations: Arc::clone(&serializations),
+                    })
+                },
+                |_| true,
+            )
+            .unwrap();
+        let inputs = cache.inputs.as_ref().unwrap() as *const Inputs;
+        assert_eq!(clones.load(Ordering::Relaxed), 0);
+        assert_eq!(serializations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cache.result_bytes,
+            first.payload.len()
+                + 2
+                + size_of::<SharedRead<SharedPayload>>()
+                + size_of::<SharedPayload>()
+                + 2 * size_of::<usize>()
+                + align_of::<SharedPayload>().max(align_of::<usize>())
+                - 1
+                + size_of::<ResultProof>()
+                + b"complete-key".len()
+        );
+        let second = cache
+            .read_shared_keyed_if::<SharedPayload>(
+                &snapshot,
+                true,
+                "shared-fixture",
+                b"complete-key",
+                || panic!("complete proof hit must reuse validated data"),
+                |_| true,
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.inputs.as_ref().unwrap() as *const Inputs, inputs);
+        assert_eq!(cache.integrity_checks, 2);
+        assert_eq!(clones.load(Ordering::Relaxed), 0);
+        assert_eq!(serializations.load(Ordering::Relaxed), 1);
+        Arc::make_mut(&mut first).payload.clear();
+        assert_eq!(second.payload.len(), 256 * 1024);
+        assert_eq!(clones.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn issue856_shared_read_preserves_exact_keys_types_and_uncached_errors() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut cache = ReadCache::default();
+        for (domain, key, expected) in [
+            ("shared", b"tenant-a/session-a/op-a".as_slice(), 1_u64),
+            ("shared", b"tenant-b/session-a/op-a".as_slice(), 2),
+            ("shared", b"tenant-a/session-b/op-a".as_slice(), 3),
+            ("shared", b"tenant-a/session-a/op-b".as_slice(), 4),
+            ("other-domain", b"tenant-a/session-a/op-a".as_slice(), 5),
+        ] {
+            let first = cache
+                .read_shared_keyed_if(&snapshot, true, domain, key, || Ok(expected), |_| true)
+                .unwrap();
+            let hit = cache
+                .read_shared_keyed_if::<u64>(
+                    &snapshot,
+                    true,
+                    domain,
+                    key,
+                    || panic!("exact hit"),
+                    |_| true,
+                )
+                .unwrap();
+            assert_eq!(*hit, expected);
+            assert!(Arc::ptr_eq(&first, &hit));
+        }
+        let key = b"tenant-a/session-a/op-a";
+        let typed = cache
+            .read_shared_keyed_if(
+                &snapshot,
+                true,
+                "shared",
+                key,
+                || Ok("typed".to_owned()),
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(typed.as_str(), "typed");
+        assert_eq!(cache.results.len(), 6);
+        let inputs = cache.inputs.as_ref().unwrap() as *const Inputs;
+        let owned = cache
+            .read_keyed(&snapshot, true, "shared", key, || Ok(9_u64))
+            .unwrap();
+        assert_eq!(owned, 9);
+        assert_eq!(cache.inputs.as_ref().unwrap() as *const Inputs, inputs);
+        for code in [
+            crate::WorkflowErrorCode::NotFound,
+            crate::WorkflowErrorCode::AuthorityConflict,
+        ] {
+            let error = cache
+                .read_shared_keyed_if::<u64>(
+                    &snapshot,
+                    true,
+                    "error",
+                    key,
+                    || Err(WorkflowError::new(code, false, "original error")),
+                    |_| true,
+                )
+                .unwrap_err();
+            assert_eq!(error, WorkflowError::new(code, false, "original error"));
+            assert!(cache.results.is_empty());
+            assert!(cache.inputs.is_none());
+        }
+    }
+
+    #[test]
+    fn issue856_shared_read_invalidates_external_and_same_connection_mutations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.sqlite");
+        let mut connection = database(path.to_str().unwrap());
+        let other = Connection::open(&path).unwrap();
+        let mut cache = ReadCache::default();
+        let calls = Cell::new(0);
+        let mut load = |connection: &mut Connection| {
+            let snapshot = connection.savepoint().unwrap();
+            let result = cache.read_shared_keyed_if(
+                &snapshot,
+                true,
+                "shared",
+                b"exact",
+                || {
+                    calls.set(calls.get() + 1);
+                    value(&snapshot)
+                },
+                |_| true,
+            );
+            snapshot.commit().unwrap();
+            result
+        };
+        let old = load(&mut connection).unwrap();
+        assert!(Arc::ptr_eq(&old, &load(&mut connection).unwrap()));
+        other
+            .execute("UPDATE workflow_work_items SET value=X'6e6577'", [])
+            .unwrap();
+        let external = load(&mut connection).unwrap();
+        assert_eq!(external.as_slice(), b"new");
+        assert!(!Arc::ptr_eq(&old, &external));
+        connection
+            .execute("UPDATE workflow_work_items SET value=X'6f6c64'", [])
+            .unwrap();
+        let local = load(&mut connection).unwrap();
+        assert_eq!(local.as_slice(), b"old");
+        assert!(!Arc::ptr_eq(&old, &local));
+        other
+            .execute("DELETE FROM workflow_work_items", [])
+            .unwrap();
+        assert!(load(&mut connection).is_err());
+        assert_eq!(calls.get(), 4);
+        assert!(cache.results.is_empty());
+        // Retained data is historical, not evidence that the deleted source is live.
+        assert_eq!(old.as_slice(), b"old");
+    }
+
+    #[test]
+    fn issue856_shared_read_preserves_retention_bypass_and_result_bounds() {
+        let mut connection = database(":memory:");
+        let snapshot = connection.savepoint().unwrap();
+        let mut cache = ReadCache::default();
+        for _ in 0..2 {
+            let large = cache
+                .read_shared_keyed_if(
+                    &snapshot,
+                    true,
+                    "large",
+                    &[],
+                    || Ok("x".repeat(MAX_RESULT_BYTES)),
+                    |_| true,
+                )
+                .unwrap();
+            assert_eq!(large.len(), MAX_RESULT_BYTES);
+            assert!(cache.results.is_empty());
+        }
+        for index in 0..MAX_RESULTS + 1 {
+            cache
+                .read_shared_keyed_if(
+                    &snapshot,
+                    true,
+                    "bounded",
+                    &index.to_le_bytes(),
+                    || Ok(7_u64),
+                    |_| true,
+                )
+                .unwrap();
+            assert!(cache.results.len() <= MAX_RESULTS);
+            assert!(cache.result_bytes <= MAX_RESULT_BYTES);
+        }
+        let key = vec![0_u8; MAX_KEY_BYTES + 1];
+        for (eligible, key, retain) in [
+            (true, b"deferred".as_slice(), false),
+            (true, key.as_slice(), true),
+            (false, b"outer".as_slice(), true),
+        ] {
+            let value = cache
+                .read_shared_keyed_if(&snapshot, eligible, "bypass", key, || Ok(7_u64), |_| retain)
+                .unwrap();
+            assert_eq!(*value, 7);
+            assert!(cache.results.is_empty());
+            assert!(cache.inputs.is_none());
+        }
     }
 
     #[test]
@@ -1860,6 +2174,21 @@ mod tests {
         let calls = Cell::new(0);
         read(&mut connection, &mut cache, &calls).unwrap();
         assert_eq!(cache.integrity_checks, 1);
+        let mut shared_cache = ReadCache::default();
+        {
+            let snapshot = connection.savepoint().unwrap();
+            shared_cache
+                .read_shared_keyed_if(
+                    &snapshot,
+                    true,
+                    "fixture",
+                    &[],
+                    || value(&snapshot),
+                    |_| true,
+                )
+                .unwrap();
+            snapshot.commit().unwrap();
+        }
         let table = cache.inputs.as_ref().unwrap().tables.last().unwrap();
         match (&table.rows[0][1], &table.rows[1][1]) {
             (InputValue::Blob(first), InputValue::Blob(second)) => {
@@ -1918,6 +2247,24 @@ mod tests {
                 enabled,
             );
             assert_eq!(result.unwrap_err(), expected_error);
+            let shared_result = shared_cache.read_shared_keyed_if::<Vec<u8>>(
+                &snapshot,
+                true,
+                "fixture",
+                if new_key { b"uncached" } else { b"" },
+                || {
+                    assert!(new_key, "shared hit must reject before validation");
+                    if let Some(code) = failure {
+                        return Err(WorkflowError::new(code, false, "rejected view"));
+                    }
+                    value(&snapshot)
+                },
+                |_| true,
+            );
+            assert_eq!(shared_result.unwrap_err(), expected_error);
+            assert_eq!(shared_cache.integrity_checks, 2);
+            assert!(shared_cache.inputs.is_none());
+            assert!(shared_cache.results.is_empty());
             if let Some(diagnostic) = diagnostic {
                 assert_eq!(
                     diagnostic.category,
