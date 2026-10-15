@@ -84,7 +84,25 @@ its immutable row owner. A typed, single-use handoff makes that charge part of
 the complete memoized-result charge, rather than counting the same allocation
 twice. The counter never decreases. Connection, snapshot, memo identity and
 result type must still match; missing tokens, writes and overflow fail closed.
-The fixed proof limit and independent raw/decoded allocation charges remain.
+The fixed proof limit remains. Independent owned raw parsing buffers and decoded
+owners continue to consume separate charges.
+
+The journal loader has one additional, explicitly limited accounting contract:
+its raw input is borrowed directly from a SQLite BLOB, and the decoded entry is
+retained behind one immutable shared owner. It reserves the complete BLOB length
+before decoding, then adds the complete serialized result's positive remainder.
+The resulting logical payload charge is `max(input bytes, result bytes)`; a
+smaller decoded result never refunds the input charge. The original event-body
+handoff contract remains separate. This rule is not available for an additional
+owned raw buffer, independent decoded copies or unrelated nested proofs.
+
+This is a logical proof-byte accounting policy, not a promise that SQLite plus
+decoded peak memory or cumulative processing work is bounded to 64 MiB. The
+fixed byte, node and depth limits, full result serialization, single-use typed
+frame binding, connection/write checks, poisoning and unwind rejection still
+apply. Journal identity, digest, time, predecessor, transition, funding and
+historical-cut validation remain complete. No retained proof grants current
+credentials, runtime authority, a new clock window or permission to dispatch.
 
 ## Funded Retained Response Adoption
 
