@@ -1,5 +1,11 @@
 # Changelog
 
+- Account an audited borrowed SQLite journal input and its single decoded owner
+  with one monotone logical payload reservation plus the complete result
+  remainder. Keep independent owned buffers separately charged, preserve fixed
+  proof limits and every historical validation, and document the changed
+  accounting policy explicitly (#856).
+
 - Reuse fully validated project, agreement and participant inputs within each
   delivery-lineage adapter operation. Retain independent before/after authority
   and aggregate checks, and record bounded phase timings for slow reads without

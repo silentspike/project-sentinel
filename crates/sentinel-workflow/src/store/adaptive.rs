@@ -36,6 +36,10 @@ mod work_funding_tests;
 #[cfg(test)]
 mod working_memory_tests;
 
+#[cfg(test)]
+#[path = "adaptive/issue856_journal_owner_tests.rs"]
+mod issue856_journal_owner_tests;
+
 const MAX_JOURNAL_ENTRIES: usize = 512;
 const MAX_SCOPED_ADAPTIVE_HEADS: usize = 64;
 
@@ -3116,7 +3120,7 @@ fn journal_entry(
     id: Uuid,
     version: u64,
 ) -> Result<Option<JournalEntry>, WorkflowError> {
-    crate::domain_store::validation_scope::memoize(
+    crate::domain_store::validation_scope::memoize_borrowed_sqlite_decoded(
         connection,
         "adaptive-journal-entry",
         &(id, version),
@@ -3131,14 +3135,17 @@ fn journal_entry(
                 .query(params![namespace(id), format!("{version:020}")])
                 .map_err(map_sqlite_error)?;
             let Some(row) = rows.next().map_err(map_sqlite_error)? else {
-                return Ok(None);
+                return Ok((None, None));
             };
             let digest: String = row.get(0).map_err(map_sqlite_error)?;
             let value = row.get_ref(1).map_err(map_sqlite_error)?;
             let rusqlite::types::ValueRef::Blob(bytes) = value else {
                 return Err(corrupt_store());
             };
-            crate::domain_store::validation_scope::charge_bytes(connection, bytes.len())?;
+            // The BLOB is borrowed from SQLite; only the decoded Arc owner is retained.
+            let body = crate::domain_store::validation_scope::precharge_borrowed_sqlite_decoded::<
+                Option<JournalEntry>,
+            >(connection, bytes)?;
             let entry: Entry = decode(bytes)?;
             #[cfg(test)]
             WORKING_MEMORY_READS.with(|reads| {
@@ -3156,10 +3163,13 @@ fn journal_entry(
             {
                 return Err(corrupt_store());
             }
-            Ok(Some(JournalEntry(std::sync::Arc::new(JournalEntryData {
-                digest,
-                entry,
-            }))))
+            Ok((
+                Some(JournalEntry(std::sync::Arc::new(JournalEntryData {
+                    digest,
+                    entry,
+                }))),
+                Some(body),
+            ))
         },
     )
 }
@@ -3358,7 +3368,7 @@ mod journal_entry_reuse_tests {
 
     const ARENA_BYTES: usize = 64 * 1024 * 1024;
 
-    fn journal(id: Uuid, rounds: u16, padding: usize) -> Vec<Entry> {
+    pub(super) fn journal(id: Uuid, rounds: u16, padding: usize) -> Vec<Entry> {
         let mut root = grant();
         root.session_id = id;
         root.max_model_calls = 64;
@@ -3436,7 +3446,7 @@ mod journal_entry_reuse_tests {
         entries
     }
 
-    fn persist(store: &WorkflowStore, entries: &[Entry]) {
+    pub(super) fn persist(store: &WorkflowStore, entries: &[Entry]) {
         let mut connection = store.lock().unwrap();
         let transaction = connection.transaction().unwrap();
         for entry in entries {
@@ -3541,11 +3551,14 @@ mod journal_entry_reuse_tests {
         let retained_bytes = crate::digest::serialized_json_size(&Some(retained)).unwrap();
         let key_bytes = encode(&(id, 1_u64)).unwrap().len() + 256;
         let raw_bytes = encode(&entries[0]).unwrap().len();
+        let payload_bytes = raw_bytes.max(retained_bytes);
+        let result_remainder = retained_bytes.saturating_sub(raw_bytes);
+        assert!(result_remainder > 0);
         let (result, failures) = validation_scope::with_validation_failures(|| {
             validation_scope::with_scope(&connection, || {
                 validation_scope::charge_bytes(
                     &connection,
-                    ARENA_BYTES - key_bytes - raw_bytes - retained_bytes + 1,
+                    ARENA_BYTES - key_bytes - payload_bytes + 1,
                 )?;
                 journal_entry(&connection, id, 1)
             })
@@ -3554,8 +3567,12 @@ mod journal_entry_reuse_tests {
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].reason, ValidationFailureReason::BytesLimit);
         assert_eq!(failures[0].domain, Some("adaptive-journal-entry"));
-        assert_eq!(failures[0].attempted_bytes, Some(retained_bytes));
-        assert_eq!(failures[0].bytes, ARENA_BYTES - retained_bytes + 1);
+        assert_eq!(
+            failures[0].charge_phase,
+            Some(validation_scope::ValidationChargePhase::Result)
+        );
+        assert_eq!(failures[0].attempted_bytes, Some(result_remainder));
+        assert_eq!(failures[0].bytes, ARENA_BYTES - result_remainder + 1);
     }
 
     #[test]
