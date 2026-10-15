@@ -1042,7 +1042,7 @@ pub(super) fn historical_review_cut(
                 Ok::<_, WorkflowError>(())
             };
         let mut statement = connection.prepare(
-            "SELECT sequence,payload FROM company_events WHERE tenant_id=?1
+            "SELECT sequence FROM company_events WHERE tenant_id=?1
              AND event_type GLOB 'adaptive_leadership_review_*' AND sequence<?2 ORDER BY sequence LIMIT 4097",
         )?;
         let mut rows = statement.query(params![tenant.0, last])?;
@@ -1057,13 +1057,11 @@ pub(super) fn historical_review_cut(
                 let (cut, session) = cuts.next().ok_or_else(corrupt)?;
                 record_cut(cut, session, &history)?;
             }
-            let value = row.get_ref(1)?;
-            let rusqlite::types::ValueRef::Blob(payload) = value else {
-                return Err(corrupt());
-            };
-            validation_scope::charge_bytes(connection, payload.len())?;
+            // The shared owner charges both raw source bytes and retained data.
+            let event = super::super::company_event_shape(connection, stored_u64(sequence)?)?
+                .ok_or_else(corrupt)?;
             // Decode every tenant row before selecting a session, as before.
-            let call: AdaptiveLeadershipReviewCallV1 = decode(payload)?;
+            let call: AdaptiveLeadershipReviewCallV1 = decode(&event.payload)?;
             history
                 .entry(call.grant.session_id)
                 .or_default()
