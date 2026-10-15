@@ -229,7 +229,11 @@ impl LeadershipContext {
     }
 
     fn model_source(&self) -> Result<String, &'static str> {
-        if self.binding.grant.subject.is_none() {
+        if self.binding.grant.subject.is_none()
+            || (self.binding.grant.work_funding.is_none()
+                && self.accounting.is_none()
+                && self.accounting_correction.is_none())
+        {
             return serde_json::to_string(&self.source).map_err(|_| "leadership source invalid");
         }
         let session = &self.source.source_session;

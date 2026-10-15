@@ -4,6 +4,7 @@
   duplicated internal authority envelopes. Preserve complete validated source
   history and private evidence, expose immutable history references and exact
   operative budgets, and include perception in the final message bound.
+  Preserve legacy unmarked budget prompts as well as legacy wire bytes.
   Reuse a grant/context digest only within one immutable entity validation;
   keep standalone checks, persisted membership and corruption detection.
   Authenticate replacement-funded recovery through an exact historical prefix
