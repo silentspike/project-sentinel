@@ -3,6 +3,7 @@ use super::model_execution::{
     ModelExecutionCompletion, ModelExecutionContext, ProviderExecutionAuthority,
 };
 use super::*;
+use crate::llm_bridge::bridge::observe_completion_stage;
 use sentinel_workflow::{
     adaptive_accounting_projection, adaptive_leadership_evidence_fingerprint,
     adaptive_leadership_review_id, AdaptiveAccountingProjectionV1, AdaptiveLeadershipReviewCallV1,
@@ -1815,10 +1816,10 @@ impl WorkflowApi {
         request_id: &str,
         request_digest: &str,
     ) -> Result<(), &'static str> {
-        let _fence = self
-            .mutation_fence
-            .write()
-            .map_err(|_| "workflow recovery active")?;
+        let _fence = observe_completion_stage(request_id, "leadership_fence", || {
+            self.mutation_fence.write()
+        })
+        .map_err(|_| "workflow recovery active")?;
         self.accept_leadership_review_fenced(
             completion,
             context,
@@ -1879,14 +1880,14 @@ impl WorkflowApi {
         {
             return Err("leadership completion inadmissible");
         }
-        let call = self
-            .store
-            .adaptive_leadership_review_call(
+        let call = observe_completion_stage(request_id, "leadership_review_read", || {
+            self.store.adaptive_leadership_review_call(
                 &context.binding.grant.leadership_principal.tenant_id,
                 context.binding.grant.review_id,
             )
-            .map_err(|_| "leadership call unavailable")?
-            .ok_or("leadership call missing")?;
+        })
+        .map_err(|_| "leadership call unavailable")?
+        .ok_or("leadership call missing")?;
         if call.retired_at_unix_ms.is_some() && call.grant.subject.is_none() {
             return Err("leadership call retired");
         }
@@ -1962,7 +1963,10 @@ impl WorkflowApi {
         {
             return Err("leadership completion not durably accounted");
         }
-        let (retained, usage) = self.verified_retained_leadership_completion(&call, &stored)?;
+        let (retained, usage) =
+            observe_completion_stage(request_id, "leadership_retained", || {
+                self.verified_retained_leadership_completion(&call, &stored)
+            })?;
         if retained.context != completion.context
             || retained.content != completion.content
             || retained.admissible != completion.admissible
@@ -2014,7 +2018,9 @@ impl WorkflowApi {
             return Ok(());
         }
         // Fresh credentials must authorize the mutation; never impersonate the sealed principal.
-        self.validate_resume_policy_review(&call)?;
+        observe_completion_stage(request_id, "leadership_policy", || {
+            self.validate_resume_policy_review(&call)
+        })?;
         if call.grant.schema_version != 6
             || call.grant.work_funding.is_none()
             || call.grant.funded_review_recovery.is_none()
@@ -2233,8 +2239,12 @@ impl WorkflowApi {
                 resolution_event_id: Some(event_id),
                 continuation: Some(authorization),
             };
-            self.validate_funded_continuation_before_audit(&call, &proposed)?;
-            let audited = self.append_continuation_audit(&call, &proposed)?;
+            observe_completion_stage(request_id, "leadership_funding", || {
+                self.validate_funded_continuation_before_audit(&call, &proposed)
+            })?;
+            let audited = observe_completion_stage(request_id, "leadership_audit", || {
+                self.append_continuation_audit(&call, &proposed)
+            })?;
             if audited
                 .continuation
                 .as_ref()
@@ -2258,25 +2268,33 @@ impl WorkflowApi {
                 }
                 return Ok(());
             }
-            let committed = if local_adoption.is_some() {
-                let receipt = events
-                    .event_v2_by_id(&event_id.to_string())
-                    .map_err(|_| "local adoption audit receipt unavailable")?
-                    .ok_or("local adoption audit receipt missing")?;
-                self.store
-                    .complete_adaptive_leadership_review_call_with_local_adoption_audit(
+            let local_receipt = if local_adoption.is_some() {
+                Some(
+                    events
+                        .event_v2_by_id(&event_id.to_string())
+                        .map_err(|_| "local adoption audit receipt unavailable")?
+                        .ok_or("local adoption audit receipt missing")?,
+                )
+            } else {
+                None
+            };
+            let committed = observe_completion_stage(request_id, "leadership_commit", || {
+                if let Some(receipt) = local_receipt.as_ref() {
+                    self.store
+                        .complete_adaptive_leadership_review_call_with_local_adoption_audit(
+                            &leader.principal,
+                            &audited,
+                            receipt,
+                            clock(),
+                        )
+                } else {
+                    self.store.complete_adaptive_leadership_review_call(
                         &leader.principal,
                         &audited,
-                        &receipt,
                         clock(),
                     )
-            } else {
-                self.store.complete_adaptive_leadership_review_call(
-                    &leader.principal,
-                    &audited,
-                    clock(),
-                )
-            };
+                }
+            });
             if committed.is_err() {
                 let now = clock();
                 if !audited

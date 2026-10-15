@@ -7726,9 +7726,19 @@ fn entity_shape<T: DeserializeOwned + Serialize + Clone + CompanyEntity + 'stati
     kind: &str,
     id: &str,
 ) -> Result<Option<T>, WorkflowError> {
+    entity_shape_with_observer(connection, tenant_id, kind, id, |_| {})
+}
+
+fn entity_shape_with_observer<T: DeserializeOwned + Serialize + Clone + CompanyEntity + 'static>(
+    connection: &Connection,
+    tenant_id: &TenantId,
+    kind: &str,
+    id: &str,
+    mut before_payload_copy: impl FnMut(usize),
+) -> Result<Option<T>, WorkflowError> {
     let owner: Option<EntityShape<T>> =
         validation_scope::memoize(connection, "entity-shape", &(tenant_id, kind, id), || {
-            entity_shape_uncached(connection, tenant_id, kind, id)
+            entity_shape_uncached(connection, tenant_id, kind, id, &mut before_payload_copy)
                 .map(|value| value.map(|value| EntityShape(std::sync::Arc::new(value))))
         })?;
     Ok(owner.map(|value| value.0.as_ref().clone()))
@@ -7739,6 +7749,7 @@ fn entity_shape_uncached<T: DeserializeOwned + CompanyEntity>(
     tenant_id: &TenantId,
     kind: &str,
     id: &str,
+    mut before_payload_copy: impl FnMut(usize),
 ) -> Result<Option<T>, WorkflowError> {
     let mut statement = connection.prepare("SELECT tenant_id,entity_kind,entity_id,version,payload,payload_digest FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3")?;
     let mut rows = statement.query(params![tenant_id.0, kind, id])?;
@@ -7759,6 +7770,7 @@ fn entity_shape_uncached<T: DeserializeOwned + CompanyEntity>(
             };
             let payload_digest: String = row.get(5)?;
             validation_scope::charge_bytes(connection, payload.len())?;
+            before_payload_copy(payload.len());
             if row_tenant != tenant_id.0
                 || row_kind != kind
                 || row_id != id
