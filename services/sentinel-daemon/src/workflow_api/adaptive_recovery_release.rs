@@ -13,6 +13,8 @@ const GATEWAY_FILE: &str = "/opt/sentinel/bin/cortex-gateway";
 const DAEMON_FILE: &str = "/opt/sentinel/bin/sentinel-daemon";
 const ADMISSION_REPAIR_DIRECTORY: &str = "/etc/sentinel/adaptive-admission-repair";
 const FUNDED_RECOVERY_DIRECTORY: &str = "/etc/sentinel/adaptive-funded-review-recovery";
+const FUNDED_LOCAL_ADOPTION_REPAIR_FILE: &str =
+    "/etc/sentinel/adaptive-funded-local-adoption-repair.json";
 const MAX_EVIDENCE_BYTES: u64 = 256 * 1024;
 const MAX_GATEWAY_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -31,6 +33,152 @@ pub(crate) struct ProtectedRepairEvidenceV1 {
     pub path: PathBuf,
     pub digest: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FundedLocalAdoptionRepairV1 {
+    schema_version: u16,
+    purpose: String,
+    release: AdaptiveRecoveryReleaseV1,
+    daemon_binary_digest: String,
+    repair_contract: String,
+    gate_evidence: ProtectedRepairEvidenceV1,
+}
+
+fn validate_funded_local_adoption_repair(
+    bytes: &[u8],
+    manifest: &[u8],
+    gateway: &str,
+    daemon: &str,
+    loader: impl Fn(&ProtectedRepairEvidenceV1) -> Result<Vec<u8>, &'static str>,
+) -> Result<(AdaptiveRecoveryReleaseV1, String), &'static str> {
+    let proof: FundedLocalAdoptionRepairV1 =
+        serde_json::from_slice(bytes).map_err(|_| "funded local adoption repair shape invalid")?;
+    proof
+        .release
+        .validate()
+        .map_err(|_| "funded local adoption release invalid")?;
+    if bytes.is_empty()
+        || bytes.len() as u64 > MAX_EVIDENCE_BYTES
+        || proof.schema_version != 1
+        || proof.purpose != "adaptive-funded-local-adoption-repair"
+        || proof.repair_contract != "funded-review-history-cut-v1"
+        || !is_digest(gateway)
+        || !is_digest(daemon)
+        || proof.daemon_binary_digest != daemon
+        || proof.release.gateway_binary_digest != gateway
+        || !proof.gate_evidence.path.is_absolute()
+        || !is_digest(&proof.gate_evidence.digest)
+    {
+        return Err("funded local adoption repair binding invalid");
+    }
+    let installed: InstalledManifest =
+        serde_json::from_slice(manifest).map_err(|_| "funded local adoption manifest invalid")?;
+    if installed.version != "1.0"
+        || installed.created_at.is_empty()
+        || installed.artifacts.is_empty()
+        || installed.artifacts.len() > 4096
+        || installed.git_sha != proof.release.source_git_sha
+        || format!("{:x}", Sha256::digest(manifest)) != proof.release.release_manifest_digest
+    {
+        return Err("funded local adoption installed release mismatch");
+    }
+    require_manifest_binary(
+        &installed,
+        GATEWAY_FILE,
+        "cmd/cortex-gateway/cortex-gateway",
+        gateway,
+    )?;
+    require_manifest_binary(
+        &installed,
+        DAEMON_FILE,
+        "target/release/sentinel-daemon",
+        daemon,
+    )?;
+    let gate_bytes = loader(&proof.gate_evidence)?;
+    if gate_bytes.is_empty()
+        || gate_bytes.len() as u64 > MAX_EVIDENCE_BYTES
+        || format!("{:x}", Sha256::digest(&gate_bytes)) != proof.gate_evidence.digest
+    {
+        return Err("funded local adoption gate bytes changed");
+    }
+    let gate: serde_json::Value =
+        serde_json::from_slice(&gate_bytes).map_err(|_| "funded local adoption gates invalid")?;
+    if gate.get("purpose").and_then(|value| value.as_str()) != Some("exact-release-gate-evidence")
+        || gate.get("merged_commit").and_then(|value| value.as_str())
+            != Some(proof.release.source_git_sha.as_str())
+        || gate
+            .get("merged_tree_equals_reviewed_tree")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+        || gate.pointer("/ci/status").and_then(|value| value.as_str()) != Some("completed")
+        || gate
+            .pointer("/ci/conclusion")
+            .and_then(|value| value.as_str())
+            != Some("success")
+        || gate
+            .pointer("/release/result")
+            .and_then(|value| value.as_str())
+            != Some("PASS")
+        || gate
+            .pointer("/release/gateway_sha256")
+            .and_then(|value| value.as_str())
+            != Some(gateway)
+        || gate
+            .pointer("/release/daemon_sha256")
+            .and_then(|value| value.as_str())
+            != Some(daemon)
+    {
+        return Err("funded local adoption gate binding invalid");
+    }
+    Ok((proof.release, format!("{:x}", Sha256::digest(bytes))))
+}
+
+pub(super) fn verified_current_funded_local_adoption_repair(
+) -> Result<(AdaptiveRecoveryReleaseV1, String), &'static str> {
+    #[cfg(test)]
+    if let Some(result) = funded_local_adoption_repair_tests::current_verified() {
+        return result;
+    }
+    let path = Path::new(FUNDED_LOCAL_ADOPTION_REPAIR_FILE);
+    let repair = evidence_bytes(path)?;
+    let proof: FundedLocalAdoptionRepairV1 = serde_json::from_slice(&repair)
+        .map_err(|_| "funded local adoption repair shape invalid")?;
+    let manifest = evidence_bytes(Path::new(MANIFEST_FILE))?;
+    let gate = referenced_evidence(&proof.gate_evidence)?;
+    let gateway = gateway_digest()?;
+    let daemon = serving_binary_digest(Path::new(DAEMON_FILE), "sentinel-daemon.service")?;
+    let (installed, installed_identity) =
+        protected_file(Path::new(DAEMON_FILE), MAX_GATEWAY_BYTES)?;
+    validate_serving_identity(
+        installed_identity,
+        identity(
+            &fs::metadata("/proc/self/exe").map_err(|_| "funded local adoption daemon missing")?,
+        ),
+    )?;
+    let result =
+        validate_funded_local_adoption_repair(&repair, &manifest, &gateway, &daemon, |_| {
+            Ok(gate.clone())
+        })?;
+    // No release fact survives a serving-process, binary or protected-input change.
+    if evidence_bytes(path)? != repair
+        || evidence_bytes(Path::new(MANIFEST_FILE))? != manifest
+        || referenced_evidence(&proof.gate_evidence)? != gate
+        || gateway_digest()? != gateway
+        || serving_binary_digest(Path::new(DAEMON_FILE), "sentinel-daemon.service")? != daemon
+    {
+        return Err("funded local adoption serving evidence changed");
+    }
+    unchanged(Path::new(DAEMON_FILE), &installed, installed_identity)?;
+    Ok(result)
+}
+
+#[cfg(test)]
+pub(super) use funded_local_adoption_repair_tests::TestFundedLocalAdoptionRepairGuard;
+
+#[cfg(test)]
+#[path = "adaptive_recovery_release/funded_local_adoption_repair_tests.rs"]
+mod funded_local_adoption_repair_tests;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

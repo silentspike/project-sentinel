@@ -397,6 +397,24 @@ impl CompanyEntity for AdaptiveFundedReviewRecoveryReceiptV1 {
                 .as_ref()
                 .ok_or_else(corrupt)?,
         )?;
+        // Authenticate the immutable issuance event before using its sequence
+        // as the boundary of the historical no-I/O claim.
+        adaptive_resume_policy::require_leaf_event(
+            connection,
+            &self.issuer_principal.tenant_id,
+            &source.project_id,
+            EVENT,
+            self.request.operation_id,
+            &self.receipt_digest()?,
+            &self.issuer_principal,
+            self.issued_at_unix_ms,
+            self,
+        )?;
+        let issuance_sequence: i64 = connection.query_row(
+            "SELECT sequence FROM company_events WHERE tenant_id=?1 AND event_type=?2 AND operation_id=?3",
+            params![self.issuer_principal.tenant_id.0, EVENT, self.request.operation_id.to_string()],
+            |row| row.get(0),
+        )?;
         adaptive_work_funding::require_pre_recovery_funding_history(
             connection,
             self.grant_template
@@ -408,6 +426,7 @@ impl CompanyEntity for AdaptiveFundedReviewRecoveryReceiptV1 {
                 &self.context,
                 self.request.operation_id,
                 self.issued_at_unix_ms,
+                stored_u64(issuance_sequence)?,
             )),
         )?;
         let grant = self.bound_grant()?;
@@ -421,17 +440,7 @@ impl CompanyEntity for AdaptiveFundedReviewRecoveryReceiptV1 {
             &context_digest,
             self.request.operation_id,
         )?;
-        adaptive_resume_policy::require_leaf_event(
-            connection,
-            &self.issuer_principal.tenant_id,
-            &source.project_id,
-            EVENT,
-            self.request.operation_id,
-            &self.receipt_digest()?,
-            &self.issuer_principal,
-            self.issued_at_unix_ms,
-            self,
-        )
+        Ok(())
     }
 }
 
