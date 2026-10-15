@@ -1498,6 +1498,11 @@ pub(crate) fn continue_adaptive_session_in_transaction(
     if matches!(review.grant.schema_version, 3 | 4 | 6) && authorization.local_adoption.is_some() {
         return Err(authority_conflict());
     }
+    if let Some(adoption) = authorization.local_adoption.as_deref() {
+        if adoption.request.is_funded() {
+            WorkflowStore::require_funded_local_adoption(tx, review, adoption)?;
+        }
+    }
     let stored_review: AdaptiveLeadershipReviewCallV1 = read_company_entity(
         tx,
         &current.tenant_id.0,
@@ -1565,6 +1570,15 @@ pub(crate) fn continue_adaptive_session_in_transaction(
     if review.decision.is_some()
         || session != review.context.source_session
         || session.version != authorization.source_session_version
+    {
+        return Err(authority_conflict());
+    }
+    if authorization
+        .local_adoption
+        .as_ref()
+        .is_some_and(|adoption| {
+            adoption.request.is_funded() && adoption.request.session_head_digest != prior_digest
+        })
     {
         return Err(authority_conflict());
     }
@@ -3195,6 +3209,21 @@ fn require_journal_step(
                                 &prior.grant.authority,
                             )?;
                             require_work_funding_anchor(connection, epoch, prior)?;
+                            if let Some(adoption) = authorization.local_adoption.as_deref() {
+                                WorkflowStore::require_funded_adoption_authority(
+                                    connection,
+                                    authorization,
+                                )?;
+                                if entry.previous_digest.as_deref()
+                                    != Some(adoption.request.session_head_digest.as_str())
+                                    || adoption.request.session_digest
+                                        != crate::adaptive_leadership_recovery_session_digest(
+                                            prior,
+                                        )?
+                                {
+                                    return Err(corrupt_store());
+                                }
+                            }
                         }
                     }
                     if let Some(AdaptiveTransitionV1::ResumeRejectedModel {

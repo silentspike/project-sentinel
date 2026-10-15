@@ -85,7 +85,14 @@ impl AdaptiveContinuationAuthorizationV1 {
             epoch.validate()?;
             let limits = &epoch.binding.limits;
             if self.resume_policy.is_some()
-                || self.local_adoption.is_some()
+                || self.local_adoption.as_ref().is_some_and(|adoption| {
+                    !adoption.request.is_funded()
+                        || adoption
+                            .request
+                            .funded_binding
+                            .as_ref()
+                            .is_none_or(|binding| binding.validate_epoch(epoch).is_err())
+                })
                 || !matches!(
                     self.source,
                     AdaptiveContinuationSourceV1::BudgetWindowExhausted { .. }
@@ -140,7 +147,9 @@ impl AdaptiveContinuationAuthorizationV1 {
                 None,
             ) if validate_sha256(active_allowance_digest)
                 && validate_sha256(continuation_history_digest)
-                && self.local_adoption.is_none() => {}
+                && self.local_adoption.as_ref().is_none_or(|adoption| {
+                    adoption.request.is_funded() && self.work_funding.is_some()
+                }) => {}
             _ => return Err(invalid()),
         }
         if let Some(adoption) = &self.local_adoption {
@@ -154,6 +163,7 @@ impl AdaptiveContinuationAuthorizationV1 {
                 return Err(invalid());
             };
             if adoption.request.session_id != self.session_id
+                || (adoption.request.is_funded() && self.work_funding.is_none())
                 || adoption.request.review_id != self.review_id
                 || adoption.issued_at_unix_ms != self.issued_at_ms
                 || adoption.continuation_deadline_ms != self.deadline_ms

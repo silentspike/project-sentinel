@@ -18,6 +18,45 @@ pub const ADAPTIVE_LEADERSHIP_LOCAL_ADOPTION_MAX_COMPLETION_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AdaptiveLeadershipLocalAdoptionFundingBindingV2 {
+    pub funding_id: String,
+    pub receipt_digest: String,
+    pub binding_digest: String,
+}
+
+impl AdaptiveLeadershipLocalAdoptionFundingBindingV2 {
+    pub fn from_epoch(epoch: &crate::AdaptiveWorkFundingEpochV1) -> Result<Self, WorkflowError> {
+        epoch.validate()?;
+        Ok(Self {
+            funding_id: epoch.receipt.funding_id.clone(),
+            receipt_digest: epoch.receipt.receipt_digest()?,
+            binding_digest: canonical_sha256(
+                "sentinel.workflow.leadership-local-adoption-funding-binding.v2",
+                &epoch.binding,
+            )?,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        crate::model::validate_identifier(&self.funding_id)?;
+        validate_digest(&self.receipt_digest)?;
+        validate_digest(&self.binding_digest)
+    }
+
+    pub fn validate_epoch(
+        &self,
+        epoch: &crate::AdaptiveWorkFundingEpochV1,
+    ) -> Result<(), WorkflowError> {
+        self.validate()?;
+        if *self != Self::from_epoch(epoch)? {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdaptiveLeadershipLocalAdoptionRequestV1 {
     pub schema_version: u16,
     pub operation_id: Uuid,
@@ -26,7 +65,10 @@ pub struct AdaptiveLeadershipLocalAdoptionRequestV1 {
     pub work_item_id: WorkItemId,
     pub session_id: Uuid,
     pub review_id: Uuid,
-    pub epoch_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funded_binding: Option<AdaptiveLeadershipLocalAdoptionFundingBindingV2>,
     pub original_call_digest: String,
     pub project_digest: String,
     pub session_digest: String,
@@ -99,6 +141,11 @@ fn dispatch_source_call(
 }
 
 impl AdaptiveLeadershipLocalAdoptionRequestV1 {
+    /// Version discrimination only; this does not validate authority.
+    pub fn is_funded(&self) -> bool {
+        self.schema_version == 2
+    }
+
     pub fn key(&self) -> Result<String, WorkflowError> {
         local_adoption_key(&self.tenant_id, self.review_id)
     }
@@ -121,7 +168,6 @@ impl AdaptiveLeadershipLocalAdoptionRequestV1 {
         self.work_item_id.validate()?;
         self.release.validate()?;
         for digest in [
-            &self.epoch_digest,
             &self.original_call_digest,
             &self.project_digest,
             &self.session_digest,
@@ -136,8 +182,28 @@ impl AdaptiveLeadershipLocalAdoptionRequestV1 {
             validate_digest(digest)?;
         }
         continuation_bounds(&self.decision)?;
-        if self.schema_version != 1
-            || operator.kind != CompanyPrincipalKindV1::Operator
+        match (
+            self.schema_version,
+            &self.epoch_digest,
+            &self.funded_binding,
+        ) {
+            (1, Some(digest), None)
+                if self.original_completion_error == "continuation audit invalid"
+                    && (1..=ADAPTIVE_LEADERSHIP_LOCAL_ADOPTION_MAX_COMPLETION_ATTEMPTS)
+                        .contains(&self.completion_attempts) =>
+            {
+                validate_digest(digest)?;
+            }
+            (2, None, Some(binding))
+                if self.original_completion_error == "work funding current reviews unavailable"
+                    && self.completion_attempts
+                        == ADAPTIVE_LEADERSHIP_LOCAL_ADOPTION_MAX_COMPLETION_ATTEMPTS =>
+            {
+                binding.validate()?;
+            }
+            _ => return Err(invalid()),
+        }
+        if operator.kind != CompanyPrincipalKindV1::Operator
             || !matches!(
                 operator.role,
                 CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
@@ -147,9 +213,6 @@ impl AdaptiveLeadershipLocalAdoptionRequestV1 {
             || self.session_id.is_nil()
             || self.review_id.is_nil()
             || self.request_id != format!("company-leadership-{}", self.review_id)
-            || self.original_completion_error != "continuation audit invalid"
-            || !(1..=ADAPTIVE_LEADERSHIP_LOCAL_ADOPTION_MAX_COMPLETION_ATTEMPTS)
-                .contains(&self.completion_attempts)
             || now_ms == 0
             || self
                 .expires_at_unix_ms
@@ -220,6 +283,9 @@ impl AdaptiveLeadershipLocalAdoptionV1 {
         &self,
         original_call: &AdaptiveLeadershipReviewCallV1,
     ) -> Result<(), WorkflowError> {
+        if self.request.is_funded() {
+            return self.validate_funded_against(original_call);
+        }
         self.validate()?;
         self.validate_call_phase(original_call)?;
         let source_call = dispatch_source_call(original_call)?;
@@ -238,7 +304,7 @@ impl AdaptiveLeadershipLocalAdoptionV1 {
             || request.session_id != grant.session_id
             || request.review_id != grant.review_id
             || request.review_id != binding.review_id
-            || request.epoch_digest != binding.epoch_digest
+            || request.epoch_digest.as_deref() != Some(binding.epoch_digest.as_str())
             || request.original_call_digest
                 != adaptive_leadership_local_adoption_source_call_digest(original_call)?
             || request.project_digest
@@ -277,6 +343,92 @@ impl AdaptiveLeadershipLocalAdoptionV1 {
             binding.max_additional_model_calls,
             binding.max_window_ms,
         )
+    }
+
+    /// Pure binding only. The daemon proves retained response/usage provenance;
+    /// the store separately proves funding membership and the exact journal head.
+    pub fn validate_funded_against(
+        &self,
+        original_call: &AdaptiveLeadershipReviewCallV1,
+    ) -> Result<(), WorkflowError> {
+        self.validate()?;
+        self.validate_call_phase(original_call)?;
+        let request = &self.request;
+        let grant = &original_call.grant;
+        let source = &original_call.context.source_session;
+        let epoch = grant.work_funding.as_deref().ok_or_else(invalid)?;
+        request
+            .funded_binding
+            .as_ref()
+            .ok_or_else(invalid)?
+            .validate_epoch(epoch)?;
+        let source_call = dispatch_source_call(original_call)?;
+        source_call.validate_continuation_source()?;
+        let dispatch = original_call.dispatch.as_ref().ok_or_else(invalid)?;
+        let (calls, _) = continuation_bounds(&request.decision)?;
+        let history = source
+            .continuation
+            .as_ref()
+            .map_or(&[][..], |state| state.authorizations.as_slice());
+        let limits = &epoch.binding.limits;
+        if !request.is_funded()
+            || original_call.schema_version != 5
+            || grant.schema_version != 5
+            || grant.recovery_epoch.is_some()
+            || grant.resume_policy.is_some()
+            || grant.funded_review_recovery.is_some()
+            || request.tenant_id != grant.leadership_principal.tenant_id
+            || request.project_id != grant.project_id
+            || request.work_item_id != grant.work_item_id
+            || request.session_id != grant.session_id
+            || request.review_id != grant.review_id
+            || request.original_call_digest
+                != adaptive_leadership_local_adoption_source_call_digest(original_call)?
+            || request.project_digest
+                != adaptive_leadership_recovery_project_digest(
+                    &original_call.context.source_project,
+                )?
+            || request.session_digest != adaptive_leadership_recovery_session_digest(source)?
+            || request.request_id != original_call.request_id()
+            || request.request_id != dispatch.request_id
+            || request.request_digest != dispatch.request_digest
+            || request.context_digest != original_call.context_digest()?
+            || request.context_digest != dispatch.context_digest
+            || self.issued_at_unix_ms < dispatch.dispatched_at_unix_ms
+            || self.issued_at_unix_ms < source.updated_at_ms
+            || self.issued_at_unix_ms >= limits.expires_at_unix_ms
+            || self.continuation_deadline_ms > limits.expires_at_unix_ms
+            || source
+                .model_calls
+                .checked_add(calls)
+                .is_none_or(|total| total > limits.total_model_call_ceiling)
+            || source.tool_calls > limits.total_tool_call_ceiling
+            || history.len() >= usize::from(limits.total_window_ceiling)
+            || epoch.binding.ordinal > limits.total_review_ceiling
+            || history.iter().any(|prior| {
+                prior.review_id == grant.review_id
+                    || prior
+                        .work_funding
+                        .as_ref()
+                        .is_some_and(|prior| prior.binding.ordinal >= epoch.binding.ordinal)
+                    || prior
+                        .resume_policy
+                        .as_ref()
+                        .is_some_and(|prior| prior.ordinal >= epoch.binding.ordinal)
+            })
+        {
+            return Err(invalid());
+        }
+        request
+            .decision
+            .validate(&original_call.context.evidence_refs)?;
+        request.decision.validate_subject(grant)?;
+        original_call.continuation_allowance(
+            self.issued_at_unix_ms,
+            self.continuation_deadline_ms,
+            calls,
+        )?;
+        Ok(())
     }
 
     fn validate_call_phase(
@@ -318,6 +470,9 @@ impl AdaptiveLeadershipLocalAdoptionV1 {
         epoch: &AdaptiveLeadershipRecoveryEpochV1,
         original_call: &AdaptiveLeadershipReviewCallV1,
     ) -> Result<(), WorkflowError> {
+        if self.request.is_funded() {
+            return Err(invalid());
+        }
         self.validate_call(original_call)?;
         epoch.validate_review(
             &original_call.grant,
@@ -331,7 +486,7 @@ impl AdaptiveLeadershipLocalAdoptionV1 {
             || request.work_item_id != epoch.request.work_item_id
             || request.session_id != epoch.request.session_id
             || request.review_id != epoch.review_id
-            || request.epoch_digest != epoch.canonical_digest()?
+            || request.epoch_digest.as_deref() != Some(epoch.canonical_digest()?.as_str())
             || request.session_head_digest != epoch.request.session_head_digest
             || original_call.operation_id != epoch.request.operation_id
             || original_call.allowance_id != format!("leadership-recovery-{}", epoch.epoch_key)
@@ -375,6 +530,10 @@ fn invalid() -> WorkflowError {
 mod tests {
     use super::*;
 
+    mod issue856_funded_wire_tests {
+        include!("adaptive_leadership_local_adoption/issue856_funded_wire_tests.rs");
+    }
+
     fn record() -> AdaptiveLeadershipLocalAdoptionV1 {
         let authority = PrincipalAuthorityV1::derive("adoption-operator", 1, &[1; 32]).unwrap();
         let principal = AuthenticatedCompanyPrincipalV1 {
@@ -396,7 +555,8 @@ mod tests {
             work_item_id: WorkItemId::parse("adoption-work").unwrap(),
             session_id: Uuid::from_u128(2),
             review_id: Uuid::from_u128(3),
-            epoch_digest: "a".repeat(64),
+            epoch_digest: Some("a".repeat(64)),
+            funded_binding: None,
             original_call_digest: "b".repeat(64),
             project_digest: "c".repeat(64),
             session_digest: "d".repeat(64),

@@ -868,6 +868,9 @@ impl WorkflowApi {
             return self.verify_funded_review_recovery_membership(call);
         }
         let Some(binding) = &call.grant.recovery_epoch else {
+            if call.grant.schema_version == 5 && call.grant.work_funding.is_some() {
+                self.verify_current_funded_local_adoption_release(call)?;
+            }
             return Ok(());
         };
         if binding.schema_version == 2 {

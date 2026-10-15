@@ -1,5 +1,13 @@
 # Changelog
 
+- Validate funded-recovery NoIO against its authenticated issuance-event cut,
+  preserving complete history checks without treating later authorized work as
+  an earlier dispatch. Adopt an exact retained ordinary funded leadership
+  response only through versioned durable local authority, original usage,
+  unchanged funding ceilings and a verified installed repair. Preserve legacy
+  wire bytes, bounded failure disposition and replay without another provider
+  call; reject binary-only downgrade after new authority is committed (#856).
+
 - Reuse validated historical policy, funding and funded-recovery SQL facts only
   while the complete database input proof is unchanged. Keep verifier-only
   recovery snapshots private, recheck current authority and serving evidence,

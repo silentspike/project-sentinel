@@ -106,6 +106,26 @@ fn require_unique_membership_event(
     if count != 1 {
         return Err(corrupt());
     }
+    if event_type == ADOPTION_EVENT {
+        // Both full and sealed adoption views use this boundary. A late
+        // review-expiry exception must retain its durable local authority.
+        let sequence: i64 = connection.query_row(
+            "SELECT sequence FROM company_events
+             WHERE tenant_id=?1 AND event_type=?2 AND operation_id=?3",
+            params![tenant.0, event_type, operation_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let row = company_event_shape(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
+        let leaf: FundingAdoptionLeaf = decode(&row.payload)?;
+        if leaf
+            .authorization
+            .local_adoption
+            .as_ref()
+            .is_some_and(|adoption| adoption.request.is_funded())
+        {
+            WorkflowStore::require_funded_adoption_authority(connection, &leaf.authorization)?;
+        }
+    }
     Ok(())
 }
 
@@ -298,6 +318,25 @@ fn require_adoption_review(
 ) -> Result<(), WorkflowError> {
     let auth = &leaf.authorization;
     let epoch = auth.work_funding.as_deref().ok_or_else(corrupt)?;
+    let funded_local = auth
+        .local_adoption
+        .as_deref()
+        .filter(|adoption| adoption.request.is_funded());
+    if let Some(adoption) = funded_local {
+        auth.validate()?;
+        let request = &adoption.request;
+        if review.grant.schema_version != 5
+            || request.tenant_id != review.grant.leadership_principal.tenant_id
+            || request.project_id != review.grant.project_id
+            || request.work_item_id != review.grant.work_item_id
+            || request.session_id != review.grant.session_id
+            || request.review_id != review.grant.review_id
+            || request.context_digest != review.context_digest
+            || request.decision.schema_version != review.grant.schema_version
+        {
+            return Err(corrupt());
+        }
+    }
     if review.grant.work_funding.as_deref() != Some(epoch)
         || review.operation_id != auth.operation_id
         || review.grant.review_id != auth.review_id
@@ -306,7 +345,7 @@ fn require_adoption_review(
         || review.grant.assignee_authority != leaf.authority
         || review.grant.leadership_principal != leaf.issuer_principal
         || review.issued_at_unix_ms > auth.issued_at_ms
-        || auth.issued_at_ms >= review.grant.expires_at_unix_ms
+        || (auth.issued_at_ms >= review.grant.expires_at_unix_ms && funded_local.is_none())
     {
         return Err(corrupt());
     }
@@ -462,6 +501,13 @@ pub(crate) fn insert_funding_adoption_membership(
     };
     leaf.validate_entity()?;
     require_adoption_review(&leaf, &review)?;
+    if authorization
+        .local_adoption
+        .as_ref()
+        .is_some_and(|adoption| adoption.request.is_funded())
+    {
+        WorkflowStore::require_funded_adoption_authority(transaction, authorization)?;
+    }
     if let Some(prior) = get_entity::<FundingAdoptionLeaf>(
         transaction,
         &authority.tenant_id,
@@ -715,6 +761,8 @@ pub(super) fn require_never_dispatched_funding(
     require_pre_recovery_funding_history(connection, epoch, None)
 }
 
+// The designated tuple ends with issuance time and the sequence of the fully
+// validated recovery issuance event. This boundary proves history, not authority.
 pub(super) fn require_pre_recovery_funding_history(
     connection: &Connection,
     epoch: &AdaptiveWorkFundingEpochV1,
@@ -722,6 +770,7 @@ pub(super) fn require_pre_recovery_funding_history(
         &AdaptiveLeadershipReviewGrantV1,
         &AdaptiveLeadershipReviewContextV1,
         Uuid,
+        u64,
         u64,
     )>,
 ) -> Result<(), WorkflowError> {
@@ -740,6 +789,7 @@ fn require_pre_recovery_funding_history_uncached(
         &AdaptiveLeadershipReviewGrantV1,
         &AdaptiveLeadershipReviewContextV1,
         Uuid,
+        u64,
         u64,
     )>,
 ) -> Result<(), WorkflowError> {
@@ -766,13 +816,32 @@ fn require_pre_recovery_funding_history_uncached(
             .work_funding
             .as_ref()
             .is_some_and(|prior| prior.same_epoch(epoch))
-            && !designated.is_some_and(|(grant, _, operation, issued)| {
-                leaf.authorization.review_id == grant.review_id
-                    && leaf.authorization.operation_id == operation
-                    && leaf.authorization.issued_at_ms >= issued
-            })
         {
-            return Err(transition());
+            let Some((grant, _, operation, issued, cut)) = designated else {
+                return Err(transition());
+            };
+            // Sealed adoption already proved this issuance event unique and
+            // authentic. Use its sequence, never payload time alone, as the cut.
+            let sequence: i64 = connection.query_row(
+                "SELECT sequence FROM company_events
+                 WHERE tenant_id=?1 AND event_type=?2 AND operation_id=?3",
+                params![
+                    tenant.0,
+                    ADOPTION_EVENT,
+                    leaf.authorization.operation_id.to_string()
+                ],
+                |row| row.get(0),
+            )?;
+            let original = leaf.authorization.review_id == grant.review_id
+                && leaf.authorization.operation_id == operation
+                && leaf.authorization.issued_at_ms >= issued
+                && stored_u64(sequence)? > cut;
+            let later = stored_u64(sequence)? > cut
+                && leaf.authorization.issued_at_ms >= issued
+                && leaf.authorization.source_session_version > grant.expected_session_version;
+            if !original && !later {
+                return Err(transition());
+            }
         }
     }
     let mut statement = connection.prepare(
@@ -793,7 +862,8 @@ fn require_pre_recovery_funding_history_uncached(
         if payload_type != "blob" {
             return Err(corrupt());
         }
-        let owner = company_event_shape(connection, stored_u64(sequence)?)?.ok_or_else(corrupt)?;
+        let sequence = stored_u64(sequence)?;
+        let owner = company_event_shape(connection, sequence)?.ok_or_else(corrupt)?;
         let payload = owner.payload.as_slice();
         // Adoption events have a separate typed shape and sealed membership.
         if event_type == ADOPTION_EVENT {
@@ -808,21 +878,61 @@ fn require_pre_recovery_funding_history_uncached(
                 .work_funding
                 .as_ref()
                 .is_some_and(|prior| prior.same_epoch(epoch))
-                && !designated.is_some_and(|(grant, _, operation, issued)| {
-                    leaf.authorization.review_id == grant.review_id
+                && !designated.is_some_and(|(grant, _, operation, issued, cut)| {
+                    (leaf.authorization.review_id == grant.review_id
                         && leaf.authorization.operation_id == operation
                         && leaf.authorization.issued_at_ms >= issued
+                        && sequence > cut)
+                        || (sequence > cut
+                            && leaf.authorization.issued_at_ms >= issued
+                            && leaf.authorization.source_session_version
+                                > grant.expected_session_version)
                 })
             {
                 return Err(transition());
             }
         } else {
             let call: AdaptiveLeadershipReviewCallV1 = decode(payload)?;
-            if designated.is_some_and(|(grant, context, operation, issued)| {
+            call.validate_entity()?;
+            // Authenticate every observation before allowing an original or
+            // later call. Loading current call membership here would recurse.
+            let digest = canonical_sha256("sentinel.workflow.adaptive-leadership-call.v1", &call)?;
+            let principal = &call.grant.leadership_principal;
+            let payload_digest =
+                bytes_digest("sentinel.workflow.company-event-payload.v1", payload)?;
+            let authority_digest = principal.binding_digest()?;
+            let event_id = canonical_sha256(
+                "sentinel.workflow.company-event-id.v1",
+                &(
+                    tenant,
+                    Some(&call.grant.project_id),
+                    &event_type,
+                    call.operation_id,
+                    &digest,
+                    &authority_digest,
+                    &payload_digest,
+                    call.updated_at_unix_ms,
+                ),
+            )?;
+            if company_event_principal(&owner)? != *principal
+                || owner.tenant_id != tenant.0
+                || owner.project_id.as_deref() != Some(call.grant.project_id.0.as_str())
+                || owner.event_type != event_type
+                || owner.operation_id != call.operation_id.to_string()
+                || owner.operation_digest != digest
+                || owner.authority_binding_digest != authority_digest
+                || owner.payload_digest != payload_digest
+                || owner.event_id != event_id
+                || stored_u64(owner.created_at_ms)? != call.updated_at_unix_ms
+            {
+                return Err(corrupt());
+            }
+            if designated.is_some_and(|(grant, context, operation, issued, cut)| {
                 call.grant == *grant
                     && call.context == *context
                     && call.operation_id == operation
                     && call.grant_issued_at_unix_ms == issued
+                    && sequence > cut
             }) {
                 continue;
             }
@@ -831,14 +941,28 @@ fn require_pre_recovery_funding_history_uncached(
                 .work_funding
                 .as_ref()
                 .is_some_and(|prior| prior.same_epoch(epoch))
-                && (call.grant.schema_version != 5
+            {
+                if let Some((grant, _, _, issued, cut)) = designated {
+                    if sequence > cut {
+                        if call.grant_issued_at_unix_ms < issued
+                            || call.grant.expected_session_version <= grant.expected_session_version
+                        {
+                            return Err(transition());
+                        }
+                        // This proves only that a later immutable observation
+                        // cannot invalidate the old issuance-time NoIO fact.
+                        continue;
+                    }
+                }
+                if call.grant.schema_version != 5
                     || call.dispatch.is_some()
                     || call.decision.is_some()
                     || call.model_response_digest.is_some()
                     || call.continuation.is_some()
-                    || call.resolution_event_id.is_some())
-            {
-                return Err(transition());
+                    || call.resolution_event_id.is_some()
+                {
+                    return Err(transition());
+                }
             }
         }
     }

@@ -104,6 +104,14 @@ const CREATE_IDX_LLM_COMPLETION_RECOVERABLE: &str =
 pub const LLM_COMPLETION_TERMINAL_LIMIT: i64 = 10_000;
 const LLM_COMPLETION_RESOLUTION_REASON_MAX_BYTES: usize = 512;
 
+const FUNDED_LOCAL_ADOPTION_ERROR: &str = "work funding current reviews unavailable";
+
+#[derive(Clone, Copy)]
+enum FundedLeadershipLocalAdoptionDisposition {
+    Finish,
+    Retire,
+}
+
 const CREATE_SNAPSHOTS: &str = "
 CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3879,6 +3887,228 @@ impl EventStore {
         Ok(true)
     }
 
+    /// Finish a funded local adoption only after the caller verified its exact
+    /// durable domain receipt. No response, usage or provider work is replayed.
+    pub fn finish_known_funded_leadership_local_adoption(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        payload_digest: &str,
+        adoption_key: &str,
+        domain_receipt_digest: &str,
+    ) -> anyhow::Result<bool> {
+        self.disposition_known_funded_leadership_local_adoption(
+            request_id,
+            request_digest,
+            payload_digest,
+            adoption_key,
+            domain_receipt_digest,
+            FundedLeadershipLocalAdoptionDisposition::Finish,
+        )
+    }
+
+    /// Retire only an exact funded response whose durable domain adoption has
+    /// retired. Preserve the response, usage, owner and exhausted attempt budget.
+    pub fn retire_known_funded_leadership_local_adoption(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        payload_digest: &str,
+        adoption_key: &str,
+        domain_receipt_digest: &str,
+    ) -> anyhow::Result<bool> {
+        self.disposition_known_funded_leadership_local_adoption(
+            request_id,
+            request_digest,
+            payload_digest,
+            adoption_key,
+            domain_receipt_digest,
+            FundedLeadershipLocalAdoptionDisposition::Retire,
+        )
+    }
+
+    fn disposition_known_funded_leadership_local_adoption(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        payload_digest: &str,
+        adoption_key: &str,
+        domain_receipt_digest: &str,
+        disposition: FundedLeadershipLocalAdoptionDisposition,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            request_id.starts_with("company-leadership-")
+                && is_canonical_sha256(request_digest)
+                && is_canonical_sha256(payload_digest)
+                && is_canonical_sha256(domain_receipt_digest)
+                && adoption_key.starts_with("local-adoption-")
+                && adoption_key.len() <= 96,
+            "invalid funded local adoption disposition identity"
+        );
+        let owner = self.llm_completion_scope(request_id)?;
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
+        let state: (String, String, String, String, Option<String>, i64) = conn.query_row(
+            "SELECT request_digest,owner_scope,payload,status,last_error,attempt_count
+             FROM llm_completion_outbox WHERE request_id=?1",
+            [request_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        anyhow::ensure!(
+            state.0 == request_digest
+                && state.1 == owner.to_wire()
+                && !state.2.is_empty()
+                && state.2.len() <= 2 * 1024 * 1024
+                && sentinel_common::sha256_hex(state.2.as_bytes()) == payload_digest
+                && state.5 == 5,
+            "funded local adoption source changed"
+        );
+        let aggregate = match owner {
+            StateTransferScope::NanoContainer(agent) => agent,
+            StateTransferScope::World => {
+                anyhow::bail!("funded local adoption requires agent scope")
+            }
+        };
+        let value: serde_json::Value = serde_json::from_str(&state.2)?;
+        let completion: RetainedAdaptiveCompletion = serde_json::from_value(
+            value
+                .get("model_work")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("funded local adoption model response missing"))?,
+        )?;
+        anyhow::ensure!(
+            value.get("version").and_then(serde_json::Value::as_u64) == Some(2)
+                && value.get("request_id").and_then(serde_json::Value::as_str) == Some(request_id)
+                && value
+                    .get("request_digest")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(request_digest)
+                && value
+                    .get("actions")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                && completion.admissible
+                && completion.context.is_object()
+                && !completion.content.is_empty()
+                && value
+                    .get("model_response_digest")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(sentinel_common::sha256_hex(completion.content.as_bytes()).as_str()),
+            "funded local adoption is not an exact known action-free response"
+        );
+        let usage: DomainEvent = serde_json::from_value(
+            value
+                .get("usage_event")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("funded local adoption usage missing"))?,
+        )?;
+        let typed_usage: DomainEventPayload = serde_json::from_str(&usage.payload)?;
+        anyhow::ensure!(
+            usage.event_type == "agent_llm_usage"
+                && usage.aggregate_id == aggregate
+                && usage.correlation_id == request_id
+                && usage.operation_id == format!("llm_usage_{request_id}")
+                && matches!(typed_usage, DomainEventPayload::AgentLlmUsage { agent_id, output_tokens, .. }
+                    if agent_id.to_string() == aggregate && output_tokens > 0),
+            "funded local adoption usage owner or outcome changed"
+        );
+        let persisted_usage = retained_rejection_event(&conn, &usage.operation_id)?
+            .ok_or_else(|| anyhow::anyhow!("funded local adoption usage not durable"))?;
+        anyhow::ensure!(
+            serde_json::to_value(&persisted_usage)? == serde_json::to_value(&usage)?,
+            "funded local adoption usage changed"
+        );
+        let (operation, event_type, replay, next_status, next_error) = match disposition {
+            FundedLeadershipLocalAdoptionDisposition::Finish => {
+                anyhow::ensure!(
+                    matches!(state.3.as_str(), "failed" | "action_claimed")
+                        && state.4.as_deref() == Some(FUNDED_LOCAL_ADOPTION_ERROR),
+                    "funded local adoption failure state changed"
+                );
+                (
+                    format!("llm_local_adoption_{request_id}"),
+                    "llm_completion_locally_adopted",
+                    state.3 == "action_claimed",
+                    "action_claimed",
+                    FUNDED_LOCAL_ADOPTION_ERROR,
+                )
+            }
+            FundedLeadershipLocalAdoptionDisposition::Retire => {
+                anyhow::ensure!(
+                    state.3 == "failed"
+                        && (state.4.as_deref() == Some(FUNDED_LOCAL_ADOPTION_ERROR)
+                            || state.4.as_deref() == Some("leadership_review_stale")),
+                    "funded local adoption retirement state changed"
+                );
+                (
+                    format!("llm_local_adoption_retired_{request_id}"),
+                    "llm_completion_local_adoption_retired",
+                    state.4.as_deref() == Some("leadership_review_stale"),
+                    "failed",
+                    "leadership_review_stale",
+                )
+            }
+        };
+        let receipt = serde_json::json!({
+            "schema_version": 2,
+            "request_id": request_id, "request_digest": request_digest,
+            "payload_digest": payload_digest, "adoption_key": adoption_key,
+            "domain_receipt_digest": domain_receipt_digest,
+            "original_completion_error": FUNDED_LOCAL_ADOPTION_ERROR,
+        })
+        .to_string();
+        if replay {
+            let prior = retained_rejection_event(&conn, &operation)?
+                .ok_or_else(|| anyhow::anyhow!("funded local adoption receipt missing"))?;
+            anyhow::ensure!(
+                prior.event_type == event_type
+                    && prior.aggregate_id == aggregate
+                    && prior.correlation_id == request_id
+                    && prior.causation_id.is_none()
+                    && prior.schema_version == 2
+                    && prior.compensation_type == "none"
+                    && prior.payload == receipt,
+                "funded local adoption receipt changed"
+            );
+            conn.commit()?;
+            return Ok(false);
+        }
+        let mut event = DomainEvent::new(event_type, &aggregate, &receipt, request_id, 0)
+            .with_operation_id(&operation);
+        event.schema_version = 2;
+        conn.execute("INSERT INTO events (event_id,event_type,aggregate_id,payload,correlation_id,causation_id,operation_id,tick,timestamp_ms,schema_version,compensation_type)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![event.event_id,event.event_type,event.aggregate_id,event.payload,
+            event.correlation_id,event.causation_id,event.operation_id,event.tick as i64,event.timestamp_ms as i64,event.schema_version,event.compensation_type])?;
+        let changed = conn.execute(
+            "UPDATE llm_completion_outbox SET status=?4,last_error=?5
+             WHERE request_id=?1 AND request_digest=?2 AND owner_scope=?3
+             AND payload=?6 AND status='failed' AND attempt_count=5 AND last_error=?7",
+            params![
+                request_id,
+                request_digest,
+                state.1,
+                next_status,
+                next_error,
+                state.2,
+                FUNDED_LOCAL_ADOPTION_ERROR
+            ],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "funded local adoption disposition state changed"
+        );
+        conn.commit()?;
+        Ok(true)
+    }
+
     /// Claim actions before sending them. A crash after this transition is
     /// intentionally at-most-once/fail-closed: claimed actions are never replayed.
     pub fn claim_llm_completion_actions(
@@ -5672,6 +5902,11 @@ pub trait OutboxTransport: Send + Sync + 'static {
 
 #[cfg(test)]
 mod local_adoption_tests;
+
+#[cfg(test)]
+mod issue856_funded_local_adoption_tests {
+    include!("event_store/issue856_funded_local_adoption_tests.rs");
+}
 
 #[cfg(test)]
 mod tests {
