@@ -164,6 +164,12 @@ fn replacement_history_cut_shares_cold_and_warm_event_owners_with_single_raw_cha
         .collect::<Vec<_>>();
     assert!(!events.is_empty());
     let payload_bytes: usize = events.iter().map(|(_, bytes)| bytes).sum();
+    let serialized_bytes: usize = events.iter().map(|(sequence, _)| {
+        let row = crate::domain_store::read_company_event_row(&connection, *sequence)
+            .unwrap().unwrap();
+        crate::digest::serialized_json_size(&row).unwrap()
+    }).sum();
+    assert!(serialized_bytes > payload_bytes);
     let cut = crate::domain_store::adaptive_work_funding::historical_review_cut;
     let mut previous_totals = None;
     for owners_first in [false, true] {
@@ -200,8 +206,8 @@ fn replacement_history_cut_shares_cold_and_warm_event_owners_with_single_raw_cha
         let owner = failure.top_contributors.iter().find(|entry| entry.domain == Some("event-shape")).unwrap();
         let history = failure.top_contributors.iter().find(|entry| entry.domain == Some("replacement-review-history")).unwrap();
         assert_eq!(owner.totals.body, payload_bytes);
-        // A cold owner also pays retained row serialization, unlike the old raw-only scan.
-        assert!(owner.totals.result > payload_bytes);
+        // The unchanged payload stays charged as body; only its full-row remainder is new.
+        assert_eq!(owner.totals.result, serialized_bytes - payload_bytes);
         assert_eq!(history.totals.body, 0);
         if let Some(previous) = previous_totals {
             assert_eq!(failure.charge_totals, previous);

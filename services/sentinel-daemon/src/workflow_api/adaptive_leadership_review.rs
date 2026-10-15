@@ -2094,7 +2094,8 @@ impl WorkflowApi {
             .authority
             .as_ref()
             .ok_or("leadership runtime missing")?
-            .snapshot_for_admission(
+            .snapshot_from_validated_project(
+                &current_project,
                 &current_project.tenant_id,
                 &current_project.project_id,
                 &call.grant.work_item_id,
@@ -7003,7 +7004,13 @@ pub(crate) mod tests {
         assert!(!reads.contains(".adaptive_session_for_authority("));
         assert!(reads.contains("current_project != call.context.source_project"));
         assert!(reads.contains("source != call.context.source_session"));
-        assert!(acceptance.contains(".snapshot_for_admission("));
+        assert!(acceptance
+            .contains(".snapshot_from_validated_project(\n                &current_project,"));
+        assert!(!acceptance
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .contains(".snapshot_for_admission("));
     }
 
     #[test]

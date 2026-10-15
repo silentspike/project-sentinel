@@ -1115,7 +1115,7 @@ fn company_event_shape_with_observer(
     sequence: u64,
     mut before_payload_copy: impl FnMut(usize),
 ) -> Result<Option<CompanyEventShape>, WorkflowError> {
-    validation_scope::memoize(connection, "event-shape", &sequence, || {
+    validation_scope::memoize_precharged(connection, "event-shape", &sequence, || {
         let payload_bytes: Option<usize> = connection
             .query_row(
                 "SELECT payload FROM company_events WHERE sequence=?1",
@@ -1134,15 +1134,24 @@ fn company_event_shape_with_observer(
             )
             .optional()?;
         let Some(payload_bytes) = payload_bytes else {
-            return Ok(None);
+            return Ok((None, None));
         };
-        validation_scope::charge_bytes(connection, payload_bytes)?;
+        let body = validation_scope::precharge_body::<Option<CompanyEventShape>>(
+            connection,
+            payload_bytes,
+        )?;
         before_payload_copy(payload_bytes);
         let row = read_company_event_row(connection, sequence)?.ok_or_else(corrupt)?;
+        if row.payload.len() != payload_bytes {
+            return Err(corrupt());
+        }
         // This is data ownership, not an event or caller-authority proof.
         // Invalid UTF-8 must fail as corruption before owner accounting.
         std::str::from_utf8(&row.payload).map_err(|_| corrupt())?;
-        Ok(Some(CompanyEventShape(std::sync::Arc::new(row))))
+        Ok((
+            Some(CompanyEventShape(std::sync::Arc::new(row))),
+            Some(body),
+        ))
     })
 }
 
@@ -7879,6 +7888,9 @@ fn persistence() -> WorkflowError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod owned_body_accounting {
+        include!("domain_store/tests/owned_body_accounting.rs");
+    }
     use crate::{
         AgentId, CompanyPrincipalKindV1, CompanyRoleV1, ParticipantBindingV1, ProposalGovernanceV1,
         WorkProfileBindingV1, COMPANY_DOMAIN_SCHEMA_VERSION,
