@@ -948,32 +948,14 @@ impl CompanyEntity for AdaptiveWorkFundingExpiredReplacementReceiptV1 {
             ],
             |row| row.get(0),
         )?;
-        let mut history = BTreeMap::new();
-        let mut statement = connection.prepare("SELECT payload FROM company_events WHERE tenant_id=?1
-            AND event_type GLOB 'adaptive_leadership_review_*' AND sequence<?2 ORDER BY sequence LIMIT 4097")?;
-        let mut rows = statement.query(params![source.tenant_id.0, issuance_sequence])?;
-        let mut count = 0;
-        while let Some(row) = rows.next()? {
-            count += 1;
-            if count > 4096 {
-                return Err(corrupt());
-            }
-            let value = row.get_ref(0)?;
-            let rusqlite::types::ValueRef::Blob(payload) = value else {
-                return Err(corrupt());
-            };
-            validation_scope::charge_bytes(connection, payload.len())?;
-            let call: AdaptiveLeadershipReviewCallV1 = decode(payload)?;
-            if call.grant.session_id == source.session_id {
-                history.insert(call.grant.review_id, call);
-            }
-        }
-        let calls = history.into_values().collect::<Vec<_>>();
-        if calls.len() != usize::from(source.current_resume_source.base_review_count)
-            || canonical_sha256(
-                "sentinel.workflow.adaptive-resume-review-history.v1",
-                &calls,
-            )? != source.current_resume_source.review_history_digest
+        let (count, digest) = historical_review_cut(
+            connection,
+            &source.tenant_id,
+            source.session_id,
+            issuance_sequence,
+        )?;
+        if count != usize::from(source.current_resume_source.base_review_count)
+            || digest != source.current_resume_source.review_history_digest
         {
             return Err(corrupt());
         }
@@ -989,6 +971,114 @@ impl CompanyEntity for AdaptiveWorkFundingExpiredReplacementReceiptV1 {
             self,
         )
     }
+}
+
+#[derive(Clone, Serialize)]
+struct HistoricalReviewCut {
+    session_id: Uuid,
+    count: usize,
+    digest: String,
+}
+
+// Discovery supplies cut positions, not authority. Each replacement still
+// validates its sealed relation, complete membership and exact historical digest.
+pub(super) fn historical_review_cut(
+    connection: &Connection,
+    tenant: &TenantId,
+    session_id: Uuid,
+    sequence: i64,
+) -> Result<(usize, String), WorkflowError> {
+    let cuts = validation_scope::memoize(connection, "replacement-review-history", tenant, || {
+        let mut statement = connection.prepare(
+            "SELECT sequence,json_extract(payload,'$.request.source.session_id') FROM company_events
+             WHERE tenant_id=?1 AND event_type=?2 ORDER BY sequence LIMIT 4097",
+        )?;
+        let mut rows = statement.query(params![tenant.0, EVENT])?;
+        let mut cuts = Vec::new();
+        while let Some(row) = rows.next()? {
+            if cuts.len() >= 4096 {
+                return Err(corrupt());
+            }
+            let sequence: i64 = row.get(0)?;
+            let rusqlite::types::ValueRef::Text(session) = row.get_ref(1)? else {
+                return Err(corrupt());
+            };
+            if sequence <= 0 || session.len() != 36 {
+                return Err(corrupt());
+            }
+            let session = std::str::from_utf8(session).map_err(|_| corrupt())?;
+            cuts.push((sequence, session.to_owned()));
+        }
+        let Some(last) = cuts.last().map(|(sequence, _)| *sequence) else {
+            return Ok(BTreeMap::new());
+        };
+        let mut cuts = cuts.into_iter().peekable();
+        let mut history = BTreeMap::<Uuid, BTreeMap<Uuid, AdaptiveLeadershipReviewCallV1>>::new();
+        let mut result = BTreeMap::new();
+        let mut record_cut =
+            |sequence,
+             session: String,
+             history: &BTreeMap<Uuid, BTreeMap<Uuid, AdaptiveLeadershipReviewCallV1>>| {
+                let session_id = Uuid::parse_str(&session).map_err(|_| corrupt())?;
+                if session_id.is_nil() || session_id.to_string() != session {
+                    return Err(corrupt());
+                }
+                let calls = history
+                    .get(&session_id)
+                    .map(|calls| calls.values().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let digest = canonical_sha256(
+                    "sentinel.workflow.adaptive-resume-review-history.v1",
+                    &calls,
+                )?;
+                result.insert(
+                    sequence,
+                    HistoricalReviewCut {
+                        session_id,
+                        count: calls.len(),
+                        digest,
+                    },
+                );
+                Ok::<_, WorkflowError>(())
+            };
+        let mut statement = connection.prepare(
+            "SELECT sequence,payload FROM company_events WHERE tenant_id=?1
+             AND event_type GLOB 'adaptive_leadership_review_*' AND sequence<?2 ORDER BY sequence LIMIT 4097",
+        )?;
+        let mut rows = statement.query(params![tenant.0, last])?;
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            count += 1;
+            if count > 4096 {
+                return Err(corrupt());
+            }
+            let sequence: i64 = row.get(0)?;
+            while cuts.peek().is_some_and(|(cut, _)| *cut <= sequence) {
+                let (cut, session) = cuts.next().ok_or_else(corrupt)?;
+                record_cut(cut, session, &history)?;
+            }
+            let value = row.get_ref(1)?;
+            let rusqlite::types::ValueRef::Blob(payload) = value else {
+                return Err(corrupt());
+            };
+            validation_scope::charge_bytes(connection, payload.len())?;
+            // Decode every tenant row before selecting a session, as before.
+            let call: AdaptiveLeadershipReviewCallV1 = decode(payload)?;
+            history
+                .entry(call.grant.session_id)
+                .or_default()
+                .insert(call.grant.review_id, call);
+        }
+        for (cut, session) in cuts {
+            record_cut(cut, session, &history)?;
+        }
+        Ok(result)
+    })?;
+    let cut = cuts.get(&sequence).ok_or_else(corrupt)?;
+    if cut.session_id != session_id {
+        return Err(corrupt());
+    }
+    Ok((cut.count, cut.digest.clone()))
 }
 
 fn require_unique_relation_event(

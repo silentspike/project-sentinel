@@ -2751,15 +2751,32 @@ mod tests {
             .try_into()
             .unwrap();
         let started = std::time::Instant::now();
+        let mode = std::env::var("SENTINEL_DIAGNOSTIC_MODE")
+            .unwrap_or_else(|_| "replacement_source".into());
+        assert!(matches!(
+            mode.as_str(),
+            "replacement_source" | "funding_review_selection"
+        ));
         let (result, failures) =
             crate::domain_store::validation_scope::with_validation_failures(|| {
-                store.adaptive_work_funding_expired_replacement_verification_source(
-                    &operator,
-                    &source.project_id,
-                    source.session_id,
-                    &source.old_funding_receipt_digest,
-                    now,
-                )
+                if mode == "funding_review_selection" {
+                    return store
+                        .adaptive_work_funding_for_review(
+                            &operator.tenant_id,
+                            source.session_id,
+                            now,
+                        )
+                        .map(|selected| selected.is_some());
+                }
+                store
+                    .adaptive_work_funding_expired_replacement_verification_source(
+                        &operator,
+                        &source.project_id,
+                        source.session_id,
+                        &source.old_funding_receipt_digest,
+                        now,
+                    )
+                    .map(|_| true)
             });
         let connection = store.connection.lock().unwrap();
         let after: i64 = connection
@@ -2768,7 +2785,9 @@ mod tests {
         assert!(connection.is_readonly("main").unwrap());
         assert_eq!(after, changes);
         eprintln!(
-            "READ_ONLY_FUNDING_DIAGNOSTIC elapsed_ms={} error_code={:?} failures={:?} writes=0",
+            "READ_ONLY_FUNDING_DIAGNOSTIC mode={} selected={:?} elapsed_ms={} error_code={:?} failures={:?} writes=0",
+            mode,
+            result.as_ref().ok(),
             started.elapsed().as_millis(),
             result.as_ref().err().map(|error| error.code),
             failures,
