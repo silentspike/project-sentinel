@@ -10,6 +10,9 @@ use crate::{
 mod expired_replacement;
 
 #[cfg(test)]
+mod issue_856_receipt_lookup_snapshot_tests;
+
+#[cfg(test)]
 pub(super) fn historical_review_cut(
     connection: &Connection,
     tenant: &TenantId,
@@ -1697,8 +1700,17 @@ impl WorkflowStore {
         session_id: Uuid,
         operation_id: Uuid,
     ) -> Result<Option<AdaptiveWorkFundingReceiptV1>, WorkflowError> {
-        let connection = self.connection.lock().map_err(|_| persistence())?;
-        read_funding_leaf(&connection, tenant, session_id, operation_id)
+        let query_key =
+            serde_json::to_vec(&(tenant, session_id, operation_id)).map_err(|_| persistence())?;
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        // Retain historical evidence only. The leaf reader owns one shared
+        // validation arena; current eligibility and authority are separate reads.
+        self.validated_read_snapshot(
+            &mut connection,
+            "work-funding-receipt-exact",
+            &query_key,
+            |snapshot| read_funding_leaf(snapshot, tenant, session_id, operation_id),
+        )
     }
 }
 
@@ -1803,7 +1815,7 @@ mod review_payload_budget_tests {
     const ARENA_BYTES: usize = 64 * 1024 * 1024;
     const NOW: u64 = 1_000_000;
 
-    fn review_leaf() -> FundingReviewLeaf {
+    pub(super) fn review_leaf() -> FundingReviewLeaf {
         let tenant = TenantId::parse("review-budget-tenant").unwrap();
         let project = ProjectId::parse("review-budget-project").unwrap();
         let work = crate::WorkItemId::parse("review-budget-work").unwrap();

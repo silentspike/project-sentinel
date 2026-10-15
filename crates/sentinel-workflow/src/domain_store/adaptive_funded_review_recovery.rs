@@ -520,12 +520,18 @@ impl WorkflowStore {
         tenant: &TenantId,
         receipt_key: &str,
     ) -> Result<Option<AdaptiveFundedReviewRecoveryReceiptV1>, WorkflowError> {
+        let key = serde_json::to_vec(&(tenant, receipt_key)).map_err(|_| persistence())?;
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let scope = validation_scope::enter(&transaction)?;
-        let receipt = receipt_in_connection(&transaction, tenant, receipt_key)?;
-        scope.finish()?;
-        Ok(receipt)
+        self.validated_read_snapshot(
+            &mut connection,
+            "funded-review-recovery-receipt",
+            &key,
+            |snapshot| {
+                validation_scope::with_scope(snapshot, || {
+                    receipt_in_connection(snapshot, tenant, receipt_key)
+                })
+            },
+        )
     }
 
     /// Rust-only reconstruction of the immutable issuance snapshot. This remains
@@ -535,39 +541,59 @@ impl WorkflowStore {
         tenant: &TenantId,
         receipt_key: &str,
     ) -> Result<Option<AdaptiveFundedReviewRecoveryVerificationSourceV1>, WorkflowError> {
+        // Keep the verifier-only DTO non-serializable. Only immutable SQL facts
+        // enter the existing bounded cache; serving proof and authority do not.
+        type HistoricalFacts = (
+            AdaptiveFundedReviewRecoverySourceV1,
+            Box<ProjectV1>,
+            Box<crate::AdaptiveSessionV1>,
+            Box<crate::AdaptiveWorkFundingReceiptV1>,
+            Vec<AdaptiveLeadershipReviewCallV1>,
+        );
+        let key = serde_json::to_vec(&(tenant, receipt_key)).map_err(|_| persistence())?;
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let scope = validation_scope::enter(&transaction)?;
-        let Some(receipt) = receipt_in_connection(&transaction, tenant, receipt_key)? else {
-            scope.finish()?;
-            return Ok(None);
-        };
-        let calls = receipt
-            .review_members
-            .iter()
-            .map(|member| {
-                load_member(
-                    &transaction,
-                    tenant,
-                    receipt.request.source.session_id,
-                    member,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let funding = receipt
-            .grant_template
-            .work_funding
-            .as_ref()
-            .ok_or_else(corrupt)?
-            .receipt
-            .clone();
-        scope.finish()?;
-        Ok(Some(AdaptiveFundedReviewRecoveryVerificationSourceV1 {
-            source: *receipt.request.source,
-            project: Box::new(receipt.context.source_project),
-            session: Box::new(receipt.context.source_session),
-            funding: Box::new(funding),
-            calls,
+        let facts: Option<HistoricalFacts> = self.validated_read_snapshot(
+            &mut connection,
+            "funded-review-recovery-historical-source",
+            &key,
+            |snapshot| {
+                validation_scope::with_scope(snapshot, || {
+                    let Some(receipt) = receipt_in_connection(snapshot, tenant, receipt_key)?
+                    else {
+                        return Ok(None);
+                    };
+                    let calls = receipt
+                        .review_members
+                        .iter()
+                        .map(|member| {
+                            load_member(snapshot, tenant, receipt.request.source.session_id, member)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let funding = receipt
+                        .grant_template
+                        .work_funding
+                        .as_ref()
+                        .ok_or_else(corrupt)?
+                        .receipt
+                        .clone();
+                    Ok(Some((
+                        *receipt.request.source,
+                        Box::new(receipt.context.source_project),
+                        Box::new(receipt.context.source_session),
+                        Box::new(funding),
+                        calls,
+                    )))
+                })
+            },
+        )?;
+        Ok(facts.map(|(source, project, session, funding, calls)| {
+            AdaptiveFundedReviewRecoveryVerificationSourceV1 {
+                source,
+                project,
+                session,
+                funding,
+                calls,
+            }
         }))
     }
 
