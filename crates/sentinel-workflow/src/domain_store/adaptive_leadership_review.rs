@@ -931,8 +931,23 @@ fn commit_continuation_allowance(
     call: &AdaptiveLeadershipReviewCallV1,
     authorization: &crate::adaptive::AdaptiveContinuationAuthorizationV1,
     result: &CompleteAdaptiveLeadershipReviewCallV1,
+    continued: &crate::AdaptiveSessionV1,
     now_ms: u64,
 ) -> Result<(), WorkflowError> {
+    // The journal has changed: build fresh proofs only until the next allowance write.
+    let post_write = validation_scope::enter(transaction)?;
+    if call.grant.work_funding.is_some() {
+        require_funding_authorization_membership(
+            transaction,
+            authorization,
+            &call.grant.assignee_authority,
+        )?;
+    }
+    let (current, _) =
+        crate::store::adaptive::load(transaction, call.grant.session_id)?.ok_or_else(not_found)?;
+    if &current != continued {
+        return Err(transition());
+    }
     let mut project = call.context.source_project.clone();
     let prior = project
         .subscription_call
@@ -989,6 +1004,7 @@ fn commit_continuation_allowance(
     {
         return Err(transition());
     }
+    post_write.finish()?;
     put_entity(
         transaction,
         &project.tenant_id,
@@ -2672,19 +2688,14 @@ impl WorkflowStore {
             if let Some(scope) = preflight.take() {
                 scope.finish()?;
             }
-            if call.grant.work_funding.is_some() {
-                require_funding_authorization_membership(
-                    &transaction,
-                    authorization,
-                    &call.grant.assignee_authority,
-                )?;
-            }
-            let (current, _) = crate::store::adaptive::load(&transaction, call.grant.session_id)?
-                .ok_or_else(not_found)?;
-            if current != continued {
-                return Err(transition());
-            }
-            commit_continuation_allowance(&transaction, &call, authorization, result, now_ms)?;
+            commit_continuation_allowance(
+                &transaction,
+                &call,
+                authorization,
+                result,
+                &continued,
+                now_ms,
+            )?;
         } else if result.decision.resolves_blocked() {
             let resolution = result.resolution_event_id.ok_or_else(transition)?;
             let mut project: ProjectV1 = get_entity(

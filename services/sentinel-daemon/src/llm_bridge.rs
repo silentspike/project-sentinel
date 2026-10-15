@@ -11,6 +11,9 @@
 //! - Structured Logging mit Tracing Spans
 
 #[cfg(feature = "llm")]
+#[path = "llm_bridge/completion_recovery.rs"]
+mod completion_recovery;
+#[cfg(feature = "llm")]
 #[path = "llm_bridge/provider_blocking_lanes.rs"]
 mod provider_blocking_lanes;
 #[cfg(feature = "llm")]
@@ -19,6 +22,7 @@ mod provider_preparation_controller;
 
 #[cfg(feature = "llm")]
 pub mod bridge {
+    use super::completion_recovery::CompletionRecovery;
     use super::provider_blocking_lanes::{
         BlockingExecutor, JobCancellation, JobError, Lane, OwnedBlockingLanes, SubmitError,
     };
@@ -1475,6 +1479,47 @@ pub mod bridge {
         if !matches!(entry.status.as_str(), "pending_usage" | "ready_for_action") {
             return;
         }
+        let Some(_recovery) = CompletionRecovery::try_acquire(store, &entry.request_id) else {
+            info!(request_id = %entry.request_id, "Durable completion recovery already active");
+            return;
+        };
+        recover_completion_owned(store, entry, action_tx, max_attempts, resolver, _recovery);
+    }
+
+    fn recover_completion_owned<S: CompletionStore>(
+        store: &S,
+        entry: LlmCompletionEntry,
+        action_tx: &mpsc::Sender<AgentAction>,
+        max_attempts: u32,
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        _recovery: CompletionRecovery<'_, S>,
+    ) {
+        let current = match observe_completion_stage(&entry.request_id, "recovery_refresh", || {
+            store.get_completion(&entry.request_id)
+        }) {
+            Ok(Some(current)) => current,
+            Ok(None) => return,
+            Err(error) => {
+                error!(request_id = %entry.request_id, error = %error, "Failed to refresh durable completion recovery");
+                return;
+            }
+        };
+        if current.request_id != entry.request_id
+            || current.request_digest != entry.request_digest
+            || current.owner_scope != entry.owner_scope
+            || current.payload != entry.payload
+            || current.created_at != entry.created_at
+        {
+            error!(request_id = %entry.request_id, "Durable completion recovery binding changed");
+            return;
+        }
+        if !matches!(
+            current.status.as_str(),
+            "pending_usage" | "ready_for_action"
+        ) {
+            return;
+        }
+        let entry = current;
         let completed: CompletedLlmResponse = match serde_json::from_str(&entry.payload) {
             Ok(completed) => completed,
             Err(error) => {
@@ -1957,6 +2002,9 @@ pub mod bridge {
         let payload =
             observe_completion_stage(request_id, "encode", || serde_json::to_string(&completed))
                 .map_err(|error| error.to_string())?;
+        // Own the enqueue-to-load window too: a recovery consumer must not
+        // finish/delete this row between its successful enqueue and first read.
+        let recovery = CompletionRecovery::try_acquire(store, request_id);
         if let Err(error) = observe_completion_stage(request_id, "enqueue", || {
             store.enqueue_completion(request_id, request_digest, &payload)
         }) {
@@ -1982,11 +2030,22 @@ pub mod bridge {
             }
             return Err(error.to_string());
         }
+        let Some(recovery) = recovery else {
+            info!(request_id, "Durable completion handed to active recovery");
+            return Ok(());
+        };
         let entry =
             observe_completion_stage(request_id, "load", || store.get_completion(request_id))
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| format!("durable LLM completion {request_id} disappeared"))?;
-        recover_completion(store, entry, action_tx, max_attempts, authority_resolver);
+        recover_completion_owned(
+            store,
+            entry,
+            action_tx,
+            max_attempts,
+            authority_resolver,
+            recovery,
+        );
         Ok(())
     }
 
@@ -4223,6 +4282,10 @@ pub mod bridge {
         use super::*;
 
         include!("llm_bridge/tests/owned_pipeline.rs");
+
+        mod completion_recovery_tests {
+            include!("llm_bridge/completion_recovery_tests.rs");
+        }
 
         #[test]
         fn completion_stage_observation_preserves_results_and_runs_once() {
