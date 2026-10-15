@@ -284,7 +284,6 @@ impl WorkflowApi {
                 .is_none_or(|dispatch| dispatch.request_digest != proposed.request_digest)
             || authorization.work_funding != call.grant.work_funding
             || authorization.resume_policy.is_some()
-            || authorization.local_adoption.is_some()
             || authorization.session_id != call.grant.session_id
             || authorization.review_id != call.grant.review_id
             || authorization.operation_id != call.operation_id
@@ -307,6 +306,28 @@ impl WorkflowApi {
                 .map_err(|_| "work funding continuation provider binding invalid")?
         {
             return Err("work funding pre-audit authorization changed");
+        }
+        if let Some(adoption) = authorization.local_adoption.as_deref() {
+            if !adoption.request.is_funded()
+                || adoption.validate_funded_against(call).is_err()
+                || adoption.request.decision != proposed.decision
+                || adoption.request.request_digest != proposed.request_digest
+                || adoption.request.model_response_digest != proposed.model_response_digest
+                || adoption.issued_at_unix_ms != authorization.issued_at_ms
+                || adoption.continuation_deadline_ms != authorization.deadline_ms
+            {
+                return Err("work funding local adoption changed");
+            }
+            let stored = self
+                .store
+                .adaptive_leadership_local_adoption(
+                    &call.grant.leadership_principal.tenant_id,
+                    call.grant.review_id,
+                )
+                .map_err(|_| "work funding local adoption unavailable")?;
+            if stored.as_ref() != Some(adoption) {
+                return Err("work funding local adoption not durable");
+            }
         }
         Ok(())
     }
