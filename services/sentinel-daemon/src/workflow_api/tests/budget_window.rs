@@ -3929,6 +3929,232 @@ fn budget_evidence_cannot_omit_required_refs_or_invent_model_and_tool_evidence()
 }
 
 #[test]
+fn large_funded_continuation_keeps_wire_bytes_but_bounds_model_prompt() {
+    let mut fixture = Fixture::root(true);
+    let operator = fixture.api.principals.principal("operator").unwrap();
+    let now = now_unix_ms();
+    let request = fixture
+        .api
+        .store
+        .adaptive_work_funding_draft(
+            &operator.principal,
+            &fixture.session.grant.authority.project_id,
+            fixture.session.grant.session_id,
+            Uuid::new_v4(),
+            "large-continuation-model-view-regression",
+            sentinel_workflow::AdaptiveWorkFundingLimitsV1 {
+                additional_model_calls: 56,
+                additional_tool_calls: 56,
+                additional_reviews: 64,
+                additional_windows: 64,
+                max_window_ms: 300_000,
+                max_call_duration_ms: 120_000,
+                dispatch_margin_ms: sentinel_workflow::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+                expires_at_unix_ms: now + 3_600_000,
+            },
+            now,
+        )
+        .unwrap();
+    fixture
+        .api
+        .store
+        .authorize_adaptive_work_funding(&operator.principal, &request, now)
+        .unwrap();
+    let private_content = format!("{PRIVATE_CONTENT}:{}", "x".repeat(16 * 1024));
+    let limit = sentinel_workflow::ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES;
+    let mut large = None;
+    // Every window comes from a durable review and an accepted fixture completion.
+    // This is offline journal evidence, never a provider or customer-work claim.
+    for _ in 0..64 {
+        assert!(reconcile_review_at(
+            &fixture.api,
+            &fixture.project(),
+            now_unix_ms(),
+        ));
+        let call = fixture
+            .calls()
+            .into_iter()
+            .find(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
+            .unwrap();
+        assert_eq!(call.grant.schema_version, 5);
+        let binding = LeadershipAuthority::from_call(&call);
+        let context = fixture
+            .with_workbench_store(|| fixture.api.prepare_leadership_review(&binding))
+            .unwrap();
+        let wire = serde_json::to_vec(&context).unwrap();
+        if wire.len() > limit && serde_json::to_vec(&context.source).unwrap().len() > 100 * 1024 {
+            large = Some((context, wire));
+            break;
+        }
+        let (id, digest) = fixture.with_workbench_store(|| {
+            super::adaptive_resume_policy::tests::claim_review(&fixture.api, &context)
+        });
+        let result = ModelExecutionCompletion {
+            context: ModelExecutionContext::AdaptiveLeadershipReview(Box::new(context.clone())),
+            content: serde_json::json!({"schema_version":5,"decision":{
+                "kind":"continue","additional_model_calls":1,"window_ms":180_000,
+                "rationale":"Offline bounded-history projection regression.",
+                "evidence_refs":[context.source.evidence_refs[0]],
+            }})
+            .to_string(),
+            admissible: true,
+        };
+        persist(&fixture.api, &result, &context, &id, &digest, true);
+        fixture
+            .api
+            .accept_leadership_review_with_clock(&result, &context, &id, &digest, now_unix_ms)
+            .unwrap();
+        fixture.session = fixture.read();
+        let observed_at = now_unix_ms();
+        let tool = fixture.claim_tool(observed_at);
+        fixture.observe_tool_content(&tool, observed_at, observed_at, &private_content);
+    }
+    let (context, wire) =
+        large.expect("legitimate continuation history must cross the old self cap");
+    let source_bytes = serde_json::to_vec(&context.source).unwrap().len();
+    assert!(source_bytes > 100 * 1024);
+    assert!(
+        source_bytes <= limit,
+        "the independent raw-source cap is unchanged"
+    );
+    assert!(wire.len() > limit);
+    context.source.validate(&context.binding.grant).unwrap();
+    context.validate_dispatch(now_unix_ms()).unwrap();
+    let before = fixture.read();
+    let calls = fixture.calls();
+    let prompt = context.prompt().unwrap();
+    assert!(prompt.len() <= limit);
+    let (_, rendered) = prompt.split_once(" Source: ").unwrap();
+    let (source, observation) = rendered.rsplit_once(". Private tool evidence: ").unwrap();
+    let source: serde_json::Value = serde_json::from_str(source).unwrap();
+    let observation: serde_json::Value = serde_json::from_str(observation).unwrap();
+    assert_eq!(source["schema_version"], 1);
+    assert_eq!(
+        source["content_ref"],
+        format!("adaptive-leadership-context:{}", context.context_digest),
+    );
+    for (name, expected) in [
+        (
+            "source_project",
+            serde_json::to_value(&context.source.source_project).unwrap(),
+        ),
+        ("tool_catalog", context.source.tool_catalog.clone()),
+        (
+            "evidence_refs",
+            serde_json::to_value(&context.source.evidence_refs).unwrap(),
+        ),
+    ] {
+        assert_eq!(source[name], expected);
+    }
+    let session = &context.source.source_session;
+    let projected = &source["source_session"];
+    assert_eq!(projected["version"], session.version);
+    assert_eq!(
+        projected["cursor"],
+        serde_json::to_value(&session.cursor).unwrap()
+    );
+    assert_eq!(projected["model_calls"], session.model_calls);
+    assert_eq!(projected["tool_calls"], session.tool_calls);
+    assert_eq!(
+        projected["root_model_call_ceiling"],
+        session.grant.max_model_calls
+    );
+    assert_eq!(
+        projected["root_tool_call_ceiling"],
+        session.grant.max_tool_calls
+    );
+    assert_eq!(
+        projected["active_model_call_ceiling"],
+        session.active_model_ceiling()
+    );
+    assert_eq!(
+        projected["active_tool_call_ceiling"],
+        session.funded_tool_call_ceiling()
+    );
+    assert_eq!(
+        projected["active_deadline_ms"],
+        session.active_deadline_ms()
+    );
+    assert_eq!(
+        projected["max_call_duration_ms"],
+        session.effective_call_duration_ms()
+    );
+    assert_eq!(
+        projected["last_observation"],
+        serde_json::to_value(&session.last_observation).unwrap(),
+    );
+    assert!(projected.get("grant").is_none());
+    let windows = projected["continuation_windows"].as_array().unwrap();
+    let history = &session.continuation.as_ref().unwrap().authorizations;
+    assert_eq!(windows.len(), history.len());
+    assert!(windows.len() > 1);
+    for (index, (projected, window)) in windows.iter().zip(history).enumerate() {
+        assert_eq!(
+            projected["content_ref"],
+            format!(
+                "adaptive-leadership-context:{}#context/source_session/continuation/authorizations/{index}",
+                context.context_digest,
+            )
+        );
+        assert_eq!(projected["review_id"], window.review_id.to_string());
+        assert_eq!(
+            projected["source"],
+            serde_json::to_value(&window.source).unwrap()
+        );
+        assert_eq!(projected["issued_at_ms"], window.issued_at_ms);
+        assert_eq!(projected["deadline_ms"], window.deadline_ms);
+        assert_eq!(
+            projected["additional_model_calls"],
+            window.additional_model_calls
+        );
+        assert_eq!(
+            projected["work_funding"],
+            serde_json::to_value(&window.work_funding.as_ref().unwrap().binding).unwrap()
+        );
+        assert!(projected["work_funding"].get("receipt").is_none());
+    }
+    let grant = &context.binding.grant;
+    assert_eq!(
+        source["review"]["leadership_role"],
+        serde_json::to_value(grant.leadership_principal.role).unwrap()
+    );
+    assert_eq!(source["review"]["assignment_id"], grant.assignment_id);
+    assert_eq!(
+        source["review"]["assignee_capabilities"],
+        serde_json::to_value(&grant.assignee_authority.capabilities).unwrap()
+    );
+    let funding = grant.work_funding.as_ref().unwrap();
+    assert_eq!(
+        source["review"]["work_funding"]["binding"],
+        serde_json::to_value(&funding.binding).unwrap()
+    );
+    assert!(prompt.contains("Operative funded total model/tool ceilings for this review: 64/64"));
+    assert!(prompt.contains(&format!(
+        "Actual continuation windows issued {}",
+        history.len()
+    )));
+    let private = context.private_observation.as_ref().unwrap();
+    assert_eq!(observation, serde_json::to_value(private).unwrap());
+    assert_eq!(private.output().get("content"), Some(&private_content));
+    let reference = session.last_observation.as_ref().unwrap();
+    private
+        .validate(
+            &reference.effect.id.to_string(),
+            &reference.effect.request_digest,
+        )
+        .unwrap();
+    assert_eq!(private.digest(), reference.observation_digest);
+    // Rendering is a private projection, not a new internal transport schema.
+    assert_eq!(serde_json::to_vec(&context).unwrap(), wire);
+    assert_eq!(
+        serde_json::from_slice::<LeadershipContext>(&wire).unwrap(),
+        context
+    );
+    assert_eq!(fixture.read(), before);
+    assert_eq!(fixture.calls(), calls);
+}
+
+#[test]
 fn authentic_private_observation_cannot_overflow_total_leadership_context() {
     let mut fixture = Fixture::continued();
     while fixture.session.model_calls + 1 < fixture.session.active_model_ceiling() {
@@ -3942,7 +4168,7 @@ fn authentic_private_observation_cannot_overflow_total_leadership_context() {
     assert!(reconcile_review_at(&fixture.api, &fixture.project(), now));
     let call = fixture.calls().into_iter().find(is_budget).unwrap();
     // The observation has a real retained digest and the public source validates;
-    // production preparation must reject the oversized combined private context.
+    // production preparation and rendering must reject it at the same prompt bound.
     call.context.validate(&call.grant).unwrap();
     let observation = fixture.private_observation(&request.invocation_id);
     observation
@@ -3955,6 +4181,22 @@ fn authentic_private_observation_cannot_overflow_total_leadership_context() {
     let before = fixture.read();
     let calls = fixture.calls();
     let binding = LeadershipAuthority::from_call(&call);
+    let context = LeadershipContext {
+        binding: binding.clone(),
+        source: call.context.clone(),
+        context_digest: call.context_digest().unwrap(),
+        private_observation: Some(observation),
+        accounting: None,
+        accounting_correction: None,
+    };
+    assert_eq!(
+        context.prompt(),
+        Err("private leadership context exceeds bound")
+    );
+    assert_eq!(
+        context.validate_dispatch(now_unix_ms()),
+        Err("private leadership context exceeds bound")
+    );
     assert_eq!(
         fixture
             .with_workbench_store(|| fixture.api.prepare_leadership_review(&binding))
