@@ -9,6 +9,131 @@ use crate::{
 
 mod expired_replacement;
 
+struct HistoricalRecoveryJournal {
+    connection: usize,
+    source: crate::AdaptiveSessionV1,
+    binding: String,
+}
+
+thread_local! {
+    static HISTORICAL_RECOVERY_JOURNAL: std::cell::RefCell<Option<HistoricalRecoveryJournal>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct HistoricalRecoveryJournalGuard;
+
+impl Drop for HistoricalRecoveryJournalGuard {
+    fn drop(&mut self) {
+        HISTORICAL_RECOVERY_JOURNAL.with(|active| {
+            active.borrow_mut().take();
+        });
+    }
+}
+
+// Historical step proofs must never be reused as ordinary full-membership
+// proofs, or collide with an ordinary step currently validating its successor.
+pub(crate) fn historical_journal_proof_binding(
+    connection: &Connection,
+    session_id: Uuid,
+) -> Option<String> {
+    HISTORICAL_RECOVERY_JOURNAL.with(|active| {
+        active.borrow().as_ref().and_then(|proof| {
+            (proof.connection == connection as *const Connection as usize
+                && proof.source.grant.session_id == session_id)
+                .then(|| proof.binding.clone())
+        })
+    })
+}
+
+pub(super) fn require_recovery_journal_source(
+    connection: &Connection,
+    receipt: &crate::AdaptiveFundedReviewRecoveryReceiptV1,
+) -> Result<(), WorkflowError> {
+    require_recovery_journal_source_with_observer(connection, receipt, || Ok(()))
+}
+
+#[cfg(test)]
+pub(super) fn observe_recovery_journal_source(
+    connection: &Connection,
+    receipt: &crate::AdaptiveFundedReviewRecoveryReceiptV1,
+    after_replay: impl FnOnce() -> Result<(), WorkflowError>,
+) -> Result<(), WorkflowError> {
+    require_recovery_journal_source_with_observer(connection, receipt, after_replay)
+}
+
+fn require_recovery_journal_source_with_observer(
+    connection: &Connection,
+    receipt: &crate::AdaptiveFundedReviewRecoveryReceiptV1,
+    after_replay: impl FnOnce() -> Result<(), WorkflowError>,
+) -> Result<(), WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        let source = &receipt.context.source_session;
+        let epoch = receipt
+            .grant_template
+            .work_funding
+            .as_ref()
+            .ok_or_else(corrupt)?;
+        if !source.continuation.as_ref().is_some_and(|state| {
+            state
+                .authorizations
+                .iter()
+                .any(|authorization| authorization.work_funding.is_some())
+        }) {
+            crate::store::adaptive::require_funding_journal_source(connection, epoch, source)?;
+            return after_replay();
+        }
+        let binding = canonical_sha256(
+            "sentinel.workflow.recovery-historical-journal-proof.v1",
+            &(epoch, source),
+        )?;
+        // This is a temporary owned proof input, not a pre-write proof or an
+        // authority cache. Its clone remains inside the existing scope budget.
+        validation_scope::charge_bytes(connection, encode(source)?.len())?;
+        HISTORICAL_RECOVERY_JOURNAL.with(|active| {
+            let mut active = active.borrow_mut();
+            if active.is_some() {
+                return Err(corrupt());
+            }
+            *active = Some(HistoricalRecoveryJournal {
+                connection: connection as *const Connection as usize,
+                source: source.clone(),
+                binding,
+            });
+            Ok(())
+        })?;
+        let _guard = HistoricalRecoveryJournalGuard;
+        crate::store::adaptive::require_funding_journal_source(connection, epoch, source)?;
+        after_replay()
+    })
+}
+
+fn is_historical_recovery_authorization(
+    connection: &Connection,
+    authorization: &AdaptiveContinuationAuthorizationV1,
+    authority: &RuntimeAuthoritySnapshotV1,
+) -> Result<bool, WorkflowError> {
+    HISTORICAL_RECOVERY_JOURNAL.with(|active| {
+        let active = active.borrow();
+        let Some(proof) = active.as_ref().filter(|proof| {
+            proof.connection == connection as *const Connection as usize
+                && proof.source.grant.session_id == authorization.session_id
+        }) else {
+            return Ok(false);
+        };
+        if proof.source.grant.authority != *authority
+            || authorization.source_session_version >= proof.source.version
+            || !proof
+                .source
+                .continuation
+                .as_ref()
+                .is_some_and(|state| state.authorizations.contains(authorization))
+        {
+            return Err(corrupt());
+        }
+        Ok(true)
+    })
+}
+
 #[cfg(test)]
 mod issue_856_receipt_lookup_snapshot_tests;
 
@@ -461,6 +586,20 @@ pub(crate) fn require_funding_authorization_membership(
     authority: &RuntimeAuthoritySnapshotV1,
 ) -> Result<(), WorkflowError> {
     validation_scope::with_scope(connection, || {
+        // A complete selected-head replay authenticates exact immutable
+        // membership, not future successor history that may depend on this
+        // very prefix. The ordinary caller still validates that full relation.
+        if is_historical_recovery_authorization(connection, authorization, authority)? {
+            let leaf = expired_replacement::sealed_adoption(
+                connection,
+                &authority.tenant_id,
+                &adoption_id(authority, authorization)?,
+            )?;
+            if leaf.authorization != *authorization || leaf.authority != *authority {
+                return Err(corrupt());
+            }
+            return Ok(());
+        }
         let leaf: FundingAdoptionLeaf = get_entity(
             connection,
             &authority.tenant_id,

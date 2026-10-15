@@ -15,12 +15,7 @@ pub(super) fn require_recovery_journal_head(
     receipt: &AdaptiveFundedReviewRecoveryReceiptV1,
 ) -> Result<(), WorkflowError> {
     let session = &receipt.context.source_session;
-    let epoch = receipt
-        .grant_template
-        .work_funding
-        .as_ref()
-        .ok_or_else(corrupt)?;
-    crate::store::adaptive::require_funding_journal_source(connection, epoch, session)?;
+    adaptive_work_funding::require_recovery_journal_source(connection, receipt)?;
     // Prefix replay authenticated this exact version's bytes and digest. Read
     // only its scalar digest in the same snapshot, not a later current head.
     let digest: String = connection.query_row(

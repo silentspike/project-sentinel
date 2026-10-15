@@ -1,5 +1,16 @@
 # Changelog
 
+- Bound leadership model input by its rendered decision view rather than
+  duplicated internal authority envelopes. Preserve complete validated source
+  history and private evidence, expose immutable history references and exact
+  operative budgets, and include perception in the final message bound.
+  Preserve legacy unmarked budget prompts as well as legacy wire bytes.
+  Reuse a grant/context digest only within one immutable entity validation;
+  keep standalone checks, persisted membership and corruption detection.
+  Authenticate replacement-funded recovery through an exact historical prefix
+  without recursively validating its successor. Isolate historical step proofs
+  and retain full epoch checks after publication, rollback and unwind (#856).
+
 - Share immutable validated read results without cloning their complete payloads,
   preserve full retention accounting and exact database-input invalidation, and
   reuse one source snapshot within each adaptive admission gate. Recheck fresh
