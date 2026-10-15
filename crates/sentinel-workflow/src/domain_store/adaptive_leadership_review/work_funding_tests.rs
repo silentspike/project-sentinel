@@ -1,4 +1,8 @@
 use super::*;
+
+mod issue856_recovery_read_cache_tests {
+    include!("work_funding_tests/recovery_read_cache_tests.rs");
+}
 use crate::{AdaptiveWorkFundingEpochV1, AdaptiveWorkFundingLimitsV1, AdaptiveWorkFundingReceiptV1};
 
 const WINDOW_MS: u64 = 180_000;

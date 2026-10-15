@@ -1743,24 +1743,28 @@ impl WorkflowStore {
         connection: &Connection,
         call: &AdaptiveLeadershipReviewCallV1,
     ) -> Result<(), WorkflowError> {
-        if call.grant.work_funding.is_some() {
-            require_funding_review_membership(
-                connection,
-                &call.grant,
-                &call.context_digest()?,
-                call.operation_id,
-            )?;
-            require_budget_source(connection, &call.grant, &call.context)
-        } else if call.grant.resume_policy.is_some() {
-            require_resume_review_membership(
-                connection,
-                &call.grant,
-                &call.context_digest()?,
-                call.operation_id,
-            )
-        } else {
-            require_budget_source(connection, &call.grant, &call.context)
-        }
+        // Membership and budget validation overlap on the full journal. After an
+        // allowance write, share only fresh proofs within this read-only composition.
+        validation_scope::with_scope(connection, || {
+            if call.grant.work_funding.is_some() {
+                require_funding_review_membership(
+                    connection,
+                    &call.grant,
+                    &call.context_digest()?,
+                    call.operation_id,
+                )?;
+                require_budget_source(connection, &call.grant, &call.context)
+            } else if call.grant.resume_policy.is_some() {
+                require_resume_review_membership(
+                    connection,
+                    &call.grant,
+                    &call.context_digest()?,
+                    call.operation_id,
+                )
+            } else {
+                require_budget_source(connection, &call.grant, &call.context)
+            }
+        })
     }
 
     /// Build the shared local-adoption audit proposal; this is not proof of a durable append.
@@ -3379,6 +3383,10 @@ mod tests {
 
         mod completion_validation_tests {
             include!("adaptive_leadership_review/completion_validation_tests.rs");
+        }
+
+        mod issue856_authority_source_sharing_tests {
+            include!("adaptive_leadership_review/issue856_authority_source_sharing_tests.rs");
         }
     }
     mod recovery_tests {

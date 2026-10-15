@@ -693,8 +693,21 @@ impl WorkflowStore {
         tenant: &TenantId,
         session_id: Uuid,
     ) -> Result<Option<AdaptiveResumePolicyReceiptV1>, WorkflowError> {
-        let connection = self.connection.lock().map_err(|_| persistence())?;
-        read_resume_policy_leaf(&connection, tenant, session_id)
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        // Preserve identity-error precedence before the snapshot touches SQLite.
+        adaptive_resume_policy_id(tenant, session_id)?;
+        let query_key = serde_json::to_vec(&(tenant, session_id)).map_err(|_| persistence())?;
+        // Reuse only the persisted leaf proof, never current execution authority.
+        self.validated_read_snapshot(
+            &mut connection,
+            "adaptive-resume-policy-exact",
+            &query_key,
+            |snapshot| {
+                validation_scope::with_scope(snapshot, || {
+                    read_resume_policy_leaf(snapshot, tenant, session_id)
+                })
+            },
+        )
     }
 }
 
@@ -904,3 +917,7 @@ fn conflict() -> WorkflowError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "adaptive_resume_policy/issue_856_policy_read_reuse_tests.rs"]
+mod issue_856_policy_read_reuse_tests;
