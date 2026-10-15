@@ -1,5 +1,13 @@
 # Changelog
 
+- Coalesce simultaneous durable completion recovery for the same request and
+  store instance without serializing unrelated work. Refresh the exact stored
+  response before admission so stale recovery batches do not repeat expensive
+  authority validation after another consumer has completed the response.
+  Share fresh post-continuation proofs only until the next allowance write;
+  never carry pre-write proofs across mutations. Retain durable claims, owner
+  binding, corruption detection, fixed budgets and retryable failures (#856).
+
 - Batch funding-review evidence reads in one validated snapshot and reuse
   continuation preflight proofs only until the first write. Retain fresh
   post-write journal validation, complete history and corruption checks, fixed

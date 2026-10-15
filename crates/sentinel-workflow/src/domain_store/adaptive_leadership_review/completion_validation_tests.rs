@@ -18,14 +18,14 @@ fn assert_completion_proof_phases(
             Some(&1),
         );
     }
-    let post_write = scopes
-        .iter()
-        .skip(1)
-        .find(|scope| scope.contains_key("adaptive-journal"))
-        .expect("fresh production journal validation after the write");
+    let post_write = scopes.get(1).expect("fresh post-write allowance preflight");
     assert_eq!(post_write.get("adaptive-journal"), Some(&1));
     assert_eq!(post_write.get("adaptive-journal-entry"), Some(&(entries + 1)));
     assert_eq!(post_write.get("adaptive-journal-step"), Some(&(entries + 1)));
+    assert_eq!(post_write.get("historical-project"), Some(&1));
+    assert!(post_write.get("budget-source").is_some_and(|count| *count > 0));
+    let post_write_nodes: usize = post_write.values().sum();
+    assert!(post_write_nodes <= 16_384);
     assert_eq!(validation_scope::validations("adaptive-journal"), 0);
 }
 
@@ -326,5 +326,150 @@ fn completion_preflight_budget_errors_clean_up_before_production_retry() {
         assert_completion_proof_phases(&scopes, &call.context.source_session, true);
         assert_eq!(session(&f).version, call.context.source_session.version + 1);
         assert!(f.store.connection.lock().unwrap().is_autocommit());
+    }
+}
+
+#[test]
+fn completion_post_write_scope_ends_before_abandonment_write_and_rejects_corruption() {
+    for target in ["journal", "membership-event"] {
+        let (f, _, now) = funded_fixture();
+        let call = dispatch(&f, now);
+        let result = continued(&call, now + 2, 5);
+        let damage = match target {
+            "journal" => format!(
+                "UPDATE workflow_operations SET request_digest='invalid'
+                 WHERE operation_namespace='adaptive-session-v1:{}'
+                 AND operation_id='00000000000000000001';",
+                call.grant.session_id,
+            ),
+            "membership-event" => "DELETE FROM company_events
+                WHERE event_type='adaptive_work_funding_review_issued';"
+                .to_owned(),
+            _ => unreachable!(),
+        };
+        // These proofs were valid in the fresh post-write scope, before the next write.
+        f.store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER corrupt_completion_after_abandonment
+                 AFTER INSERT ON company_entities WHEN NEW.entity_kind='{ABANDONED_KIND}'
+                 BEGIN {damage} END;",
+            ))
+            .unwrap();
+        let before = rows(&f.store);
+        let (failed, scopes) = validation_scope::with_completed_validations(|| {
+            f.store
+                .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+        });
+        assert_eq!(failed.unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        assert_completion_proof_phases(&scopes, &call.context.source_session, true);
+        assert!(scopes[2..]
+            .iter()
+            .all(|scope| !scope.contains_key("adaptive-journal")));
+        assert_eq!(rows(&f.store), before);
+        assert_eq!(session(&f), call.context.source_session);
+        assert!(f.store.connection.lock().unwrap().is_autocommit());
+        f.store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER corrupt_completion_after_abandonment")
+            .unwrap();
+        let (retried, scopes) = validation_scope::with_completed_validations(|| {
+            f.store
+                .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+        });
+        retried.unwrap();
+        assert_completion_proof_phases(&scopes, &call.context.source_session, true);
+        assert_eq!(session(&f).version, call.context.source_session.version + 1);
+    }
+}
+
+#[test]
+fn completion_post_write_scope_budget_errors_preserve_outer_transaction_and_retry() {
+    for pressure in ["bytes", "nodes"] {
+        let (f, _, now) = funded_fixture();
+        let call = dispatch(&f, now);
+        let result = continued(&call, now + 2, 5);
+        let authorization = result.continuation.as_ref().unwrap();
+        let allowance = call
+            .continuation_allowance(
+                authorization.issued_at_ms,
+                authorization.deadline_ms,
+                authorization.additional_model_calls,
+            )
+            .unwrap();
+        let before = rows(&f.store);
+        let mut connection = f.store.connection.lock().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (_, continued) = crate::store::adaptive::continue_adaptive_session_in_transaction(
+            &transaction,
+            authorization,
+            &call,
+            &allowance,
+            &call.grant.assignee_authority,
+            now + 2,
+        )
+        .unwrap();
+        // Apply bounded pressure only to the new post-write arena, not the earlier proofs.
+        let (failed, failures) = validation_scope::with_validation_failures(|| {
+            validation_scope::with_scope(&transaction, || {
+                if pressure == "bytes" {
+                    validation_scope::charge_bytes(&transaction, 64 * 1024 * 1024)?;
+                } else {
+                    for index in 0_u32..16_384 {
+                        validation_scope::memoize(
+                            &transaction,
+                            "completion-post-write-budget-pressure",
+                            &index,
+                            || Ok(()),
+                        )?;
+                    }
+                }
+                commit_continuation_allowance(
+                    &transaction,
+                    &call,
+                    authorization,
+                    &result,
+                    &continued,
+                    now + 2,
+                )
+            })
+        });
+        assert_eq!(failed.unwrap_err().code, WorkflowErrorCode::CorruptStore);
+        let first = failures.first().expect("recorded post-write arena exhaustion");
+        if pressure == "bytes" {
+            assert_eq!(first.reason, validation_scope::ValidationFailureReason::BytesLimit);
+            assert_eq!(first.bytes, 64 * 1024 * 1024);
+        } else {
+            assert_eq!(first.reason, validation_scope::ValidationFailureReason::NodeLimit);
+            assert_eq!(first.nodes, 16_384);
+        }
+        assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+        assert_eq!(validation_scope::validations("completion-post-write-budget-pressure"), 0);
+        assert!(!transaction.is_autocommit());
+        let head_version: i64 = transaction
+            .query_row(
+                "SELECT version FROM workflow_adaptive_heads WHERE session_id=?1",
+                [call.grant.session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(u64::try_from(head_version).unwrap(), continued.version);
+        transaction.rollback().unwrap();
+        assert!(connection.is_autocommit());
+        drop(connection);
+        assert_eq!(rows(&f.store), before);
+        let (completed, scopes) = validation_scope::with_completed_validations(|| {
+            f.store
+                .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+        });
+        completed.unwrap();
+        assert_completion_proof_phases(&scopes, &call.context.source_session, true);
+        assert_eq!(session(&f).version, continued.version);
     }
 }
