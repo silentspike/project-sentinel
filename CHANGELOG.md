@@ -1,5 +1,10 @@
 # Changelog
 
+- Reuse fully validated project, agreement and participant inputs within each
+  delivery-lineage adapter operation. Retain independent before/after authority
+  and aggregate checks, and record bounded phase timings for slow reads without
+  logging private project or credential data (#856).
+
 - Reuse canonical SHA-256 results only for identical serialized content,
   encoding and domain. Bound JSON retention inside the existing content-cache
   budget without displacing numeric-payload entries; stream oversized values

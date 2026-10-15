@@ -87,6 +87,24 @@ pub struct DeliveryReadinessSnapshotV1 {
     pub pending_publication_count: usize,
 }
 
+fn measure_lineage_read<T>(
+    phase: &'static str,
+    read: impl FnOnce() -> Result<T, DeliveryError>,
+) -> Result<T, DeliveryError> {
+    let started = std::time::Instant::now();
+    let result = read();
+    let elapsed = started.elapsed();
+    if elapsed >= std::time::Duration::from_millis(100) {
+        tracing::info!(
+            phase,
+            elapsed_us = elapsed.as_micros(),
+            succeeded = result.is_ok(),
+            "Slow delivery lineage read finished"
+        );
+    }
+    result
+}
+
 impl<I, S, E> DeliveryCore<I, S, E>
 where
     I: DeliveryIntegrationPort,
@@ -146,13 +164,17 @@ where
                 "principal has no public delivery-lineage reader role".to_string(),
             )
         })?;
-        let authority = self.require_current_authority(
-            context,
-            tenant_id,
-            role.clone(),
-            "read_public_delivery_lineage",
-        )?;
-        let aggregate = self.required_aggregate(tenant_id, project_id)?;
+        let authority = measure_lineage_read("principal_before", || {
+            self.require_current_authority(
+                context,
+                tenant_id,
+                role.clone(),
+                "read_public_delivery_lineage",
+            )
+        })?;
+        let aggregate = measure_lineage_read("aggregate_before", || {
+            self.required_aggregate(tenant_id, project_id)
+        })?;
         if role == AuthorityRole::Customer
             && !aggregate
                 .deliveries
@@ -179,7 +201,9 @@ where
             work_items_digest: candidate.work_items_digest.clone(),
             candidate_digest: candidate.candidate_digest.clone(),
         };
-        let candidate_authority = self.integration.candidate_authority(&candidate_query)?;
+        let candidate_authority = measure_lineage_read("candidate_before", || {
+            self.integration.candidate_authority(&candidate_query)
+        })?;
         validate_candidate_authority(
             &candidate_authority,
             candidate,
@@ -206,15 +230,18 @@ where
             query_digest: ContentDigest::zero(),
         }
         .seal()?;
-        let workflow = self.integration.workflow_lineage(&query)?;
-        let authority_after = self.require_current_authority(
-            context,
-            tenant_id,
-            role,
-            "read_public_delivery_lineage",
-        )?;
-        let candidate_authority_after = self.integration.candidate_authority(&candidate_query)?;
-        let aggregate_after = self.required_aggregate(tenant_id, project_id)?;
+        let workflow = measure_lineage_read("workflow_snapshot", || {
+            self.integration.workflow_lineage(&query)
+        })?;
+        let authority_after = measure_lineage_read("principal_after", || {
+            self.require_current_authority(context, tenant_id, role, "read_public_delivery_lineage")
+        })?;
+        let candidate_authority_after = measure_lineage_read("candidate_after", || {
+            self.integration.candidate_authority(&candidate_query)
+        })?;
+        let aggregate_after = measure_lineage_read("aggregate_after", || {
+            self.required_aggregate(tenant_id, project_id)
+        })?;
         if !same_authority_identity(&authority_after, &authority)
             || authority_after.contract_authority_generation
                 != candidate_authority.authority_generation
@@ -2794,9 +2821,11 @@ where
         tenant_id: &str,
         project_id: &str,
     ) -> Result<PublicDeliveryLineageDtoV1, DeliveryError> {
-        self.lineage_readiness()?;
-        self.core
-            .read_public_lineage_authorized(context, tenant_id, project_id)
+        measure_lineage_read("total", || {
+            measure_lineage_read("store_readiness", || self.lineage_readiness())?;
+            self.core
+                .read_public_lineage_authorized(context, tenant_id, project_id)
+        })
     }
 
     pub fn publish_pending(&self) -> Result<usize, DeliveryError> {
