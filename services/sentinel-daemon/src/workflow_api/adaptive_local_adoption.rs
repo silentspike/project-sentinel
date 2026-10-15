@@ -865,7 +865,7 @@ mod tests {
     use super::*;
 
     mod funded_local_adoption_tests {
-        include!("adaptive_local_adoption/funded_local_adoption_tests.rs");
+        include!("adaptive_local_adoption/tests/funded_local_adoption_tests.rs");
     }
 
     use super::super::adaptive_continuation_tests::{

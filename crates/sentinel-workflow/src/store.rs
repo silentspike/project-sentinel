@@ -2755,7 +2755,10 @@ mod tests {
             .unwrap_or_else(|_| "replacement_source".into());
         assert!(matches!(
             mode.as_str(),
-            "replacement_source" | "funding_review_selection" | "funding_review_reads"
+            "replacement_source"
+                | "funding_review_selection"
+                | "funding_review_reads"
+                | "adaptive_health_inventory"
         ));
         if mode == "funding_review_reads" {
             diagnose_funding_review_reads(&store, &operator);
@@ -2769,6 +2772,15 @@ mod tests {
         }
         let (result, failures) =
             crate::domain_store::validation_scope::with_validation_failures(|| {
+                if mode == "adaptive_health_inventory" {
+                    return store
+                        .adaptive_health_inventory()
+                        .map(|_| true)
+                        .map_err(|error| match error {
+                            super::AdaptiveHealthReadError::Projects(error)
+                            | super::AdaptiveHealthReadError::Sessions(error) => error,
+                        });
+                }
                 if mode == "funding_review_selection" {
                     return store
                         .adaptive_work_funding_for_review(
