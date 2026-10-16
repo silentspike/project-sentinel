@@ -1,5 +1,40 @@
 # Changelog
 
+- Authenticate completed adaptive producer journals before transferring work
+  to independent QA or a bounded correction. Preserve unknown effects, original
+  producer proof and immutable review history while allowing a fresh authorized
+  correction to replace the completed queue head. Validate archived QA rework
+  consistently in ordinary and batch reads (#856).
+
+- Reuse one validated standing-funding source observation across a reconciliation
+  pass. Distinguish an expired unadopted manual deferral from live, adopted or
+  unresolved funding; retain the complete immutable deferral/standing chain
+  instead of issuing duplicate work or dropping historical authority (#856).
+
+- Add isolated, owner-leased lab lifecycle controls with fixed-address conflict
+  checks, balloon admission, guarded host headroom, complete isolation readback
+  and recoverable snapshot intents. Keep sanitized guest identities separate
+  from production data and preserve investigation/rollback snapshots (#856).
+
+- Add counted, pinned nextest archives and an optimized CI test profile with
+  debug assertions and overflow checks retained. Bind source fixtures, helper
+  binaries, exact test inventories, disjoint lab partitions and JUnit receipts;
+  keep compiler, doctest, privileged and optional coverage explicit rather than
+  treating missing or skipped tests as passed (#856).
+
+- Bind aggregate qualification to a separately frozen applicability plan,
+  original build inputs, exact reviewed head and unchanged promoted artifacts.
+  Reject failed routing, incomplete shards, stale receipts and foreign checks;
+  retain existing required CI while authenticated shadow reporting is qualified.
+  Keep untrusted fork jobs on hosted infrastructure and require exact-head
+  matching in the protected merge path (#856).
+
+- Add bounded read-only runtime and desktop probes, separately attributed
+  provider/internal phase observations, comparable release-measurement checks
+  and explicit developer/independent-QA/correction/delivery evidence bindings.
+  Preserve fixture, missing-delivery and low-sample limitations; mechanism tests
+  and infrastructure progress never imply genuine product acceptance (#856).
+
 - Allow an optional, protected standing operator policy to propose a distinct
   zero-addition funding epoch after a genuine funded Defer. Issue at most once
   per policy generation and exact execution head, retain the original decision
