@@ -348,6 +348,49 @@ The daemon validates authorization before dispatch. The runtime validates reques
 
 Stdout/stderr are bounded and redacted. Full private logs may live in protected runtime storage; public events carry structured summaries and safe references.
 
+### Native coding and independent QA
+
+Python and Node source packages include `sentinel-qa.json`, describing one to
+64 concrete behavioral cases derived from the accepted requirements. Each case
+names a packaged relative script and supplies `id`, `script`, `args`, `stdin`,
+`expected_stdout`, `expected_stderr`, and `expected_exit`. The independent
+evaluator executes the script against read-only source and compares actual
+output and exit status. An employee's test count, summary or claim of success
+is not an execution receipt or independent approval.
+
+The same package contract is presented for one-shot and adaptive coding. Fresh
+adaptive Python/Node requests bind `native_qa_contract_version=1`; an absent
+marker preserves the original prompt and request bytes. Reserved reconstruction
+matches legacy presentations before versioned ones, including numeric and
+enriched working memory. Unknown versions and non-native marker use reject.
+The contract stays within the existing prompt bound and never disappears merely
+to make a request fit. A binary that cannot read retained marked contexts is not
+a compatible downgrade target.
+
+Proposing completion is not marking a work item Done. The server verifies the
+observed package, executes the admitted completion plan, seals its outputs and
+checks the work-item gate. Only then can independent source review be assigned.
+The handoff recognizes either the existing one-shot dispatch or an authenticated
+adaptive journal ending in the exact proposed completion. The latter must agree
+with the resolving model effect, completed execution plan, terminal artifacts,
+gate evidence and assignment lineage. It does not manufacture a one-shot call.
+
+Historical reads and rework bind the original producer and its current or
+archived execution, not whichever session or allowance is newest. Missing,
+ambiguous, changed or future-only evidence cannot authorize review. A distinct
+QA employee receives a separately bounded source-review call; that review is
+not silently routed back into developer coding. Technical behavioral QA and
+release approval remain separate, and customer acceptance remains explicit.
+
+A sealed negative review can start a bounded correction of the same assigned
+work. It preserves the original completed journal, execution, artifact and QA
+report, and admits a new execution revision with their exact feedback binding.
+For adaptive work, leadership delegates the ordinary 16-call correction phase;
+it neither clones a shortened final continuation window nor transfers previous
+funding or refunds prior usage. The independent QA call has one model turn and
+the ordinary call duration. Existing correction-count and project cost bounds
+remain enforced. Pending or unknown effects never qualify as completed work.
+
 ### Retained correction evidence
 
 Inspecting a file changes the employee's latest observation, but does not erase
@@ -432,6 +475,20 @@ the already adopted lifetime ceilings and require remaining model and tool
 capacity. They cannot borrow an unadopted proposal, refund spending, replace a
 pending manual proposal or bypass an unknown provider outcome. Existing global
 review, window, receipt and call bounds remain operative.
+
+An expired, unadopted manual proposal whose exact funded review durably chose
+Defer is terminal history, not a live proposal. A standing successor may exclude
+that manual proposal from selection only after authenticating the completion
+event, closed review history, unchanged journal head and authority. The manual
+receipt and Defer remain immutable; only a new genuine Continue may adopt the
+new epoch. Undispatched, unknown, unreviewed or still-live manual proposals remain
+barriers. A standing proposal cannot use this exclusion to replace another
+standing proposal, even after expiry or a configured generation change.
+
+The terminal-manual relationship remains necessary after successor adoption.
+Older binaries that count both receipts as pending are not compatible rollback
+targets once that successor exists. Preserve the records and use a compatible
+forward repair rather than restoring or deleting business history.
 
 The immutable proposal identity depends on the tenant, session, exact journal
 head, policy ID and explicitly configured generation, not on changing review

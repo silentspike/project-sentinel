@@ -78,11 +78,18 @@ pub(super) fn restart(
     let prior_source = project
         .source_review_previous_call
         .as_ref()
-        .filter(|allowance| {
-            allowance.grant.work_item_id == *source_work_item_id && allowance.dispatch.is_some()
-        })
+        .filter(|allowance| allowance.grant.work_item_id == *source_work_item_id)
         .ok_or_else(transition)?
         .clone();
+    if prior_source.dispatch.is_none() {
+        crate::store::adaptive::completion_proof::require_source_review_producer(
+            connection,
+            project,
+            &source,
+            &prior_source,
+            now_ms,
+        )?;
+    }
     let prior_review = project
         .subscription_call
         .as_ref()
@@ -257,7 +264,6 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
             || entry.source_work.output_receipts.len() != 1
             || entry.source_allowance.grant.work_item_id != *source_id
             || entry.review_allowance.grant.work_item_id != *review_id
-            || entry.source_allowance.dispatch.is_none()
             || entry.review_allowance.dispatch.is_none()
             || entry.source_allowance.allowance_id == entry.review_allowance.allowance_id
             || entry.archived_at_unix_ms < project.created_at_unix_ms
@@ -305,6 +311,24 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
         historical.abandoned_subscription_calls = entry.review_abandoned_calls.clone();
         subscription::validate(&historical)?;
         subscription::validate_allowance(project, &entry.source_allowance)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_persisted(
+    connection: &Connection,
+    project: &ProjectV1,
+) -> Result<(), WorkflowError> {
+    for entry in &project.archived_source_reviews {
+        if entry.source_allowance.dispatch.is_none() {
+            crate::store::adaptive::completion_proof::require_source_review_producer(
+                connection,
+                project,
+                &entry.source_work,
+                &entry.source_allowance,
+                entry.archived_at_unix_ms,
+            )?;
+        }
     }
     Ok(())
 }
