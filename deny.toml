@@ -108,6 +108,10 @@ skip = [
     # Reason: #632 decision investigate retained incompatible constraints; 2.14.0 is the unskipped baseline.
     # Revisit: remove when serde_with accepts indexmap 2.14.0 or leaves the graph.
     "indexmap@1.9.3",
+    # Forcing chain: io-lifetimes 2.0.4 <- fs-set-times@0.20.3 <- cap-primitives@4.0.3 <- wasmtime-wasi@49.0.3.
+    # Reason: #856 retains the security-fixed WASI 49 graph; cap-primitives@4.0.3 and io-extras@0.19.0 also require the incompatible io-lifetimes 3.0.1 major (unskipped baseline).
+    # Expiry: 2026-10-28. Revisit: remove when fs-set-times and the capability stack converge on one io-lifetimes major or leave the graph.
+    "io-lifetimes@2.0.4",
     # Forcing chain: itertools 0.13.0 <- criterion@0.8.2 and criterion-plot@0.8.2.
     # Reason: #632 decision investigate retained incompatible constraints; 0.14.0 is the unskipped baseline.
     # Revisit: remove when Criterion accepts itertools 0.14.0 or leaves the graph.
@@ -188,6 +192,10 @@ skip = [
     # Reason: #632 decision investigate retained incompatible constraints; 0.251.0 is the unskipped baseline.
     # Revisit: remove when both listed parents accept wasm-encoder 0.251.0 or leave the graph.
     "wasm-encoder@0.244.0",
+    # Forcing chain: wasm-encoder 0.258.3 <- wasmtime@49.0.3, wasm-compose@0.258.3, wasm-metadata@0.258.3 and wit-component@0.258.3.
+    # Reason: #856 preserves Wasmtime 49 security fixes; wat@1.262.0 -> wast@262.0.0 requires the incompatible pre-1.0 encoder 0.262.0 (unskipped baseline).
+    # Expiry: 2026-10-28. Revisit: remove when the Wasmtime/component and wat/wast stacks converge on one wasm-encoder minor or leave the graph.
+    "wasm-encoder@0.258.3",
     # Forcing chain: wasmparser 0.244.0 <- wasm-encoder/metadata@0.244.0, wit-component/parser@0.244.0.
     # Reason: #632 decision investigate retained incompatible constraints; 0.251.0 is the unskipped baseline.
     # Revisit: remove when the 0.244 component stack accepts wasmparser 0.251.0 or leaves the graph.
@@ -248,6 +256,10 @@ skip = [
     # Reason: #632 decision investigate retained incompatible constraints; 0.7.14 is the unskipped baseline.
     # Revisit: remove when toml_edit 0.20 accepts winnow 0.7.14 or leaves the graph.
     "winnow@0.5.40",
+    # Forcing chain: winnow 0.7.14 <- toml_edit@0.23.10+spec-1.0.0 <- bevy_macro_utils@0.18.0.
+    # Reason: #856 retains existing Bevy APIs; toml@1.1.8+spec-1.1.0 and toml_parser@1.1.5+spec-1.1.0 require incompatible winnow 1.0.4 (unskipped baseline).
+    # Expiry: 2026-10-28. Revisit: remove when Bevy's TOML editor and the TOML parser stack converge on one winnow major or leave the graph.
+    "winnow@0.7.14",
     # Forcing chain: wit-parser 0.244.0 <- wit-bindgen-core@0.51.0, wit-component@0.244.0.
     # Reason: #632 decision investigate retained incompatible constraints; 0.251.0 is the unskipped baseline.
     # Revisit: remove when both listed parents accept wit-parser 0.251.0 or leave the graph.
