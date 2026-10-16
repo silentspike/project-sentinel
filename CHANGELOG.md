@@ -1,5 +1,10 @@
 # Changelog
 
+- Reserve the full physical cold-boot memory promise before starting lab VMs,
+  retain uncertain start commitments and invalidation evidence, and guard actual
+  balloon growth retries. Keep shrink/no-op behavior and use private portable
+  scratch directories for controller tests on hosted CI (#856).
+
 - Bind mixed ignored-test applicability to independently frozen exact IDs,
   reasons and original partitions. Preserve schema-1 receipts and distinguish
   unexecuted tests from passing assertions throughout archive and signed
