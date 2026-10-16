@@ -19,7 +19,10 @@ use crate::{
 
 pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 3;
 pub(crate) mod adaptive;
-pub use adaptive::{AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot};
+pub use adaptive::{
+    AdaptiveModelAdoptionRead, AdaptiveModelAdoptionReadError,
+    AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot,
+};
 mod read_cache;
 mod revisions;
 pub(crate) use revisions::require_completed_source;
@@ -2822,6 +2825,7 @@ mod tests {
                 | "funding_review_selection"
                 | "funding_review_reads"
                 | "adaptive_health_inventory"
+                | "model_adoption_reads"
         ));
         let repeat = std::env::var_os("SENTINEL_DIAGNOSTIC_REPEAT")
             .map(|value| {
@@ -2837,6 +2841,16 @@ mod tests {
             repeat == 1 || mode == "adaptive_health_inventory",
             "repeat is supported only for adaptive_health_inventory"
         );
+        if mode == "model_adoption_reads" {
+            diagnose_model_adoption_reads(&store, source.session_id);
+            let connection = store.connection.lock().unwrap();
+            assert!(connection.is_readonly("main").unwrap());
+            let after: i64 = connection
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(after, changes);
+            return;
+        }
         if mode == "funding_review_reads" {
             let result = diagnose_funding_review_reads(&store, &operator);
             let connection = store.connection.lock().unwrap();
@@ -2917,6 +2931,115 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn diagnose_model_adoption_reads(store: &super::WorkflowStore, session_id: uuid::Uuid) {
+        use crate::{AdaptiveModelAdoptionRead, AdaptiveModelAdoptionReadError};
+
+        // Raw metadata selects the retained case; neither path trusts it as proof.
+        let (head, command) = {
+            let connection = store.connection.lock().unwrap();
+            let version: i64 = connection
+                .query_row(
+                    "SELECT version FROM workflow_adaptive_heads WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let namespace = format!("adaptive-session-v1:{session_id}");
+            let head: Vec<u8> = connection
+                .query_row(
+                    "SELECT response FROM workflow_operations WHERE operation_namespace=?1 AND operation_id=?2",
+                    (&namespace, format!("{version:020}")),
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let resolved: Vec<u8> = connection
+                .query_row(
+                    "SELECT response FROM workflow_operations WHERE operation_namespace=?1
+                     AND json_extract(CAST(response AS TEXT),'$.command.kind')='resolve_model'
+                     ORDER BY operation_id DESC LIMIT 1",
+                    [&namespace],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let head: serde_json::Value = serde_json::from_slice(&head).unwrap();
+            let resolved: serde_json::Value = serde_json::from_slice(&resolved).unwrap();
+            (
+                serde_json::from_value::<crate::AdaptiveSessionV1>(head["session"].clone())
+                    .unwrap(),
+                serde_json::from_value::<crate::AdaptiveTransitionV1>(resolved["command"].clone())
+                    .unwrap(),
+            )
+        };
+        let crate::AdaptiveTransitionV1::ResolveModel {
+            effect,
+            result_digest,
+            decision,
+        } = command
+        else {
+            panic!("explicit retained ResolveModel required");
+        };
+        let grant = head.effective_grant();
+        let legacy = || {
+            let session = store
+                .adaptive_session(session_id, &grant.authority)?
+                .ok_or_else(super::corrupt_store)?;
+            assert!(session.effective_grant() == grant, "retained grant changed");
+            let adopted = store.adaptive_model_result_is_adopted(
+                &grant,
+                &effect,
+                &result_digest,
+                &decision,
+            )?;
+            Ok::<_, crate::WorkflowError>((session, adopted))
+        };
+        let batch = || match store
+            .adaptive_model_adoption_read(
+                &grant,
+                &grant.authority,
+                &effect,
+                &result_digest,
+                &decision,
+            )
+            .map_err(|error| match error {
+                AdaptiveModelAdoptionReadError::Session(error)
+                | AdaptiveModelAdoptionReadError::Replay(error) => error,
+            })? {
+            AdaptiveModelAdoptionRead::Current {
+                session,
+                already_adopted,
+            } => Ok((*session, already_adopted)),
+            _ => Err(super::corrupt_store()),
+        };
+        let mut previous = None;
+        for (trial, batch_first) in [(1, false), (2, true)] {
+            let mut compared = Vec::new();
+            for use_batch in [batch_first, !batch_first] {
+                store.validated_reads.lock().unwrap().clear();
+                let _ = store.take_read_cache_diagnostics();
+                let started = std::time::Instant::now();
+                let result = if use_batch { batch() } else { legacy() };
+                let elapsed = started.elapsed().as_micros();
+                let records = store.take_read_cache_diagnostics();
+                eprintln!(
+                    "READ_ONLY_ADOPTION trial={trial} batch={use_batch} succeeded={} elapsed_us={elapsed} diagnostics={} writes=0",
+                    result.is_ok(), records.len(),
+                );
+                let value = result.unwrap_or_else(|error| {
+                    panic!("retained adoption read failed: {:?}", error.code)
+                });
+                if let Some(previous) = &previous {
+                    assert!(&value == previous, "retained adoption results changed");
+                }
+                previous = Some(value.clone());
+                compared.push(value);
+            }
+            assert!(compared[0] == compared[1], "adoption compositions differ");
+        }
+        eprintln!(
+            "READ_ONLY_ADOPTION_RESULTS identical=true writes=0 scope=storage_read_composition"
+        );
     }
 
     fn diagnose_funding_review_reads(

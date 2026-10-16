@@ -15,6 +15,9 @@ use sentinel_workflow::{
 use tempfile::tempdir;
 use uuid::Uuid;
 
+#[path = "adaptive_execution/adoption_core.rs"]
+mod adoption_core;
+
 const NOW: u64 = 1_900_000_000_000;
 
 fn authority() -> RuntimeAuthoritySnapshotV1 {

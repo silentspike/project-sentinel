@@ -1,5 +1,13 @@
 # Changelog
 
+- Apply the existing duration-plus-dispatch-margin admission rule to funded
+  work windows before preparing a new model call. Read the authorized adaptive
+  head and exact historical result status in one validated snapshot, sharing
+  immutable journal owners instead of decoding their complete payloads again.
+  Preserve fresh organization authority, final transactional checks, exact
+  replay, abandoned-effect fencing and independent collaboration completion
+  evidence without changing deadlines, funding or employee decisions (#856).
+
 - Account an audited borrowed SQLite journal input and its single decoded owner
   with one monotone logical payload reservation plus the complete result
   remainder. Keep independent owned buffers separately charged, preserve fixed
