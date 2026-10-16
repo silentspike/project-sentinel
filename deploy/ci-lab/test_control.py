@@ -300,6 +300,7 @@ class LifecycleTests(unittest.TestCase):
             "vmid": 8602, "name": "ci-rollback", "preserve": True, "expires": 0, "state": "ready"}
         with patch.object(c.time, "time", return_value=1000), patch.object(self.lab, "stop") as stop, \
                 patch.object(c, "api", return_value=[{"vmid": 8602, "node": "lab-host", "status": "running"}]), \
+                patch.object(self.lab, "status", return_value={"status": "running"}), \
                 patch.object(c, "run") as command:
             result = self.lab.reap()
             stop.assert_called_once_with(8602)
@@ -355,6 +356,7 @@ class LifecycleTests(unittest.TestCase):
         with patch.object(c, "available_mib", side_effect=[6000, 6000, 8000, 8000]), \
                 patch.object(c, "api", return_value=[{"vmid": 9999, "status": "running"},
                                                    {"vmid": 8601, "status": "running"}]), \
+                patch.object(self.lab, "status", return_value={"status": "running"}), \
                 patch.object(self.lab, "owned") as owned, patch.object(self.lab, "stop") as stop:
             result = self.lab.guard()
             owned.assert_called_once_with(8601)
@@ -428,7 +430,7 @@ class LifecycleTests(unittest.TestCase):
                     base = {"owner": c.OWNER, "leases": {"8601": {
                         "holder": "old-job", "generation": "old-gen", "expires": 0 if lease_state == "expired" else 9999999999}},
                         "runs": {"8601": {"holder": "old-job", "generation": "old-gen", "vmgenid": "vm", "phase": "quiesced" if phase == "stopped" else phase}},
-                        "balloon_requests": {"8601": 4096}, "last_used": {},
+                        "balloon_requests": {} if phase == "stopped" else {"8601": 4096}, "last_used": {},
                         "snapshots": {"investigation": {"preserve": True}},
                         "invalidated_leases": [{"vmid": 8601, "lease": {"holder": "old-job"}}] if lease_state == "invalidated" else [],
                         "capacity_sample": self.sample}
@@ -468,9 +470,11 @@ class LifecycleTests(unittest.TestCase):
                     with patch.object(self.lab, "capacity_sample", return_value=unsafe), \
                             patch.object(c, "available_mib", return_value=6143), \
                             patch.object(c, "api", return_value=[{"vmid": 8601, "status": actual}]), \
-                            patch.object(self.lab, "owned"), patch.object(self.lab, "stop") as stop:
+                            patch.object(self.lab, "status", return_value={"status": actual}), \
+                            patch.object(self.lab, "owned"), \
+                            patch.object(self.lab, "stop", side_effect=c.CapacityUnavailable("in flight") if phase == "starting" else None) as stop:
                         self.lab.guard()
-                        self.assertEqual(stop.call_count, int(phase == "running"))
+                        self.assertEqual(stop.call_count, int(phase != "stopped"))
                     self.assertEqual(self.lab.state["balloon_requests"], base["balloon_requests"])
 
     def test_interrupted_start_requires_unlocked_task_free_stopped_readback(self):
@@ -492,6 +496,85 @@ class LifecycleTests(unittest.TestCase):
                 patch.object(c, "api", return_value=[{"id": "8601", "type": "qmstart", "endtime": 1}]):
             self.lab.lease(8601, "new", 1800)
         self.assertNotIn("8601", self.lab.state["balloon_requests"])
+
+    def test_guard_and_reap_find_running_owned_work_despite_stopped_or_missing_cluster_entry(self):
+        for hint in ([], [{"vmid": 8601, "status": "stopped"}]):
+            for operation in ("guard", "reap"):
+                with self.subTest(hint=hint, operation=operation):
+                    self.lab.state["runs"] = {"8601": {"phase": "running"}}
+                    self.lab.state["balloon_requests"] = {"8601": 4096}
+                    self.lab.state["last_used"]["8601"] = 0
+                    self.lab.state["capacity_baseline"] = self.sample
+                    self.lab.state["leases"]["8601"] = {"holder": "job", "expires": 9999999999 if operation == "guard" else 0}
+                    unsafe = {**self.sample, "available_mib": 6143}
+                    with patch.object(c, "api", return_value=hint), \
+                            patch.object(self.lab, "status", return_value={"status": "running"}) as status, \
+                            patch.object(self.lab, "capacity_sample", return_value=unsafe), \
+                            patch.object(c, "available_mib", return_value=6143), \
+                            patch.object(self.lab, "owned"), patch.object(self.lab, "stop") as stop:
+                        getattr(self.lab, operation)()
+                        status.assert_called_once_with(8601)
+                        stop.assert_called_once_with(8601)
+
+    def test_guard_cluster_running_actual_quiesced_does_not_stop_or_invalidate_idle_job(self):
+        self.lab.state["runs"] = {"8601": {"phase": "quiesced"}}
+        self.lab.state["capacity_baseline"] = self.sample
+        with patch.object(c, "api", return_value=[{"vmid": 8601, "status": "running"}]), \
+                patch.object(self.lab, "status", return_value={"status": "stopped"}), \
+                patch.object(self.lab, "stop") as stop:
+            self.lab.guard()
+            stop.assert_not_called()
+        self.assertNotIn("capacity_baseline", self.lab.state)
+        self.assertEqual(self.lab.state.get("invalidated_leases", []), [])
+
+    def test_unsafe_pending_task_invalidates_without_releasing_baseline_or_promise(self):
+        self.lab.state["runs"] = {"8601": {"phase": "starting"}}
+        self.lab.state["balloon_requests"] = {"8601": 4096}
+        self.lab.state["capacity_baseline"] = copy.deepcopy(self.sample)
+        self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "g", "expires": 9999999999}
+        baseline = copy.deepcopy(self.lab.state["capacity_baseline"])
+        def api(path):
+            return [{"id": "8601", "type": "qmstart"}] if path.endswith("/tasks") else []
+        unsafe = {**self.sample, "available_mib": 6143}
+        with patch.object(c, "api", side_effect=api), patch.object(self.lab, "owned", return_value={}), \
+                patch.object(self.lab, "status", return_value={"status": "stopped"}), \
+                patch.object(self.lab, "capacity_sample", return_value=unsafe), \
+                patch.object(c, "available_mib", return_value=6143), patch.object(c, "run") as effect:
+            result = self.lab.guard()
+            self.assertEqual(result["pressure_stopped"], [])
+            self.assertEqual(result["quiescence_pending"][0]["vmid"], 8601)
+            effect.assert_not_called()
+            self.lab.state["leases"]["8601"]["expires"] = 0
+            self.lab.state["last_used"]["8601"] = 0
+            self.assertEqual(self.lab.reap()["quiescence_pending"][0]["vmid"], 8601)
+        self.assertEqual(self.lab.state["capacity_baseline"], baseline)
+        self.assertEqual(self.lab.state["balloon_requests"]["8601"], 4096)
+        self.assertEqual(self.lab.state["runs"]["8601"]["phase"], "starting")
+        self.lab.state["leases"]["8601"]["expires"] = 9999999999
+        with self.assertRaises(RuntimeError):
+            self.lab.require_lease(8601, "job")
+        # A late effect cannot become valid just because the host recovered
+        # or the same holder renewed its lease expiration.
+        self.lab.state["leases"]["8601"]["expires"] += 60
+        with patch.object(c, "api", return_value=[]), patch.object(self.lab, "owned", return_value={}), \
+                patch.object(self.lab, "status", return_value={"status": "running"}), \
+                patch.object(self.lab, "stop") as stop:
+            recovered = self.lab.guard()
+            stop.assert_called_once_with(8601)
+        self.assertEqual(recovered["pressure_stopped"], [8601])
+        self.assertEqual(len(self.lab.state["invalidated_leases"]), 1)
+
+    def test_unknown_owned_activity_preserves_baseline_and_pending_commitment(self):
+        self.lab.state["runs"] = {"8601": {"phase": "starting"}}
+        self.lab.state["balloon_requests"] = {"8601": 4096}
+        self.lab.state["capacity_baseline"] = copy.deepcopy(self.sample)
+        with patch.object(c, "api", return_value=[]), patch.object(self.lab, "status", return_value={"status": "unknown"}), \
+                patch.object(self.lab, "stop") as stop:
+            with self.assertRaises(c.CapacityUnavailable):
+                self.lab.guard()
+            stop.assert_not_called()
+        self.assertEqual(self.lab.state["capacity_baseline"], self.sample)
+        self.assertEqual(self.lab.state["balloon_requests"]["8601"], 4096)
 
     def test_expired_or_released_running_guest_cannot_transfer(self):
         for holder in ("old-job", "new-job"):
@@ -564,13 +647,11 @@ class LifecycleTests(unittest.TestCase):
 
     def test_idle_reaper_never_queries_already_stopped_slots(self):
         self.lab.state["last_used"] = {"8601": 0, "8602": 0}
-        self.lab.state["runs"] = {"8601": {"phase": "starting"}}
         with patch.object(c, "api", return_value=[{"vmid": 8601, "node": "lab-host", "status": "stopped"}]) as query, \
                 patch.object(self.lab, "stop") as stop:
             self.lab.reap()
             stop.assert_not_called()
             query.assert_called_once_with("/cluster/resources")
-        self.assertEqual(self.lab.state["runs"]["8601"]["phase"], "starting")
 
     def test_unmanaged_unknown_potential_is_not_an_admission_prerequisite(self):
         guest = {"vmid": 9999, "node": "lab-host", "type": "qemu", "status": "running", "maxmem": 65536 * c.MIB}
@@ -605,6 +686,7 @@ class LifecycleTests(unittest.TestCase):
                 with patch.object(self.lab, "capacity_sample", side_effect=RuntimeError("unavailable") if cause == "missing" else lambda: sample), \
                         patch.object(c, "available_mib", return_value=12000), \
                         patch.object(c, "api", return_value=[{"vmid": 9999, "status": "running"}, {"vmid": 8601, "status": "running"}]), \
+                        patch.object(self.lab, "status", return_value={"status": "running"}), \
                         patch.object(self.lab, "owned") as owned, patch.object(self.lab, "stop") as stop:
                     result = self.lab.guard()
                     self.assertTrue(result["capacity_safety"]["reasons"])

@@ -75,6 +75,12 @@ cluster hints in both directions, including just-started guests and guard stops.
 | running | expired | refused | refused | stop first |
 | running | invalidated | refused | refused | stop and cleanup first |
 
+Guard and expired-job cleanup read fresh owned running/starting/pending activity,
+even when the cluster cache says stopped or omits the entry. An unsafe sample
+invalidates uncertain starting leases too; a late boot remains invalid and is
+stopped even after host pressure recovers. The initial managed-growth baseline
+survives until every owned running/pending promise is proven quiescent. Active
+start tasks return bounded quiescence-pending results, never a cleared promise.
 An unsafe guard sample stops actual running owned guests regardless of lease
 state. It never discards an uncertain stopped start promise. Missing process
 telemetry on a running owned guest remains a bounded capacity wait, not zero

@@ -692,6 +692,28 @@ class Lab:
         if self.reconcile_snapshot(vmid, name) is not None:
             raise RuntimeError("snapshot deletion not yet proven")
 
+    def owned_activity(self, expired_only: bool = False) -> dict:
+        candidates = {v.get("vmid") for v in api("/cluster/resources")
+                      if v.get("vmid") in self.config["slots"] and v.get("status") == "running"}
+        for vmid in self.config["slots"]:
+            key = str(vmid)
+            if (self.state.get("runs", {}).get(key, {}).get("phase") in {"starting", "running"}
+                    or key in self.state.get("balloon_requests", {})
+                    or self.state["leases"].get(key, {}).get("expires", 0) > time.time()):
+                candidates.add(vmid)
+        activity = {}
+        for vmid in sorted(candidates):
+            if expired_only and self.state["leases"].get(str(vmid), {}).get("expires", 0) > time.time():
+                continue
+            status = self.status(vmid)
+            if status.get("status") not in {"running", "stopped"}:
+                raise CapacityUnavailable("owned activity status unavailable; retain promises and baseline")
+            phase = self.state.get("runs", {}).get(str(vmid), {}).get("phase")
+            activity[vmid] = {"status": status["status"], "phase": phase,
+                              "promise": phase in {"starting", "running"}
+                              or str(vmid) in self.state.get("balloon_requests", {})}
+        return activity
+
     def guard(self) -> dict:
         before = available_mib()
         stopped = []
@@ -701,44 +723,60 @@ class Lab:
         except (OSError, RuntimeError, ValueError, IndexError, subprocess.SubprocessError) as error:
             sample = None
             safety = {"reasons": ["capacity-measurement-unavailable"], "error": str(error)}
-        active = [v for v in api("/cluster/resources")
-                  if v.get("vmid") in self.config["slots"] and v.get("status") == "running"]
-        if safety["reasons"]:
-            # An unsafe host window invalidates lab work, even if a lease is
-            # active. Stop only owned labs gracefully, never foreign guests.
-            for guest in active:
-                vmid = guest["vmid"]
+        activity = self.owned_activity()
+        pending = []
+        for vmid, current in activity.items():
+            lease = self.state["leases"].get(str(vmid))
+            invalidated = any(f.get("vmid") == vmid
+                              and (f.get("lease") or {}).get("holder") == (lease or {}).get("holder")
+                              for f in self.state.get("invalidated_leases", []))
+            reasons = list(safety["reasons"])
+            if current["phase"] == "running" and current["status"] == "stopped":
+                reasons.append("owned-run-unexpectedly-stopped")
+            affected = current["status"] == "running" or current["promise"]
+            if affected and (reasons or invalidated):
+                # Invalidation survives a late start and later pressure recovery.
                 self.owned(vmid)
-                fault = {"vmid": vmid, "time": time.time(), "reasons": safety["reasons"],
-                         "available_mib": available_mib(),
-                         "lease": self.state["leases"].get(str(vmid))}
-                self.state.setdefault("invalidated_leases", []).append(fault)
+                if not invalidated:
+                    self.state.setdefault("invalidated_leases", []).append({
+                        "vmid": vmid, "time": time.time(), "reasons": reasons,
+                        "available_mib": available_mib(), "lease": dict(lease) if lease else None})
                 self.save()
-                self.stop(vmid)
-                stopped.append(vmid)
+                try:
+                    self.stop(vmid)
+                    stopped.append(vmid)
+                    current.update(status="stopped", phase="quiesced", promise=False)
+                except CapacityUnavailable as error:
+                    pending.append({"vmid": vmid, "error": str(error)})
+        if safety["reasons"]:
             self.state["capacity_hold_until"] = time.time() + 15
         if sample:
             self.state["capacity_sample"] = sample
-        if not active or len(stopped) == len(active):
+        if not any(v["status"] == "running" or v["promise"] for v in activity.values()):
             self.state.pop("capacity_baseline", None)
         self.save()
         return {"available_before_mib": before, "available_after_mib": available_mib(),
                 "reserve_mib": self.config["reserve_mib"], "pressure_stopped": stopped,
+                "quiescence_pending": pending, "owned_activity": activity,
                 "capacity_safety": safety, "sample": sample}
 
     def reap(self) -> dict:
         now = time.time()
         stopped, removed = [], []
-        running = {v["vmid"] for v in api("/cluster/resources")
-                   if v.get("node") == self.config["node"] and v.get("status") == "running"}
+        activity = self.owned_activity(expired_only=True)
+        pending = []
         for vmid in self.config["slots"]:
             lease = self.state["leases"].get(str(vmid), {})
             if lease.get("expires", 0) > now:
                 continue
             last = self.state["last_used"].get(str(vmid), now)
-            if vmid in running and now - last >= self.config.get("idle_seconds", 900):
-                self.stop(vmid)
-                stopped.append(vmid)
+            current = activity.get(vmid, {})
+            if (current.get("status") == "running" or current.get("promise")) and now - last >= self.config.get("idle_seconds", 900):
+                try:
+                    self.stop(vmid)
+                    stopped.append(vmid)
+                except CapacityUnavailable as error:
+                    pending.append({"vmid": vmid, "error": str(error)})
         for key, snapshot in list(self.state["snapshots"].items()):
             vmid = snapshot["vmid"]
             lease = self.state["leases"].get(str(vmid), {})
@@ -753,7 +791,7 @@ class Lab:
                         raise RuntimeError("expired snapshot deletion not proven")
             removed.append(key)
         self.save()
-        return {"idle_stopped": stopped, "expired_snapshots_removed": removed}
+        return {"idle_stopped": stopped, "expired_snapshots_removed": removed, "quiescence_pending": pending}
 
 
 def main():
