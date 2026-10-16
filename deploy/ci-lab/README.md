@@ -40,9 +40,11 @@ immutable for a live generation and for a deduplicated deferred request.
 `start` and `resize` inherit the stored lease purpose, not a caller override.
 Renewal must supply the same effective purpose. Missing or unrecognized stored
 purpose remains strict measurement semantics; renewal never silently adds or
-changes it. Legacy pending requests without purpose cannot create a new lease:
-use a new explicit-purpose request identity after safe cleanup. A reconnect to
-an already accepted legacy start remains strict and task-fenced.
+changes it. Persisted legacy pending requests without purpose resume with
+strict measurement semantics; recovery never adds a purpose field to the old
+request or a purpose-absent legacy lease. An existing legacy generation remains
+unchanged on renewal/reconnect. The public API still rejects new requests
+without explicit purpose. Already accepted starts remain task-fenced.
 
 These CLI/state semantics require the reviewed version-2 controller. They are
 not a compatibility fallback for an older deployed controller. Do not rewrite

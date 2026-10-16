@@ -382,15 +382,73 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(request["state"], "blocked")
         self.assertEqual(self.lab.state["leases"]["8601"]["purpose"], "measurement")
 
-    def test_legacy_pending_request_cannot_create_explicit_purpose_lease(self):
-        request = {"holder": "job", "memory_mib": 2048, "state": "pending", "expires": 9999999999}
+    def test_legacy_pending_request_resumes_strict_without_purpose_relabel(self):
+        request = {"holder": "job", "memory_mib": 2048, "state": "pending", "expires": time.time() + 1800}
         self.lab.state["deferred"] = {"8601": request}
-        with patch.object(self.lab, "resources", return_value={"allowed": True}), patch.object(self.lab, "start") as start:
+        with patch.object(self.lab, "resources", return_value={"allowed": True}) as resources, \
+                patch.object(self.lab, "owned"), patch.object(self.lab, "status", return_value={"status": "stopped"}), \
+                patch.object(self.lab, "start", return_value={"allowed": True}) as start:
             self.lab.process_deferred()
-        start.assert_not_called()
-        self.assertEqual(request["state"], "blocked")
+        start.assert_called_once_with(8601, "job", 2048)
+        resources.assert_called_once_with(2048, purpose="measurement")
+        self.assertEqual(request["state"], "started")
         self.assertNotIn("purpose", request)
-        self.assertEqual(self.lab.state["leases"], {})
+        self.assertNotIn("purpose", self.lab.state["leases"]["8601"])
+        self.assertEqual(self.lab.lease_purpose(8601), "measurement")
+
+    def test_legacy_capacity_and_transport_recovery_keep_existing_generation(self):
+        request = {"holder": "job", "memory_mib": 2048, "state": "pending", "expires": time.time() + 1800}
+        self.lab.state["deferred"] = {"8601": request}
+        self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "legacy-gen", "expires": 9999999999}
+        with patch.object(self.lab, "resources", side_effect=[{"allowed": False}, {"allowed": True}, {"allowed": True}]), \
+                patch.object(self.lab, "owned"), patch.object(self.lab, "status", return_value={"status": "stopped"}), \
+                patch.object(self.lab, "start", side_effect=[c.CapacityUnavailable("wait"), {"allowed": True}]) as start:
+            self.lab.process_deferred()
+            self.assertEqual(start.call_count, 0)
+            self.lab.process_deferred()
+            self.assertEqual(request["state"], "pending")
+            reloaded = c.Lab(config(), self.path)
+            self.assertEqual(reloaded.state["leases"]["8601"]["generation"], "legacy-gen")
+            self.assertNotIn("purpose", reloaded.state["leases"]["8601"])
+            self.lab.process_deferred()
+        self.assertEqual(request["state"], "started")
+        self.assertEqual(start.call_count, 2)
+        self.assertEqual(self.lab.state["leases"]["8601"]["generation"], "legacy-gen")
+        self.assertNotIn("purpose", request)
+        self.assertNotIn("purpose", self.lab.state["leases"]["8601"])
+
+    def test_legacy_dedup_and_accepted_start_reconnect_preserve_missing_purpose(self):
+        request = {"holder": "job", "memory_mib": 2048, "state": "pending", "expires": time.time() + 1800}
+        self.lab.state["deferred"] = {"8601": request}
+        self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "legacy-gen", "expires": 9999999999}
+        self.lab.state["runs"] = {"8601": {"holder": "job", "generation": "legacy-gen", "phase": "starting"}}
+        with patch.object(self.lab, "owned"), patch.object(self.lab, "resources") as resources, \
+                patch.object(self.lab, "start", return_value={"already_running": True}) as start:
+            self.assertIs(self.lab.defer_start(8601, "job", 1800, 2048, "measurement"), request)
+            with self.assertRaises(RuntimeError):
+                self.lab.defer_start(8601, "job", 1800, 2048, "functional")
+            self.lab.process_deferred()
+        resources.assert_not_called()
+        start.assert_called_once_with(8601, "job", 2048)
+        self.assertEqual(request["state"], "started")
+        self.assertEqual(self.lab.state["leases"]["8601"]["generation"], "legacy-gen")
+        self.assertNotIn("purpose", request)
+        self.assertNotIn("purpose", self.lab.state["leases"]["8601"])
+
+    def test_legacy_request_recovery_does_not_starve_later_explicit_functional_request(self):
+        self.lab.state["deferred"] = {
+            "8601": {"holder": "old", "memory_mib": 2048, "state": "pending", "expires": time.time() + 1800},
+            "8602": {"holder": "new", "memory_mib": 2048, "state": "pending", "expires": time.time() + 1800,
+                     "purpose": "functional"}}
+        with patch.object(self.lab, "resources", return_value={"allowed": True}) as resources, \
+                patch.object(self.lab, "owned"), patch.object(self.lab, "status", return_value={"status": "stopped"}), \
+                patch.object(self.lab, "start", return_value={"allowed": True}) as start:
+            self.lab.process_deferred()
+        self.assertEqual([call.kwargs["purpose"] for call in resources.call_args_list], ["measurement", "functional"])
+        self.assertEqual([call.args for call in start.call_args_list], [(8601, "old", 2048), (8602, "new", 2048)])
+        self.assertEqual([r["state"] for r in self.lab.state["deferred"].values()], ["started", "started"])
+        self.assertNotIn("purpose", self.lab.state["leases"]["8601"])
+        self.assertEqual(self.lab.state["leases"]["8602"]["purpose"], "functional")
 
     def test_functional_admission_guard_boundary_and_settled_balloon_revalidation(self):
         guest = {"vmid": 8601, "node": "lab-host", "type": "qemu", "status": "running"}
