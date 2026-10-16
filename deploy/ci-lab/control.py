@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import ipaddress
 import json
@@ -13,10 +14,23 @@ import socket
 import struct
 import subprocess
 import time
+import uuid
 from typing import Any
 
 MIB = 1024 * 1024
 OWNER = "sentinel-ci-v1"
+
+
+class CapacityUnavailable(RuntimeError):
+    pass
+
+
+@contextmanager
+def state_lock(state: Path):
+    state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with state.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def run(*args: str, data: str | None = None) -> str:
@@ -74,6 +88,9 @@ def validate_config(config: dict) -> None:
     for key in ("bridge", "pool", "storage", "node"):
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", config[key]):
             raise ValueError("invalid resource name")
+    check = config.get("network_check")
+    if check is not None and (not isinstance(check, list) or not check or any(not isinstance(x, str) or not x for x in check)):
+        raise ValueError("network_check must be an explicit argument vector")
 
 
 def admission(available_mib: int, active: int, target_mib: int,
@@ -158,7 +175,7 @@ def address_inventory(config: dict, address: str, vmid: int | None = None) -> di
 
 
 class Lab:
-    def __init__(self, config: dict, state: Path):
+    def __init__(self, config: dict, state: Path, allow_decommission: bool = False):
         validate_config(config)
         self.config = config
         self.path = state
@@ -166,9 +183,21 @@ class Lab:
             "owner": OWNER, "leases": {}, "snapshots": {}, "last_used": {}}
         if self.state.get("owner") != OWNER:
             raise RuntimeError("foreign lifecycle state")
+        if not allow_decommission and self.state.get("phase", "active") != "active":
+            raise RuntimeError("lab decommission admission fence is active")
 
     def save(self):
         atomic_json(self.path, self.state)
+
+    def begin_decommission(self):
+        if any(lease.get("expires", 0) > time.time() for lease in self.state["leases"].values()):
+            raise RuntimeError("active leases block decommission")
+        if any(request.get("state") == "pending" for request in self.state.get("deferred", {}).values()):
+            raise RuntimeError("pending starts block decommission")
+        if any(snapshot.get("preserve") for snapshot in self.state["snapshots"].values()):
+            raise RuntimeError("preserved snapshots block decommission")
+        self.state["phase"] = "decommissioning"
+        self.save()
 
     def owned(self, vmid: int) -> dict:
         if vmid not in [self.config["template"], *self.config["slots"]]:
@@ -198,25 +227,33 @@ class Lab:
         return api(f"/nodes/{self.config['node']}/qemu/{vmid}/status/current")
 
     def resources(self, target_mib: int) -> dict:
-        available = available_mib()
         guests = api("/cluster/resources")
         active = sum(v.get("status") == "running" for v in guests
                      if v.get("vmid") in [self.config["template"], *self.config["slots"]])
         # Actual balloon target is a commitment, even when guest-used RAM is low.
-        growth = self.config.get("growth_margin_mib", 1024)
+        margin = self.config.get("growth_margin_mib", 1024)
+        headroom = 0
         balloons = []
         for guest in guests:
             if guest.get("node") != self.config["node"] or guest.get("status") != "running" or guest.get("type") != "qemu":
                 continue
             status = api(f"/nodes/{self.config['node']}/qemu/{guest['vmid']}/status/current")
-            actual = int(status.get("balloon", status.get("maxmem", 0))) // MIB
-            if actual <= 0:
-                raise RuntimeError("missing actual balloon telemetry")
-            balloons.append({"vmid": guest["vmid"], "actual_mib": actual,
-                             "max_mib": guest["maxmem"] // MIB})
-        # Automatic balloon growth is not treated as free capacity. Admission
-        # is a bounded current window, guarded by ongoing host telemetry.
-        return {**admission(available, active, target_mib, growth, self.config), "balloons": balloons}
+            actual = status.get("balloon")
+            actual = status.get("maxmem") if actual is None else actual
+            resident = status.get("memhost")
+            if actual is None or resident is None or actual <= 0 or resident < 0:
+                raise RuntimeError("missing actual balloon/resident telemetry")
+            requested = self.state.get("balloon_requests", {}).get(str(guest["vmid"]), 0) * MIB
+            committed = max(actual, status.get("balloon_min") or 0, requested)
+            outstanding = (max(0, committed - resident) + MIB - 1) // MIB
+            headroom += outstanding
+            balloons.append({"vmid": guest["vmid"], "actual_mib": actual // MIB,
+                             "committed_mib": committed // MIB, "resident_mib": resident // MIB,
+                             "outstanding_mib": outstanding, "max_mib": guest["maxmem"] // MIB})
+        # Sample availability last. Nonresident current commitments are not
+        # spare RAM, including an accepted resize whose balloon is still old.
+        return {**admission(available_mib(), active, target_mib, margin + headroom, self.config),
+                "growth_margin_mib": margin, "outstanding_commitments_mib": headroom, "balloons": balloons}
 
     def lease(self, vmid: int, holder: str, seconds: int) -> dict:
         self.owned(vmid)
@@ -225,7 +262,14 @@ class Lab:
         current = self.state["leases"].get(str(vmid))
         if current and current["expires"] > time.time() and current["holder"] != holder:
             raise RuntimeError("lab slot already leased")
-        lease = {"holder": holder, "expires": time.time() + seconds}
+        renewal = bool(current and current["expires"] > time.time() and current["holder"] == holder)
+        if not renewal:
+            if self.status(vmid)["status"] != "stopped":
+                raise RuntimeError("lease takeover requires the prior guest to be stopped")
+            self.state.setdefault("runs", {}).pop(str(vmid), None)
+            self.state.setdefault("balloon_requests", {}).pop(str(vmid), None)
+        lease = {"holder": holder, "expires": time.time() + seconds,
+                 "generation": current.get("generation", uuid.uuid4().hex) if renewal else uuid.uuid4().hex}
         self.state["leases"][str(vmid)] = lease
         self.state["last_used"][str(vmid)] = time.time()
         self.save()
@@ -242,19 +286,35 @@ class Lab:
     def start(self, vmid: int, holder: str, memory_mib: int) -> dict:
         self.require_lease(vmid, holder)
         status = self.status(vmid)
-        if status["status"] == "running":
-            return {"already_running": True}
         config = self.owned(vmid)
+        lease = self.state["leases"][str(vmid)]
+        if status["status"] == "running":
+            previous = self.state.get("runs", {}).get(str(vmid), {})
+            if (previous.get("generation") != lease.get("generation")
+                    or previous.get("holder") != holder or previous.get("vmgenid") != config.get("vmgenid")
+                    or previous.get("phase") not in {"starting", "running"}):
+                raise RuntimeError("running guest is not bound to this lease generation")
+            previous["phase"] = "running"
+            self.save()
+            return {"already_running": True}
         if config.get("template"):
             raise RuntimeError("template cannot be started")
         decision = self.resources(memory_mib)
         if not decision["allowed"]:
-            raise RuntimeError("capacity unavailable: " + json.dumps(decision))
+            raise CapacityUnavailable("capacity unavailable: " + json.dumps(decision))
+        if not self.config.get("network_check"):
+            raise RuntimeError("live network policy check is required before start")
+        run(*self.config["network_check"])
         address_inventory(self.config, self.config["addresses"][str(vmid)], vmid)
+        self.state.setdefault("runs", {})[str(vmid)] = {
+            "holder": holder, "generation": lease["generation"], "vmgenid": config.get("vmgenid"), "phase": "starting"}
+        self.state.setdefault("balloon_requests", {})[str(vmid)] = memory_mib
+        self.save()
         # Proxmox sends this explicit balloon target before resuming QEMU.
         # Disable pvestatd automatic growth; later increases require admission.
         run("qm", "set", str(vmid), "--memory", "8192", "--balloon", str(memory_mib), "--shares", "0")
         run("qm", "start", str(vmid))
+        self.state["runs"][str(vmid)]["phase"] = "running"
         self.state["last_used"][str(vmid)] = time.time()
         self.save()
         return decision
@@ -267,7 +327,9 @@ class Lab:
         actual = status.get("balloon")
         if actual is None:
             raise RuntimeError("actual balloon is unknown")
-        delta = max(0, memory_mib - int(actual) // MIB)
+        current_target = max(int(actual) // MIB, int(status.get("balloon_min") or 0) // MIB,
+                             self.state.get("balloon_requests", {}).get(str(vmid), 0))
+        delta = max(0, memory_mib - current_target)
         # resources() validates whole start requests; resize admits only growth.
         decision = self.resources(2048)
         decision.update(target_mib=memory_mib, growth_request_mib=delta)
@@ -275,7 +337,9 @@ class Lab:
                                                - decision["foreign_growth_mib"])
         decision["allowed"] = decision["projected_available_mib"] >= self.config["reserve_mib"]
         if delta and not decision["allowed"]:
-            raise RuntimeError("balloon growth capacity unavailable: " + json.dumps(decision))
+            raise CapacityUnavailable("balloon growth capacity unavailable: " + json.dumps(decision))
+        self.state.setdefault("balloon_requests", {})[str(vmid)] = memory_mib
+        self.save()
         run("qm", "set", str(vmid), "--balloon", str(memory_mib), "--shares", "0")
         self.state["last_used"][str(vmid)] = time.time()
         self.save()
@@ -283,9 +347,79 @@ class Lab:
 
     def release(self, vmid: int, holder: str):
         self.require_lease(vmid, holder)
+        if self.status(vmid)["status"] != "stopped":
+            raise RuntimeError("stop the guest before releasing its lease")
         self.state["leases"][str(vmid)]["expires"] = time.time()
         self.state["last_used"][str(vmid)] = time.time()
         self.save()
+
+    def defer_start(self, vmid: int, holder: str, seconds: int, memory_mib: int) -> dict:
+        self.owned(vmid)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", holder) or not 60 <= seconds <= 14400 or not 2048 <= memory_mib <= 8192:
+            raise ValueError("invalid bounded deferred request")
+        current = self.state.setdefault("deferred", {}).get(str(vmid))
+        if current and current["holder"] == holder:
+            if current["memory_mib"] != memory_mib:
+                raise RuntimeError("same request identity cannot change its memory input")
+            return current
+        if current and current["state"] == "pending" and current["expires"] > time.time():
+            raise RuntimeError("slot already has a deferred request")
+        lease = self.state["leases"].get(str(vmid), {})
+        if lease.get("expires", 0) > time.time() and lease.get("holder") != holder:
+            raise RuntimeError("slot is leased by another job")
+        if self.status(vmid)["status"] != "stopped":
+            raise RuntimeError("new deferred requests require a stopped slot")
+        request = {"holder": holder, "memory_mib": memory_mib, "expires": time.time() + seconds,
+                   "state": "pending", "created": time.time()}
+        self.state["deferred"][str(vmid)] = request
+        self.save()
+        return request
+
+    def process_deferred(self) -> dict:
+        results = {}
+        for key, request in self.state.get("deferred", {}).items():
+            if request["state"] != "pending":
+                continue
+            if request["expires"] <= time.time():
+                request["state"] = "expired"
+                continue
+            vmid = int(key)
+            try:
+                current = self.state["leases"].get(key, {})
+                if current.get("expires", 0) > time.time() and current.get("holder") != request["holder"]:
+                    request["last_wait"] = "slot leased by another job"
+                    continue
+                previous = self.state.get("runs", {}).get(key, {})
+                if (current.get("expires", 0) > time.time() and current.get("holder") == request["holder"]
+                        and previous.get("generation") == current.get("generation")
+                        and previous.get("phase") in {"starting", "running"}):
+                    results[key] = self.start(vmid, request["holder"], request["memory_mib"])
+                    request["state"] = "started"
+                    continue
+                decision = self.resources(request["memory_mib"])
+                if not decision["allowed"]:
+                    request["last_wait"] = decision
+                    continue
+                remaining = int(request["expires"] - time.time())
+                if remaining < 60:
+                    request["state"] = "expired"
+                    continue
+                self.lease(vmid, request["holder"], remaining)
+                results[key] = self.start(vmid, request["holder"], request["memory_mib"])
+                request["state"] = "started"
+            except CapacityUnavailable as error:
+                request["last_wait"] = str(error)
+            except (subprocess.SubprocessError, OSError) as error:
+                # A retained starting intent binds a reconnect to this exact
+                # generation; transport failures never justify a second boot.
+                request["last_wait"] = str(error)
+            except (RuntimeError, ValueError) as error:
+                request["state"] = "blocked"
+                request["error"] = str(error)
+            finally:
+                self.save()
+        self.save()
+        return results
 
     def telemetry(self) -> dict:
         guests = []
@@ -309,6 +443,40 @@ class Lab:
     def stop(self, vmid: int) -> None:
         if self.status(vmid)["status"] == "running":
             run("qm", "shutdown", str(vmid), "--timeout", "90", "--forceStop", "0")
+        if self.status(vmid)["status"] != "stopped":
+            raise RuntimeError("guest has not quiesced")
+        if str(vmid) in self.state.get("runs", {}):
+            self.state["runs"][str(vmid)]["phase"] = "quiesced"
+        self.state.setdefault("balloon_requests", {}).pop(str(vmid), None)
+        self.save()
+
+    def reconcile_snapshot(self, vmid: int, name: str) -> dict | None:
+        key = f"{vmid}:{name}"
+        record = self.state["snapshots"].get(key)
+        if record is None:
+            return None
+        config = self.owned(vmid)
+        if config.get("lock"):
+            raise RuntimeError("VM effect is still locked; retain snapshot intent")
+        tasks = api(f"/nodes/{self.config['node']}/tasks")
+        if any(str(task.get("id")) == str(vmid) and not task.get("endtime")
+               and task.get("type") in {"qmsnapshot", "qmdelsnapshot", "qmrollback"} for task in tasks):
+            raise RuntimeError("snapshot effect is still active")
+        external = next((item for item in api(f"/nodes/{self.config['node']}/qemu/{vmid}/snapshot")
+                         if item.get("name") == name), None)
+        if external:
+            if external.get("description") != record.get("effect_owner", OWNER):
+                raise RuntimeError("external snapshot owner collision")
+            if record["state"] == "creating":
+                record["state"] = "ready"
+                self.save()
+        elif record["state"] == "deleting":
+            del self.state["snapshots"][key]
+            self.save()
+            return None
+        elif record["state"] == "ready":
+            raise RuntimeError("tracked ready snapshot is missing externally")
+        return record
 
     def snapshot(self, vmid: int, holder: str, name: str, preserve: bool) -> dict:
         self.require_lease(vmid, holder)
@@ -317,23 +485,34 @@ class Lab:
             raise ValueError("snapshot name must use ci- prefix")
         key = f"{vmid}:{name}"
         if key in self.state["snapshots"]:
-            raise RuntimeError("snapshot name already tracked")
+            record = self.reconcile_snapshot(vmid, name)
+            if record is None or record["state"] != "creating":
+                if record and record["state"] == "ready":
+                    return record
+                raise RuntimeError("snapshot deletion is in progress")
+        else:
+            external = api(f"/nodes/{self.config['node']}/qemu/{vmid}/snapshot")
+            if any(item.get("name") == name for item in external):
+                raise RuntimeError("untracked snapshot name collision")
+            self.state["snapshots"][key] = {"vmid": vmid, "name": name,
+                                           "expires": time.time() + 86400, "preserve": preserve,
+                                           "effect_owner": OWNER + ":snapshot:" + uuid.uuid4().hex,
+                                           "state": "creating"}
+            self.save()
         # Stop the guest for application-consistent disks; external effects are
         # never reversible and RAM is deliberately excluded.
         self.stop(vmid)
-        self.state["snapshots"][key] = {"vmid": vmid, "name": name,
-                                       "expires": time.time() + 86400,
-                                       "preserve": preserve, "state": "creating"}
-        self.save()
-        run("qm", "snapshot", str(vmid), name, "--vmstate", "0", "--description", OWNER)
-        self.state["snapshots"][key]["state"] = "ready"
-        self.save()
-        return self.state["snapshots"][key]
+        run("qm", "snapshot", str(vmid), name, "--vmstate", "0", "--description",
+            self.state["snapshots"][key]["effect_owner"])
+        record = self.reconcile_snapshot(vmid, name)
+        if not record or record["state"] != "ready":
+            raise RuntimeError("snapshot effect not yet proven; retain intent")
+        return record
 
     def rollback(self, vmid: int, holder: str, name: str) -> None:
         self.require_lease(vmid, holder)
         self.owned(vmid)
-        snapshot = self.state["snapshots"].get(f"{vmid}:{name}", {})
+        snapshot = self.reconcile_snapshot(vmid, name) or {}
         if snapshot.get("state") != "ready":
             raise RuntimeError("tracked ready snapshot required")
         self.stop(vmid)
@@ -347,9 +526,16 @@ class Lab:
             raise RuntimeError("only tracked snapshots may be removed")
         if self.state["snapshots"][key]["preserve"]:
             raise RuntimeError("preserved investigation/rollback snapshot cannot be removed")
-        run("qm", "delsnapshot", str(vmid), name)
-        del self.state["snapshots"][key]
+        self.reconcile_snapshot(vmid, name)
+        if key not in self.state["snapshots"]:
+            return
+        self.state["snapshots"][key]["state"] = "deleting"
         self.save()
+        if self.reconcile_snapshot(vmid, name) is None:
+            return
+        run("qm", "delsnapshot", str(vmid), name)
+        if self.reconcile_snapshot(vmid, name) is not None:
+            raise RuntimeError("snapshot deletion not yet proven")
 
     def guard(self) -> dict:
         before = available_mib()
@@ -390,9 +576,13 @@ class Lab:
             lease = self.state["leases"].get(str(vmid), {})
             if snapshot["preserve"] or snapshot["expires"] > now or lease.get("expires", 0) > now:
                 continue
-            self.owned(vmid)
-            run("qm", "delsnapshot", str(vmid), snapshot["name"])
-            del self.state["snapshots"][key]
+            if self.reconcile_snapshot(vmid, snapshot["name"]) is not None:
+                self.state["snapshots"][key]["state"] = "deleting"
+                self.save()
+                if self.reconcile_snapshot(vmid, snapshot["name"]) is not None:
+                    run("qm", "delsnapshot", str(vmid), snapshot["name"])
+                    if self.reconcile_snapshot(vmid, snapshot["name"]) is not None:
+                        raise RuntimeError("expired snapshot deletion not proven")
             removed.append(key)
         self.save()
         return {"idle_stopped": stopped, "expired_snapshots_removed": removed}
@@ -402,7 +592,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--state", type=Path, required=True)
-    parser.add_argument("action", choices=["status", "telemetry", "admit", "lease", "release", "start", "resize", "stop", "snapshot", "rollback", "discard-snapshot", "guard", "reap"])
+    parser.add_argument("action", choices=["status", "telemetry", "admit", "lease", "release", "start", "defer-start", "resize", "stop", "snapshot", "rollback", "discard-snapshot", "guard", "reap"])
     parser.add_argument("--vmid", type=int)
     parser.add_argument("--holder", default="")
     parser.add_argument("--seconds", type=int, default=1800)
@@ -410,9 +600,7 @@ def main():
     parser.add_argument("--name", default="")
     parser.add_argument("--preserve", action="store_true")
     args = parser.parse_args()
-    args.state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with args.state.with_suffix(".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with state_lock(args.state):
         lab = Lab(json.loads(args.config.read_text()), args.state)
         if args.action == "status":
             result = {str(v): lab.status(v) for v in lab.config["slots"]}
@@ -424,6 +612,8 @@ def main():
             result = lab.lease(args.vmid, args.holder, args.seconds)
         elif args.action == "start":
             result = lab.start(args.vmid, args.holder, args.memory_mib)
+        elif args.action == "defer-start":
+            result = lab.defer_start(args.vmid, args.holder, args.seconds, args.memory_mib)
         elif args.action == "resize":
             result = lab.resize(args.vmid, args.holder, args.memory_mib)
         elif args.action == "release":
