@@ -5,6 +5,13 @@
   prompts. Preserve employee identity, perception, independent decisions,
   ambient prompt bytes and existing Anthropic system pass-through (#856).
 
+- Charge complete retained authorization history separately from the unchanged
+  128 KiB head-envelope limit for explicitly funded leadership reviews. Keep
+  finite history-byte/window budgets, all historical authority and digest
+  checks, legacy context limits and the actual rendered prompt limit. Count
+  serialized bytes without allocating another complete JSON buffer; preserve
+  wire identities, funding ceilings and genuine employee decisions (#856).
+
 - Apply the existing duration-plus-dispatch-margin admission rule to funded
   work windows before preparing a new model call. Read the authorized adaptive
   head and exact historical result status in one validated snapshot, sharing

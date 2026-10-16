@@ -2767,6 +2767,7 @@ fn corrupt_store() -> WorkflowError {
 
 #[cfg(test)]
 mod tests {
+    include!("store/adaptive/leadership_source_diagnostic.rs");
     #[test]
     #[ignore = "Explicit protected-runtime read-only diagnostic; not product acceptance"]
     fn diagnose_existing_expired_funding_source_read_only() {
@@ -2826,6 +2827,7 @@ mod tests {
                 | "funding_review_reads"
                 | "adaptive_health_inventory"
                 | "model_adoption_reads"
+                | "funded_leadership_source"
         ));
         let repeat = std::env::var_os("SENTINEL_DIAGNOSTIC_REPEAT")
             .map(|value| {
@@ -2841,6 +2843,16 @@ mod tests {
             repeat == 1 || mode == "adaptive_health_inventory",
             "repeat is supported only for adaptive_health_inventory"
         );
+        if mode == "funded_leadership_source" {
+            diagnose_funded_leadership_source(&store, now);
+            let connection = store.connection.lock().unwrap();
+            assert!(connection.is_readonly("main").unwrap());
+            let after: i64 = connection
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(after, changes);
+            return;
+        }
         if mode == "model_adoption_reads" {
             diagnose_model_adoption_reads(&store, source.session_id);
             let connection = store.connection.lock().unwrap();
