@@ -409,6 +409,7 @@ class Lab:
             "holder": holder, "generation": lease["generation"], "vmgenid": config.get("vmgenid"), "phase": "starting"}
         self.state.setdefault("balloon_requests", {})[str(vmid)] = memory_mib
         self.state.setdefault("capacity_baseline", decision["capacity_sample"])
+        self.state["capacity_sample"] = decision["capacity_sample"]
         self.save()
         # Proxmox sends this explicit balloon target before resuming QEMU.
         # Disable pvestatd automatic growth; later increases require admission.
@@ -439,6 +440,8 @@ class Lab:
                                and not decision.get("capacity_safety", {}).get("reasons"))
         if delta and not decision["allowed"]:
             raise CapacityUnavailable("balloon growth capacity unavailable: " + json.dumps(decision))
+        if decision["allowed"]:
+            self.state["capacity_sample"] = decision["capacity_sample"]
         self.state.setdefault("balloon_requests", {})[str(vmid)] = memory_mib
         self.save()
         run("qm", "set", str(vmid), "--balloon", str(memory_mib), "--shares", "0")
