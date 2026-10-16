@@ -487,6 +487,11 @@ fn funded_recovery_durable_gate_serde_is_additive_and_old_verifiers_reject_it() 
     }
 }
 
+fn context_head_bytes(context: &AdaptiveLeadershipReviewContextV1) -> usize {
+    let history = &context.source_session.continuation.as_ref().unwrap().authorizations;
+    serde_json::to_vec(context).unwrap().len() - serde_json::to_vec(history).unwrap().len() + 2
+}
+
 fn fill_recovery_context_to_exact_limit(f: &mut Fixture) {
     use crate::{
         ADAPTIVE_LEADERSHIP_MAX_CATALOG_BYTES, ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES,
@@ -494,15 +499,15 @@ fn fill_recovery_context_to_exact_limit(f: &mut Fixture) {
     };
     f.context.tool_catalog["context_byte_boundary_padding"] = serde_json::json!("");
     let catalog_bytes = serde_json::to_vec(&f.context.tool_catalog).unwrap().len();
-    // Leave catalog slack so the overbound test fails only the whole-context cap.
+    // Leave catalog slack so the overbound test fails only the head-envelope cap.
     let padding_bytes = ADAPTIVE_LEADERSHIP_MAX_CATALOG_BYTES.checked_sub(catalog_bytes + 8).unwrap();
     f.context.tool_catalog["context_byte_boundary_padding"] = serde_json::json!("x".repeat(padding_bytes));
-    while serde_json::to_vec(&f.context).unwrap().len() < ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES {
+    while context_head_bytes(&f.context) < ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES {
         assert!(f.context.evidence_refs.len() < ADAPTIVE_LEADERSHIP_MAX_SUPPLIED_REFS);
         let prefix = format!("boundary-byte-ref-{}:", f.context.evidence_refs.len());
         f.context.evidence_refs.push(format!("{prefix}{}", "y".repeat(4096 - prefix.len())));
     }
-    let excess = serde_json::to_vec(&f.context).unwrap().len() - ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES;
+    let excess = context_head_bytes(&f.context) - ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES;
     let last = f.context.evidence_refs.last_mut().unwrap();
     let trim = excess.min(last.len() - 1);
     last.truncate(last.len() - trim);
@@ -512,7 +517,8 @@ fn fill_recovery_context_to_exact_limit(f: &mut Fixture) {
             serde_json::json!("x".repeat(padding_bytes.checked_sub(remaining).unwrap()));
     }
     rebind_budget_evidence(f);
-    assert_eq!(serde_json::to_vec(&f.context).unwrap().len(), ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES);
+    assert_eq!(context_head_bytes(&f.context), ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES);
+    assert!(serde_json::to_vec(&f.context).unwrap().len() > ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES);
     assert!(serde_json::to_vec(&f.context.tool_catalog).unwrap().len() < ADAPTIVE_LEADERSHIP_MAX_CATALOG_BYTES);
     assert!(f.context.evidence_refs.iter().all(|reference| reference.len() <= 4096));
     f.context.validate(&f.grant).unwrap();
@@ -527,7 +533,7 @@ fn funded_recovery_exact_context_byte_limit_survives_reopen_and_historical_repla
     let original_session = session(&f);
     let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
         &request, &f.grant, &f.context, at, recovery_evidence).unwrap().1;
-    assert_eq!(serde_json::to_vec(&receipt.context).unwrap().len(), crate::ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES);
+    assert_eq!(context_head_bytes(&receipt.context), crate::ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES);
     let receipt_bytes = serde_json::to_vec(&receipt).unwrap();
     let receipt_json = serde_json::to_value(&receipt).unwrap();
     assert_eq!(receipt_json["request"], serde_json::to_value(&request).unwrap());
@@ -573,7 +579,7 @@ fn funded_recovery_one_byte_over_context_limit_rejects_before_commit() {
     padding.push('x');
     f.context.tool_catalog["context_byte_boundary_padding"] = serde_json::json!(padding);
     rebind_budget_evidence(&mut f);
-    assert_eq!(serde_json::to_vec(&f.context).unwrap().len(), crate::ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES + 1);
+    assert_eq!(context_head_bytes(&f.context), crate::ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES + 1);
     assert!(serde_json::to_vec(&f.context.tool_catalog).unwrap().len() <= crate::ADAPTIVE_LEADERSHIP_MAX_CATALOG_BYTES);
     f.grant.validate(at).unwrap();
     assert!(f.context.validate(&f.grant).is_err());
@@ -587,6 +593,28 @@ fn funded_recovery_one_byte_over_context_limit_rejects_before_commit() {
         &request.source.receipt_key().unwrap()).unwrap().is_none());
     assert_eq!(f.store.adaptive_leadership_review_calls(&f.leader.tenant_id,
         f.grant.session_id).unwrap().len(), usize::from(request.source.review_count));
+}
+
+#[test]
+fn funded_ordinary_review_preserves_large_proof_wire_and_rejects_changed_history() {
+    let (mut f, _, now) = funded_fixture();
+    fill_recovery_context_to_exact_limit(&mut f);
+    f.context.evidence_refs.sort();
+    let before_session = session(&f);
+    let before_context = encode(&f.context).unwrap();
+    let call = issue(&f, now).unwrap();
+    assert_eq!(encode(&call.context).unwrap(), before_context);
+    assert_eq!(session(&f), before_session);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    let before = rows(&reopened);
+    let retained = reopened.adaptive_leadership_review_call(&f.leader.tenant_id,
+        call.grant.review_id).unwrap().unwrap();
+    assert_eq!(retained, call);
+    assert_eq!(rows(&reopened), before);
+    f.context.source_session.continuation.as_mut().unwrap().authorizations[0]
+        .provider_authority_digest = "f".repeat(64);
+    assert!(f.context.validate(&f.grant).is_err());
+    assert_eq!(rows(&reopened), before);
 }
 
 #[test]

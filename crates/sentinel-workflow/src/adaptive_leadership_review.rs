@@ -18,6 +18,10 @@ use crate::{
 
 pub const ADAPTIVE_LEADERSHIP_MAX_REVIEWS: usize = 3;
 pub const ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES: usize = 128 * 1024;
+// Funded reviews retain up to 128 authenticated windows, not 128 copies in
+// the model prompt. Keep a separate finite proof budget and the original head cap.
+const MAX_RETAINED_HISTORY_BYTES: usize =
+    ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES * crate::ADAPTIVE_RESUME_MAX_REVIEWS as usize;
 pub const ADAPTIVE_LEADERSHIP_MAX_CATALOG_BYTES: usize = 32 * 1024;
 pub const ADAPTIVE_LEADERSHIP_MAX_SUPPLIED_REFS: usize = 32;
 pub const ADAPTIVE_LEADERSHIP_MAX_DECISION_REFS: usize = 8;
@@ -1006,6 +1010,31 @@ impl AdaptiveLeadershipReviewGrantV1 {
 }
 
 impl AdaptiveLeadershipReviewContextV1 {
+    fn size_is_bounded(
+        &self,
+        grant: &AdaptiveLeadershipReviewGrantV1,
+    ) -> Result<bool, WorkflowError> {
+        let history = if matches!(grant.schema_version, 5 | 6) {
+            self.source_session
+                .continuation
+                .as_ref()
+                .map(|state| &state.authorizations)
+        } else {
+            None
+        };
+        if history
+            .is_some_and(|values| values.len() > usize::from(crate::ADAPTIVE_RESUME_MAX_REVIEWS))
+        {
+            return Ok(false);
+        }
+        let bytes = crate::digest::serialized_json_size(self).map_err(|_| invalid())?;
+        let Some(history) = history else {
+            return Ok(bytes <= ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES);
+        };
+        let history_bytes = crate::digest::serialized_json_size(history).map_err(|_| invalid())?;
+        Ok(funded_context_size_is_bounded(bytes, history_bytes))
+    }
+
     pub fn validate(&self, grant: &AdaptiveLeadershipReviewGrantV1) -> Result<(), WorkflowError> {
         grant.validate_work_funding()?;
         if !matches!(
@@ -1029,6 +1058,9 @@ impl AdaptiveLeadershipReviewContextV1 {
                     .as_ref()
                     .is_none_or(|binding| binding.schema_version != 2))
         {
+            return Err(invalid());
+        }
+        if !self.size_is_bounded(grant)? {
             return Err(invalid());
         }
         let project = &self.source_project;
@@ -1202,13 +1234,22 @@ impl AdaptiveLeadershipReviewContextV1 {
                     &self.tool_catalog,
                     &self.evidence_refs,
                 )?
-            || serde_json::to_vec(self).map_err(|_| invalid())?.len()
-                > ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES
         {
             return Err(invalid());
         }
         Ok(())
     }
+}
+
+fn funded_context_size_is_bounded(context_bytes: usize, history_bytes: usize) -> bool {
+    // Only the typed authorization array is separately charged. Its existing
+    // complete-history digest, every authorization and store membership still
+    // require validation; counting never changes serialized or retained content.
+    (2..=MAX_RETAINED_HISTORY_BYTES).contains(&history_bytes)
+        && context_bytes
+            .checked_sub(history_bytes)
+            .and_then(|head| head.checked_add(2))
+            .is_some_and(|head| head <= ADAPTIVE_LEADERSHIP_MAX_CONTEXT_BYTES)
 }
 
 fn validate_refs(refs: &[String], max: usize) -> Result<(), WorkflowError> {
@@ -1246,6 +1287,9 @@ fn invalid() -> WorkflowError {
 mod budget_tests {
     use super::*;
     use crate::adaptive::continuation_tests::{authorization, grant, NOW};
+    mod context_size_tests {
+        include!("adaptive_leadership_review/context_size_tests.rs");
+    }
     mod work_funding_tests {
         include!("adaptive_leadership_review/work_funding_tests.rs");
     }
