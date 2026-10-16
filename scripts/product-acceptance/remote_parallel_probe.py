@@ -28,7 +28,8 @@ PHASE_LABELS = {
         "enqueue_wait", "permit_wait", "unreserved_authority", "reservation", "predispatch_authority",
         "http", "response_decode", "persistence", "cleanup", "total"))),
     "Owned completion stage finished": ("adoption", "stage", frozenset((
-        "recovery_refresh", "usage", "admission", "claim", "complete", "encode", "enqueue", "load"))),
+        "recovery_refresh", "usage", "admission", "claim", "complete", "encode", "enqueue", "load",
+        "adaptive_adoption_read", "adaptive_model_commit"))),
     "Adaptive context evidence read": ("context", "phase", frozenset((
         "preparation_snapshot", "latest_observation", "post_callback_snapshot",
         "working_memory_source", "historical_observations"))),

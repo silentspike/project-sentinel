@@ -67,6 +67,24 @@ class DistributionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             probe.parse_phase({"MESSAGE": 'Owned provider phase finished phase="http" elapsed_us=1000 elapsed_ms=2'})
 
+    def test_existing_adaptive_adoption_and_commit_keep_exact_request_and_outcome(self):
+        for stage in ("adaptive_adoption_read", "adaptive_model_commit"):
+            for outcome in ("true", "false"):
+                row = probe.parse_phase({"MESSAGE": 'Owned completion stage finished '
+                    f'request_id="synthetic-exact-request" stage="{stage}" elapsed_us=1234 '
+                    f'succeeded={outcome} private=never_export', "__REALTIME_TIMESTAMP": "123456"})
+                self.assertEqual(row, {"family": "adoption", "phase": stage, "elapsed": 1234,
+                    "unit": "us", "request_id": "synthetic-exact-request", "accepted": outcome == "true",
+                    "timestamp_us": 123456, "attribution": "request_id"})
+
+    def test_adaptive_adoption_without_request_is_not_original_task_evidence(self):
+        row = probe.parse_phase({"MESSAGE": 'Owned completion stage finished '
+            'stage="adaptive_model_commit" elapsed_us=1234 succeeded=true'})
+        self.assertEqual(row["attribution"], "process_only_not_original_task")
+        self.assertNotIn("request_id", row)
+        self.assertIsNone(probe.parse_phase({"MESSAGE": 'Owned completion stage finished '
+            'request_id="synthetic-exact-request" stage="invented_commit" elapsed_us=1234 succeeded=true'}))
+
 
 class NativeTests(unittest.TestCase):
     def text(self):
