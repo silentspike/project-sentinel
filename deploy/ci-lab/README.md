@@ -56,6 +56,36 @@ across a partial failure. A new lease generation cannot take over a running
 expired/released job; stop it first. A running-start retry succeeds only for
 the same recorded lease generation and VM identity.
 
+The bounded lifecycle transition table below uses `starting` for a retained,
+possibly disconnected start effect, even while PVE still reports stopped.
+An in-flight task or VM lock blocks transfer, release and duplicate boot.
+Completed tasks plus unlocked, repeated stopped readback allow recovery; expiry
+alone never clears its target promise. Fresh owned status overrides stale
+cluster hints in both directions, including just-started guests and guard stops.
+
+| Guest Phase | Lease | Start | Release | New Holder |
+|---|---|---|---|---|
+| stopped | active | fresh admission | allowed | refused |
+| stopped | expired | refused | refused | fresh generation |
+| stopped | invalidated | refused | cleanup only | after cleanup |
+| starting | active | task-fenced retry | task-fenced | refused |
+| starting | expired | refused | refused | quiescence proof first |
+| starting | invalidated | refused | quiescence proof first | after cleanup |
+| running | active | same-generation reconnect | refused | refused |
+| running | expired | refused | refused | stop first |
+| running | invalidated | refused | refused | stop and cleanup first |
+
+Guard and expired-job cleanup read fresh owned running/starting/pending activity,
+even when the cluster cache says stopped or omits the entry. An unsafe sample
+invalidates uncertain starting leases too; a late boot remains invalid and is
+stopped even after host pressure recovers. The initial managed-growth baseline
+survives until every owned running/pending promise is proven quiescent. Active
+start tasks return bounded quiescence-pending results, never a cleared promise.
+An unsafe guard sample stops actual running owned guests regardless of lease
+state. It never discards an uncertain stopped start promise. Missing process
+telemetry on a running owned guest remains a bounded capacity wait, not zero
+residency or a successful run. Invalidated job identities never resume or PASS.
+
 Starts and balloon increases reserve their request, the named 1536-MiB growth
 allowance, and **owned** outstanding current/pending targets minus measured
 residency. Accepted stopped starting intents also remain promises after a crash.
