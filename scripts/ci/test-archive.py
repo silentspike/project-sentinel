@@ -233,6 +233,7 @@ def extract(args):
         tar.extractall(source, members=members, filter="data")
     for name, sha in expected.items():
         require(digest(source / name) == sha, "source bundle content mismatch")
+    (destination / "build").mkdir()
     command = nextest(args.nextest) + ["list", "--archive-file", str(bundle / "tests.tar.zst"), "--extract-to", str(destination / "build"), "--workspace-remap", str(source), "--message-format", "json", "--run-ignored", "all", "--user-config-file", "none"]
     listing = subprocess.check_output(command, cwd=source, text=True)
     write(destination / "test-list.json", json.loads(listing))
