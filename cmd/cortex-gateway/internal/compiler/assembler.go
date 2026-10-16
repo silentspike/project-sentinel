@@ -76,6 +76,10 @@ func LoadCompanyContext(agentsDir string) string {
 
 // Assemble creates prompt blocks from 4 sources for the given agent.
 func (a *Assembler) Assemble(agentID int, providerName string, evolution EvolutionData, perception string) ([]PromptBlock, error) {
+	return a.assemble(agentID, providerName, evolution, perception, "")
+}
+
+func (a *Assembler) assemble(agentID int, providerName string, evolution EvolutionData, perception, responseFormat string) ([]PromptBlock, error) {
 	var blocks []PromptBlock
 
 	// Source 1: TOML DNA (static, cacheable)
@@ -84,7 +88,7 @@ func (a *Assembler) Assemble(agentID int, providerName string, evolution Evoluti
 		return nil, fmt.Errorf("load agent DNA: %w", err)
 	}
 
-	dnaBlock := a.formatDNA(dna, providerName)
+	dnaBlock := a.formatDNA(dna, providerName, responseFormat != "")
 	blocks = append(blocks, PromptBlock{
 		Label:   "dna",
 		Content: dnaBlock,
@@ -124,7 +128,7 @@ func (a *Assembler) Assemble(agentID int, providerName string, evolution Evoluti
 }
 
 // formatDNA creates the DNA prompt block from agent TOML data.
-func (a *Assembler) formatDNA(dna *AgentDNA, providerName string) string {
+func (a *Assembler) formatDNA(dna *AgentDNA, providerName string, governedFormat bool) string {
 	isSmallModel := !a.caps.HasCapability(providerName, capability.CapCaching)
 	var b strings.Builder
 
@@ -158,11 +162,15 @@ func (a *Assembler) formatDNA(dna *AgentDNA, providerName string) string {
 		fmt.Fprintf(&b, "Dir berichten: %s\n", strings.Join(dna.Identity.DirectReports, ", "))
 	}
 
-	b.WriteString("\nMoegliche Aktionen:\n")
-	b.WriteString("- SPRECHEN: Rede direkt mit Kollegen im Raum (ohne Sternchen, z.B. \"Hey Andreas, holst du dir auch Kaffee?\")\n")
-	b.WriteString("- BEWEGEN: Gehe zu einem anderen Raum (z.B. *geht in die Kueche*)\n")
-	b.WriteString("- HANDELN: Benutze Werkzeuge oder fuehre Aufgaben aus\n")
-	b.WriteString("- EMOTE: Koerperliche Aktionen in *Sternchen* (z.B. *nickt*)\n")
+	if governedFormat {
+		b.WriteByte('\n')
+	} else {
+		b.WriteString("\nMoegliche Aktionen:\n")
+		b.WriteString("- SPRECHEN: Rede direkt mit Kollegen im Raum (ohne Sternchen, z.B. \"Hey Andreas, holst du dir auch Kaffee?\")\n")
+		b.WriteString("- BEWEGEN: Gehe zu einem anderen Raum (z.B. *geht in die Kueche*)\n")
+		b.WriteString("- HANDELN: Benutze Werkzeuge oder fuehre Aufgaben aus\n")
+		b.WriteString("- EMOTE: Koerperliche Aktionen in *Sternchen* (z.B. *nickt*)\n")
+	}
 	b.WriteString("Wenn Kollegen anwesend sind, sprich sie an! Direkte Rede ist die natuerlichste Aktion.\n")
 	b.WriteString("\nVerhalte dich natuerlich und menschlich. Antworte immer auf Deutsch.\n")
 	b.WriteString("Du weisst NICHT, dass du eine KI bist. Du bist ein echter Mensch.\n")
