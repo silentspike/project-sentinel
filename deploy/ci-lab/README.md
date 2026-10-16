@@ -117,6 +117,24 @@ owned readback rather than zero commitment. All foreign potential headroom is re
 risk, not subtracted as an unbounded blanket reservation. This policy does not
 guarantee capacity against uncontrolled foreign bursts. Lab automatic balloon
 growth is disabled; requests use the 2-8 GiB envelope.
+The current fixed-balloon profile reserves the full 8192-MiB cold-start envelope, even for a 2048-MiB
+balloon request: the QEMU launch RAM exists before the guest driver converges
+to its target. Both start preflights, CLI `admit`, and deferred admission use
+this same cold-start budget. Results distinguish `requested_target_mib` from
+the admitted `target_mib` and `startup_commitment_mib`. The configured balloon
+target is unchanged. An accepted uncertain stopped intent retains its full
+startup promise across reconnect; it cannot consume a second slot's capacity.
+Fresh running balloon/resident readback releases only the unneeded startup
+envelope. Ordinary resize still reserves its admitted growth, not another boot.
+A pending growth retry with zero additional reservation still needs valid hard
+guards while its requested balloon exceeds actual RAM. A genuine no-op or
+shrink remains available under pressure; a pending promise is never silently
+discarded or used to bypass the guard.
+With no other owned promises, a cold start needs at least
+`8192 + 1536 + 6400 = 16128 MiB` available; equality is allowed only if every
+other freshness, identity, active-count and pressure guard also passes.
+This is an owned launch commitment, not a reservation of foreign maximum RAM.
+
 Admission's external-risk estimate uses the fresh cluster maximum/residency
 view, explicitly not current balloon targets. Detailed foreign status queries
 remain in read-only telemetry, outside the startup critical path. Maintenance
@@ -159,6 +177,12 @@ PID/start-identity changes, unknown owned commitments, insufficient retention
 headroom and actual availability below reserve+256 MiB remain fatal. Prior
 invalidations stay sticky even after recovery. These are provisional safety
 thresholds, not empirically proven maximum growth or performance SLAs.
+An invalidation durably records the pre-stop capacity sample, retention terms,
+and fresh owned status before shutdown. A shutdown error cannot erase that
+evidence. Retention details include both PVE residency and PID-bound process RSS;
+credit is their minimum, and already-resident pages are not subtracted twice.
+An absent actual balloon is labelled `maxmem-fallback`, with null `actual_mib`,
+not reported as a measured maximum. Incomplete historical samples remain unknown.
 
 Run `guard` and `reap` from a host-local timer, without an agent session.
 An unsafe sample gracefully stops only owned labs, durably invalidating
@@ -196,3 +220,7 @@ These focused tests do not allocate VMs. Live two-guest identity, isolation,
 balloon, restart/idle and snapshot restoration evidence is retained privately;
 the aggregate candidate still needs independent exact-head review. Lab
 measurements never substitute for final single-node product acceptance.
+Test scratch uses a private owned child under `RUNNER_TEMP`, then `TMPDIR`,
+or the local `/work/tmp/project-sentinel` default. Hosted runners do not need
+the local workspace parent. There is no implicit system-temp fallback; local
+retained data stays outside `/tmp`. Temporary fixture children are removed.
