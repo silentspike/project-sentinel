@@ -45,6 +45,9 @@ pub struct SpawnedSandbox {
 
 impl SpawnedSandbox {
     /// Reaps the owned supervisor; --die-with-parent terminates its namespace.
+    /// This does not wait for namespace init reaping by its host-side parent.
+    /// The thread that called `spawn` must remain alive while the cage is used:
+    /// Linux parent-death signals follow the creating thread, not a Child handle.
     pub fn terminate(&mut self) {
         terminate_sandbox_process(&mut self.child);
     }
