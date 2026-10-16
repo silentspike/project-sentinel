@@ -9,6 +9,7 @@ function fixture() {
   const raw = Buffer.from(JSON.stringify(receipt));
   const key = 'test-only-reporting-key-not-a-credential';
   const env = {RECEIPT_B64: raw.toString('base64'), RECEIPT_KEY: key,
+    PLAN_SHA256: 'f'.repeat(64),
     RECEIPT_SIGNATURE: crypto.createHmac('sha256', key).update(raw).digest('hex')};
   const context = {repo: {owner: 'silentspike', repo: 'project-sentinel'},
     eventName: 'workflow_dispatch', ref: 'refs/heads/main', runId: 123};
@@ -65,6 +66,19 @@ test('authenticated failed qualification reports failure and fails workflow', as
   await assert.rejects(report(f), /qualification failed/);
   assert.equal(f.calls.length, 1);
   assert.equal(f.calls[0].conclusion, 'failure');
+});
+
+test('trusted workflow variable binds the independently frozen plan', async () => {
+  for (const value of ['', 'not-a-digest', undefined]) {
+    const f = fixture(); f.env.PLAN_SHA256 = value;
+    await assert.rejects(report(f), /frozen qualification plan missing/);
+    assert.equal(f.calls.length, 0);
+  }
+  const f = fixture();
+  let binding;
+  f.verify = (_raw, _receipt, expected) => {binding = expected; return true;};
+  await report(f);
+  assert.equal(binding, f.env.PLAN_SHA256);
 });
 
 test('duplicate receipt delivery updates original Actions check, not foreign app', async () => {

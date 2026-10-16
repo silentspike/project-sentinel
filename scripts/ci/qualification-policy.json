@@ -6,6 +6,8 @@
     "rust-static",
     "rust-doc",
     "rust-tests",
+    "builder-compiler-tests",
+    "doctests",
     "rust-ebpf-tests",
     "go-tests",
     "console-tests",
