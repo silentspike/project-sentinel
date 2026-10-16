@@ -21,7 +21,7 @@ pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 3;
 pub(crate) mod adaptive;
 pub use adaptive::{
     AdaptiveModelAdoptionRead, AdaptiveModelAdoptionReadError,
-    AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot,
+    AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot, AdaptiveSourceCompletionV1,
 };
 mod read_cache;
 mod revisions;

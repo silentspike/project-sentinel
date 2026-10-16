@@ -281,6 +281,8 @@ impl WorkflowApi {
             .store
             .company_project(&principal.principal.tenant_id, project_id)?
             .ok_or_else(source_conflict)?;
+        #[cfg(test)]
+        super::adaptive_work_funding::SOURCE_DISCOVERIES.with(|count| count.set(count.get() + 1));
         let session = self
             .review_sessions(&project)
             .map_err(|_| workflow_unavailable())?

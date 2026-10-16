@@ -83,6 +83,42 @@ impl StandingFundingPolicyBinding {
 }
 
 impl WorkflowApi {
+    fn recheck_standing_work_funding_source(
+        &self,
+        binding: &StandingFundingPolicyBinding,
+        operator: &BoundPrincipal,
+        project: &sentinel_workflow::ProjectV1,
+        session: &AdaptiveSessionV1,
+    ) -> Result<(), WorkflowError> {
+        let live_operator = binding
+            .current_operator(&self.principals)?
+            .ok_or_else(source_conflict)?;
+        if live_operator.principal != operator.principal
+            || live_operator.execution_authority != operator.execution_authority
+        {
+            return Err(source_conflict());
+        }
+        self.validate_work_funding_operator(&live_operator)?;
+        self.work_funding_current_source_in_snapshot(project, session, now_unix_ms())?;
+        let current = self
+            .authority
+            .as_ref()
+            .ok_or_else(workflow_unavailable)?
+            .snapshot_from_validated_project(
+                project,
+                &project.tenant_id,
+                &project.project_id,
+                &session.grant.authority.work_item_id,
+                session.grant.authority.agent_id,
+                true,
+            )
+            .map_err(execution_intent_port_error)?;
+        if current != session.grant.authority {
+            return Err(source_conflict());
+        }
+        Ok(())
+    }
+
     // Called only by reconciliation, already holding its recovery/mutation fence.
     pub(super) fn reconcile_standing_work_funding(
         &self,
@@ -102,6 +138,8 @@ impl WorkflowApi {
             return Ok(false);
         };
         self.validate_work_funding_operator(&operator)?;
+        #[cfg(test)]
+        super::adaptive_work_funding::SOURCE_DISCOVERIES.with(|count| count.set(count.get() + 1));
         for session in self
             .review_sessions(project)
             .map_err(|_| workflow_unavailable())?
@@ -111,52 +149,22 @@ impl WorkflowApi {
             {
                 continue;
             }
-            match self.work_funding_current_source(
-                &operator,
-                &project.project_id,
-                session.grant.session_id,
-                now_unix_ms(),
-            ) {
+            match self.work_funding_current_source_from_observed(project, &session, now_unix_ms()) {
                 Ok(()) => {}
                 Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => continue,
                 Err(error) => return Err(error),
             }
             let proposal = self
                 .store
-                .propose_standing_work_funding_checked_with_clock(
+                .propose_standing_work_funding_observed_with_clock(
                     &operator.principal,
                     &binding.policy,
-                    &project.project_id,
-                    session.grant.session_id,
-                    &session.grant.authority,
+                    (project, &session),
                     now_unix_ms,
                     || {
-                        let live_operator = binding
-                            .current_operator(&self.principals)?
-                            .ok_or_else(source_conflict)?;
-                        if live_operator.principal != operator.principal
-                            || live_operator.execution_authority != operator.execution_authority
-                        {
-                            return Err(source_conflict());
-                        }
-                        self.validate_work_funding_operator(&live_operator)?;
-                        let current = self
-                            .authority
-                            .as_ref()
-                            .ok_or_else(workflow_unavailable)?
-                            .snapshot_from_validated_project(
-                                project,
-                                &project.tenant_id,
-                                &project.project_id,
-                                &session.grant.authority.work_item_id,
-                                session.grant.authority.agent_id,
-                                true,
-                            )
-                            .map_err(execution_intent_port_error)?;
-                        if current != session.grant.authority {
-                            return Err(source_conflict());
-                        }
-                        Ok(())
+                        self.recheck_standing_work_funding_source(
+                            binding, &operator, project, &session,
+                        )
                     },
                 )?;
             if proposal.is_some_and(|(replayed, _)| !replayed) {
