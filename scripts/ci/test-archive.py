@@ -275,12 +275,14 @@ def plan(args):
           "test_inventory_digest": object_digest(rows), "test_count": len(rows), "shards": shards,
           "non_sharded": {k: v for k, v in groups.items() if k not in ("lab-normal", "lab-ignored")},
           "external_gates": inventory["external_gates"]}
+    if getattr(args, "applicability", None):
+        data = applicable_plan(data, load(args.applicability))
     validate_plan(data)
     write(args.output, data)
 
 
 def validate_plan(data):
-    require(data["schema_version"] == SCHEMA, "unsupported plan")
+    require(data["schema_version"] in (SCHEMA, 2), "unsupported plan")
     ids, rows, owners = set(), [], {}
     for shard in data["shards"]:
         require(shard["id"] not in ids, "duplicate shard id")
@@ -298,6 +300,83 @@ def validate_plan(data):
         rows.extend(tests)
     require(len(rows) == len({key(r) for r in rows}) == data["test_count"], "duplicate/missing tests in plan")
     require(object_digest(sorted(rows, key=key)) == data["test_inventory_digest"], "plan inventory digest mismatch")
+    if data["schema_version"] == 2:
+        require(type(data["schema_version"]) is int and type(data["test_count"]) is int, "invalid schema2 numeric fields")
+        require(all(type(s[k]) is int for s in data["shards"] for k in ("partition", "total", "expected_count")), "invalid schema2 partition fields")
+        for shards in owners.values():
+            ordered = sorted([r for s in shards for r in s["tests"]], key=key)
+            require(all(s["tests"] == ordered[s["partition"]::s["total"]] for s in shards), "changed original round-robin partition")
+        validate_applicability(data)
+
+
+def ignored_rows(data):
+    return sorted([r for s in data["shards"] if s["owner"] == "lab-ignored" for r in s["tests"]], key=key)
+
+
+def applicable_plan(data, applicability):
+    require(data["schema_version"] == SCHEMA, "applicability requires an original v1 compiled plan")
+    validate_plan(data)
+    result = {**data, "schema_version": 2, "applicability": applicability,
+              "applicability_digest": object_digest(applicability)}
+    validate_plan(result)
+    return result
+
+
+def validate_applicability(data):
+    applicability = data["applicability"]
+    require(isinstance(applicability, dict) and set(applicability) == {
+        "schema_version", "identity", "manifest_sha256", "test_inventory_digest", "owner",
+        "compiled_owner_count", "compiled_owner_digest", "decisions"}, "invalid applicability fields")
+    require(type(applicability["schema_version"]) is int and applicability["schema_version"] == 2
+            and applicability["owner"] == "lab-ignored", "invalid applicability owner/schema")
+    require(object_digest(applicability) == data["applicability_digest"], "applicability digest mismatch")
+    require(applicability["identity"] == data["identity"] and applicability["manifest_sha256"] == data["manifest_sha256"]
+            and applicability["test_inventory_digest"] == data["test_inventory_digest"], "applicability source/inventory mismatch")
+    rows = ignored_rows(data)
+    require(type(applicability["compiled_owner_count"]) is int and applicability["compiled_owner_count"] == len(rows)
+            and applicability["compiled_owner_digest"] == object_digest(rows), "applicability compiled owner mismatch")
+    decisions = applicability["decisions"]
+    require(isinstance(decisions, list) and len(decisions) == len(rows), "missing applicability decisions")
+    for decision in decisions:
+        require(isinstance(decision, dict) and set(decision) == {"binary_id", "name", "required", "reason"}, "invalid decision fields")
+        require(all(isinstance(decision[k], str) and 1 <= len(decision[k]) <= 1024 and decision[k].isascii()
+                    and decision[k].isprintable() for k in ("binary_id", "name")), "invalid decision identity")
+        reason = decision["reason"]
+        require(type(decision["required"]) is bool, "decision required must be boolean")
+        require(isinstance(reason, str) and 1 <= len(reason) <= 1024 and reason == reason.strip()
+                and reason.isascii() and reason.isprintable(), "decision needs a bounded printable ASCII reason")
+    require(Counter(key(d) for d in decisions) == Counter(key(r) for r in rows), "unknown/duplicate/missing applicability IDs")
+
+
+def required_tests(data, shard):
+    if data["schema_version"] == SCHEMA or shard["owner"] != "lab-ignored":
+        return shard["tests"]
+    required = {key(d) for d in data["applicability"]["decisions"] if d["required"]}
+    return [r for r in shard["tests"] if key(r) in required]
+
+
+def check_frozen_plan(data, args):
+    if data["schema_version"] == 2:
+        expected = getattr(args, "frozen_plan_sha256", None)
+        require(isinstance(expected, str) and re.fullmatch(r"[0-9a-f]{64}", expected), "schema2 requires independently frozen plan SHA-256")
+        require(digest(args.plan) == expected, "independently frozen plan digest mismatch")
+
+
+def applicability_summary(data, observed):
+    rows = ignored_rows(data)
+    decisions = {key(d): d for d in data["applicability"]["decisions"]}
+    required = [r for r in rows if decisions[key(r)]["required"]]
+    omitted = [r for r in rows if not decisions[key(r)]["required"]]
+    owner = {"compiled_count": len(rows), "compiled_digest": object_digest(rows),
+            "required_count": len(required), "required_digest": object_digest(required),
+            "not_applicable_count": len(omitted), "not_applicable_digest": object_digest(omitted),
+            "observed_required_count": observed, "not_applicable_status": "NOTEXECUTED_NOTPASS",
+            "partitions": [{"partition": s["partition"], "total": s["total"],
+                            "required_count": len(required_tests(data, s)),
+                            "required_digest": object_digest(sorted(required_tests(data, s), key=key))}
+                           for s in data["shards"] if s["owner"] == "lab-ignored"]}
+    not_executed = [{**r, "reason": decisions[key(r)]["reason"], "status": "NOTEXECUTED_NOTPASS"} for r in omitted]
+    return owner, not_executed
 
 
 def escape(value):
@@ -333,12 +412,19 @@ def junit_tests(path):
 def run(args):
     plan_data = load(args.plan)
     validate_plan(plan_data)
+    check_frozen_plan(plan_data, args)
     shard = next(s for s in plan_data["shards"] if s["id"] == args.shard)
     require(shard["owner"].startswith("lab-"), "compiler tests must execute on the builder")
+    execution = required_tests(plan_data, shard)
+    require(execution, "no required tests in partition; N/A remains NOTEXECUTED_NOTPASS")
     extracted, bundle = Path(args.extracted).resolve(), Path(args.bundle).resolve()
-    check_bundle(bundle)
+    manifest = check_bundle(bundle)
     require(plan_data["manifest_sha256"] == digest(bundle / "manifest.json"), "plan bundle mismatch")
-    require(load(extracted / "extracted.json")["manifest_sha256"] == plan_data["manifest_sha256"], "extraction mismatch")
+    marker = load(extracted / "extracted.json")
+    require(marker["manifest_sha256"] == plan_data["manifest_sha256"], "extraction mismatch")
+    if plan_data["schema_version"] == 2:
+        require(marker["test_inventory_digest"] == plan_data["test_inventory_digest"], "compiled extraction inventory mismatch")
+        require(all(manifest[k] == value for k, value in plan_data["identity"].items()), "compiled bundle identity mismatch")
     # Compiler-injected paths cannot be repaired by --workspace-remap alone.
     # The lab controller mounts these exact private clone-local paths.
     require(os.path.samefile("/workspace", extracted / "source"), "controller must mount this source at /workspace")
@@ -351,13 +437,13 @@ def run(args):
                 "--workspace-remap", "/workspace", "--target-dir-remap", "/target/current", "--profile", "ci",
                 "--config-file", "/workspace/.config/nextest.toml", "--user-config-file", "none", "--run-ignored", "all"]
     env = {**os.environ, "INSTA_UPDATE": "no", "RUST_TEST_THREADS": "1", "RAYON_NUM_THREADS": "2"}
-    expected = sorted(key(r) for r in shard["tests"])
+    expected = sorted(key(r) for r in execution)
     require(expected, "empty partition")
     junit = Path("/workspace/target/nextest/ci/junit.xml")
     combined = ET.Element("testsuites")
     commands, observed, code = [], [], 0
     with (output / "run.log").open("wb") as log:
-        for index, batch in enumerate(batches(shard["tests"])):
+        for index, batch in enumerate(batches(execution)):
             options = [*metadata, "-E", filterset(batch)]
             listing = subprocess.check_output(common + ["list", *options, "--message-format", "json"], cwd="/workspace", env=env, text=True)
             write(output / f"selected-{index}.json", json.loads(listing))
@@ -387,6 +473,10 @@ def run(args):
                "nextest_version": PIN["version"]}
     if (output / "junit.xml").exists():
         receipt["junit_sha256"] = digest(output / "junit.xml")
+    if plan_data["schema_version"] == 2:
+        receipt.update(schema_version=2, applicability_digest=plan_data["applicability_digest"],
+                       required_digest=object_digest(sorted(execution, key=key)))
+    check_frozen_plan(plan_data, args)
     write(output / "receipt.json", receipt)
     require(code == 0 and not missing and not duplicates and not extra and len(expected) == len(observed), "shard failed or count mismatch")
 
@@ -394,9 +484,11 @@ def run(args):
 def verify(args):
     data = load(args.plan)
     validate_plan(data)
+    check_frozen_plan(data, args)
     not_applicable = set(getattr(args, "not_applicable_owner", []) or [])
     require(not_applicable <= {"lab-ignored"}, "only whole lab-ignored owner can be declared not applicable")
-    expected = {s["id"]: s for s in data["shards"] if s["owner"] not in not_applicable}
+    require(data["schema_version"] == SCHEMA or not not_applicable, "schema2 forbids whole-owner override")
+    expected = {s["id"]: s for s in data["shards"] if s["owner"] not in not_applicable and required_tests(data, s)}
     require(expected, "empty plan")
     receipts = [load(Path(p) / "receipt.json") for p in args.receipts]
     require(Counter(r["id"] for r in receipts) == Counter({k: 1 for k in expected}), "missing or duplicate shard receipts")
@@ -406,12 +498,18 @@ def verify(args):
         require(all(receipt[k] == v for k, v in data["identity"].items()), "receipt identity mismatch")
         require(receipt["test_inventory_digest"] == data["test_inventory_digest"], "receipt inventory mismatch")
         require(receipt["nextest_version"] == PIN["version"], "receipt nextest version mismatch")
-        require(receipt["exit_code"] == 0 and receipt["expected_count"] == receipt["observed_count"] == shard["expected_count"] > 0, "failed/empty/count-mismatched shard")
+        execution = required_tests(data, shard)
+        require(receipt["exit_code"] == 0 and receipt["expected_count"] == receipt["observed_count"] == len(execution) > 0, "failed/empty/count-mismatched shard")
         require(not receipt["missing"] and not receipt["duplicates"] and not receipt["extra"], "invalid test coverage")
         require(receipt["partition"] == shard["partition"] and receipt["total"] == shard["total"] and receipt["owner"] == shard["owner"], "partition mismatch")
         require(digest(Path(folder) / "run.log") == receipt["evidence_sha"], "log checksum mismatch")
         require(digest(Path(folder) / "junit.xml") == receipt["junit_sha256"], "JUnit checksum mismatch")
-        require(sorted(junit_tests(Path(folder) / "junit.xml")) == sorted(key(r) for r in shard["tests"]), "JUnit test identity mismatch")
+        require(sorted(junit_tests(Path(folder) / "junit.xml")) == sorted(key(r) for r in execution), "JUnit test identity mismatch")
+        if data["schema_version"] == 2:
+            require(all(type(receipt[k]) is int for k in ("schema_version", "expected_count", "observed_count", "partition", "total", "exit_code")), "invalid schema2 receipt numeric fields")
+            require(receipt["schema_version"] == 2 and receipt["applicability_digest"] == data["applicability_digest"], "receipt applicability mismatch")
+            require(receipt["required_digest"] == object_digest(sorted(execution, key=key)), "receipt required subset mismatch")
+            require(sorted(tuple(r) for r in receipt["observed"]) == sorted(key(r) for r in execution), "receipt observed IDs mismatch")
     pending = {k: len(v) for k, v in data["non_sharded"].items() if v}
     expected_owners = Counter()
     observed_owners = Counter()
@@ -438,6 +536,17 @@ def verify(args):
                "blocked": [{"owner": name, "tests": data["non_sharded"][name]} for name in pending if name != "builder-compiler"],
                "external_gates": data["external_gates"], "aggregate_pass": False}
     summary["not_applicable_owners"] = {owner: summary["owner_inventory"][owner] for owner in sorted(not_applicable)}
+    if data["schema_version"] == 2:
+        applicability, omitted = applicability_summary(data, observed_owners["lab-ignored"])
+        require(applicability["observed_required_count"] == applicability["required_count"], "missing required ignored execution")
+        require(data["test_count"] == summary["observed_count"] + len(omitted) + sum(pending.values()), "compiled applicability accounting mismatch")
+        summary.update(schema_version=2, applicability=data["applicability"], applicability_digest=data["applicability_digest"],
+                       owner_applicability={"lab-ignored": applicability}, not_applicable_tests=omitted,
+                       accounting={"compiled_count": data["test_count"], "observed_required_count": summary["observed_count"],
+                                   "not_applicable_count": len(omitted), "other_owner_count": sum(pending.values())})
+        for item, receipt in zip(summary["shards"], receipts):
+            item.update(applicability_digest=receipt["applicability_digest"], required_digest=receipt["required_digest"])
+    check_frozen_plan(data, args)
     if getattr(args, "output", None):
         write(args.output, summary)
     print(json.dumps(summary, sort_keys=True))
@@ -483,15 +592,18 @@ def main():
     for flag in ("bundle", "extracted", "output"):
         planning.add_argument("--" + flag, required=True)
     planning.add_argument("--shards", type=int, default=2)
+    planning.add_argument("--applicability", help="Explicit schema2 independently frozen exact-ID lab-ignored map")
     planning.set_defaults(action=plan)
     running = commands.add_parser("run")
     for flag in ("plan", "bundle", "extracted", "shard", "output"):
         running.add_argument("--" + flag, required=True)
     running.add_argument("--nextest", default="cargo-nextest")
+    running.add_argument("--frozen-plan-sha256", help="Independently reviewed immutable plan hash; required for schema2")
     running.set_defaults(action=run)
     verifying = commands.add_parser("verify")
     verifying.add_argument("--plan", required=True)
     verifying.add_argument("--output")
+    verifying.add_argument("--frozen-plan-sha256", help="Independently reviewed immutable plan hash; required for schema2")
     verifying.add_argument("--not-applicable-owner", action="append", choices=["lab-ignored"],
                            help="Omit only this whole owner; acceptance still requires a separately frozen applicability decision")
     verifying.add_argument("receipts", nargs="+")
