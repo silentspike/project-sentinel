@@ -552,6 +552,7 @@ fn is_project_event_type(value: &str) -> bool {
         "project_created"
             | "project_work_graph_planned"
             | "project_source_review_planned"
+            | "project_source_review_rework_started"
             | "project_activated"
             | "project_work_assigned"
             | "project_work_reassigned"
@@ -7715,7 +7716,9 @@ pub(crate) fn validated_company_projects_in_snapshot(
             return Err(corrupt());
         }
         validate_project(&project).map_err(|_| corrupt())?;
-        subscription::validate_persisted(connection, &project).map_err(|_| corrupt())?;
+        project
+            .validate_persisted(connection)
+            .map_err(|_| corrupt())?;
         Ok(project)
     })
     .collect::<Result<Vec<_>, WorkflowError>>()
