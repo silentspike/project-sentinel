@@ -2104,6 +2104,22 @@ pub mod bridge {
         Ok(())
     }
 
+    /// Serialize the real bound request for compatibility fixtures, without dispatch.
+    #[cfg(test)]
+    pub(crate) fn serialized_model_gateway_request_for_test(
+        context: &ModelWorkContext,
+        perception: &Perception,
+        state: &StateStore,
+    ) -> Result<(Vec<u8>, String), &'static str> {
+        let binding = context.binding();
+        let mut request =
+            build_gateway_request(perception, state, &binding.request_id(), Some(&binding));
+        bind_model_work_request(&mut request, context)?;
+        let bytes = serde_json::to_vec(&request).map_err(|_| "test request encoding failed")?;
+        let digest = gateway_request_digest(&request).map_err(|_| "test request digest failed")?;
+        Ok((bytes, digest))
+    }
+
     /// Synthetic test input through the real serializer, usage append and admission;
     /// this is not evidence of live provider execution.
     #[cfg(test)]

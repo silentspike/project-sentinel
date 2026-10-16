@@ -305,6 +305,10 @@ struct Fixture {
 
 impl Fixture {
     fn continued_unknown_with_observation() -> Self {
+        Self::continued_unknown_with_observation_and_calls(3)
+    }
+
+    fn continued_unknown_with_observation_and_calls(additional_model_calls: u16) -> Self {
         use super::super::super::adaptive_leadership_review::tests::{
             persist, reconcile_review_at, seed_planning_receipt_with_catalog,
         };
@@ -473,7 +477,7 @@ impl Fixture {
                 "schema_version": 2,
                 "decision": {
                     "kind": "continue",
-                    "additional_model_calls": 3,
+                    "additional_model_calls": additional_model_calls,
                     "window_ms": 300_000,
                     "rationale": "Inspect fresh state after the sealed unknown effect.",
                     "evidence_refs": context.source.evidence_refs,
@@ -1193,4 +1197,580 @@ fn retained_observation_never_relaxes_store_rejection_of_noninspection_decisions
     assert!(fixture.session.requires_fresh_observation());
     assert_eq!(fixture.session.model_calls, before.model_calls);
     assert_eq!(fixture.session.tool_calls, before.tool_calls);
+}
+
+mod retained_failure_output {
+    use super::*;
+    use redb::ReadableTable;
+
+    const FAILURE: &str = "SyntaxError: fixture expected a closing brace\n";
+    const CURRENT: &str = "const corrected = true;\n";
+
+    impl Fixture {
+        fn with_retained_failure() -> Self {
+            let mut fixture = Self::continued_unknown_with_observation_and_calls(6);
+            fixture.inspect_and_observe(now_unix_ms(), "fresh inspection before testing");
+            fixture.run_syntax_test(1, FAILURE);
+            fixture.inspect_and_observe(now_unix_ms(), CURRENT);
+            fixture
+        }
+
+        fn run_syntax_test(&mut self, exit_code: i32, stderr: &str) {
+            let now = now_unix_ms();
+            let effect = self.claim_model(now);
+            let tool = WorkbenchTool::RunTests {
+                suite_id: "javascript-syntax".into(),
+                program: "node".into(),
+                args: vec!["--check".into(), "main.js".into()],
+            };
+            let tool_digest = adaptive_tool_digest(&tool).unwrap();
+            self.advance(
+                AdaptiveTransitionV1::ResolveModel {
+                    effect,
+                    result_digest: "b".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Tool {
+                        tool: tool.clone(),
+                        tool_digest: tool_digest.clone(),
+                    },
+                },
+                now,
+            );
+            let adapter = self.api.workbench.as_ref().unwrap();
+            let effect = adapter.adaptive_tool_effect(&self.session, &tool).unwrap();
+            let request = adapter
+                .build_adaptive_request(&self.session, &effect, &tool)
+                .unwrap();
+            self.advance(
+                AdaptiveTransitionV1::ClaimTool {
+                    effect: effect.clone(),
+                    tool_digest,
+                },
+                now,
+            );
+            self.tools.reserve(&request, now).unwrap();
+            self.tools
+                .mark_executing(&request.invocation_id, &request.input_digest, now)
+                .unwrap();
+            let mut output = sentinel_common::WorkbenchCommandStatus {
+                exit_code,
+                stdout_bytes: 0,
+                stderr_bytes: stderr.len() as u64,
+            }
+            .output();
+            output.insert("stdout".into(), String::new());
+            output.insert("stderr".into(), stderr.into());
+            self.tools
+                .accept_result(
+                    &sentinel_common::WorkbenchMessage::Result {
+                        schema_version: WORKBENCH_SCHEMA_VERSION,
+                        invocation_id: request.invocation_id.clone(),
+                        input_digest: request.input_digest.clone(),
+                        outcome: sentinel_common::WorkbenchOutcome::Succeeded,
+                        resources: sentinel_common::WorkbenchResourceUsage::default(),
+                        artifacts: Vec::new(),
+                        error: None,
+                        output,
+                    },
+                    now,
+                )
+                .unwrap();
+            let authority = self.api.authority.as_ref().unwrap();
+            let (profile, digest) = authority
+                .profile_for_binding(&self.session.grant.authority.profile_id)
+                .unwrap();
+            let observation = WorkbenchCoordinator::new(&self.tools, profile, digest)
+                .private_observation(&request.invocation_id, authority.as_ref())
+                .unwrap()
+                .unwrap();
+            self.advance(
+                AdaptiveTransitionV1::ObserveTool {
+                    observation: AdaptiveObservationRefV1 {
+                        effect,
+                        observation_digest: observation.digest().to_owned(),
+                    },
+                },
+                now,
+            );
+        }
+
+        fn reopen_after(self, change: impl FnOnce(&Path)) -> Self {
+            let Self {
+                api,
+                session,
+                tools,
+                _temp,
+            } = self;
+            let allowance_id = api.subscription_allowance_id.clone();
+            drop(api);
+            drop(tools);
+            change(_temp.path());
+            let mut api = super::super::super::super::model_work::configured_test_api(
+                &_temp.path().join("company.sqlite"),
+            );
+            api.subscription_allowance_id = allowance_id;
+            api.event_store = Some(
+                sentinel_limbo::EventStore::open(
+                    _temp.path().join("events.sqlite").to_str().unwrap(),
+                )
+                .unwrap(),
+            );
+            api.workbench = Some(Arc::new(WorkbenchExecutionAdapter {
+                store: Arc::clone(&api.store),
+                authority: Arc::clone(api.authority.as_ref().unwrap()),
+            }));
+            let tools = Arc::new(
+                WorkbenchInvocationStore::open(_temp.path().join("workbench.redb")).unwrap(),
+            );
+            let fixture = Self {
+                api,
+                session,
+                tools,
+                _temp,
+            };
+            assert_eq!(fixture.read(), fixture.session);
+            fixture
+        }
+    }
+
+    fn gateway_identity(
+        context: &AdaptiveModelContext,
+        state: &sentinel_redb::StateStore,
+    ) -> (Vec<u8>, String) {
+        let perception = sentinel_common::Perception {
+            agent_id: context.binding.grant.authority.agent_id,
+            circadian_text: String::new(),
+            body_text: String::new(),
+            environment_text: String::new(),
+            acoustic_text: String::new(),
+            heard_text: String::new(),
+            presence_text: String::new(),
+            impulse_text: String::new(),
+            is_directly_addressed: false,
+            timestamp: sentinel_common::Timestamp(100),
+            tick: sentinel_common::Tick(100),
+            room_id: "buero-dev-1".into(),
+            max_priority: "NONE".into(),
+            synth_fingerprint: "retained-failure-output-fixture".into(),
+            personality_type: "E".into(),
+            has_operator_impulse: false,
+        };
+        let envelope = ModelExecutionContext::Adaptive(Box::new(context.clone()));
+        let identity = crate::llm_bridge::bridge::serialized_model_gateway_request_for_test(
+            &envelope,
+            &perception,
+            state,
+        )
+        .unwrap();
+        assert_eq!(identity.1, sentinel_common::sha256_hex(&identity.0));
+        let request: serde_json::Value = serde_json::from_slice(&identity.0).unwrap();
+        assert_eq!(
+            request["metadata"]["company_execution_context_digest"],
+            sentinel_common::sha256_hex(&serde_json::to_vec(&envelope).unwrap())
+        );
+        identity
+    }
+
+    fn reserve_context(fixture: &Fixture, context: &AdaptiveModelContext, digest: &str) {
+        let id = context.binding.request_id();
+        let events = fixture.api.event_store.as_ref().unwrap();
+        events
+            .reserve_llm_request(
+                &id,
+                digest,
+                &context.binding.grant.authority.agent_id.to_string(),
+            )
+            .unwrap();
+        events
+            .bind_llm_model_reservation(
+                &crate::llm_bridge::bridge::model_reservation(
+                    &ModelExecutionContext::Adaptive(Box::new(context.clone())),
+                    &id,
+                    digest,
+                )
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn reserve_failure_context(fixture: &Fixture, context: &AdaptiveModelContext) {
+        let state = sentinel_redb::StateStore::open(
+            fixture
+                ._temp
+                .path()
+                .join("request-state.redb")
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let (_, digest) = gateway_identity(context, &state);
+        reserve_context(fixture, context, &digest);
+    }
+
+    #[test]
+    fn failed_test_then_inspection_keeps_exact_failure_and_current_content_until_next_pass() {
+        let fixture = Fixture::with_retained_failure();
+        let context = fixture.context();
+        context.validate_dispatch(now_unix_ms()).unwrap();
+        let value = serde_json::to_value(context.working_memory.as_ref().unwrap()).unwrap();
+        assert_eq!(value["retained_failure_output"]["stderr"]["text"], FAILURE);
+        assert_eq!(
+            value["retained_failure_output"]["stderr"]["omitted_prefix_bytes"],
+            0
+        );
+        assert_eq!(
+            context.observation.as_ref().unwrap().output()["content"],
+            CURRENT
+        );
+        assert!(!context.fresh_observation_required);
+        assert!(context.prompt().unwrap().contains(FAILURE.trim_end()));
+        assert!(!format!("{context:?}").contains(FAILURE.trim_end()));
+        let grant = fixture.session.grant.clone();
+        let spent = (fixture.session.model_calls, fixture.session.tool_calls);
+        let fixture = fixture.reopen_after(|_| {});
+        assert_eq!(fixture.context(), context);
+        assert_eq!(fixture.session.grant, grant);
+        assert_eq!(
+            (fixture.session.model_calls, fixture.session.tool_calls),
+            spent
+        );
+        let mut fixture = fixture;
+        fixture.run_syntax_test(0, "");
+        assert!(fixture
+            .context()
+            .working_memory
+            .unwrap()
+            .retained_failure_output
+            .is_none());
+        fixture.inspect_and_observe(now_unix_ms(), "source inspected after passing test");
+        let passing = fixture.context();
+        assert!(passing
+            .working_memory
+            .as_ref()
+            .unwrap()
+            .retained_failure_output
+            .is_none());
+        assert!(!passing.prompt().unwrap().contains(FAILURE.trim_end()));
+        assert_eq!(fixture.session.grant, grant);
+    }
+
+    #[test]
+    fn numeric_and_enriched_reservations_keep_exact_gateway_identity_across_claim_and_reopen() {
+        for numeric_only in [true, false] {
+            let mut fixture = Fixture::with_retained_failure();
+            let mut sealed = fixture.context();
+            assert!(sealed
+                .working_memory
+                .as_ref()
+                .unwrap()
+                .retained_failure_output
+                .is_some());
+            if numeric_only {
+                // Reconstruct the pre-enrichment presentation, without rewriting any history.
+                sealed.working_memory = Some(fixture.with_observations(|| {
+                    super::super::super::working_memory::compose(
+                        sealed.working_memory.as_ref().unwrap().source.clone(),
+                        sealed.observation.as_ref(),
+                        |effect| {
+                            fixture
+                                .api
+                                .workbench
+                                .as_ref()
+                                .unwrap()
+                                .private_observation(
+                                    effect,
+                                    &sealed.binding.grant.authority.profile_id,
+                                )
+                                .map(Some)
+                                .map_err(|_| "legacy private observation read failed")
+                        },
+                    )
+                    .unwrap()
+                }));
+            }
+            let state_temp = tempfile::tempdir().unwrap();
+            let state = sentinel_redb::StateStore::open(
+                state_temp.path().join("state.redb").to_str().unwrap(),
+            )
+            .unwrap();
+            let identity = gateway_identity(&sealed, &state);
+            reserve_context(&fixture, &sealed, &identity.1);
+            let context_bytes = serde_json::to_vec(&sealed).unwrap();
+            let prompt = sealed.prompt().unwrap();
+            assert_eq!(fixture.context(), sealed);
+            fixture.advance(
+                AdaptiveTransitionV1::ClaimModel {
+                    effect: AdaptiveEffectV1 {
+                        id: sealed.binding.effect_id,
+                        request_digest: identity.1.clone(),
+                    },
+                    previous_observation_digest: sealed
+                        .binding
+                        .previous_observation
+                        .as_ref()
+                        .map(|observation| observation.observation_digest.clone()),
+                },
+                now_unix_ms(),
+            );
+            let fixture = fixture.reopen_after(|_| {});
+            let before = fixture.read();
+            let entry = fixture
+                .api
+                .event_store
+                .as_ref()
+                .unwrap()
+                .get_llm_completion(&sealed.binding.request_id())
+                .unwrap();
+            for _ in 0..2 {
+                let restored = fixture.with_observations(|| {
+                    fixture.api.prepare_adaptive_model(&sealed.binding).unwrap()
+                });
+                assert_eq!(restored, sealed);
+                assert_eq!(serde_json::to_vec(&restored).unwrap(), context_bytes);
+                assert_eq!(restored.prompt().unwrap(), prompt);
+                assert_eq!(gateway_identity(&restored, &state), identity);
+                fixture.with_observations(|| {
+                    fixture
+                        .api
+                        .validate_prepared_adaptive_model_context(&sealed.binding, &restored)
+                        .unwrap()
+                });
+                assert_eq!(fixture.read(), before);
+                assert_eq!(
+                    fixture
+                        .api
+                        .event_store
+                        .as_ref()
+                        .unwrap()
+                        .get_llm_completion(&sealed.binding.request_id())
+                        .unwrap(),
+                    entry
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_failure_never_renews_unknown_provider_authority_after_restart() {
+        let mut fixture = Fixture::with_retained_failure();
+        let context = fixture.context();
+        let state_temp = tempfile::tempdir().unwrap();
+        let state =
+            sentinel_redb::StateStore::open(state_temp.path().join("state.redb").to_str().unwrap())
+                .unwrap();
+        let (_, digest) = gateway_identity(&context, &state);
+        reserve_context(&fixture, &context, &digest);
+        fixture.advance(
+            AdaptiveTransitionV1::ClaimModel {
+                effect: AdaptiveEffectV1 {
+                    id: context.binding.effect_id,
+                    request_digest: digest.clone(),
+                },
+                previous_observation_digest: context
+                    .binding
+                    .previous_observation
+                    .as_ref()
+                    .map(|observation| observation.observation_digest.clone()),
+            },
+            now_unix_ms(),
+        );
+        fixture.with_observations(|| {
+            fixture
+                .api
+                .validate_prepared_adaptive_model_context(&context.binding, &context)
+                .unwrap()
+        });
+        assert!(fixture
+            .api
+            .event_store
+            .as_ref()
+            .unwrap()
+            .mark_llm_provider_outcome_unknown(
+                &context.binding.request_id(),
+                &digest,
+                "UnknownOutcome: provider_transport_deadline_elapsed",
+            )
+            .unwrap());
+        let fixture = fixture.reopen_after(|_| {});
+        let before = fixture.read();
+        assert!(fixture
+            .with_observations(|| fixture
+                .api
+                .validate_prepared_adaptive_model_context(&context.binding, &context))
+            .is_err());
+        assert_eq!(fixture.read(), before);
+        assert_eq!(
+            fixture
+                .api
+                .event_store
+                .as_ref()
+                .unwrap()
+                .get_llm_completion(&context.binding.request_id())
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn missing_changed_and_foreign_private_failure_reject_after_restart() {
+        for change in ["missing", "changed", "foreign"] {
+            let fixture = Fixture::with_retained_failure();
+            let context = fixture.context();
+            reserve_failure_context(&fixture, &context);
+            let memory = context.working_memory.as_ref().unwrap();
+            let row = memory
+                .source
+                .rows
+                .iter()
+                .rfind(|row| {
+                    row.tool_kind == sentinel_workflow::AdaptiveWorkingMemoryToolKindV1::RunTests
+                })
+                .unwrap();
+            let id = row.observation.effect.id.to_string();
+            let foreign = fixture.api.principals.principal("pm").unwrap().principal;
+            let fixture = fixture.reopen_after(|root| {
+                let database = redb::Database::open(root.join("workbench.redb")).unwrap();
+                let write = database.begin_write().unwrap();
+                {
+                    let table: redb::TableDefinition<&str, &[u8]> = if change == "foreign" {
+                        redb::TableDefinition::new("workbench_invocations_v1")
+                    } else {
+                        redb::TableDefinition::new("workbench_private_observations_v1")
+                    };
+                    let mut table = write.open_table(table).unwrap();
+                    if change == "missing" {
+                        assert!(table.remove(id.as_str()).unwrap().is_some());
+                    } else {
+                        let bytes = table.get(id.as_str()).unwrap().unwrap().value().to_vec();
+                        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        if change == "changed" {
+                            value["output"]["stderr"] = "changed private failure".into();
+                        } else {
+                            value["caller_id"] = foreign.principal_id.clone().into();
+                            value["agent_id"] =
+                                serde_json::to_value(foreign.agent_id.unwrap()).unwrap();
+                        }
+                        let bytes = serde_json::to_vec(&value).unwrap();
+                        table.insert(id.as_str(), bytes.as_slice()).unwrap();
+                    }
+                }
+                write.commit().unwrap();
+            });
+            let before = fixture.read();
+            assert_eq!(
+                fixture
+                    .with_observations(|| { fixture.api.prepare_adaptive_model(&context.binding) }),
+                Err("historical private observation access or validation rejected"),
+                "{change}"
+            );
+            assert_eq!(fixture.read(), before);
+        }
+    }
+
+    #[test]
+    fn retained_failure_does_not_bypass_current_runtime_authority_after_restart() {
+        let fixture = Fixture::with_retained_failure();
+        let context = fixture.context();
+        reserve_failure_context(&fixture, &context);
+        let fixture = fixture.reopen_after(|_| {});
+        fixture
+            .api
+            .authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == context.binding.grant.authority.agent_id.0)
+            .unwrap()
+            .expected_active = false;
+        let before = fixture.read();
+        assert!(fixture
+            .with_observations(|| { fixture.api.prepare_adaptive_model(&context.binding) })
+            .is_err());
+        assert_eq!(fixture.read(), before);
+    }
+
+    #[test]
+    fn optional_failure_omission_preserves_numeric_identity_at_full_prompt_boundary() {
+        // Synthetic task padding tests presentation fitting only, not dispatch admission.
+        let fixture = Fixture::with_retained_failure();
+        let mut enriched = fixture.context();
+        let mut invalid = enriched.clone();
+        let mut numeric = enriched.clone();
+        numeric
+            .working_memory
+            .as_mut()
+            .unwrap()
+            .retained_failure_output = None;
+        let limit = super::super::super::super::model_work::MAX_MODEL_WORK_BYTES;
+        let padding = limit - numeric.prompt().unwrap().len();
+        let suffix = "x".repeat(padding);
+        enriched.task.objective.push_str(&suffix);
+        numeric.task.objective.push_str(&suffix);
+        assert_eq!(numeric.prompt().unwrap().len(), limit);
+        assert_eq!(
+            enriched.prompt(),
+            Err("adaptive model context exceeds its bound")
+        );
+        let numeric_bytes = serde_json::to_vec(&numeric).unwrap();
+        assert!(enriched.fit_optional_failure_output_to_prompt().unwrap());
+        assert_eq!(enriched, numeric);
+        assert_eq!(serde_json::to_vec(&enriched).unwrap(), numeric_bytes);
+        assert!(!enriched.fit_optional_failure_output_to_prompt().unwrap());
+        let state_temp = tempfile::tempdir().unwrap();
+        let state =
+            sentinel_redb::StateStore::open(state_temp.path().join("state.redb").to_str().unwrap())
+                .unwrap();
+        let identity = gateway_identity(&numeric, &state);
+        assert_eq!(gateway_identity(&enriched, &state), identity);
+        reserve_context(&fixture, &enriched, &identity.1);
+        let fixture = fixture.reopen_after(|_| {});
+        let decoded: AdaptiveModelContext = serde_json::from_slice(&numeric_bytes).unwrap();
+        assert_eq!(gateway_identity(&decoded, &state), identity);
+        let reservation = crate::llm_bridge::bridge::model_reservation(
+            &ModelExecutionContext::Adaptive(Box::new(decoded.clone())),
+            &decoded.binding.request_id(),
+            &identity.1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            fixture
+                .api
+                .event_store
+                .as_ref()
+                .unwrap()
+                .llm_model_reservation(&reservation.request_id, &reservation.owner_scope,)
+                .unwrap(),
+            Some(reservation)
+        );
+        assert_eq!(decoded.prompt().unwrap(), numeric.prompt().unwrap());
+        enriched.task.objective.push('x');
+        assert_eq!(
+            enriched.prompt(),
+            Err("adaptive model context exceeds its bound")
+        );
+        assert!(!enriched.fit_optional_failure_output_to_prompt().unwrap());
+        invalid
+            .working_memory
+            .as_mut()
+            .unwrap()
+            .source
+            .active_model_ceiling = 0;
+        assert_eq!(
+            invalid.fit_optional_failure_output_to_prompt(),
+            Err("adaptive working memory active accounting invalid")
+        );
+        assert!(invalid
+            .working_memory
+            .as_ref()
+            .unwrap()
+            .retained_failure_output
+            .is_some());
+    }
 }

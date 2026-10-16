@@ -574,6 +574,29 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl AdaptiveModelContext {
+    fn fit_optional_failure_output_to_prompt(&mut self) -> Result<bool, &'static str> {
+        if self
+            .working_memory
+            .as_ref()
+            .is_none_or(|memory| memory.retained_failure_output.is_none())
+        {
+            return Ok(false);
+        }
+        match self.prompt() {
+            Ok(_) => Ok(true),
+            Err("adaptive model context exceeds its bound") => {
+                // Optional history must not make a valid numeric context unusable.
+                self.working_memory
+                    .as_mut()
+                    .ok_or("adaptive working memory unavailable")?
+                    .retained_failure_output = None;
+                self.prompt()?;
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn validate_dispatch_clock(&self, now_ms: u64) -> Result<(), &'static str> {
         if now_ms >= self.binding.grant.deadline_ms {
             return Err("adaptive model context is stale or unsupported");
@@ -2763,10 +2786,34 @@ impl WorkflowApi {
                     }
                 }
             };
-            working_memory::compose(source.clone(), context.observation.as_ref(), |effect| {
-                Ok(observations.remove(&effect))
-            })?
+            if let Some(reserved) = &reservation {
+                let legacy = working_memory::compose(
+                    source.clone(),
+                    context.observation.as_ref(),
+                    |effect| Ok(observations.get(&effect).cloned()),
+                )?;
+                let mut retained = context.clone();
+                retained.working_memory = Some(legacy.clone());
+                // A reservation seals presentation bytes as well as authority.
+                // Match numeric-only history before deriving any new excerpts.
+                if digest(&retained)? == reserved.context_digest {
+                    legacy
+                } else {
+                    working_memory::compose_with_failure_output(
+                        source.clone(),
+                        context.observation.as_ref(),
+                        |effect| Ok(observations.remove(&effect)),
+                    )?
+                }
+            } else {
+                working_memory::compose_with_failure_output(
+                    source.clone(),
+                    context.observation.as_ref(),
+                    |effect| Ok(observations.remove(&effect)),
+                )?
+            }
         });
+        let prompt_checked = context.fit_optional_failure_output_to_prompt()?;
         if reservation
             .as_ref()
             .is_some_and(|value| digest(&context).ok().as_ref() != Some(&value.context_digest))
@@ -2775,7 +2822,9 @@ impl WorkflowApi {
         }
         self.validate_adaptive_preparation_freshness(binding, session, project)?;
         context.validate_dispatch(now_unix_ms())?;
-        context.prompt()?;
+        if !prompt_checked {
+            context.prompt()?;
+        }
         Ok(context)
     }
 
@@ -5590,8 +5639,12 @@ impl WorkflowApi {
 }
 
 #[cfg(test)]
+#[path = "model_execution"]
 mod family_selection_tests {
     use super::*;
+
+    #[path = "family_retained_failure_tests.rs"]
+    mod retained_failure_tests;
 
     #[test]
     fn model_role_prefilters_skip_impossible_and_foreign_identities_before_store_reads() {
