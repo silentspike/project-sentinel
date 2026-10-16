@@ -45,7 +45,10 @@ and partial table presence are never equivalent to live isolation.
 Each effect checks VM ID, node, pool membership, owner marker, bridge, storage
 and a bounded matching lease. Start checks configured address reservations and
 three ARP duplicate-address probes immediately before boot. Failed ping is not
-an IP allocation check. Pool and network provisioning also require a fresh
+an IP allocation check. An owned stopped reservation is recognized only at its
+exact node/VM config path with matching structured PVE owner and IP values;
+PVE's encoded description comments are not parsed as configuration keys.
+Pool and network provisioning also require a fresh
 cluster-wide configuration/interface/route inventory before initial allocation.
 Provisioning, decommission, lifecycle and maintenance share one durable state
 lock. Decommission fences admission before destruction and retains that fence
@@ -61,6 +64,10 @@ is not counted twice. All foreign potential headroom is reported as external
 risk, not subtracted as an unbounded blanket reservation. This policy does not
 guarantee capacity against uncontrolled foreign bursts. Lab automatic balloon
 growth is disabled; requests use the 2-8 GiB envelope.
+Admission's external-risk estimate uses the fresh cluster maximum/residency
+view, explicitly not current balloon targets. Detailed foreign status queries
+remain in read-only telemetry, outside the startup critical path. Maintenance
+skips already-stopped idle slots without clearing their retained starting intents.
 
 The existing read-only `telemetry` command returns schema 2: Unix-second
 `timestamp`, `host_mem_bytes` (including cache and availability), raw cumulative
