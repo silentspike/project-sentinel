@@ -348,6 +348,38 @@ The daemon validates authorization before dispatch. The runtime validates reques
 
 Stdout/stderr are bounded and redacted. Full private logs may live in protected runtime storage; public events carry structured summaries and safe references.
 
+### Retained correction evidence
+
+Inspecting a file changes the employee's latest observation, but does not erase
+the preceding diagnostic needed to understand a failed command or test. Private
+working memory can retain an optional excerpt from the latest retained command
+or test attempt after a later inspection. It is selected only from an exact,
+authorized terminal observation with explicit failure evidence. An unavailable
+or passing latest attempt does not select an older failure instead. No excerpt
+is duplicated when the full observation is already current.
+
+For example, a Python developer can observe an assertion failure, inspect the
+relevant function and still see the earlier diagnostic while choosing whether
+and how to correct it. The same mechanism applies to Node tests and permitted
+commands. It does not select a patch, direct a model decision or declare a fix.
+The employee must observe a subsequent execution to know its actual result.
+
+Each UTF-8 suffix is at most 2,048 text bytes; the entire optional value is at
+most 4,096 serialized bytes, including JSON escaping. Omitted-prefix counts make
+clipping explicit. Excerpts consume only remaining capacity inside the existing
+16 KiB historical-memory and 128 KiB rendered-prompt limits; they do not evict
+additional legacy rows. Retention remains bounded by the existing row inventory,
+not an unlimited log archive. Debug output and public events do not expose text.
+
+The sealed model reservation binds this presentation as well as the execution
+authority. Reconstruction first matches the original no-memory or numeric-only
+context, before considering enriched bytes. Existing requests are not rewritten.
+New enriched requests must reconstruct to their exact retained digest. Old
+binaries that reject the optional field cannot be used to downgrade a release
+after it has retained enriched contexts; preserve history with a compatible
+forward repair. These excerpts are untrusted historical evidence, not new
+capabilities, fresh filesystem state or current completion evidence.
+
 ### Bounded leadership windows
 
 An employee's previous execution window, the leadership review call, and a
