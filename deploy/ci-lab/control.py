@@ -271,16 +271,25 @@ class Lab:
         headroom = 0
         external = 0
         balloons = []
+        fresh_stopped = set()
         running = {str(v["vmid"]) for v in guests if v.get("status") == "running" and v.get("node") == self.config["node"]}
         for guest in guests:
-            if guest.get("node") != self.config["node"] or guest.get("status") != "running" or guest.get("type") != "qemu":
+            owned = guest.get("vmid") in [self.config["template"], *self.config["slots"]]
+            key = str(guest.get("vmid"))
+            promised = owned and (self.state.get("runs", {}).get(key, {}).get("phase") in {"starting", "running"}
+                                  or key in self.state.get("balloon_requests", {}))
+            if (guest.get("node") != self.config["node"] or guest.get("type") != "qemu"
+                    or (guest.get("status") != "running" and not promised)):
                 continue
-            owned = guest["vmid"] in [self.config["template"], *self.config["slots"]]
             status = api(f"/nodes/{self.config['node']}/qemu/{guest['vmid']}/status/current") if owned else guest
             if owned and status.get("status") == "stopped":
-                active -= 1
-                running.discard(str(guest["vmid"]))
+                active -= key in running
+                running.discard(key)
+                fresh_stopped.add(key)
                 continue
+            if owned and status.get("status") == "running" and key not in running:
+                active += 1
+                running.add(key)
             actual = status.get("balloon") if owned else guest.get("maxmem")
             actual = status.get("maxmem") if actual is None else actual
             resident = status.get("memhost")
@@ -311,7 +320,9 @@ class Lab:
                              "outstanding_mib": outstanding, "max_mib": guest["maxmem"] // MIB})
         # Stopped, accepted starting intents remain promises after a crash.
         for key, intent in self.state.get("runs", {}).items():
-            if key not in running and key != str(starting_vmid) and intent.get("phase") == "starting":
+            if (key not in running and key != str(starting_vmid)
+                    and (intent.get("phase") == "starting"
+                         or (intent.get("phase") == "running" and key not in fresh_stopped))):
                 headroom += self.state.get("balloon_requests", {}).get(key, 8192)
                 active += 1
         decision = admission(min(sample["available_mib"], available_mib()), active, target_mib,
@@ -358,6 +369,18 @@ class Lab:
         return {"reasons": reasons, "managed_growth": growth,
                 "sample_max_age_seconds": 45, "psi_some_avg10_limit": 1.0, "psi_full_avg10_limit": 0.1}
 
+    def fence_starting(self, vmid: int):
+        if self.state.get("runs", {}).get(str(vmid), {}).get("phase") != "starting":
+            return
+        config = self.owned(vmid)
+        tasks = api(f"/nodes/{self.config['node']}/tasks")
+        if config.get("lock") or any(str(v.get("id")) == str(vmid) and not v.get("endtime")
+                                      and v.get("type") in {"qmstart", "qmstop", "qmshutdown", "qmresume", "qmreboot", "qmreset", "qmrollback"}
+                                      for v in tasks):
+            raise CapacityUnavailable("accepted start effect is still in flight; retain its generation and commitment")
+        if self.status(vmid)["status"] != "stopped":
+            raise CapacityUnavailable("start effect changed during quiescence readback")
+
     def lease(self, vmid: int, holder: str, seconds: int) -> dict:
         self.owned(vmid)
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", holder) or not 60 <= seconds <= 14400:
@@ -369,6 +392,7 @@ class Lab:
         if not renewal:
             if self.status(vmid)["status"] != "stopped":
                 raise RuntimeError("lease takeover requires the prior guest to be stopped")
+            self.fence_starting(vmid)
             self.state.setdefault("runs", {}).pop(str(vmid), None)
             self.state.setdefault("balloon_requests", {}).pop(str(vmid), None)
         lease = {"holder": holder, "expires": time.time() + seconds,
@@ -402,6 +426,7 @@ class Lab:
             return {"already_running": True}
         if config.get("template"):
             raise RuntimeError("template cannot be started")
+        self.fence_starting(vmid)
         decision = self.resources(memory_mib, vmid)
         if not decision["allowed"]:
             raise CapacityUnavailable("capacity unavailable: " + json.dumps(decision))
@@ -460,6 +485,7 @@ class Lab:
         self.require_lease(vmid, holder, allow_invalidated=True)
         if self.status(vmid)["status"] != "stopped":
             raise RuntimeError("stop the guest before releasing its lease")
+        self.fence_starting(vmid)
         self.state["leases"][str(vmid)]["expires"] = time.time()
         self.state["last_used"][str(vmid)] = time.time()
         self.save()
@@ -573,6 +599,7 @@ class Lab:
             run("qm", "shutdown", str(vmid), "--timeout", "90", "--forceStop", "0")
         if self.status(vmid)["status"] != "stopped":
             raise RuntimeError("guest has not quiesced")
+        self.fence_starting(vmid)
         if str(vmid) in self.state.get("runs", {}):
             self.state["runs"][str(vmid)]["phase"] = "quiesced"
         self.state.setdefault("balloon_requests", {}).pop(str(vmid), None)
