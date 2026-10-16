@@ -80,7 +80,12 @@ impl WorkflowStore {
         self.propose_standing_work_funding_from_source(
             issuer,
             policy,
-            StandingProposalSource { project_id, session_id, current, observed: None },
+            StandingProposalSource {
+                project_id,
+                session_id,
+                current,
+                observed: None,
+            },
             clock,
             before_commit,
         )
@@ -128,7 +133,12 @@ impl WorkflowStore {
         Clock: FnMut() -> u64,
         Check: FnMut() -> Result<(), WorkflowError>,
     {
-        let StandingProposalSource { project_id, session_id, current, observed } = source;
+        let StandingProposalSource {
+            project_id,
+            session_id,
+            current,
+            observed,
+        } = source;
         policy.validate_for(issuer)?;
         current.validate()?;
         project_id.validate()?;
@@ -193,7 +203,10 @@ impl WorkflowStore {
             // New terminal-manual history is still authenticated on replay;
             // this uses the receipt's immutable cut, never a fresh clock/check.
             terminal_manual_defer::excluded_by_standing_receipts(
-                &transaction, &receipts, &calls, &session,
+                &transaction,
+                &receipts,
+                &calls,
+                &session,
             )?;
             let prior = prior.clone();
             scope.finish()?;
@@ -201,9 +214,9 @@ impl WorkflowStore {
         }
 
         if let Some((observed_project, observed_session)) = observed {
-            let project: ProjectV1 = get_entity(
-                &transaction, &current.tenant_id, "project", &project_id.0,
-            )?.ok_or_else(not_found)?;
+            let project: ProjectV1 =
+                get_entity(&transaction, &current.tenant_id, "project", &project_id.0)?
+                    .ok_or_else(not_found)?;
             if project != *observed_project || session != *observed_session {
                 return Err(WorkflowError::new(
                     WorkflowErrorCode::AuthorityConflict,
@@ -216,15 +229,23 @@ impl WorkflowStore {
         // Authenticate all retained history before treating a manual pending
         // proposal or an exhausted bound as ordinary ineligibility.
         let historical_terminal = terminal_manual_defer::excluded_by_standing_receipts(
-            &transaction, &receipts, &calls, &session,
+            &transaction,
+            &receipts,
+            &calls,
+            &session,
         )?;
-        let pending: Vec<_> = receipts.iter().filter(|receipt| {
-            !adopted.iter().any(|epoch| epoch.receipt == **receipt)
-                && !consumed.contains(&receipt.funding_id)
-                && !historical_terminal.contains(&receipt.funding_id)
-        }).collect();
+        let pending: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| {
+                !adopted.iter().any(|epoch| epoch.receipt == **receipt)
+                    && !consumed.contains(&receipt.funding_id)
+                    && !historical_terminal.contains(&receipt.funding_id)
+            })
+            .collect();
         if pending.len() > 1
-            || pending.iter().any(|receipt| terminal_manual_defer::candidate(receipt, &calls, &session).is_none())
+            || pending.iter().any(|receipt| {
+                terminal_manual_defer::candidate(receipt, &calls, &session).is_none()
+            })
             || receipts.len() >= 128
             || !matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
             || session.active_work_funding().is_none()
@@ -293,9 +314,17 @@ impl WorkflowStore {
             return Ok(None);
         }
         let terminal = terminal_manual_defer::excluded_at_head(
-            &transaction, &receipts, &calls, &session, &head_digest, eligible_at,
+            &transaction,
+            &receipts,
+            &calls,
+            &session,
+            &head_digest,
+            eligible_at,
         )?;
-        if pending.iter().any(|receipt| !terminal.contains(&receipt.funding_id)) {
+        if pending
+            .iter()
+            .any(|receipt| !terminal.contains(&receipt.funding_id))
+        {
             scope.finish()?;
             return Ok(None);
         }

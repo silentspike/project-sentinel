@@ -78,9 +78,7 @@ pub(super) fn restart(
     let prior_source = project
         .source_review_previous_call
         .as_ref()
-        .filter(|allowance| {
-            allowance.grant.work_item_id == *source_work_item_id
-        })
+        .filter(|allowance| allowance.grant.work_item_id == *source_work_item_id)
         .ok_or_else(transition)?
         .clone();
     if prior_source.dispatch.is_none() {

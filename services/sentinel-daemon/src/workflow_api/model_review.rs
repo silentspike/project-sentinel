@@ -504,7 +504,8 @@ pub(super) fn restart_source_after_negative_review(
     // Sealed independent QA authorizes a new correction phase, not a refund
     // or transfer of the old campaign's root, final window or funding epoch.
     let mut next_grant = source_successor_grant(
-        source_allowance, super::model_execution::ADAPTIVE_MODEL_WORK_MAX_CALLS,
+        source_allowance,
+        super::model_execution::ADAPTIVE_MODEL_WORK_MAX_CALLS,
     );
     next_grant.expires_at_unix_ms = now_unix_ms()
         .checked_add(300_000)
@@ -1279,10 +1280,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let api = model_work::configured_test_api(&temp.path().join("company.sqlite"));
         let binding = model_work::assign_test_work_from(&api, Some(4), 0);
-        let project = api.store.company_project(
-            &TenantId::parse(&binding.tenant_id).unwrap(),
-            &ProjectId::parse(&binding.project_id).unwrap(),
-        ).unwrap().unwrap();
+        let project = api
+            .store
+            .company_project(
+                &TenantId::parse(&binding.tenant_id).unwrap(),
+                &ProjectId::parse(&binding.project_id).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
         // This is a shortened-window descriptor, not an issued authority.
         let mut previous = project.subscription_call.unwrap();
         previous.grant.max_calls = 2;
@@ -1290,14 +1295,26 @@ mod tests {
         previous.grant.expires_at_unix_ms = previous.created_at_unix_ms + 10_000;
         let original = previous.clone();
         let qa = source_successor_grant(&previous, 1);
-        assert_eq!((qa.max_calls, qa.max_concurrent, qa.max_duration_ms), (1, 1, 120_000));
-        let correction = source_successor_grant(
-            &previous, super::super::model_execution::ADAPTIVE_MODEL_WORK_MAX_CALLS,
+        assert_eq!(
+            (qa.max_calls, qa.max_concurrent, qa.max_duration_ms),
+            (1, 1, 120_000)
         );
-        assert_eq!((correction.max_calls, correction.max_concurrent, correction.max_duration_ms), (16, 1, 120_000));
+        let correction = source_successor_grant(
+            &previous,
+            super::super::model_execution::ADAPTIVE_MODEL_WORK_MAX_CALLS,
+        );
+        assert_eq!(
+            (
+                correction.max_calls,
+                correction.max_concurrent,
+                correction.max_duration_ms
+            ),
+            (16, 1, 120_000)
+        );
         assert_eq!(previous, original);
         previous.dispatch = Some(sentinel_workflow::SubscriptionCallDispatchV1 {
-            request_id: "legacy-request".into(), request_digest: "a".repeat(64),
+            request_id: "legacy-request".into(),
+            request_digest: "a".repeat(64),
             dispatched_at_unix_ms: previous.created_at_unix_ms,
         });
         assert_eq!(source_successor_grant(&previous, 1), previous.grant);

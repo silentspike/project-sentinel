@@ -2,10 +2,10 @@
 
 mod known_rejection;
 #[cfg(test)]
-pub(crate) mod tests;
-#[cfg(test)]
 #[path = "model_execution/model_work_grant_due_tests.rs"]
 mod model_work_grant_due_tests;
+#[cfg(test)]
+pub(crate) mod tests;
 pub(super) mod tool_catalog;
 mod working_memory;
 
@@ -2278,6 +2278,7 @@ impl WorkflowApi {
         if existing.as_ref().is_some_and(|session| {
             session.continuation.is_some()
                 && session.active_provider_allowance_id() != allowance.allowance_id
+                && !matches!(session.cursor, AdaptiveCursorV1::CompletionProposed { .. })
         }) {
             return Err("adaptive continuation allowance changed");
         }
@@ -2319,7 +2320,10 @@ impl WorkflowApi {
             deadline_ms: subscription.expires_at_unix_ms,
         };
         let mut session = match existing {
-            Some(session) if session.continuation.is_some() => {
+            Some(session)
+                if session.continuation.is_some()
+                    && session.active_provider_allowance_id() == allowance.allowance_id =>
+            {
                 let effective = session.effective_grant();
                 if effective.authority != current
                     || effective.provider_authority_digest != grant.provider_authority_digest
@@ -2339,6 +2343,9 @@ impl WorkflowApi {
             Some(session) if session.grant == grant => session,
             _ if existing_only => return Ok((None, false)),
             _ => {
+                // A completed continued campaign may have a fresh correction
+                // grant. The store proves that exact edge; discovery cannot
+                // transfer the prior continuation or replace unknown effects.
                 self.core
                     .begin_adaptive_session(&grant, allowance.created_at_unix_ms)
                     .map_err(|_| "adaptive session unavailable")?
@@ -2780,10 +2787,9 @@ impl WorkflowApi {
                 return Err("adaptive adopted funding receipt changed");
             }
         }
-        let native_qa_enabled = super::model_work::native_qa_package_contract(
-            &binding.grant.authority.profile_id,
-        )
-        .is_some();
+        let native_qa_enabled =
+            super::model_work::native_qa_package_contract(&binding.grant.authority.profile_id)
+                .is_some();
         let mut numeric_memory = None;
         context.working_memory = Some({
             let _phase = AdaptiveContextReadPhase::start("historical_observations");
@@ -3381,7 +3387,10 @@ impl WorkflowApi {
         if let Some(correction) = &context.correction {
             let project = self
                 .store
-                .company_project(&context.binding.grant.authority.tenant_id, &intent.project_id)
+                .company_project(
+                    &context.binding.grant.authority.tenant_id,
+                    &intent.project_id,
+                )
                 .map_err(|_| "adaptive correction project unavailable")?
                 .ok_or("adaptive correction project missing")?;
             let record = project
@@ -3422,11 +3431,8 @@ impl WorkflowApi {
                     now_unix_ms(),
                 )
             } else {
-                self.core.admit_revision_plan(
-                    &admission.plan,
-                    &correction.revision,
-                    now_unix_ms(),
-                )
+                self.core
+                    .admit_revision_plan(&admission.plan, &correction.revision, now_unix_ms())
             }
         } else if admission.replay {
             self.store
