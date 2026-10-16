@@ -389,6 +389,13 @@ class Lab:
     def lease(self, vmid: int, holder: str, seconds: int, purpose: str | None = None) -> dict:
         if purpose not in {"functional", "measurement"}:
             raise ValueError("explicit functional or measurement purpose required")
+        return self._grant_lease(vmid, holder, seconds, purpose)
+
+    def _grant_lease(self, vmid: int, holder: str, seconds: int, purpose: str | None) -> dict:
+        # None is only the persisted legacy-request recovery path, never a new
+        # API request. Keep its stored purpose absent and its semantics strict.
+        if purpose is not None and purpose not in {"functional", "measurement"}:
+            raise ValueError("invalid persisted lease purpose")
         self.owned(vmid)
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", holder) or not 60 <= seconds <= 14400:
             raise ValueError("invalid bounded lease")
@@ -396,7 +403,7 @@ class Lab:
         if current and current["expires"] > time.time() and current["holder"] != holder:
             raise RuntimeError("lab slot already leased")
         renewal = bool(current and current["expires"] > time.time() and current["holder"] == holder)
-        if renewal and purpose != self.lease_purpose(vmid):
+        if renewal and (purpose or "measurement") != self.lease_purpose(vmid):
             raise RuntimeError("lease purpose is immutable within a generation")
         if not renewal:
             if self.status(vmid)["status"] != "stopped":
@@ -406,7 +413,7 @@ class Lab:
             self.state.setdefault("balloon_requests", {}).pop(str(vmid), None)
         lease = {"holder": holder, "expires": time.time() + seconds,
                  "generation": current.get("generation", uuid.uuid4().hex) if renewal else uuid.uuid4().hex}
-        if not renewal or "purpose" in current:
+        if (renewal and "purpose" in current) or (not renewal and purpose is not None):
             lease["purpose"] = current["purpose"] if renewal else purpose
         self.state["leases"][str(vmid)] = lease
         self.state["last_used"][str(vmid)] = time.time()
@@ -560,7 +567,10 @@ class Lab:
                 if remaining < 60:
                     request["state"] = "expired"
                     continue
-                self.lease(vmid, request["holder"], remaining, request.get("purpose"))
+                if request.get("purpose") is None:
+                    self._grant_lease(vmid, request["holder"], remaining, None)
+                else:
+                    self.lease(vmid, request["holder"], remaining, request["purpose"])
                 results[key] = self.start(vmid, request["holder"], request["memory_mib"])
                 request["state"] = "started"
             except CapacityUnavailable as error:
