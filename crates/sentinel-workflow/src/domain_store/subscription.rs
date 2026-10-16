@@ -1465,6 +1465,11 @@ mod adaptive_successor_tests {
         command: &CompanyWorkflowCommandV1,
         now: u64,
     ) {
+        let event_type = project_event_type(command).unwrap();
+        assert!(
+            is_project_event_type(event_type),
+            "unreadable emitted event: {event_type}"
+        );
         let operation = Uuid::new_v4();
         let result = f
             .store
@@ -1482,6 +1487,7 @@ mod adaptive_successor_tests {
                 .as_ref(),
             Some(&f.project)
         );
+        assert_eq!(f.store.company_projects().unwrap(), vec![f.project.clone()]);
         let rows = company_rows(&f.store);
         f.store = WorkflowStore::open(&f.path).unwrap();
         assert_eq!(
@@ -1843,6 +1849,7 @@ mod adaptive_successor_tests {
                 .unwrap(),
             Some(f.project.clone())
         );
+        assert_eq!(f.store.company_projects().unwrap(), vec![f.project.clone()]);
         assert_eq!(f.store.adaptive_health_inventory().unwrap().1.len(), 1);
         assert_eq!(
             f.store
@@ -1895,6 +1902,7 @@ mod adaptive_successor_tests {
             .store
             .company_project(&pm.tenant_id, &f.project.project_id)
             .is_err());
+        assert!(f.store.company_projects().is_err());
     }
 
     #[test]

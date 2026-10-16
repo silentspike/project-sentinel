@@ -171,7 +171,7 @@ fn planned_fixture_with_initial_calls(successor: bool, calls: Option<u16>) -> (F
         store: Arc::clone(&api.store), authority: Arc::clone(&authority),
     });
     api.core = Arc::new(WorkflowCore::new(
-        Arc::clone(&api.store), Arc::clone(&authority), Arc::clone(&adapter), adapter.clone(),
+        Arc::clone(&api.store), authority.clone(), adapter.clone(), adapter.clone(),
         Arc::new(UnavailableGateEvidencePort),
     ));
     api.workbench = Some(adapter);
@@ -201,6 +201,16 @@ fn planned_fixture_with_initial_calls(successor: bool, calls: Option<u16>) -> (F
 fn project(f: &FamilyFixture) -> sentinel_workflow::ProjectV1 {
     f.api.store.company_project(&f.session.grant.authority.tenant_id, &f.session.grant.authority.project_id)
         .unwrap().unwrap()
+}
+
+fn one_shot_authority(binding: ProviderUsageBinding) -> ProviderUsageAuthority {
+    ProviderUsageAuthority {
+        tenant_id: binding.tenant_id, project_id: binding.project_id,
+        work_item_id: binding.work_item_id, reservation_id: binding.reservation_id,
+        assignment_id: binding.assignment_id, assignment_version: binding.assignment_version,
+        agent_id: binding.agent_id, provider: binding.provider,
+        subscription_grant: binding.subscription_grant,
+    }
 }
 
 fn complete_source(f: &mut FamilyFixture, resolve_completion: bool) -> sentinel_workflow::WorkItemExecutionV1 {
@@ -474,7 +484,7 @@ fn proved_adaptive_completion_composes_independent_one_shot_qa_and_rejects_arbit
     assert!(!model_review::setup_due(&reviewed));
     let binding = select_provider_usage_binding(std::slice::from_ref(&reviewed), qa.grant.agent_id, Some(&qa.allowance_id))
         .unwrap().unwrap();
-    assert!(f.api.prepare_model_work(&binding).unwrap().is_some());
+    assert!(f.api.prepare_model_work(&one_shot_authority(binding)).unwrap().is_some());
     assert!(f.api.adaptive_provider_authority_for_claim(qa.grant.agent_id).unwrap().is_none());
 }
 
@@ -530,7 +540,7 @@ fn complete_negative_qa(f: &FamilyFixture) -> model_review::ValidatedProjectRevi
     let binding = select_provider_usage_binding(
         std::slice::from_ref(&assigned), allowance.grant.agent_id, Some(&allowance.allowance_id),
     ).unwrap().unwrap();
-    let context = f.api.prepare_model_work(&binding).unwrap().unwrap();
+    let context = f.api.prepare_model_work(&one_shot_authority(binding)).unwrap().unwrap();
     let source_files = model_review::source_inventory(&context).unwrap();
     let report = model_review::SourceReview {
         schema_version: 1,
