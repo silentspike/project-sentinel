@@ -35,8 +35,9 @@ python3 control.py --config /work/lab/site.json --state /work/lab/state.json res
 The config requires `owner=sentinel-ci-v1`, `runtime_target_class=LAB`, `node`,
 `pool`, `storage`, `bridge`, private IPv4 `network`, `gateway`, disjoint `template`
 and `slots`, an `addresses` map keyed by VM ID, `reserve_mib>=6144`, and
-`max_active<=3`. Optional `growth_margin_mib` and `idle_seconds` default to 1024
-and 900. Private manifests contain the complete runtime-target declaration.
+`max_active<=3`. `managed_growth` binds named `builder` and `agent` guest IDs
+to provisional allowances of 1024 and 512 MiB respectively. `idle_seconds`
+defaults to 900. Private manifests contain the complete runtime-target declaration.
 Starts also require a private `network_check` argument vector that verifies the
 complete live owned firewall graph without modifying it. Saved configuration
 and partial table presence are never equivalent to live isolation.
@@ -52,23 +53,45 @@ across a partial failure. A new lease generation cannot take over a running
 expired/released job; stop it first. A running-start retry succeeds only for
 the same recorded lease generation and VM identity.
 
-Starts and balloon increases reserve their requested memory plus a conservative
-foreign-growth margin **and outstanding current target minus resident memory**
-for every running VM. Pending balloon requests remain committed until actual
-convergence; resident memory is not counted twice. Lab automatic balloon growth is disabled; requests use
-the 2-8 GiB envelope. `telemetry` reports actual balloon, configured minimum,
-maximum, guest/host-used bytes, concurrent guests, host available memory, PSI and
-load. Null telemetry is unknown, not zero. This is shared capacity, not a claim
-that all foreign maximum memory commitments fit simultaneously.
+Starts and balloon increases reserve their request, the named 1536-MiB growth
+allowance, and **owned** outstanding current/pending targets minus measured
+residency. Accepted stopped starting intents also remain promises after a crash.
+Pending balloon requests remain committed until actual convergence; residency
+is not counted twice. All foreign potential headroom is reported as external
+risk, not subtracted as an unbounded blanket reservation. This policy does not
+guarantee capacity against uncontrolled foreign bursts. Lab automatic balloon
+growth is disabled; requests use the 2-8 GiB envelope.
+
+The existing read-only `telemetry` command returns schema 2: Unix-second
+`timestamp`, `host_mem_bytes` (including cache and availability), raw cumulative
+`host_cpu_stat`/`host_diskstats`, `host_psi` for CPU/memory/I/O, and `guests` for
+concurrent load. Each QEMU entry includes PVE byte fields `balloon` (actual),
+`balloon_min` (configured target), `maxmem`, `memhost`, CPU and I/O counters, plus
+`process` with actual `/proc` `rss_bytes`, `pss_bytes`, `swap_bytes`, `pid` and
+`start_ticks`. Owned entries include `lease`, generation-bound `run` and
+`pending_target_mib`. Unknown process measurements are null with an explicit
+error, never fabricated zeros. The private site interface publishes the exact
+SSH command. It does not allocate a measurement lease.
+
+Maintenance samples actual managed QEMU RSS/PSS with PID-reuse protection.
+Admission requires a preceding sample at most 45 seconds old and stable process
+identity. An active lab window retains its initial managed-RSS baseline;
+cumulative builder growth above 1024 MiB or agent growth above 512 MiB invalidates
+it. Memory PSI avg10 `some>=1.0` or `full>=0.1`, unavailable telemetry and host
+availability below reserve+256 MiB also trip the guard. These are provisional
+safety thresholds, not empirically proven maximum growth or performance SLAs.
 
 Run `guard` and `reap` from a host-local timer, without an agent session.
-Host reserve pressure gracefully stops only owned labs, durably invalidating
+An unsafe sample gracefully stops only owned labs, durably invalidating
 their leases, including active work; interrupted tests cannot count as PASS.
 Released/expired idle slots shut down after the idle interval. `release` ends
 only the stopped caller's lease. Renewal uses the same holder and bounded lease API.
 `defer-start` records a bounded, deduplicated request rather than bypassing
 capacity. Host-local maintenance automatically retries only capacity/transport
 waits with fresh admission. Semantic failures stay explicitly blocked, not PASS.
+Raw-log expiry after seven days is suspended while any active lease, pending
+request, running intent or preserved investigation snapshot exists. Explicit
+`.keep` files and symlinks remain protected even when the lab is idle.
 
 ## Snapshots
 

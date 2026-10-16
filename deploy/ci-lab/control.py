@@ -46,6 +46,30 @@ def available_mib() -> int:
     return int(re.search(r"MemAvailable:\s+(\d+)", Path("/proc/meminfo").read_text())[1]) // 1024
 
 
+def process_memory(pid: int) -> dict:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise RuntimeError("missing QEMU process identity")
+    root = Path(f"/proc/{pid}")
+    before = (root / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    values = {key: int(value) * 1024 for key, value in re.findall(
+        r"^(Rss|Pss|Swap):\s+(\d+) kB$", (root / "smaps_rollup").read_text(), re.M)}
+    after = (root / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    if before != after or not {"Rss", "Pss", "Swap"} <= values.keys():
+        raise RuntimeError("QEMU process changed or resident telemetry incomplete")
+    return {"pid": pid, "start_ticks": before, "rss_bytes": values["Rss"],
+            "pss_bytes": values["Pss"], "swap_bytes": values["Swap"]}
+
+
+def memory_psi() -> dict:
+    lines = Path("/proc/pressure/memory").read_text().splitlines()
+    result = {parts[0]: {key: float(value) for key, value in
+                         (item.split("=", 1) for item in parts[1:])}
+              for parts in (line.split() for line in lines)}
+    if not all(kind in result and "avg10" in result[kind] for kind in ("some", "full")):
+        raise RuntimeError("missing memory PSI telemetry")
+    return result
+
+
 def atomic_json(path: Path, value: Any) -> None:
     pending = path.with_suffix(".pending")
     with pending.open("w") as stream:
@@ -91,6 +115,15 @@ def validate_config(config: dict) -> None:
     check = config.get("network_check")
     if check is not None and (not isinstance(check, list) or not check or any(not isinstance(x, str) or not x for x in check)):
         raise ValueError("network_check must be an explicit argument vector")
+    managed = config.get("managed_growth", {})
+    if set(managed) != {"builder", "agent"}:
+        raise ValueError("named provisional builder and agent growth allowances required")
+    for name, allowance in (("builder", 1024), ("agent", 512)):
+        item = managed[name]
+        if item.get("allowance_mib") != allowance or not isinstance(item.get("vmid"), int) or item["vmid"] in ids:
+            raise ValueError("invalid managed growth binding")
+    if managed["builder"]["vmid"] == managed["agent"]["vmid"]:
+        raise ValueError("managed guests must be distinct")
 
 
 def admission(available_mib: int, active: int, target_mib: int,
@@ -102,7 +135,7 @@ def admission(available_mib: int, active: int, target_mib: int,
     allowed = active < config["max_active"] and remaining >= config["reserve_mib"]
     return {"allowed": allowed, "active": active, "max_active": config["max_active"],
             "available_mib": available_mib, "target_mib": target_mib,
-            "foreign_growth_mib": growth_mib, "projected_available_mib": remaining,
+            "reserved_growth_mib": growth_mib, "projected_available_mib": remaining,
             "reserve_mib": config["reserve_mib"]}
 
 
@@ -226,34 +259,94 @@ class Lab:
         self.owned(vmid)
         return api(f"/nodes/{self.config['node']}/qemu/{vmid}/status/current")
 
-    def resources(self, target_mib: int) -> dict:
+    def resources(self, target_mib: int, starting_vmid: int | None = None) -> dict:
         guests = api("/cluster/resources")
         active = sum(v.get("status") == "running" for v in guests
                      if v.get("vmid") in [self.config["template"], *self.config["slots"]])
-        # Actual balloon target is a commitment, even when guest-used RAM is low.
-        margin = self.config.get("growth_margin_mib", 1024)
+        sample = self.capacity_sample()
+        safety = self.capacity_safety(sample)
+        margin = sum(v["allowance_mib"] for v in self.config["managed_growth"].values())
         headroom = 0
+        external = 0
         balloons = []
         for guest in guests:
             if guest.get("node") != self.config["node"] or guest.get("status") != "running" or guest.get("type") != "qemu":
                 continue
             status = api(f"/nodes/{self.config['node']}/qemu/{guest['vmid']}/status/current")
+            owned = guest["vmid"] in [self.config["template"], *self.config["slots"]]
             actual = status.get("balloon")
             actual = status.get("maxmem") if actual is None else actual
             resident = status.get("memhost")
             if actual is None or resident is None or actual <= 0 or resident < 0:
-                raise RuntimeError("missing actual balloon/resident telemetry")
+                if owned:
+                    raise RuntimeError("missing actual balloon/resident telemetry")
+                balloons.append({"vmid": guest["vmid"], "owned": False, "outstanding_mib": None,
+                                 "error": "external potential unknown"})
+                continue
             requested = self.state.get("balloon_requests", {}).get(str(guest["vmid"]), 0) * MIB
             committed = max(actual, status.get("balloon_min") or 0, requested)
             outstanding = (max(0, committed - resident) + MIB - 1) // MIB
-            headroom += outstanding
+            if owned:
+                measured = process_memory(status.get("pid"))
+                # Never credit stale PVE telemetry above actual process residency.
+                resident = min(resident, measured["rss_bytes"])
+                outstanding = (max(0, committed - resident) + MIB - 1) // MIB
+                headroom += outstanding
+            else:
+                external += outstanding
             balloons.append({"vmid": guest["vmid"], "actual_mib": actual // MIB,
+                             "owned": owned,
                              "committed_mib": committed // MIB, "resident_mib": resident // MIB,
                              "outstanding_mib": outstanding, "max_mib": guest["maxmem"] // MIB})
-        # Sample availability last. Nonresident current commitments are not
-        # spare RAM, including an accepted resize whose balloon is still old.
-        return {**admission(available_mib(), active, target_mib, margin + headroom, self.config),
-                "growth_margin_mib": margin, "outstanding_commitments_mib": headroom, "balloons": balloons}
+        # Stopped, accepted starting intents remain promises after a crash.
+        running = {str(v["vmid"]) for v in guests if v.get("status") == "running" and v.get("node") == self.config["node"]}
+        for key, intent in self.state.get("runs", {}).items():
+            if key not in running and key != str(starting_vmid) and intent.get("phase") == "starting":
+                headroom += self.state.get("balloon_requests", {}).get(key, 8192)
+                active += 1
+        decision = admission(min(sample["available_mib"], available_mib()), active, target_mib,
+                             margin + headroom, self.config)
+        decision["allowed"] = decision["allowed"] and not safety["reasons"]
+        return {**decision, "growth_margin_mib": margin, "outstanding_commitments_mib": headroom,
+                "external_potential_mib": external, "external_risk": "uncontrolled foreign bursts are not reserved or guaranteed",
+                "capacity_safety": safety, "capacity_sample": sample, "balloons": balloons}
+
+    def capacity_sample(self) -> dict:
+        managed = {}
+        for name, item in self.config["managed_growth"].items():
+            status = api(f"/nodes/{self.config['node']}/qemu/{item['vmid']}/status/current")
+            if status.get("status") != "running":
+                raise RuntimeError("managed guest is not running; growth baseline requires reconciliation")
+            managed[name] = {"vmid": item["vmid"], **process_memory(status.get("pid"))}
+        return {"timestamp": time.time(), "available_mib": available_mib(),
+                "memory_psi": memory_psi(), "managed": managed}
+
+    def capacity_safety(self, sample: dict, include_hold: bool = True) -> dict:
+        reasons, growth = [], {}
+        if include_hold and sample["timestamp"] < self.state.get("capacity_hold_until", 0):
+            reasons.append("previous-unsafe-sample-window")
+        previous = self.state.get("capacity_sample", {})
+        baseline = self.state.get("capacity_baseline") or previous
+        if not previous or not 0 <= sample["timestamp"] - previous.get("timestamp", 0) <= 45:
+            reasons.append("managed-sample-missing-or-stale")
+        for name, item in self.config["managed_growth"].items():
+            old = baseline.get("managed", {}).get(name, {})
+            current = sample["managed"][name]
+            if not old or any(current.get(k) != old.get(k) for k in ("pid", "start_ticks", "vmid")):
+                reasons.append(name + "-process-baseline-changed")
+                continue
+            delta = max(0, current["rss_bytes"] - old["rss_bytes"])
+            growth[name] = {"rss_growth_mib": (delta + MIB - 1) // MIB,
+                            "allowance_mib": item["allowance_mib"], "provisional": True}
+            if delta > item["allowance_mib"] * MIB:
+                reasons.append(name + "-growth-envelope-exceeded")
+        # Conservative provisional pressure trip points, not a performance SLA.
+        if sample["memory_psi"]["some"]["avg10"] >= 1.0 or sample["memory_psi"]["full"]["avg10"] >= 0.1:
+            reasons.append("host-memory-psi")
+        if sample["available_mib"] < self.config["reserve_mib"] + 256:
+            reasons.append("host-reserve-pressure")
+        return {"reasons": reasons, "managed_growth": growth,
+                "sample_max_age_seconds": 45, "psi_some_avg10_limit": 1.0, "psi_full_avg10_limit": 0.1}
 
     def lease(self, vmid: int, holder: str, seconds: int) -> dict:
         self.owned(vmid)
@@ -299,16 +392,20 @@ class Lab:
             return {"already_running": True}
         if config.get("template"):
             raise RuntimeError("template cannot be started")
-        decision = self.resources(memory_mib)
+        decision = self.resources(memory_mib, vmid)
         if not decision["allowed"]:
             raise CapacityUnavailable("capacity unavailable: " + json.dumps(decision))
         if not self.config.get("network_check"):
             raise RuntimeError("live network policy check is required before start")
         run(*self.config["network_check"])
         address_inventory(self.config, self.config["addresses"][str(vmid)], vmid)
+        decision = self.resources(memory_mib, vmid)
+        if not decision["allowed"]:
+            raise CapacityUnavailable("capacity changed during network preflight: " + json.dumps(decision))
         self.state.setdefault("runs", {})[str(vmid)] = {
             "holder": holder, "generation": lease["generation"], "vmgenid": config.get("vmgenid"), "phase": "starting"}
         self.state.setdefault("balloon_requests", {})[str(vmid)] = memory_mib
+        self.state.setdefault("capacity_baseline", decision["capacity_sample"])
         self.save()
         # Proxmox sends this explicit balloon target before resuming QEMU.
         # Disable pvestatd automatic growth; later increases require admission.
@@ -334,8 +431,9 @@ class Lab:
         decision = self.resources(2048)
         decision.update(target_mib=memory_mib, growth_request_mib=delta)
         decision["projected_available_mib"] = (decision["available_mib"] - delta
-                                               - decision["foreign_growth_mib"])
-        decision["allowed"] = decision["projected_available_mib"] >= self.config["reserve_mib"]
+                                               - decision["reserved_growth_mib"])
+        decision["allowed"] = (decision["projected_available_mib"] >= self.config["reserve_mib"]
+                               and not decision.get("capacity_safety", {}).get("reasons"))
         if delta and not decision["allowed"]:
             raise CapacityUnavailable("balloon growth capacity unavailable: " + json.dumps(decision))
         self.state.setdefault("balloon_requests", {})[str(vmid)] = memory_mib
@@ -429,15 +527,32 @@ class Lab:
             fields = {key: guest.get(key) for key in ("vmid", "type", "status", "cpu", "maxmem", "mem", "memhost")}
             if guest.get("type") == "qemu":
                 data = api(f"/nodes/{self.config['node']}/qemu/{guest['vmid']}/status/current")
-                fields.update({key: data.get(key) for key in ("balloon", "balloon_min", "ballooninfo", "mem", "memhost", "maxmem", "cpus", "uptime")})
+                fields.update({key: data.get(key) for key in ("balloon", "balloon_min", "ballooninfo", "mem", "memhost", "maxmem", "cpus", "uptime", "cpu", "diskread", "diskwrite", "netin", "netout")})
+                try:
+                    fields["process"] = process_memory(data.get("pid"))
+                except (OSError, RuntimeError, ValueError, IndexError) as error:
+                    fields["process"] = None
+                    fields["process_error"] = str(error)
+            fields["owned"] = guest.get("vmid") in self.config["slots"]
+            if fields["owned"]:
+                key = str(guest["vmid"])
+                fields["lease"] = self.state["leases"].get(key)
+                fields["run"] = self.state.get("runs", {}).get(key)
+                fields["pending_target_mib"] = self.state.get("balloon_requests", {}).get(key)
             guests.append(fields)
         memory = {key: int(value) * 1024 for key, value in re.findall(
             r"^(\w+):\s+(\d+) kB$", Path("/proc/meminfo").read_text(), re.M)}
-        return {"schema": 1, "owner": OWNER, "timestamp": time.time(),
+        return {"schema": 2, "owner": OWNER, "timestamp": time.time(),
                 "host_mem_bytes": memory, "host_reserve_bytes": self.config["reserve_mib"] * MIB,
                 "host_loadavg": Path("/proc/loadavg").read_text().strip(),
+                "host_cpu_stat": Path("/proc/stat").read_text().splitlines()[0],
+                "host_diskstats": Path("/proc/diskstats").read_text(),
                 "host_psi": {name: Path(f"/proc/pressure/{name}").read_text().strip()
                              for name in ("cpu", "memory", "io")},
+                "managed_growth_allowances": self.config["managed_growth"],
+                "capacity_baseline": self.state.get("capacity_baseline"),
+                "invalidated_leases": self.state.get("invalidated_leases", []),
+                "external_risk": "uncontrolled foreign bursts are not reserved or guaranteed",
                 "guests": guests}
 
     def stop(self, vmid: int) -> None:
@@ -540,25 +655,36 @@ class Lab:
     def guard(self) -> dict:
         before = available_mib()
         stopped = []
-        if before < self.config["reserve_mib"] + 256:
+        try:
+            sample = self.capacity_sample()
+            safety = self.capacity_safety(sample, include_hold=False)
+        except (OSError, RuntimeError, ValueError, IndexError, subprocess.SubprocessError) as error:
+            sample = None
+            safety = {"reasons": ["capacity-measurement-unavailable"], "error": str(error)}
+        active = [v for v in api("/cluster/resources")
+                  if v.get("vmid") in self.config["slots"] and v.get("status") == "running"]
+        if safety["reasons"]:
             # An unsafe host window invalidates lab work, even if a lease is
             # active. Stop only owned labs gracefully, never foreign guests.
-            active = [v for v in api("/cluster/resources")
-                      if v.get("vmid") in self.config["slots"] and v.get("status") == "running"]
             for guest in active:
                 vmid = guest["vmid"]
                 self.owned(vmid)
-                fault = {"vmid": vmid, "time": time.time(), "reason": "host-reserve-pressure",
+                fault = {"vmid": vmid, "time": time.time(), "reasons": safety["reasons"],
                          "available_mib": available_mib(),
                          "lease": self.state["leases"].get(str(vmid))}
                 self.state.setdefault("invalidated_leases", []).append(fault)
                 self.save()
                 self.stop(vmid)
                 stopped.append(vmid)
-                if available_mib() >= self.config["reserve_mib"] + 512:
-                    break
+            self.state["capacity_hold_until"] = time.time() + 15
+        if sample:
+            self.state["capacity_sample"] = sample
+        if not active or len(stopped) == len(active):
+            self.state.pop("capacity_baseline", None)
+        self.save()
         return {"available_before_mib": before, "available_after_mib": available_mib(),
-                "reserve_mib": self.config["reserve_mib"], "pressure_stopped": stopped}
+                "reserve_mib": self.config["reserve_mib"], "pressure_stopped": stopped,
+                "capacity_safety": safety, "sample": sample}
 
     def reap(self) -> dict:
         now = time.time()
