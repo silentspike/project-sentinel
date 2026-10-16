@@ -96,6 +96,43 @@ class ProcessTelemetryTests(unittest.TestCase):
                 c.process_memory(123)
 
 
+class AddressInventoryTests(unittest.TestCase):
+    def test_pve_comment_owner_uses_structured_exact_reservation(self):
+        with tempfile.TemporaryDirectory(dir="/work/tmp/project-sentinel") as directory:
+            root = Path(directory)
+            path = root / "etc/pve/nodes/lab-host/qemu-server/8601.conf"
+            path.parent.mkdir(parents=True)
+            path.write_text("#sentinel-ci-v1\nipconfig0: ip=192.0.2.11/24,gw=192.0.2.1\n")
+            reservation = {"description": c.OWNER, "ipconfig0": "ip=192.0.2.11/24,gw=192.0.2.1"}
+            for change, valid in (({}, True), ({"description": "foreign"}, False),
+                                  ({"ipconfig0": "ip=192.0.2.12/24,gw=192.0.2.1"}, False)):
+                with patch.object(c, "Path", side_effect=lambda value: root / str(value).lstrip("/")), \
+                        patch.object(c, "api", return_value={**reservation, **change}), \
+                        patch.object(c, "run", return_value="[]"), patch.object(c, "arp_dad", return_value={"conflict": False}) as dad:
+                    if valid:
+                        c.address_inventory(config(), "192.0.2.11", 8601)
+                        dad.assert_called_once_with("labbr0", "192.0.2.11")
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            c.address_inventory(config(), "192.0.2.11", 8601)
+                        dad.assert_not_called()
+
+    def test_same_basename_other_node_and_other_reservations_still_conflict(self):
+        for relative in ("etc/pve/nodes/other-node/qemu-server/8601.conf", "etc/network/other-reservation"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory(dir="/work/tmp/project-sentinel") as directory:
+                root = Path(directory)
+                path = root / relative
+                path.parent.mkdir(parents=True)
+                path.write_text("#sentinel-ci-v1\nipconfig0: ip=192.0.2.11/24,gw=192.0.2.1\n")
+                with patch.object(c, "Path", side_effect=lambda value: root / str(value).lstrip("/")), \
+                        patch.object(c, "api") as query, patch.object(c, "run", return_value="[]"), \
+                        patch.object(c, "arp_dad") as dad:
+                    with self.assertRaises(RuntimeError):
+                        c.address_inventory(config(), "192.0.2.11", 8601)
+                    query.assert_not_called()
+                    dad.assert_not_called()
+
+
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(dir="/work/tmp/project-sentinel")
@@ -213,6 +250,7 @@ class LifecycleTests(unittest.TestCase):
         self.lab.state["snapshots"]["8602:ci-rollback"] = {
             "vmid": 8602, "name": "ci-rollback", "preserve": True, "expires": 0, "state": "ready"}
         with patch.object(c.time, "time", return_value=1000), patch.object(self.lab, "stop") as stop, \
+                patch.object(c, "api", return_value=[{"vmid": 8602, "node": "lab-host", "status": "running"}]), \
                 patch.object(c, "run") as command:
             result = self.lab.reap()
             stop.assert_called_once_with(8602)
@@ -336,15 +374,28 @@ class LifecycleTests(unittest.TestCase):
                 self.lab.resources(2048)
 
     def test_foreign_potential_is_risk_not_blanket_reservation(self):
-        guest = {"vmid": 9999, "node": "lab-host", "type": "qemu", "status": "running", "maxmem": 65536 * c.MIB}
+        guest = {"vmid": 9999, "node": "lab-host", "type": "qemu", "status": "running", "maxmem": 65536 * c.MIB,
+                 "memhost": 1024 * c.MIB}
         status = {"balloon": 32768 * c.MIB, "memhost": 1024 * c.MIB}
         with patch.object(c, "available_mib", return_value=12000), \
                 patch.object(c, "api", side_effect=lambda path: [guest] if path == "/cluster/resources" else status):
             result = self.lab.resources(2048)
         self.assertTrue(result["allowed"])
-        self.assertEqual(result["external_potential_mib"], 31744)
+        self.assertEqual(result["external_potential_mib"], 64512)
+        self.assertIsNone(result["balloons"][0]["actual_mib"])
+        self.assertEqual(result["balloons"][0]["potential_basis"], "cluster-maxmem-not-current-target")
         self.assertEqual(result["reserved_growth_mib"], 1536)
         self.assertEqual(result["outstanding_commitments_mib"], 0)
+
+    def test_idle_reaper_never_queries_already_stopped_slots(self):
+        self.lab.state["last_used"] = {"8601": 0, "8602": 0}
+        self.lab.state["runs"] = {"8601": {"phase": "starting"}}
+        with patch.object(c, "api", return_value=[{"vmid": 8601, "node": "lab-host", "status": "stopped"}]) as query, \
+                patch.object(self.lab, "stop") as stop:
+            self.lab.reap()
+            stop.assert_not_called()
+            query.assert_called_once_with("/cluster/resources")
+        self.assertEqual(self.lab.state["runs"]["8601"]["phase"], "starting")
 
     def test_unmanaged_unknown_potential_is_not_an_admission_prerequisite(self):
         guest = {"vmid": 9999, "node": "lab-host", "type": "qemu", "status": "running", "maxmem": 65536 * c.MIB}
