@@ -1,0 +1,6 @@
+{
+  "version": "0.9.145",
+  "url": "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.145/cargo-nextest-0.9.145-x86_64-unknown-linux-musl.tar.gz",
+  "sha256": "cd3c85194e8b28ad26676d287f41f0d6b4d456cef5bd94700def5dea8e328883",
+  "binary": "cargo-nextest"
+}

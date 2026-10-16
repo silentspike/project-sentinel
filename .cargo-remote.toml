@@ -5,4 +5,4 @@ profile = "linux-gnu-sentinel"
 toolchain = "1.99.0"
 targets = []
 resources = "large"
-image = "9ddf43347f111624a2c249068ec2464df4b2d603cea1c2f6fa612d2732e279c9"
+image = "fc98be79dbdd0640719ed2bcda1f3729adbc3f254096eb2a3733cda9983c554b"
