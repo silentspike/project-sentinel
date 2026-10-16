@@ -10,9 +10,8 @@ use sentinel_workflow::{
     AdaptiveTransitionV1, AdaptiveWorkingMemoryToolKindV1,
 };
 
-mod native_qa_contract_tests {
-    include!("native_qa_contract_tests.rs");
-}
+#[path = "native_qa_contract_tests.rs"]
+mod native_qa_contract_tests;
 
 mod adaptive_handoff_composition_tests {
     include!("../work_correction/adaptive_handoff_composition_tests.rs");
