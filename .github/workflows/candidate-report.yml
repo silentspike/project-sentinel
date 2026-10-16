@@ -40,6 +40,7 @@ jobs:
           RECEIPT_B64: ${{ inputs.receipt_b64 }}
           RECEIPT_SIGNATURE: ${{ inputs.signature }}
           RECEIPT_KEY: ${{ secrets.SENTINEL_CI_RECEIPT_KEY }}
+          PLAN_SHA256: ${{ vars.SENTINEL_CI_PLAN_SHA256 }}
         with:
           script: |
             const {report, verifyLocal} = require('./scripts/ci/report-candidate.cjs');
