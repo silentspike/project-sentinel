@@ -187,16 +187,43 @@ impl EventStore {
 }
 
 impl EventAppendGateway<'_> {
-    pub fn append(
+    /// Looks up a fully verified replay without acquiring write authority or
+    /// appending. A miss is not authorization to append or evidence that CAS
+    /// or committed direct-causation checks would succeed.
+    pub fn lookup_exact_replay(
         &self,
         caller: &AuthenticatedEventCallerV1,
         proposal: &AppendProposalV2,
-    ) -> Result<AppendOutcomeV2, EventAppendError> {
+    ) -> Result<Option<AppendOutcomeV2>, EventAppendError> {
+        let (_, authority_scope_digest, request_digest) =
+            self.validate_request(caller, proposal)?;
+        self.lookup_operation(
+            &authority_scope_digest,
+            &proposal.causal_context.operation_id,
+            &request_digest,
+        )
+    }
+
+    fn validate_request(
+        &self,
+        caller: &AuthenticatedEventCallerV1,
+        proposal: &AppendProposalV2,
+    ) -> Result<(CausationPolicyV1, String, String), EventAppendError> {
         self.registry.validate_proposal(proposal)?;
         let causation_policy = self.registry.causation_policy_for(proposal)?;
         validate_caller(caller, proposal)?;
         let authority_scope_digest = proposal.causal_context.authority_scope_digest()?;
         let request_digest = proposal.canonical_request_digest()?;
+        Ok((causation_policy, authority_scope_digest, request_digest))
+    }
+
+    pub fn append(
+        &self,
+        caller: &AuthenticatedEventCallerV1,
+        proposal: &AppendProposalV2,
+    ) -> Result<AppendOutcomeV2, EventAppendError> {
+        let (causation_policy, authority_scope_digest, request_digest) =
+            self.validate_request(caller, proposal)?;
 
         if let Some(outcome) = self.lookup_operation(
             &authority_scope_digest,
@@ -1157,6 +1184,462 @@ mod tests {
             producer: proposal.producer.clone(),
             authority_scope_digest: proposal.causal_context.authority_scope_digest().unwrap(),
         }
+    }
+
+    fn replay_read_state(store: &EventStore) -> [i64; 9] {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT total_changes(),
+                    (SELECT count(*) FROM events_v2),
+                    (SELECT count(*) FROM event_operations_v2),
+                    (SELECT count(*) FROM delivery_intents_v2),
+                    (SELECT count(*) FROM local_effect_reservations_v2),
+                    (SELECT count(*) FROM event_stream_heads_v2),
+                    (SELECT coalesce(sum(stream_revision), 0) FROM event_stream_heads_v2),
+                    event_truth_generation, next_global_position
+                 FROM event_truth_metadata WHERE singleton_id = 1",
+                [],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ])
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn lookup_exact_replay_is_read_only_and_precedes_cas() {
+        let store = EventStore::open(":memory:").unwrap();
+        let registry = registry();
+        let gateway = store.append_gateway(&registry);
+        let first = proposal("operation-a", ExpectedStreamRevision::NoStream);
+        let appended = gateway.append(&caller(&first), &first).unwrap();
+        let second = proposal("operation-b", ExpectedStreamRevision::Exact(1));
+        gateway.append(&caller(&second), &second).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only = ON")
+            .unwrap();
+        let before = replay_read_state(&store);
+
+        let replay = gateway
+            .lookup_exact_replay(&caller(&first), &first)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replay.disposition,
+            AppendDispositionV2::ReplayOfPriorOperation
+        );
+        assert_eq!(replay.envelope, appended.envelope);
+        assert_eq!(replay.outcome_digest, appended.outcome_digest);
+        let append_replay = gateway.append(&caller(&first), &first).unwrap();
+        assert_eq!(replay, append_replay);
+        assert_eq!(replay_read_state(&store), before);
+    }
+
+    #[test]
+    fn lookup_exact_replay_miss_is_read_only_before_and_after_append() {
+        let store = EventStore::open(":memory:").unwrap();
+        let registry = registry();
+        let gateway = store.append_gateway(&registry);
+        let missing = proposal("operation-missing", ExpectedStreamRevision::Exact(99));
+        for populated in [false, true] {
+            if populated {
+                store
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .execute_batch("PRAGMA query_only = OFF")
+                    .unwrap();
+                let first = proposal("operation-a", ExpectedStreamRevision::NoStream);
+                gateway.append(&caller(&first), &first).unwrap();
+            }
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute_batch("PRAGMA query_only = ON")
+                .unwrap();
+            let before = replay_read_state(&store);
+            assert!(gateway
+                .lookup_exact_replay(&caller(&missing), &missing)
+                .unwrap()
+                .is_none());
+            assert_eq!(replay_read_state(&store), before);
+        }
+    }
+
+    #[test]
+    fn lookup_exact_replay_rejects_wrong_callers_before_hit_or_miss() {
+        let store = EventStore::open(":memory:").unwrap();
+        let registry = registry();
+        let gateway = store.append_gateway(&registry);
+        let first = proposal("operation-a", ExpectedStreamRevision::NoStream);
+        gateway.append(&caller(&first), &first).unwrap();
+        let missing = proposal("operation-missing", ExpectedStreamRevision::NoStream);
+        let authenticated = caller(&first);
+        let mut callers = Vec::new();
+        let mut empty_service = authenticated.clone();
+        empty_service.service_id.clear();
+        callers.push(empty_service);
+        let mut oversized_service = authenticated.clone();
+        oversized_service.service_id = "x".repeat(129);
+        callers.push(oversized_service);
+        let mut wrong_producer = authenticated.clone();
+        wrong_producer.producer = "other-producer".to_string();
+        callers.push(wrong_producer);
+        let mut wrong_scope = authenticated.clone();
+        wrong_scope.authority_scope_digest = digest("other-scope");
+        callers.push(wrong_scope);
+        let before = replay_read_state(&store);
+        for candidate in [&first, &missing] {
+            for unauthorized in &callers {
+                assert!(matches!(
+                    gateway.lookup_exact_replay(unauthorized, candidate),
+                    Err(EventAppendError::UnauthorizedCaller)
+                ));
+            }
+            let mut malformed = authenticated.clone();
+            malformed.authority_scope_digest = "not-a-digest".to_string();
+            assert!(matches!(
+                gateway.lookup_exact_replay(&malformed, candidate),
+                Err(EventAppendError::Contract(_))
+            ));
+        }
+        assert_eq!(replay_read_state(&store), before);
+    }
+
+    #[test]
+    fn lookup_exact_replay_preserves_append_validation_errors() {
+        let store = EventStore::open(":memory:").unwrap();
+        let registry = registry_with_direct_event();
+        let gateway = store.append_gateway(&registry);
+        let first = proposal("operation-a", ExpectedStreamRevision::NoStream);
+        let authenticated = caller(&first);
+        gateway.append(&authenticated, &first).unwrap();
+        let mut invalid = Vec::new();
+        let mut unknown_type = first.clone();
+        unknown_type.event_type = "unknown_event".to_string();
+        invalid.push(unknown_type);
+        let mut unknown_schema = first.clone();
+        unknown_schema.schema_version = 2;
+        invalid.push(unknown_schema);
+        let mut wrong_version = first.clone();
+        wrong_version.proposal_version = 0;
+        invalid.push(wrong_version);
+        let mut bad_payload_digest = first.clone();
+        bad_payload_digest.payload = b"{}".to_vec();
+        invalid.push(bad_payload_digest);
+        let mut bad_schema_payload = first.clone();
+        bad_schema_payload.payload = b"[]".to_vec();
+        bad_schema_payload.payload_digest = sha256_hex(&bad_schema_payload.payload);
+        invalid.push(bad_schema_payload);
+        let mut unauthorized_producer = first.clone();
+        unauthorized_producer.producer = "other-producer".to_string();
+        invalid.push(unauthorized_producer);
+        let mut root_with_cause = first.clone();
+        root_with_cause.causal_context.causation_event_id =
+            Some("01890f3d-0000-7000-8000-000000000099".to_string());
+        invalid.push(root_with_cause);
+        let mut direct_without_cause = first.clone();
+        direct_without_cause.event_type = "project_followup".to_string();
+        invalid.push(direct_without_cause);
+        let mut bad_context = first.clone();
+        bad_context.causal_context.project.authority_digest = "not-a-digest".to_string();
+        invalid.push(bad_context);
+        let before = replay_read_state(&store);
+        for candidate in invalid {
+            let lookup_error = gateway
+                .lookup_exact_replay(&authenticated, &candidate)
+                .unwrap_err();
+            let append_error = gateway.append(&authenticated, &candidate).unwrap_err();
+            assert!(matches!(lookup_error, EventAppendError::Contract(_)));
+            assert_eq!(lookup_error.to_string(), append_error.to_string());
+        }
+        let empty_registry = EventSchemaRegistry::new([]).unwrap();
+        assert!(matches!(
+            store
+                .append_gateway(&empty_registry)
+                .lookup_exact_replay(&authenticated, &first),
+            Err(EventAppendError::Contract(
+                EventContractError::UnknownSchema { .. }
+            ))
+        ));
+        assert_eq!(replay_read_state(&store), before);
+    }
+
+    #[test]
+    fn lookup_exact_replay_rejects_canonical_request_conflicts() {
+        let store = EventStore::open(":memory:").unwrap();
+        let registry = registry();
+        let gateway = store.append_gateway(&registry);
+        let first = proposal("operation-a", ExpectedStreamRevision::NoStream);
+        gateway.append(&caller(&first), &first).unwrap();
+        let mut conflicts = Vec::new();
+        let mut changed_tick = first.clone();
+        changed_tick.tick = Some(8);
+        changed_tick.causal_context.tick = Some(8);
+        conflicts.push(changed_tick);
+        let mut changed_payload = first.clone();
+        changed_payload.payload = b"{}".to_vec();
+        changed_payload.payload_digest = sha256_hex(&changed_payload.payload);
+        conflicts.push(changed_payload);
+        let mut changed_intent = first.clone();
+        changed_intent.delivery_intents[0].topic = "sentinel/other".to_string();
+        conflicts.push(changed_intent);
+        let mut changed_effect = first.clone();
+        changed_effect.effect_reservations[0].request_digest = digest("other-effect");
+        conflicts.push(changed_effect);
+        let mut changed_cas = first.clone();
+        changed_cas.expected_stream_revision = ExpectedStreamRevision::Exact(1);
+        conflicts.push(changed_cas);
+        let before = replay_read_state(&store);
+        for conflict in conflicts {
+            assert!(matches!(
+                gateway.lookup_exact_replay(&caller(&conflict), &conflict),
+                Err(EventAppendError::OperationConflict)
+            ));
+        }
+        assert_eq!(replay_read_state(&store), before);
+    }
+
+    #[test]
+    fn lookup_exact_replay_rejects_corrupt_operation_receipts() {
+        for column in ["outcome_digest", "event_id"] {
+            let store = EventStore::open(":memory:").unwrap();
+            let registry = registry();
+            let first = proposal("operation-a", ExpectedStreamRevision::NoStream);
+            let gateway = store.append_gateway(&registry);
+            gateway.append(&caller(&first), &first).unwrap();
+            let value = if column == "event_id" {
+                let other = proposal("operation-b", ExpectedStreamRevision::Exact(1));
+                gateway
+                    .append(&caller(&other), &other)
+                    .unwrap()
+                    .envelope
+                    .event_id
+            } else {
+                digest("tampered-outcome")
+            };
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    &format!(
+                        "UPDATE event_operations_v2 SET {column} = ?1 WHERE operation_id = ?2"
+                    ),
+                    params![value, first.causal_context.operation_id],
+                )
+                .unwrap();
+            let before = replay_read_state(&store);
+            assert!(matches!(
+                gateway.lookup_exact_replay(&caller(&first), &first),
+                Err(EventAppendError::CorruptOutcome(_))
+            ));
+            assert_eq!(replay_read_state(&store), before, "{column}");
+        }
+    }
+
+    #[test]
+    fn lookup_exact_replay_rejects_tampered_envelope_bindings() {
+        use rusqlite::types::Value;
+
+        let mut changed_context =
+            proposal("operation-a", ExpectedStreamRevision::NoStream).causal_context;
+        changed_context.request_id = "tampered-request".to_string();
+        for (column, value) in [
+            ("payload", Value::Blob(b"{}".to_vec())),
+            (
+                "causal_context_json",
+                Value::Text(serde_json::to_string(&changed_context).unwrap()),
+            ),
+            (
+                "causal_context_digest",
+                Value::Text(digest("tampered-context")),
+            ),
+            (
+                "append_receipt_digest",
+                Value::Text(digest("tampered-receipt")),
+            ),
+            (
+                "sealed_envelope_digest",
+                Value::Text(digest("tampered-seal")),
+            ),
+            (
+                "canonical_request_digest",
+                Value::Text(digest("tampered-request")),
+            ),
+            ("stream_revision", Value::Integer(2)),
+        ] {
+            let store = EventStore::open(":memory:").unwrap();
+            let registry = registry();
+            let first = proposal("operation-a", ExpectedStreamRevision::NoStream);
+            let gateway = store.append_gateway(&registry);
+            gateway.append(&caller(&first), &first).unwrap();
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    &format!("UPDATE events_v2 SET {column} = ?1"),
+                    params![value],
+                )
+                .unwrap();
+            let before = replay_read_state(&store);
+            assert!(
+                matches!(
+                    gateway.lookup_exact_replay(&caller(&first), &first),
+                    Err(EventAppendError::Contract(_)) | Err(EventAppendError::CorruptOutcome(_))
+                ),
+                "{column}"
+            );
+            assert_eq!(replay_read_state(&store), before, "{column}");
+        }
+    }
+
+    #[test]
+    fn lookup_exact_replay_separates_tenant_and_authority_scopes() {
+        for kind in [
+            AuthorityKindV1::Tenant,
+            AuthorityKindV1::Company,
+            AuthorityKindV1::Project,
+            AuthorityKindV1::Workflow,
+            AuthorityKindV1::WorkItem,
+        ] {
+            let store = EventStore::open(":memory:").unwrap();
+            let registry = registry();
+            let gateway = store.append_gateway(&registry);
+            let first = proposal("operation-a", ExpectedStreamRevision::NoStream);
+            let original = gateway.append(&caller(&first), &first).unwrap();
+            let mut other = first.clone();
+            let changed = authority(kind, "other-authority");
+            match kind {
+                AuthorityKindV1::Tenant => other.causal_context.tenant = changed,
+                AuthorityKindV1::Company => other.causal_context.company = changed,
+                AuthorityKindV1::Project => other.causal_context.project = changed,
+                AuthorityKindV1::Workflow => other.causal_context.workflow = Some(changed),
+                AuthorityKindV1::WorkItem => other.causal_context.work_item = Some(changed),
+            }
+            other.delivery_intents[0].intent_id = "other-delivery".to_string();
+            other.effect_reservations[0].effect_id = "other-effect".to_string();
+            let before = replay_read_state(&store);
+            assert!(matches!(
+                gateway.lookup_exact_replay(&caller(&first), &other),
+                Err(EventAppendError::UnauthorizedCaller)
+            ));
+            assert!(gateway
+                .lookup_exact_replay(&caller(&other), &other)
+                .unwrap()
+                .is_none());
+            assert_eq!(replay_read_state(&store), before);
+            let separate = gateway.append(&caller(&other), &other).unwrap();
+            assert_ne!(
+                original.envelope.stream_namespace,
+                separate.envelope.stream_namespace
+            );
+            assert_eq!(separate.envelope.stream_revision, 1);
+            let before = replay_read_state(&store);
+            for (candidate, appended) in [(&first, &original), (&other, &separate)] {
+                let replay = gateway
+                    .lookup_exact_replay(&caller(candidate), candidate)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(replay.envelope, appended.envelope);
+                assert_eq!(replay.outcome_digest, appended.outcome_digest);
+            }
+            assert_eq!(replay_read_state(&store), before);
+        }
+    }
+
+    #[test]
+    fn lookup_exact_replay_verifies_direct_causation_policy() {
+        let store = EventStore::open(":memory:").unwrap();
+        let registry = registry_with_direct_event();
+        let gateway = store.append_gateway(&registry);
+        let root = proposal("operation-root", ExpectedStreamRevision::NoStream);
+        let root_outcome = gateway.append(&caller(&root), &root).unwrap();
+        let mut direct = proposal("operation-direct", ExpectedStreamRevision::Exact(1));
+        direct.event_type = "project_followup".to_string();
+        direct.causal_context.causation_event_id = Some(root_outcome.envelope.event_id);
+        let appended = gateway.append(&caller(&direct), &direct).unwrap();
+        let before = replay_read_state(&store);
+        let replay = gateway
+            .lookup_exact_replay(&caller(&direct), &direct)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.envelope, appended.envelope);
+        assert_eq!(replay.outcome_digest, appended.outcome_digest);
+        let mut missing = direct.clone();
+        missing.causal_context.operation_id = "operation-missing".to_string();
+        missing.causal_context.causation_event_id =
+            Some("01890f3d-0000-7000-8000-000000000099".to_string());
+        assert!(gateway
+            .lookup_exact_replay(&caller(&missing), &missing)
+            .unwrap()
+            .is_none());
+        assert_eq!(replay_read_state(&store), before);
+    }
+
+    #[test]
+    fn lookup_exact_replay_survives_checkpoint_and_reopen_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.db");
+        let first = proposal("operation-reopen", ExpectedStreamRevision::NoStream);
+        let registry = registry();
+        let appended = {
+            let store = EventStore::open(path.to_str().unwrap()).unwrap();
+            let appended = store
+                .append_gateway(&registry)
+                .append(&caller(&first), &first)
+                .unwrap();
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            appended
+        };
+        let store = EventStore::open_compatible(path.to_str().unwrap()).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only = ON")
+            .unwrap();
+        let before = replay_read_state(&store);
+        let gateway = store.append_gateway(&registry);
+        let replay = gateway
+            .lookup_exact_replay(&caller(&first), &first)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replay.disposition,
+            AppendDispositionV2::ReplayOfPriorOperation
+        );
+        assert_eq!(replay.envelope, appended.envelope);
+        assert_eq!(replay.outcome_digest, appended.outcome_digest);
+        let missing = proposal("operation-missing", ExpectedStreamRevision::Exact(99));
+        assert!(gateway
+            .lookup_exact_replay(&caller(&missing), &missing)
+            .unwrap()
+            .is_none());
+        assert_eq!(replay_read_state(&store), before);
     }
 
     #[test]
