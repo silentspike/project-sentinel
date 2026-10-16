@@ -8,6 +8,23 @@ const MAX_REPORT_BYTES: usize = 32 * 1024;
 const MAX_FINDINGS: usize = 16;
 const MAX_AUTONOMOUS_SOURCE_REWORKS: usize = 3;
 
+// Descriptive delegation only; callers must authenticate the producer and QA
+// evidence before the company command can authorize a new phase.
+fn source_successor_grant(
+    previous: &sentinel_workflow::SubscriptionCallAllowanceV1,
+    calls: u16,
+) -> sentinel_workflow::SubscriptionCallGrantV1 {
+    let mut grant = previous.grant.clone();
+    if previous.dispatch.is_none() {
+        grant.max_calls = calls;
+        grant.max_concurrent = 1;
+        grant.max_duration_ms = 120_000;
+        grant.token_policy =
+            sentinel_workflow::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap;
+    }
+    grant
+}
+
 pub(super) fn rework_limit_reached(project: &sentinel_workflow::ProjectV1) -> bool {
     let Some(source_id) = project
         .source_review_previous_call
@@ -25,12 +42,13 @@ pub(super) fn rework_limit_reached(project: &sentinel_workflow::ProjectV1) -> bo
 }
 
 pub(super) fn setup_due(project: &sentinel_workflow::ProjectV1) -> bool {
+    // Discovery only. An undispatched adaptive producer must pass the store,
+    // Limbo and private-package proofs before any review command is admitted.
     let predecessor_ready = project.subscription_call.as_ref().is_some_and(|allowance| {
-        allowance.dispatch.is_some()
-            && project
-                .work_items
-                .get(&allowance.grant.work_item_id)
-                .is_some_and(|work| work.state == CompanyWorkStateV1::Done)
+        project
+            .work_items
+            .get(&allowance.grant.work_item_id)
+            .is_some_and(|work| work.state == CompanyWorkStateV1::Done)
     });
     if !predecessor_ready {
         return false;
@@ -242,7 +260,9 @@ impl WorkflowApi {
                 &review_id.0,
                 1,
             );
-            let mut grant = previous.grant.clone();
+            // A proved adaptive producer delegates one independent QA turn,
+            // never its final continuation's duration or multi-call capacity.
+            let mut grant = source_successor_grant(&previous, 1);
             grant.work_item_id = review_id;
             grant.assignment_id = assignment.assignment_id.clone();
             grant.assignment_version = assignment.assignment_version;
@@ -481,7 +501,11 @@ pub(super) fn restart_source_after_negative_review(
     )
     .map_err(|_| "source-review predecessor invalid")?;
     api.validate_source_review_predecessor(&leader.principal, project, source_id, &revision)?;
-    let mut next_grant = source_allowance.grant.clone();
+    // Sealed independent QA authorizes a new correction phase, not a refund
+    // or transfer of the old campaign's root, final window or funding epoch.
+    let mut next_grant = source_successor_grant(
+        source_allowance, super::model_execution::ADAPTIVE_MODEL_WORK_MAX_CALLS,
+    );
     next_grant.expires_at_unix_ms = now_unix_ms()
         .checked_add(300_000)
         .ok_or("source-review correction clock overflow")?;
@@ -1248,6 +1272,37 @@ fn verified_report_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn adaptive_successor_limits_are_new_delegations_but_legacy_limits_are_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = model_work::configured_test_api(&temp.path().join("company.sqlite"));
+        let binding = model_work::assign_test_work_from(&api, Some(4), 0);
+        let project = api.store.company_project(
+            &TenantId::parse(&binding.tenant_id).unwrap(),
+            &ProjectId::parse(&binding.project_id).unwrap(),
+        ).unwrap().unwrap();
+        // This is a shortened-window descriptor, not an issued authority.
+        let mut previous = project.subscription_call.unwrap();
+        previous.grant.max_calls = 2;
+        previous.grant.max_duration_ms = 5_000;
+        previous.grant.expires_at_unix_ms = previous.created_at_unix_ms + 10_000;
+        let original = previous.clone();
+        let qa = source_successor_grant(&previous, 1);
+        assert_eq!((qa.max_calls, qa.max_concurrent, qa.max_duration_ms), (1, 1, 120_000));
+        let correction = source_successor_grant(
+            &previous, super::super::model_execution::ADAPTIVE_MODEL_WORK_MAX_CALLS,
+        );
+        assert_eq!((correction.max_calls, correction.max_concurrent, correction.max_duration_ms), (16, 1, 120_000));
+        assert_eq!(previous, original);
+        previous.dispatch = Some(sentinel_workflow::SubscriptionCallDispatchV1 {
+            request_id: "legacy-request".into(), request_digest: "a".repeat(64),
+            dispatched_at_unix_ms: previous.created_at_unix_ms,
+        });
+        assert_eq!(source_successor_grant(&previous, 1), previous.grant);
+        assert_eq!(source_successor_grant(&previous, 16), previous.grant);
+    }
 
     #[test]
     fn autonomous_source_review_runs_once_and_only_after_completed_predecessor() {

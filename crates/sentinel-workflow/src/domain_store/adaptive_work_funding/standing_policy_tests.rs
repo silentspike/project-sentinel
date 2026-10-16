@@ -4,6 +4,14 @@
 use super::*;
 use crate::StandingWorkFundingPolicyV1;
 
+mod observed_source_tests {
+    include!("standing_policy_observed_source_tests.rs");
+}
+
+mod terminal_manual_defer_tests {
+    include!("standing_policy_terminal_manual_defer_tests.rs");
+}
+
 fn policy(f: &Fixture) -> StandingWorkFundingPolicyV1 {
     StandingWorkFundingPolicyV1 {
         schema_version: 1,

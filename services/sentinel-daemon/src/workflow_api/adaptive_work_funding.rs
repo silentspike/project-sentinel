@@ -11,6 +11,82 @@ mod tests;
 #[path = "adaptive_work_funding/review_snapshot_tests.rs"]
 mod review_snapshot_tests;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static SOURCE_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Same projection as CompanyAuthority::workbench_snapshot, but SQL provenance
+// is already pinned by the standing transaction. Recompute external authority
+// on both coordinator reads; never call snapshot_for_admission under that mutex.
+struct FundingObservationAuthority<'a> {
+    authority: &'a CompanyAuthority,
+    project: &'a sentinel_workflow::ProjectV1,
+}
+
+impl crate::workbench::WorkbenchAuthoritySource for FundingObservationAuthority<'_> {
+    fn current_for_request(
+        &self,
+        _request: &sentinel_common::WorkbenchRequest,
+    ) -> anyhow::Result<WorkbenchAuthoritySnapshot> {
+        anyhow::bail!("funding observation authority cannot admit work")
+    }
+
+    fn current_for_record(
+        &self,
+        record: &crate::workbench::WorkbenchInvocationRecord,
+    ) -> anyhow::Result<WorkbenchAuthoritySnapshot> {
+        let caller = self.authority.principals.principal(&record.caller_id)
+            .ok_or_else(|| anyhow::anyhow!("workbench principal is unavailable"))?;
+        let project_id = ProjectId::parse(&record.project_id)?;
+        let work_item_id = WorkItemId::parse(&record.work_item_id)?;
+        let runtime = self.authority.snapshot_from_validated_project(
+            self.project, &caller.principal.tenant_id, &project_id,
+            &work_item_id, record.agent_id, false,
+        ).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let principal = self.authority.principals.principal(&runtime.principal.principal_id)
+            .filter(|principal| {
+                principal.execution_authority == runtime.principal
+                    && principal.principal.agent_id == Some(record.agent_id)
+                    && principal.principal.tenant_id == caller.principal.tenant_id
+            }).ok_or_else(|| anyhow::anyhow!("workbench principal authority changed"))?;
+        let role = principal.principal.role;
+        let (profile, _) = self.authority.profile_for_binding(&runtime.profile_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let role_capabilities = role_capabilities(role, &profile.capabilities, &profile.capabilities);
+        Ok(WorkbenchAuthoritySnapshot {
+            agent_id: record.agent_id,
+            caller_id: runtime.principal.principal_id,
+            caller_role: collaboration_policy_role_name(role).to_owned(),
+            project_id: project_id.0,
+            work_item_id: work_item_id.0,
+            assignment_version: runtime.assignment_version,
+            credential_generation: runtime.principal.principal_generation,
+            policy_digest: runtime.policy_digest,
+            tool_profile: runtime.profile_id,
+            tool_profile_digest: runtime.profile_digest,
+            runtime_key: runtime.runtime_key,
+            assignment_active: true,
+            agent_capabilities: runtime.capabilities.clone(),
+            role_capabilities,
+            assignment_capabilities: runtime.capabilities.clone(),
+            project_capabilities: runtime.capabilities,
+            profile_capabilities: profile.capabilities.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(super) fn funding_observation_projection_for_test(
+    authority: &CompanyAuthority,
+    project: &sentinel_workflow::ProjectV1,
+    record: &crate::workbench::WorkbenchInvocationRecord,
+) -> anyhow::Result<WorkbenchAuthoritySnapshot> {
+    crate::workbench::WorkbenchAuthoritySource::current_for_record(
+        &FundingObservationAuthority { authority, project }, record,
+    )
+}
+
 // Public drafts carry a digest instead of private source/authority. A typed
 // request is also accepted, but its caller-supplied source is never trusted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,6 +440,64 @@ impl WorkflowApi {
         let _phase = FundingPhase::start("current_source");
         let (project, session) =
             self.adaptive_resume_policy_current_source(operator, project_id, session_id)?;
+        self.work_funding_current_source_from_observed(&project, &session, now)
+    }
+
+    // Reuse discovery, but retain the ordinary reader's fresh Workbench authority
+    // checks outside SQL. Callbacks must use the pinned-reader variant below.
+    pub(super) fn work_funding_current_source_from_observed(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        session: &AdaptiveSessionV1,
+        now: u64,
+    ) -> Result<(), WorkflowError> {
+        self.work_funding_current_source_with_observation_reader(project, session, now, |reference| {
+            self.workbench
+                .as_ref()
+                .ok_or_else(source_conflict)?
+                .private_observation(reference.effect.id, &session.grant.authority.profile_id)
+                .map_err(|_| source_conflict())
+        })
+    }
+
+    // Only the observed standing-store entry point may call this under its SQL
+    // fence, after comparing the complete project and session to durable state.
+    pub(super) fn work_funding_current_source_in_snapshot(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        session: &AdaptiveSessionV1,
+        now: u64,
+    ) -> Result<(), WorkflowError> {
+        self.work_funding_current_source_with_observation_reader(project, session, now, |reference| {
+            self.workbench.as_ref().ok_or_else(source_conflict)?;
+            let authority = self.authority.as_ref().ok_or_else(source_conflict)?;
+            let (profile, digest) = authority
+                .profile_for_binding(&session.grant.authority.profile_id)
+                .map_err(|_| source_conflict())?;
+            crate::workbench::read_workbench_private_observation(
+                &reference.effect.id.to_string(),
+                &FundingObservationAuthority { authority, project },
+                profile,
+                digest,
+            )
+            .map_err(|_| source_conflict())?
+            .ok_or_else(source_conflict)
+        })
+    }
+
+    fn work_funding_current_source_with_observation_reader(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        session: &AdaptiveSessionV1,
+        now: u64,
+        read_observation: impl FnOnce(&sentinel_workflow::AdaptiveObservationRefV1)
+            -> Result<sentinel_common::WorkbenchPrivateObservation, WorkflowError>,
+    ) -> Result<(), WorkflowError> {
+        if project.tenant_id != session.grant.authority.tenant_id
+            || project.project_id != session.grant.authority.project_id
+        {
+            return Err(source_conflict());
+        }
         if !matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
             || !session.model_window_exhausted_at(now)
         {
@@ -423,12 +557,7 @@ impl WorkflowApi {
         )
         .map_err(|_| source_conflict())?;
         if let Some(reference) = &session.last_observation {
-            let observation = self
-                .workbench
-                .as_ref()
-                .ok_or_else(source_conflict)?
-                .private_observation(reference.effect.id, &session.grant.authority.profile_id)
-                .map_err(|_| source_conflict())?;
+            let observation = read_observation(reference)?;
             observation
                 .validate(
                     &reference.effect.id.to_string(),
