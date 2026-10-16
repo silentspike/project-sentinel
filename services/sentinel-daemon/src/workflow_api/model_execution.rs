@@ -7,7 +7,7 @@ pub(super) mod tool_catalog;
 mod working_memory;
 
 use super::*;
-use crate::llm_bridge::bridge::ProviderUsageAuthority;
+use crate::llm_bridge::bridge::{observe_completion_stage, ProviderUsageAuthority};
 use sentinel_common::WorkbenchPrivateObservation;
 use sentinel_workflow::{
     AdaptiveCollaborationActionV1, AdaptiveModelDecisionV1, CompanyRoleV1, CompanyWorkStateV1,
@@ -2312,39 +2312,10 @@ impl WorkflowApi {
             }
             session = self.reconcile_adaptive_tool(session)?;
         }
-        let governed_window = session
-            .continuation
-            .as_ref()
-            .and_then(|state| state.authorizations.last())
-            .is_some_and(|authorization| authorization.resume_policy.is_some());
-        if governed_window
-            && matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
-            && session.model_admission_at(now_unix_ms())
-                != sentinel_workflow::AdaptiveModelAdmissionV1::Admissible
-        {
+        let Some((session_version, effect_id)) =
+            self.adaptive_model_effect_at(&session, now_unix_ms())?
+        else {
             return Ok((None, reconciled_tools));
-        }
-        let (session_version, effect_id) = match &session.cursor {
-            AdaptiveCursorV1::ReadyForModel => (
-                session.version,
-                stable_operation_id(
-                    "sentinel.workflow.adaptive-model-effect.v1",
-                    &session.grant.session_id.to_string(),
-                    session.version,
-                ),
-            ),
-            AdaptiveCursorV1::ModelPending { effect }
-                if !self.adaptive_provider_outcome_unknown(&session, effect)? =>
-            {
-                (
-                    session
-                        .version
-                        .checked_sub(1)
-                        .ok_or("adaptive session version underflow")?,
-                    effect.id,
-                )
-            }
-            _ => return Ok((None, reconciled_tools)),
         };
         Ok((
             Some(AdaptiveProviderAuthority {
@@ -2357,6 +2328,50 @@ impl WorkflowApi {
             }),
             reconciled_tools,
         ))
+    }
+
+    fn adaptive_model_effect_at(
+        &self,
+        session: &AdaptiveSessionV1,
+        now_ms: u64,
+    ) -> Result<Option<(u64, Uuid)>, &'static str> {
+        let governed_window = session.active_work_funding().is_some()
+            || session
+                .continuation
+                .as_ref()
+                .and_then(|state| state.authorizations.last())
+                .is_some_and(|authorization| authorization.resume_policy.is_some());
+        // Window slack governs new claims, not adoption of an already claimed result.
+        if governed_window
+            && matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
+            && session.model_admission_at(now_ms)
+                != sentinel_workflow::AdaptiveModelAdmissionV1::Admissible
+        {
+            return Ok(None);
+        }
+        let (session_version, effect_id) = match &session.cursor {
+            AdaptiveCursorV1::ReadyForModel => (
+                session.version,
+                stable_operation_id(
+                    "sentinel.workflow.adaptive-model-effect.v1",
+                    &session.grant.session_id.to_string(),
+                    session.version,
+                ),
+            ),
+            AdaptiveCursorV1::ModelPending { effect }
+                if !self.adaptive_provider_outcome_unknown(session, effect)? =>
+            {
+                (
+                    session
+                        .version
+                        .checked_sub(1)
+                        .ok_or("adaptive session version underflow")?,
+                    effect.id,
+                )
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some((session_version, effect_id)))
     }
 
     fn reconcile_adaptive_tool(
@@ -2905,32 +2920,39 @@ impl WorkflowApi {
         }
         let decision = parse_adaptive_decision(&completion.content)?;
         validate_adaptive_decision_evidence(context.observation.as_ref(), &decision)?;
-        let session = self
-            .core
-            .adaptive_session(
-                context.binding.grant.session_id,
-                &context.binding.grant.authority,
-            )
-            .map_err(|_| "adaptive session unavailable")?
-            .ok_or("adaptive session missing")?;
-        if session.effective_grant() != context.binding.grant {
-            return Err("adaptive provider grant changed");
-        }
-        if self
-            .store
-            .adaptive_model_result_is_adopted(
+        let result_digest = hex_sha256(completion.content.as_bytes());
+        let adoption = observe_completion_stage(request_id, "adaptive_adoption_read", || {
+            self.core.adaptive_model_adoption_read(
                 &context.binding.grant,
                 &AdaptiveEffectV1 {
                     id: context.binding.effect_id,
                     request_digest: request_digest.to_owned(),
                 },
-                &hex_sha256(completion.content.as_bytes()),
+                &result_digest,
                 &decision,
             )
-            .map_err(|_| "adaptive result replay unavailable")?
-        {
-            return Ok(());
-        }
+        })
+        .map_err(|error| match error {
+            sentinel_workflow::AdaptiveModelAdoptionReadError::Session(_) => {
+                "adaptive session unavailable"
+            }
+            sentinel_workflow::AdaptiveModelAdoptionReadError::Replay(_) => {
+                "adaptive result replay unavailable"
+            }
+        })?;
+        let session = match adoption {
+            sentinel_workflow::AdaptiveModelAdoptionRead::Missing => {
+                return Err("adaptive session missing");
+            }
+            sentinel_workflow::AdaptiveModelAdoptionRead::GrantChanged => {
+                return Err("adaptive provider grant changed");
+            }
+            sentinel_workflow::AdaptiveModelAdoptionRead::Current {
+                already_adopted: true,
+                ..
+            } => return Ok(()),
+            sentinel_workflow::AdaptiveModelAdoptionRead::Current { session, .. } => *session,
+        };
         let (effect, proposed_action, needs_resolution) = match &session.cursor {
             AdaptiveCursorV1::ModelPending { effect }
             | AdaptiveCursorV1::ModelUnknown { effect }
@@ -2943,7 +2965,7 @@ impl WorkflowApi {
                 if effect.id == context.binding.effect_id
                     && effect.request_digest == request_digest
                     && session.last_model_result_digest.as_deref()
-                        == Some(hex_sha256(completion.content.as_bytes()).as_str()) =>
+                        == Some(result_digest.as_str()) =>
             {
                 (effect.clone(), Some(action.clone()), false)
             }
@@ -2975,20 +2997,21 @@ impl WorkflowApi {
                 request_id,
                 session.version,
             );
-            let (_, resolved) = self
-                .core
-                .advance_adaptive_session(
-                    session.grant.session_id,
-                    session.version,
-                    operation_id,
-                    &AdaptiveTransitionV1::ResolveModel {
-                        effect: effect.clone(),
-                        result_digest: hex_sha256(completion.content.as_bytes()),
-                        decision: decision.clone(),
-                    },
-                    &session.grant.authority,
-                    now_unix_ms(),
-                )
+            let (_, resolved) =
+                observe_completion_stage(request_id, "adaptive_model_commit", || {
+                    self.core.advance_adaptive_session(
+                        session.grant.session_id,
+                        session.version,
+                        operation_id,
+                        &AdaptiveTransitionV1::ResolveModel {
+                            effect: effect.clone(),
+                            result_digest: result_digest.clone(),
+                            decision: decision.clone(),
+                        },
+                        &session.grant.authority,
+                        now_unix_ms(),
+                    )
+                })
                 .map_err(|_| "adaptive model result admission failed")?;
             if matches!(resolved.cursor, AdaptiveCursorV1::ReadyForTool { .. }) {
                 let source = &resolved.grant.authority;

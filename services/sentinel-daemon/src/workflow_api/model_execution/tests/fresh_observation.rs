@@ -930,6 +930,35 @@ fn known_rejected_write_optional_digest_is_exact_or_rejected_without_effects() {
 }
 
 #[test]
+fn legacy_continuation_effect_discovery_keeps_existing_clock_behavior() {
+    let fixture = Fixture::continued_unknown_with_observation();
+    let before = fixture.read();
+    assert!(before.active_work_funding().is_none());
+    assert!(before
+        .continuation
+        .as_ref()
+        .unwrap()
+        .authorizations
+        .last()
+        .unwrap()
+        .resume_policy
+        .is_none());
+    let selected = fixture
+        .api
+        .adaptive_model_effect_at(&before, now_unix_ms())
+        .unwrap();
+    assert!(selected.is_some());
+    assert_eq!(
+        fixture
+            .api
+            .adaptive_model_effect_at(&before, before.active_deadline_ms() + 1)
+            .unwrap(),
+        selected,
+    );
+    assert_eq!(fixture.read(), before);
+}
+
+#[test]
 fn continued_unknown_retains_observation_but_requires_inspection_only_generation() {
     let fixture = Fixture::continued_unknown_with_observation();
     let before = fixture.read();
