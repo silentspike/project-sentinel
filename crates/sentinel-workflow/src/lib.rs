@@ -24,6 +24,7 @@ mod model;
 mod port;
 mod project_planning;
 mod request_provider;
+mod standing_work_funding;
 mod store;
 
 pub use adaptive::*;
@@ -50,6 +51,7 @@ pub use port::*;
 pub use project_planning::*;
 pub use request_provider::*;
 pub use sentinel_common::AgentId;
+pub use standing_work_funding::*;
 pub use store::{
     AdaptiveHealthReadError, AdaptiveModelAdoptionRead, AdaptiveModelAdoptionReadError,
     AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot, ExecutionRevisionV1,

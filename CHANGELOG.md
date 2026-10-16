@@ -1,5 +1,12 @@
 # Changelog
 
+- Allow an optional, protected standing operator policy to propose a distinct
+  zero-addition funding epoch after a genuine funded Defer. Issue at most once
+  per policy generation and exact execution head, retain the original decision
+  and cumulative ceilings, and require a new independent Continue before any
+  execution window. Recheck policy and current authority around the atomic
+  issuance; retries never refresh a retained proposal (#856).
+
 - Preserve bounded private diagnostics from the latest failed command or test
   across a later source inspection. Bind excerpts to the existing authenticated
   observation and journal, keep legacy reserved context bytes before enrichment,

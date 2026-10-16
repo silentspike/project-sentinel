@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "policy_id": "single-node-standing-v1",
+  "generation": 1,
+  "tenant_id": "tenant-example",
+  "issuer_principal_id": "operator",
+  "epoch_duration_ms": 21600000,
+  "additional_reviews": 4,
+  "additional_windows": 4,
+  "max_window_ms": 300000
+}
