@@ -2,12 +2,17 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <pr-number> [merge|squash|rebase]"
+  echo "Usage: $0 <pr-number> [merge|squash|rebase] <reviewed-head-sha>"
   exit 1
 fi
 
 PR_NUMBER="$1"
 MERGE_METHOD="${2:-merge}"
+REVIEWED_SHA="${3:-${REVIEWED_HEAD_SHA:-}}"
+if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ || ! "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "ERROR: A PR number and full independently reviewed head SHA are required."
+  exit 1
+fi
 
 case "$MERGE_METHOD" in
   merge|squash|rebase) ;;
@@ -34,12 +39,20 @@ gh auth status >/dev/null 2>&1 || {
 
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 
-PR_JSON="$(gh pr view "$PR_NUMBER" -R "$REPO" --json number,state,isDraft,headRefOid,body,title,url)"
+PR_JSON="$(gh pr view "$PR_NUMBER" -R "$REPO" --json number,state,isDraft,headRefOid,body,title,url,isCrossRepository,baseRefName)"
 PR_STATE="$(printf '%s' "$PR_JSON" | jq -r '.state')"
 PR_DRAFT="$(printf '%s' "$PR_JSON" | jq -r '.isDraft')"
 PR_SHA="$(printf '%s' "$PR_JSON" | jq -r '.headRefOid')"
 PR_URL="$(printf '%s' "$PR_JSON" | jq -r '.url')"
 PR_BODY="$(printf '%s' "$PR_JSON" | jq -r '.body // ""')"
+if [[ "$PR_SHA" != "$REVIEWED_SHA" ]]; then
+  echo "ERROR: PR head does not match the independently reviewed head."
+  exit 1
+fi
+if ! printf '%s' "$PR_JSON" | jq -e '.isCrossRepository == false and .baseRefName == "main"' >/dev/null; then
+  echo "ERROR: Only same-repository PRs targeting main may be merged."
+  exit 1
+fi
 
 if [[ "$PR_STATE" != "OPEN" ]]; then
   echo "ERROR: PR #$PR_NUMBER is not open"
@@ -106,17 +119,26 @@ for WORKFLOW in "${required_workflows[@]}"; do
   fi
 done
 
+# Do not accept a same-named status from a different application, or an old
+# successful check when its replacement is still running or failed.
+CHECKS="$(gh api --paginate "repos/$REPO/commits/$PR_SHA/check-runs?check_name=ci-pass&filter=latest&per_page=100" --jq '.check_runs[]' | jq -s '.')"
+if ! printf '%s' "$CHECKS" | jq -e \
+  '[.[] | select(.name == "ci-pass" and .app.id == 15368)] | sort_by(.id) | last | .status == "completed" and .conclusion == "success"' >/dev/null; then
+  echo "ERROR: Required ci-pass from GitHub Actions is missing or not successful."
+  exit 1
+fi
+
 echo "All gates passed for $PR_URL"
 echo "Merging PR #$PR_NUMBER with method: $MERGE_METHOD"
 
 case "$MERGE_METHOD" in
   merge)
-    gh pr merge "$PR_NUMBER" -R "$REPO" --merge --delete-branch
+    gh pr merge "$PR_NUMBER" -R "$REPO" --merge --delete-branch --match-head-commit "$REVIEWED_SHA"
     ;;
   squash)
-    gh pr merge "$PR_NUMBER" -R "$REPO" --squash --delete-branch
+    gh pr merge "$PR_NUMBER" -R "$REPO" --squash --delete-branch --match-head-commit "$REVIEWED_SHA"
     ;;
   rebase)
-    gh pr merge "$PR_NUMBER" -R "$REPO" --rebase --delete-branch
+    gh pr merge "$PR_NUMBER" -R "$REPO" --rebase --delete-branch --match-head-commit "$REVIEWED_SHA"
     ;;
 esac
