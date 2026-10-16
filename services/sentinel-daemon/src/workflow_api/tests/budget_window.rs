@@ -4028,7 +4028,9 @@ fn large_funded_continuation_keeps_wire_bytes_but_bounds_model_prompt() {
     let (source, observation) = rendered.rsplit_once(". Private tool evidence: ").unwrap();
     let source: serde_json::Value = serde_json::from_str(source).unwrap();
     let observation: serde_json::Value = serde_json::from_str(observation).unwrap();
-    assert_eq!(source["schema_version"], 1);
+    assert_eq!(context.source.presentation_version, Some(2));
+    assert_eq!(source["schema_version"], 2);
+    assert_eq!(source["window_presentation"]["presentation_only"], true);
     assert_eq!(
         source["content_ref"],
         format!("adaptive-leadership-context:{}", context.context_digest),

@@ -200,6 +200,8 @@ fn template(
         .ok_or("funded retired review missing")?;
     let mut grant = old.grant.clone();
     let mut context = old.context.clone();
+    // This template seals a new NoIO recovery review, never a retained replay.
+    context.presentation_version = Some(2);
     let epoch = grant
         .work_funding
         .as_mut()

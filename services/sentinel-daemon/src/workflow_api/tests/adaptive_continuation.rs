@@ -41,6 +41,80 @@ fn audited_window_expiring_at_domain_commit_retires_without_mutating_source() {
     }
 }
 
+#[test]
+fn unsealed_continuation_starts_after_exact_source_read_not_before_it() {
+    let f = Fixture::new(Some(120_000));
+    let before_read = f.call().updated_at_unix_ms;
+    let after_read = before_read + 2_500;
+    let samples = std::cell::Cell::new(0);
+    f.api
+        .accept_leadership_review_with_clock(
+            &f.completion,
+            &f.context,
+            &f.request_id,
+            &f.request_digest,
+            || {
+                let sample = samples.get();
+                samples.set(sample + 1);
+                if sample == 0 {
+                    before_read
+                } else {
+                    after_read
+                }
+            },
+        )
+        .unwrap();
+    let call = f.call();
+    let authorization = call.continuation.as_ref().unwrap();
+    assert_eq!(authorization.issued_at_ms, after_read);
+    assert_eq!(authorization.deadline_ms, after_read + 120_000);
+    assert_eq!(f.session().active_deadline_ms(), authorization.deadline_ms);
+    assert_eq!(call.context, f.context.source);
+    assert!(samples.get() >= 4);
+}
+
+#[test]
+fn source_read_crossing_review_expiry_retires_before_new_continuation_audit() {
+    let f = Fixture::new(Some(120_000));
+    let expiry = f.call().grant.expires_at_unix_ms;
+    let samples = std::cell::Cell::new(0);
+    f.api
+        .accept_leadership_review_with_clock(
+            &f.completion,
+            &f.context,
+            &f.request_id,
+            &f.request_digest,
+            || {
+                let sample = samples.get();
+                samples.set(sample + 1);
+                if sample == 0 {
+                    expiry - 1
+                } else {
+                    expiry
+                }
+            },
+        )
+        .unwrap();
+    assert_eq!(f.assert_retired().retired_at_unix_ms, Some(expiry));
+    assert_eq!(f.session(), f.context.source.source_session);
+    assert_eq!(f.project(), f.context.source.source_project);
+    let decision = serde_json::from_str(&f.completion.content).unwrap();
+    let response = format!("{:x}", Sha256::digest(f.completion.content.as_bytes()));
+    let id = adaptive_leadership_continuation_audit_id(
+        f.context.binding.grant.review_id,
+        &f.request_digest,
+        &response,
+        &decision,
+    )
+    .unwrap();
+    assert!(f
+        .events()
+        .event_v2_by_id(&id.to_string())
+        .unwrap()
+        .is_none());
+    f.assert_payload("failed");
+}
+
 use super::adaptive_leadership_review::tests::persist;
 use super::adaptive_leadership_review::{LeadershipAuthority, LeadershipContext};
 use super::model_execution::{ModelExecutionCompletion, ModelExecutionContext};
@@ -518,6 +592,7 @@ fn fixture_schema2_source(
             expires_at_unix_ms: now + 1_000,
         };
         let source = sentinel_workflow::AdaptiveLeadershipReviewContextV1 {
+            presentation_version: None,
             source_project: project.clone(),
             source_session: session,
             tool_catalog: catalog,
