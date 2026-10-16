@@ -8,6 +8,7 @@ use crate::{
 };
 
 mod expired_replacement;
+mod standing_policy;
 
 struct HistoricalRecoveryJournal {
     connection: usize,

@@ -25,6 +25,8 @@ mod budget_review_extension_tests;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/leadership_audit_clock_replay.rs"]
 mod leadership_audit_clock_replay_tests;
+#[cfg(feature = "llm")]
+mod standing_work_funding;
 
 #[cfg(feature = "llm")]
 pub(crate) mod adaptive_leadership_review;
@@ -3405,6 +3407,8 @@ pub struct WorkflowApi {
     request_sales_tenant: Option<TenantId>,
     request_sales_total_limit: u16,
     request_sales_autonomous_enabled: bool,
+    #[cfg(feature = "llm")]
+    standing_work_funding_policy: Option<standing_work_funding::StandingFundingPolicyBinding>,
     reconciliation_status: Mutex<ReconciliationStatus>,
     company_reconciliation_worker_failed: AtomicBool,
     collaboration_publication_pending: AtomicUsize,
@@ -3554,6 +3558,13 @@ impl WorkflowApi {
             &config_dir.join("company-principals.json"),
             &credentials_dir,
         )?);
+        #[cfg(feature = "llm")]
+        let standing_work_funding_policy =
+            standing_work_funding::StandingFundingPolicyBinding::load(
+                config_dir,
+                &principals,
+                model_work_enabled,
+            )?;
         let profile_registry =
             WorkbenchProfileRegistry::load(config_dir).map_err(|_| workflow_unavailable())?;
         let project_profiles =
@@ -3669,6 +3680,8 @@ impl WorkflowApi {
             request_sales_tenant,
             request_sales_total_limit,
             request_sales_autonomous_enabled,
+            #[cfg(feature = "llm")]
+            standing_work_funding_policy,
             reconciliation_status: Mutex::new(ReconciliationStatus::default()),
             company_reconciliation_worker_failed: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(usize::MAX),
@@ -3728,6 +3741,8 @@ impl WorkflowApi {
             request_sales_tenant: None,
             request_sales_total_limit: 1,
             request_sales_autonomous_enabled: false,
+            #[cfg(feature = "llm")]
+            standing_work_funding_policy: None,
             reconciliation_status: Mutex::new(ReconciliationStatus::default()),
             company_reconciliation_worker_failed: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(0),
@@ -5862,6 +5877,19 @@ impl WorkflowApi {
             })?;
             if should_stop() {
                 return Ok(());
+            }
+            #[cfg(feature = "llm")]
+            if self.standing_work_funding_policy.is_some() {
+                if self.trace_reconciliation_phase("standing_work_funding", || {
+                    self.reconcile_standing_work_funding(&project)
+                })? {
+                    // Only a proposal was committed. Discover its independent
+                    // leadership review from fresh state on the next pass.
+                    continue;
+                }
+                if should_stop() {
+                    return Ok(());
+                }
             }
             #[cfg(feature = "llm")]
             if self

@@ -1,5 +1,9 @@
 use super::*;
 
+mod standing_policy_tests {
+    include!("../adaptive_work_funding/standing_policy_tests.rs");
+}
+
 mod issue856_recovery_read_cache_tests {
     include!("work_funding_tests/recovery_read_cache_tests.rs");
 }
