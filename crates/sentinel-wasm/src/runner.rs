@@ -201,13 +201,7 @@ impl ToolRuntime {
     /// Liest eine Datei, geprueft gegen Sandbox-Pfade.
     fn execute_file_read(&self, input: &str, sandbox: &SandboxConfig) -> Result<String> {
         let path = std::path::Path::new(input.trim());
-        if !sandbox.is_path_allowed(path) {
-            return Err(anyhow!(
-                "Sandbox violation: path '{}' not in allowed paths",
-                input.trim()
-            ));
-        }
-        let content = std::fs::read_to_string(path)?;
+        let content = sandbox.scoped_path(path)?.read_text()?;
         Ok(content)
     }
 
@@ -217,13 +211,9 @@ impl ToolRuntime {
             .split_once('\n')
             .ok_or_else(|| anyhow!("FileWrite input must be 'path\\ncontent'"))?;
         let path = std::path::Path::new(path_str.trim());
-        if !sandbox.is_path_allowed(path) {
-            return Err(anyhow!(
-                "Sandbox violation: path '{}' not in allowed paths",
-                path_str.trim()
-            ));
-        }
-        std::fs::write(path, content)?;
+        sandbox
+            .scoped_path(path)?
+            .write(content.as_bytes(), false)?;
         Ok(format!(
             "Written {} bytes to {}",
             content.len(),
@@ -411,13 +401,13 @@ impl ToolRuntime {
 
         let rooms = ctx.rooms.clone().unwrap_or_default();
 
-        // Agent home: use first allowed path or a temp directory.
+        // Without an explicit root, component host filesystem access stays denied.
         let agent_home = ctx
             .sandbox
             .allowed_paths
             .first()
             .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+            .unwrap_or_default();
 
         match self.plugin_host.execute(
             &wasm_path,
@@ -607,6 +597,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Sandbox violation"));
+    }
+
+    #[test]
+    fn native_tools_reject_existing_and_dangling_outside_symlinks() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("read", ToolType::FileRead))
+            .unwrap();
+        runtime
+            .register_tool(make_tool("write", ToolType::FileWrite))
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "unchanged").unwrap();
+        let ctx = test_ctx(SandboxConfig::with_paths(vec![root.path().to_path_buf()]));
+        for name in ["secret", "missing"] {
+            let link = root.path().join(name);
+            std::os::unix::fs::symlink(outside.path().join(name), &link).unwrap();
+            assert!(runtime
+                .execute("read", link.to_str().unwrap(), &ctx)
+                .is_err());
+            assert!(runtime
+                .execute("write", &format!("{}\nescape", link.display()), &ctx)
+                .is_err());
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret")).unwrap(),
+            "unchanged"
+        );
+        assert!(!outside.path().join("missing").exists());
     }
 
     #[test]
