@@ -38,6 +38,26 @@ class WorkflowTests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_all_parallel_delivery_mechanisms_are_mandatory_in_lint(self):
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        lint = text.split("  lint:\n")[1].split("  bans:\n")[0]
+        name = "      - name: Remote parallel-delivery mechanism regressions\n"
+        block = lint.split(name)[1].split("      - name:")[0]
+        self.assertLess(lint.index("uses: actions/setup-node@"), lint.index(name))
+        for path in ("scripts/ci/test-archive-tests.py", "scripts/product-acceptance/remote_parallel_test.py",
+                     "scripts/product-acceptance/remote_parallel_desktop_test.mjs", "deploy/ci-lab/test_control.py"):
+            self.assertIn(f"test -f {path}", block)
+        for command in ("python3 -B scripts/ci/test-archive-tests.py -v",
+                        "python3 -B -m unittest discover -s scripts/product-acceptance -p 'remote_parallel_test.py' -v",
+                        "node --test scripts/product-acceptance/remote_parallel_desktop_test.mjs",
+                        "python3 -B -m unittest discover -s deploy/ci-lab -p 'test_*.py' -v",
+                        "bash -n deploy/ci-lab/prepare-guest.sh"):
+            self.assertIn(command, block)
+        self.assertNotIn("if:", block)
+        self.assertNotIn("if ", block)
+        self.assertNotIn("||", block)
+        self.assertNotIn("continue-on-error", block)
+
 
 if __name__ == "__main__":
     unittest.main()

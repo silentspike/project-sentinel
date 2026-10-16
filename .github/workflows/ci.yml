@@ -96,6 +96,20 @@ jobs:
           sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$TMPDIR"
           python3 -m unittest discover -s scripts/ci/tests -p 'test_*.py'
 
+      - name: Remote parallel-delivery mechanism regressions
+        env:
+          TMPDIR: /work/tmp/sentinel-ci-contracts
+        run: |
+          test -f scripts/ci/test-archive-tests.py
+          test -f scripts/product-acceptance/remote_parallel_test.py
+          test -f scripts/product-acceptance/remote_parallel_desktop_test.mjs
+          test -f deploy/ci-lab/test_control.py
+          python3 -B scripts/ci/test-archive-tests.py -v
+          python3 -B -m unittest discover -s scripts/product-acceptance -p 'remote_parallel_test.py' -v
+          node --test scripts/product-acceptance/remote_parallel_desktop_test.mjs
+          python3 -B -m unittest discover -s deploy/ci-lab -p 'test_*.py' -v
+          bash -n deploy/ci-lab/prepare-guest.sh
+
       - name: Virtual-company M0 product contract (#693)
         env:
           SENTINEL_CI_SCRATCH: /work/tmp/sentinel-ci-product-acceptance
