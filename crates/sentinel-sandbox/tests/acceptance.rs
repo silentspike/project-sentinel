@@ -484,7 +484,8 @@ fn ac_75_vm_only_loopback_inside_cage() {
         .read_to_end(&mut output)
         .expect("read sandbox link output");
     let status = cage.process.child.wait().expect("wait for sandbox ip");
-    cage.cleanup().expect("loopback test process must be reaped");
+    cage.cleanup()
+        .expect("loopback test process must be reaped");
     assert!(
         status.success(),
         "sandbox ip failed: {status}, stdout={output:?}"
@@ -495,9 +496,17 @@ fn ac_75_vm_only_loopback_inside_cage() {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect::<Vec<_>>();
-    assert_eq!(lines.len(), 1, "expected exactly one loopback link: {links}");
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one loopback link: {links}"
+    );
     let fields = lines[0].split_whitespace().collect::<Vec<_>>();
-    assert_eq!(fields.first(), Some(&"1:"), "unexpected link index: {links}");
+    assert_eq!(
+        fields.first(),
+        Some(&"1:"),
+        "unexpected link index: {links}"
+    );
     assert_eq!(fields.get(1), Some(&"lo:"), "unexpected interface: {links}");
     let flags = fields.get(2).expect("loopback link flags");
     assert!(
@@ -605,9 +614,12 @@ fn ac_75_vm_60_concurrent_full_cages_are_distinct() {
                 .expect("sandbox cleanup must not panic")
                 .expect("the burst must reap its supervisor and original init");
         }
-        assert!(identities.iter().all(|identity| {
-            matches!(identity.read_state(), Err(error) if pinned_proc_identity_is_gone(&error))
-        }), "the 60-sandbox burst must leave no sandboxed child behind");
+        assert!(
+            identities.iter().all(|identity| {
+                matches!(identity.read_state(), Err(error) if pinned_proc_identity_is_gone(&error))
+            }),
+            "the 60-sandbox burst must leave no sandboxed child behind"
+        );
     });
 }
 
@@ -618,10 +630,16 @@ fn pinned_proc_reaping_accepts_only_enoent_and_esrch() {
             code
         )));
     }
-    for code in [libc::EACCES, libc::EPERM, libc::EBADF, libc::EIO, libc::ETIMEDOUT] {
-        assert!(!pinned_proc_identity_is_gone(&io::Error::from_raw_os_error(
-            code
-        )));
+    for code in [
+        libc::EACCES,
+        libc::EPERM,
+        libc::EBADF,
+        libc::EIO,
+        libc::ETIMEDOUT,
+    ] {
+        assert!(!pinned_proc_identity_is_gone(
+            &io::Error::from_raw_os_error(code)
+        ));
     }
     assert!(!pinned_proc_identity_is_gone(&io::Error::new(
         io::ErrorKind::TimedOut,
