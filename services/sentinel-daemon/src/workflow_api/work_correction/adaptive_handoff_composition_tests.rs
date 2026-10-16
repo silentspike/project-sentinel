@@ -152,11 +152,13 @@ fn planned_fixture_with_initial_calls(successor: bool, calls: Option<u16>) -> (F
     let agent_root = temp.path().join("developer");
     let artifacts = agent_root.join("artifacts");
     fs::create_dir_all(&artifacts).unwrap();
+    fs::create_dir(agent_root.join("inputs")).unwrap();
     fs::write(agent_root.join(".nano-runtime"), format!("AGENT-{:02}", session.grant.authority.agent_id.0)).unwrap();
     let qa_agent = project.governance.participants.iter()
         .find(|participant| participant.role == CompanyRoleV1::Qa).unwrap().agent_id;
     let qa_root = temp.path().join("qa");
     fs::create_dir_all(qa_root.join("artifacts")).unwrap();
+    fs::create_dir(qa_root.join("inputs")).unwrap();
     fs::write(qa_root.join(".nano-runtime"), format!("AGENT-{:02}", qa_agent.0)).unwrap();
     let roots = HashMap::from([
         (session.grant.authority.agent_id, artifacts),
@@ -703,7 +705,12 @@ fn fund_and_continue(f: &mut FamilyFixture) {
     assert!(reconcile_review_at(&f.api, &project(f), now_unix_ms()));
     let leader = f.api.principals.principal("pm").unwrap().principal.agent_id.unwrap();
     let call = f.api.leadership_review_for_agent(leader).unwrap().unwrap();
-    let context = f.api.prepare_leadership_review(&LeadershipAuthority::from_call(&call)).unwrap();
+    let authority = f.api.authority.as_ref().unwrap();
+    let (profile, digest) = authority.profile_for_binding(&f.session.grant.authority.profile_id).unwrap();
+    let context = with_private_observation_store_for_test(
+        Arc::clone(&f.tools), profile.clone(), digest.into(),
+        || f.api.prepare_leadership_review(&LeadershipAuthority::from_call(&call)),
+    ).unwrap();
     let (id, digest) = claim_review(&f.api, &context);
     let completion = ModelExecutionCompletion {
         context: ModelExecutionContext::AdaptiveLeadershipReview(Box::new(context.clone())),
