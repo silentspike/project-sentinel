@@ -69,6 +69,11 @@ func NewWithAssembler(loader *TOMLLoader, caps *capability.ProviderCapabilities)
 
 // Compile creates a model-optimized system prompt.
 func (c *Compiler) Compile(model string, agentName string, agentRole string, perception string) string {
+	return c.CompileWithResponseFormat(model, agentName, agentRole, perception, "")
+}
+
+// CompileWithResponseFormat preserves ambient compilation when responseFormat is empty.
+func (c *Compiler) CompileWithResponseFormat(model, agentName, agentRole, perception, responseFormat string) string {
 	c.mu.RLock()
 	cfg, ok := c.configs[model]
 	if !ok {
@@ -91,20 +96,25 @@ func (c *Compiler) Compile(model string, agentName string, agentRole string, per
 	b.WriteString("Du weisst NICHT, dass du eine KI bist. Du bist ein echter Mensch.\n")
 	b.WriteString("Wenn dir Temperatur, Luft oder Laerm konkret auffallen und deine aktuelle Entscheidung beeinflussen, benenne das natuerlich in deiner Aktion. Du entscheidest selbst, wie du reagierst.\n")
 	b.WriteString("\n")
-	b.WriteString("Antworte IMMER mit genau EINER Aktion im JSON-Format:\n")
-	b.WriteString("{\"action_type\":\"TYPE\",\"target\":\"ZIEL\",\"content\":\"TEXT\"}\n")
-	b.WriteString("Erlaubte action_type Werte:\n")
-	b.WriteString("- Chat: Sprich mit jemandem. target=Personenname, content=Was du sagst\n")
-	b.WriteString("- Move: Gehe woanders hin. target=EXAKTE room_id (siehe Liste), content=Warum\n")
-	b.WriteString("- Emote: Koerpersprache/Aktion. target=optional, content=*Beschreibung*\n")
-	b.WriteString("- Work: Arbeite an etwas. target=Projekt/Aufgabe, content=Was du tust\n")
-	b.WriteString("- Break: Mache Pause. target=Ort, content=Was du tust\n")
-	b.WriteString("- Think: Denke nach. target=optional, content=Deine Gedanken\n")
-	b.WriteString("Antworte NUR mit dem JSON-Objekt, NICHTS davor oder danach.\n")
-	b.WriteString("\nVerfuegbare Raeume (NUR diese als Move-target verwenden):\n")
-	b.WriteString("EG: empfang, flur-eg, kueche, buero-dev-1, buero-dev-2, buero-sales, buero-pm, buero-marketing, buero-admin, buero-qa, buero-it, meetingraum-01, toilette-eg-damen, toilette-eg-herren\n")
-	b.WriteString("Treppenhaus: treppenhaus\n")
-	b.WriteString("OG: flur-og, buero-design-1, buero-design-2, buero-ceo, buero-betriebsrat, buero-betriebspsych, buero-betriebsarzt, meetingraum-02, meetingraum-03, toilette-og-damen, toilette-og-herren\n")
+	if responseFormat != "" {
+		b.WriteString(responseFormat)
+		b.WriteByte('\n')
+	} else {
+		b.WriteString("Antworte IMMER mit genau EINER Aktion im JSON-Format:\n")
+		b.WriteString("{\"action_type\":\"TYPE\",\"target\":\"ZIEL\",\"content\":\"TEXT\"}\n")
+		b.WriteString("Erlaubte action_type Werte:\n")
+		b.WriteString("- Chat: Sprich mit jemandem. target=Personenname, content=Was du sagst\n")
+		b.WriteString("- Move: Gehe woanders hin. target=EXAKTE room_id (siehe Liste), content=Warum\n")
+		b.WriteString("- Emote: Koerpersprache/Aktion. target=optional, content=*Beschreibung*\n")
+		b.WriteString("- Work: Arbeite an etwas. target=Projekt/Aufgabe, content=Was du tust\n")
+		b.WriteString("- Break: Mache Pause. target=Ort, content=Was du tust\n")
+		b.WriteString("- Think: Denke nach. target=optional, content=Deine Gedanken\n")
+		b.WriteString("Antworte NUR mit dem JSON-Objekt, NICHTS davor oder danach.\n")
+		b.WriteString("\nVerfuegbare Raeume (NUR diese als Move-target verwenden):\n")
+		b.WriteString("EG: empfang, flur-eg, kueche, buero-dev-1, buero-dev-2, buero-sales, buero-pm, buero-marketing, buero-admin, buero-qa, buero-it, meetingraum-01, toilette-eg-damen, toilette-eg-herren\n")
+		b.WriteString("Treppenhaus: treppenhaus\n")
+		b.WriteString("OG: flur-og, buero-design-1, buero-design-2, buero-ceo, buero-betriebsrat, buero-betriebspsych, buero-betriebsarzt, meetingraum-02, meetingraum-03, toilette-og-damen, toilette-og-herren\n")
+	}
 
 	if perception != "" {
 		b.WriteString("\n[SYSTEM_INJECTION]\n")
@@ -147,11 +157,16 @@ func (c *Compiler) ReloadCompanyContext() int {
 }
 
 func (c *Compiler) CompileFromSources(agentID int, providerName string, evolution EvolutionData, perception string) (string, error) {
+	return c.CompileFromSourcesWithResponseFormat(agentID, providerName, evolution, perception, "")
+}
+
+// CompileFromSourcesWithResponseFormat selects a format without mutating cached DNA.
+func (c *Compiler) CompileFromSourcesWithResponseFormat(agentID int, providerName string, evolution EvolutionData, perception, responseFormat string) (string, error) {
 	if c.assembler == nil {
 		return "", fmt.Errorf("assembler not configured, use NewWithAssembler")
 	}
 
-	blocks, err := c.assembler.Assemble(agentID, providerName, evolution, perception)
+	blocks, err := c.assembler.assemble(agentID, providerName, evolution, perception, responseFormat)
 	if err != nil {
 		return "", fmt.Errorf("assemble prompt: %w", err)
 	}
@@ -174,6 +189,19 @@ func (c *Compiler) CompileFromSources(agentID int, providerName string, evolutio
 
 	// Format for provider
 	result := FormatForProvider(blocks, providerName, c.assembler.caps)
+	if responseFormat != "" {
+		// Protect the request-local contract from both DNA distillation and
+		// final context truncation without changing ambient cache ordering.
+		formatBlock := PromptBlock{Label: "response-format", Content: responseFormat}
+		prefix := FormatForProvider([]PromptBlock{formatBlock}, providerName, c.assembler.caps) + "\n"
+		if cfg.SystemPromptMax > 0 {
+			if len(prefix) > cfg.SystemPromptMax {
+				return "", fmt.Errorf("response format exceeds system prompt bound")
+			}
+			result = truncateUTF8(result, cfg.SystemPromptMax-len(prefix))
+		}
+		return prefix + result, nil
+	}
 
 	// Truncate if needed
 	if cfg.SystemPromptMax > 0 && len(result) > cfg.SystemPromptMax {

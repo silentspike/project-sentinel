@@ -29,6 +29,17 @@ type CompiledPrompt struct {
 	LegacySystemPrompt string
 }
 
+// WithResponseFormat replaces only the response contract in request-local blocks.
+func WithResponseFormat(prompt CompiledPrompt, responseFormat string) CompiledPrompt {
+	blocks := append([]CompiledSystemBlock(nil), prompt.SystemBlocks...)
+	for i := range blocks {
+		if blocks[i].Tag == "action-format" {
+			blocks[i].Text = formatTaggedBlock("action-format", responseFormat)
+		}
+	}
+	return CompiledPrompt{SystemBlocks: blocks, LegacySystemPrompt: flattenStructuredBlocks(blocks)}
+}
+
 // StructuredPerception carries the live state that is split across body/environment/inner-voice blocks.
 type StructuredPerception struct {
 	CircadianText   string

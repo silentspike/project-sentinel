@@ -1,5 +1,10 @@
 # Changelog
 
+- Use the governed company response contract instead of ambient action-format
+  instructions for validated model work across structured and legacy gateway
+  prompts. Preserve employee identity, perception, independent decisions,
+  ambient prompt bytes and existing Anthropic system pass-through (#856).
+
 - Apply the existing duration-plus-dispatch-margin admission rule to funded
   work windows before preparing a new model call. Read the authorized adaptive
   head and exact historical result status in one validated snapshot, sharing
