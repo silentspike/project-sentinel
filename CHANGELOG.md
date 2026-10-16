@@ -6,6 +6,21 @@
   writes before truncation while retaining safe in-root relative symlinks.
   Remove the implicit ambient filesystem root from native tools (#856).
 
+- Update locked Rust TLS/QUIC security dependencies and their resolver-selected
+  certificate-verification and test-harness dependencies. Update the Go
+  toolchain patch release and Console security dependencies without changing
+  their language or runtime authority contracts (#856).
+
+- Exercise real FUSE-backed command fixtures using exact declared read-only
+  scripts, preserving command grammar, input visibility and writable quotas.
+  Retain sandbox creator threads through inspection and identity-aware cleanup;
+  keep failed original runs distinct from corrected-source results (#856).
+
+- Bind native measurement legs to actual guest clock brackets and retain
+  request-bound adaptive adoption and commit phases. Missing clock alignment,
+  incomplete runtime evidence and telemetry-only results do not imply a
+  performance or product-acceptance verdict (#856).
+
 - Authenticate completed adaptive producer journals before transferring work
   to independent QA or a bounded correction. Preserve unknown effects, original
   producer proof and immutable review history while allowing a fresh authorized
