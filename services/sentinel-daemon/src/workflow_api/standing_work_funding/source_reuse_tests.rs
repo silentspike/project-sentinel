@@ -125,7 +125,7 @@ fn ordinary_and_observed_preflight_agree_on_external_revocations() {
             // Ordinary discovery can reject the session before funding preflight.
             assert_eq!(
                 legacy.message,
-                if matches!(gate, "profile" | "catalog") {
+                if gate == "profile" {
                     "resume policy source evidence unavailable or changed"
                 } else {
                     "work funding source evidence unavailable or changed"
