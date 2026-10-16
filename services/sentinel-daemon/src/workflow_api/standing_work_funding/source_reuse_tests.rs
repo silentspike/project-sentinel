@@ -117,7 +117,21 @@ fn ordinary_and_observed_preflight_agree_on_external_revocations() {
                 .work_funding_current_source_from_observed(&project, &source, now_unix_ms())
                 .unwrap_err();
             assert_eq!(observed.code, legacy.code, "{gate}");
-            assert_eq!(observed.message, legacy.message, "{gate}");
+            assert_eq!(observed.retryable, legacy.retryable, "{gate}");
+            assert_eq!(
+                observed.message, "work funding source evidence unavailable or changed",
+                "{gate}"
+            );
+            // Ordinary discovery can reject the session before funding preflight.
+            assert_eq!(
+                legacy.message,
+                if matches!(gate, "profile" | "catalog") {
+                    "resume policy source evidence unavailable or changed"
+                } else {
+                    "work funding source evidence unavailable or changed"
+                },
+                "{gate}"
+            );
             assert_eq!(state(&temp), before);
         });
     }

@@ -215,6 +215,19 @@ fn one_shot_authority(binding: ProviderUsageBinding) -> ProviderUsageAuthority {
     }
 }
 
+fn journal_rows(f: &FamilyFixture, id: Uuid) -> Vec<Vec<sentinel_limbo::rusqlite::types::Value>> {
+    let connection = sentinel_limbo::rusqlite::Connection::open(f._temp.path().join("company.sqlite")).unwrap();
+    let mut statement = connection.prepare(
+        "SELECT * FROM workflow_operations WHERE operation_namespace IN (?1,?2,?3) ORDER BY operation_namespace,operation_id",
+    ).unwrap();
+    let count = statement.column_count();
+    let namespace = format!("adaptive-session-v1:{id}");
+    statement.query_map(sentinel_limbo::rusqlite::params![
+        namespace, format!("{namespace}:operations"), format!("{namespace}:rejected-model-dispositions"),
+    ], |row| (0..count).map(|column| row.get(column)).collect()).unwrap()
+        .collect::<Result<_, _>>().unwrap()
+}
+
 fn complete_source(f: &mut FamilyFixture, resolve_completion: bool) -> sentinel_workflow::WorkItemExecutionV1 {
     let task = project(f).work_items[&f.session.grant.authority.work_item_id].spec.clone();
     let (artifact_kind, path) = match task.required_role {
@@ -680,6 +693,53 @@ fn completed_funded_continuation_starts_a_new_correction_without_inheriting_its_
     negative_qa_correction(true);
 }
 
+#[test]
+fn completed_funded_producer_remains_readable_after_direct_pm_correction() {
+    let (mut f, _) = planned_fixture_with_initial_calls(false, Some(4));
+    fund_and_continue(&mut f);
+    let done = complete_source(&mut f, true);
+    let original = f.session.clone();
+    let completed = project(&f);
+    let source = &completed.work_items[&original.grant.authority.work_item_id];
+    let previous = completed.subscription_call.as_ref().unwrap();
+    let journal = journal_rows(&f, original.grant.session_id);
+    let proof = f.api.store.adaptive_source_completion(
+        &completed.tenant_id, &completed.project_id, previous, done.plan.plan_id,
+    ).unwrap().unwrap();
+    let feedback = sentinel_workflow::WorkCorrectionFeedbackV1 {
+        summary: "Correct the contracted behavior with a regression test".into(),
+        artifact_digest: Some(source.output_receipts[0].content_digest.clone()),
+    };
+    let mut next = previous.grant.clone();
+    next.max_calls = 16;
+    next.expires_at_unix_ms = now_unix_ms() + 300_000;
+    let pm = f.api.principals.principal("pm").unwrap();
+    f.api.core.apply_company_command(&pm.principal, Uuid::new_v4(),
+        &CompanyWorkflowCommandV1::RequestWorkCorrection {
+            project_id: completed.project_id.clone(), expected_version: completed.version,
+            work_item_id: source.spec.work_item_id.clone(), expected_work_version: source.version,
+            execution_revision: sentinel_workflow::ExecutionRevisionV1::from_completed_work(
+                &done, feedback.canonical_digest().unwrap(),
+            ).unwrap(),
+            feedback_ref: "scripted-pm-correction".into(), feedback: Some(feedback),
+            next_subscription_grant: Some(next),
+        }, now_unix_ms(),
+    ).unwrap();
+    let binding = f.api.adaptive_provider_authority_for_claim(original.grant.authority.agent_id).unwrap().unwrap();
+    f.session = f.api.store.adaptive_session(binding.grant.session_id, &binding.grant.authority).unwrap().unwrap();
+    assert!(f.session.active_work_funding().is_none());
+    assert_ne!(f.session.grant.session_id, original.grant.session_id);
+    complete_source(&mut f, true);
+    let revised = project(&f);
+    assert!(f.api.store.company_projects().unwrap().contains(&revised));
+    assert_eq!(journal_rows(&f, original.grant.session_id), journal);
+    assert_eq!(f.api.store.adaptive_source_completion(
+        &completed.tenant_id, &completed.project_id, previous, done.plan.plan_id,
+    ).unwrap().unwrap(), proof);
+    f.api.store.adaptive_health_inventory().unwrap();
+    assert!(f.api.store.adaptive_session(original.grant.session_id, &original.grant.authority).is_err());
+}
+
 fn fund_and_continue(f: &mut FamilyFixture) {
     use crate::workflow_api::adaptive_leadership_review::{tests::{persist, reconcile_review_at}, LeadershipAuthority};
     use crate::workflow_api::adaptive_resume_policy::tests::claim_review;
@@ -760,6 +820,7 @@ fn negative_qa_correction(funded: bool) {
         original.grant.session_id, proof.effect.id,
     )).unwrap().unwrap();
     let calls = f.api.store.adaptive_leadership_review_calls(&blocked.tenant_id, original.grant.session_id).unwrap();
+    let original_journal = journal_rows(&f, original.grant.session_id);
     with_terminal_workbench_service_for_test(Arc::clone(&f.tools), profile, digest, || {
         model_review::restart_source_after_negative_review(&f.api, &blocked).unwrap();
     });
@@ -797,8 +858,20 @@ fn negative_qa_correction(funded: bool) {
     assert_eq!(f.api.store.work_item_for_plan(
         &restarted.tenant_id, &restarted.project_id, &next.grant.work_item_id, original_done.plan.plan_id,
     ).unwrap().unwrap(), original_done);
-    assert_eq!(f.api.store.adaptive_session(original.grant.session_id, &original.grant.authority).unwrap().unwrap(), original);
+    assert_eq!(journal_rows(&f, original.grant.session_id), original_journal);
+    assert_eq!(f.api.store.adaptive_source_completion(
+        &restarted.tenant_id, &restarted.project_id, &original_allowance, original_done.plan.plan_id,
+    ).unwrap().unwrap(), proof);
+    assert!(f.api.store.adaptive_session(original.grant.session_id, &original.grant.authority).is_err());
     assert_eq!(f.api.store.adaptive_leadership_review_calls(&restarted.tenant_id, original.grant.session_id).unwrap(), calls);
     assert_eq!(serde_json::to_value(events.event_by_operation_id(&original_usage.operation_id).unwrap().unwrap()).unwrap(),
         serde_json::to_value(original_usage).unwrap());
+    let connection = sentinel_limbo::rusqlite::Connection::open(f._temp.path().join("company.sqlite")).unwrap();
+    assert_eq!(connection.execute(
+        "DELETE FROM workflow_operations WHERE operation_namespace=?1 AND operation_id=?2",
+        sentinel_limbo::rusqlite::params![format!("adaptive-session-v1:{}", original.grant.session_id), format!("{:020}", 1)],
+    ).unwrap(), 1);
+    assert!(f.api.store.company_project(&restarted.tenant_id, &restarted.project_id).is_err());
+    assert!(f.api.store.company_projects().is_err());
+    assert!(f.api.store.adaptive_sessions_for_health().is_err());
 }

@@ -1460,7 +1460,7 @@ fn validate_governed_allowance_ids(
     .ok_or_else(corrupt)?;
     let (session, _) =
         crate::store::adaptive::load(connection, receipt.grant.session_id)?.ok_or_else(corrupt)?;
-    crate::store::adaptive::require_head(connection, &session)?;
+    crate::store::adaptive::require_head_or_completed_producer(connection, &session)?;
     if receipt.grant.project_id != project.project_id
         || abandoned.review != receipt
         || session.grant != receipt.context.source_session.grant

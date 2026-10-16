@@ -2667,6 +2667,30 @@ pub(crate) fn require_head(
     validate_head(&head, session)
 }
 
+// Historical allowance validation is not authority to claim or advance a session.
+pub(crate) fn require_head_or_completed_producer(
+    connection: &Connection,
+    session: &AdaptiveSessionV1,
+) -> Result<(), WorkflowError> {
+    let head = read_head(connection, &session.grant.authority)?.ok_or_else(corrupt_store)?;
+    if head.session_id == session.grant.session_id {
+        return validate_head(&head, session);
+    }
+    if !matches!(
+        session.cursor,
+        crate::AdaptiveCursorV1::CompletionProposed { .. }
+    ) {
+        return Err(corrupt_store());
+    }
+    let (stored, _) = load(connection, session.grant.session_id)?.ok_or_else(corrupt_store)?;
+    if stored != *session {
+        return Err(corrupt_store());
+    }
+    // Proves journal membership, exact completed producer/execution and every
+    // authenticated correction edge to the independently validated current head.
+    require_canonical_journal_lineage(connection, &session.grant.authority)
+}
+
 fn validate_head(head: &AdaptiveHead, session: &AdaptiveSessionV1) -> Result<(), WorkflowError> {
     if head.session_id != session.grant.session_id
         || head.version != session.version
