@@ -1,5 +1,10 @@
 # Changelog
 
+- Reuse the mandatory tenant-wide event authentication inside the same pinned
+  funding-history validation scope. Keep every full decoded history visit,
+  grant/context comparison, adoption proof, cutoff and resource bound; remove
+  only repeated intrinsic/envelope authentication of those same rows (#856).
+
 - Recheck leadership completion and local-adoption clocks after source proofs
   and immediately before committing durable effects; roll back expired staged
   changes without renewing audited timestamps. Start a first unsealed

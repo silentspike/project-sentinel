@@ -138,6 +138,9 @@ fn is_historical_recovery_authorization(
 mod issue_856_receipt_lookup_snapshot_tests;
 
 #[cfg(test)]
+mod event_auth_reuse_tests;
+
+#[cfg(test)]
 pub(super) fn historical_review_cut(
     connection: &Connection,
     tenant: &TenantId,
@@ -1072,6 +1075,8 @@ fn require_pre_recovery_funding_history_uncached(
     let tenant = &epoch.receipt.request.source.resume_source.tenant_id;
     // Validate all sealed review traces before filtering by funding identity.
     reviewed_funding_ids(connection, tenant)?;
+    #[cfg(test)]
+    event_auth_reuse_tests::after_prologue(connection)?;
     let ids = {
         let mut statement = connection.prepare(
             "SELECT entity_id FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2
@@ -1183,40 +1188,12 @@ fn require_pre_recovery_funding_history_uncached(
             }
         } else {
             let call: AdaptiveLeadershipReviewCallV1 = decode(payload)?;
-            call.validate_entity()?;
-            // Authenticate every observation before allowing an original or
-            // later call. Loading current call membership here would recurse.
-            let digest = canonical_sha256("sentinel.workflow.adaptive-leadership-call.v1", &call)?;
-            let principal = &call.grant.leadership_principal;
-            let payload_digest =
-                bytes_digest("sentinel.workflow.company-event-payload.v1", payload)?;
-            let authority_digest = principal.binding_digest()?;
-            let event_id = canonical_sha256(
-                "sentinel.workflow.company-event-id.v1",
-                &(
-                    tenant,
-                    Some(&call.grant.project_id),
-                    &event_type,
-                    call.operation_id,
-                    &digest,
-                    &authority_digest,
-                    &payload_digest,
-                    call.updated_at_unix_ms,
-                ),
-            )?;
-            if company_event_principal(&owner)? != *principal
-                || owner.tenant_id != tenant.0
-                || owner.project_id.as_deref() != Some(call.grant.project_id.0.as_str())
-                || owner.event_type != event_type
-                || owner.operation_id != call.operation_id.to_string()
-                || owner.operation_digest != digest
-                || owner.authority_binding_digest != authority_digest
-                || owner.payload_digest != payload_digest
-                || owner.event_id != event_id
-                || stored_u64(owner.created_at_ms)? != call.updated_at_unix_ms
-            {
-                return Err(corrupt());
-            }
+            // The mandatory prologue authenticated this exact full raw owner:
+            // its leadership-event query is a superset of this branch's query.
+            // Both run in one pinned validation scope; writes invalidate/poison
+            // that scope. Keep full decoding and all caller-specific comparisons.
+            #[cfg(test)]
+            event_auth_reuse_tests::observe_consumer(tenant, &event_type, &owner, &call)?;
             if designated.is_some_and(|(grant, context, operation, issued, cut)| {
                 call.grant == *grant
                     && call.context == *context
@@ -1377,6 +1354,8 @@ fn reviewed_funding_ids_with_observer(
                 )
             } else {
                 let call: AdaptiveLeadershipReviewCallV1 = decode(&row.payload)?;
+                #[cfg(test)]
+                event_auth_reuse_tests::record_authentication();
                 call.validate_entity()?;
                 let digest =
                     canonical_sha256("sentinel.workflow.adaptive-leadership-call.v1", &call)?;
