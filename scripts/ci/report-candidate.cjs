@@ -24,6 +24,8 @@ async function report({ github, context, env = process.env, verify }) {
       `${context.repo.owner}/${context.repo.repo}` !== REPOSITORY)
     throw new Error('Reporter must run from protected repository main');
   const raw = authenticate(env.RECEIPT_B64, env.RECEIPT_SIGNATURE, env.RECEIPT_KEY);
+  if (!/^[0-9a-f]{64}$/.test(env.PLAN_SHA256 || ''))
+    throw new Error('Independently frozen qualification plan missing');
   const receipt = JSON.parse(raw.toString('utf8'));
   if (receipt.repository !== REPOSITORY || !Number.isSafeInteger(receipt.pr) || receipt.pr <= 0 ||
       !/^[0-9a-f]{40}$/.test(receipt.head_sha || '') || !/^[0-9a-f]{40}$/.test(receipt.base_sha || ''))
@@ -35,7 +37,7 @@ async function report({ github, context, env = process.env, verify }) {
     throw new Error('Fork, stale, draft or closed candidate');
   const { data: commit } = await github.rest.git.getCommit({ ...params, commit_sha: receipt.head_sha });
   if (commit.tree.sha !== receipt.tree_sha) throw new Error('Candidate tree mismatch');
-  const passed = verify(raw, receipt);
+  const passed = verify(raw, receipt, env.PLAN_SHA256);
   const sha = crypto.createHash('sha256').update(raw).digest('hex');
   const request = {
     ...params, name: NAME, head_sha: receipt.head_sha, external_id: `receipt:${sha}`,
@@ -58,14 +60,14 @@ async function report({ github, context, env = process.env, verify }) {
   if (!passed) throw new Error('Candidate qualification failed');
 }
 
-function verifyLocal(raw, receipt) {
+function verifyLocal(raw, receipt, expectedPlanDigest) {
   const scratch = fs.mkdtempSync('/work/tmp/sentinel-ci-report/receipt-');
   try {
     const filename = path.join(scratch, 'receipt.json');
     fs.writeFileSync(filename, raw, { mode: 0o600, flag: 'wx' });
     const policy = JSON.parse(fs.readFileSync('scripts/ci/qualification-policy.json', 'utf8'));
     const args = ['scripts/ci/candidate.py', 'verify', '--receipt', filename,
-      '--head', receipt.head_sha, '--base', receipt.base_sha];
+      '--head', receipt.head_sha, '--base', receipt.base_sha, '--plan-sha256', expectedPlanDigest];
     for (const gate of policy.required_gates) args.push('--required-gate', gate);
     const result = child.spawnSync('python3', args, {
       encoding: 'utf8', timeout: 30000,

@@ -57,10 +57,36 @@ Required fields:
   `counts` containing integer `passed` and `failed`, and an `evidence_sha` digest.
   Test/shard gates need positive passed counts; failed counts must be zero.
 - `test_inventory_digest`: the archive lane's complete coverage inventory.
-- `shards`: complete contiguous zero-based `partition`, consistent `total`,
-  positive `expected_count` equal to `observed_count`, empty `missing` and
-  `duplicates` lists. A controller must compare these with the independently
-  frozen inventory, not merely trust shard self-reporting.
+- `qualification_plan`: independently frozen applicability, bound to repository,
+  PR/head/tree/base, source `input_digest`, `test_inventory_digest` and the archive
+  `archive_plan_digest`. Its `owners` inventory includes all six archive owner
+  groups, including empty groups. Each entry has exactly `owner`, boolean
+  `required`, nonempty `reason`, `expected_count` and `inventory_id_digest`.
+  The last two match the archive verifier's exact-ID owner inventory, never a
+  regex/source count. Diagnostics or optional hardware contracts may be explicitly
+  not applicable with reviewed rationale; this does not claim they passed.
+  Required compiler-dependent tests need separate `rust-compiler-tests` gate
+  evidence. `rust-doctests` and explicit eBPF feature gates remain independently
+  required by the static policy; the applicability plan cannot omit those gates.
+- `archive`: compact projection of the archive verifier's mechanism-only summary,
+  including source/archive/manifest/plan/inventory hashes, original summary hash,
+  `cargo_profile` ci (distinct from the builder profile), nextest 0.9.145,
+  `expected_owners`, `observed_owners`, `owner_inventory`, pending non-sharded
+  counts and verified shard totals. `aggregate_pass` must remain false. The
+  controller runs archive verification against actual exact test IDs and JUnit
+  before signing; a self-report from a test VM is not sufficient.
+  Empty archive inventories, empty shard sets and zero observed totals are not
+  qualification. A package-scoped pilot does not prove full workspace coverage.
+- `shards`: the verifier's compact shards, exactly once in the envelope. They bind
+  owner, nextest version, archive plan/inventory, original receipt/JUnit/log hashes,
+  command and successful exit code. Partitions are contiguous and complete
+  independently for lab-normal and lab-ignored, not in a shared global range.
+  Required owners have exact positive per-shard counts and empty missing,
+  duplicate and extra lists. Not-applicable owners have no executed shards and
+  do not become implicit passes. Protected tests never become lab shards.
+  A whole lab-ignored exclusion must also appear explicitly in the archive
+  verifier's `not_applicable_owners` map with the unchanged inventory count and
+  digest. It is honored only when the independently frozen plan agrees.
 - `artifacts`: unique relative `path`, positive integer `size`, exact `sha256`
   and `build_origin` equal to the frozen head. No private paths or infrastructure
   details belong in public receipts. Artifact origins must come from retained
@@ -70,8 +96,31 @@ Example validation (repeat the gate argument for the complete frozen plan):
 
 ```sh
 python3 scripts/ci/candidate.py verify --receipt receipt.json \
+  --head <qualified-head> --base <qualified-base> --required-gate rust-tests \
+  --plan independently-frozen-applicability.json
+```
+
+Plans use `canonical()` encoding from `candidate.py` (sorted compact ASCII JSON
+with one trailing newline). The SHA256 of those canonical bytes is enrolled by
+the controller as repository variable `SENTINEL_CI_PLAN_SHA256` after independent
+review/freeze and before qualification. This pins one current aggregate candidate;
+changing a receipt's applicability cannot change the trusted variable. The local
+CLI accepts either a separately frozen `--plan` file or an independently enrolled
+`--plan-sha256`. Neither may be derived from an unreviewed incoming receipt.
+
+To construct the bounded envelope from retained verifier evidence:
+
+```sh
+python3 scripts/ci/candidate.py assemble --receipt draft-gates-and-artifacts.json \
+  --archive-summary verified-archive-summary.json --plan independently-frozen-applicability.json \
   --head <qualified-head> --base <qualified-base> --required-gate rust-tests
 ```
+
+Repeat every required static gate argument, as for verify. Assembly projects only
+the summary's compact identity/count/digest fields and shard assertions, omits
+large blocked-test lists and recipes, validates the complete envelope and rejects
+payloads exceeding the reporter's 60000-character base64 limit. Full exact-ID and
+JUnit evidence stays with the controller and is bound through retained hashes.
 
 ## Shadow Reporting
 
@@ -86,7 +135,8 @@ Dispatch inputs are `receipt_b64` (base64 of the exact public-safe JSON bytes,
 at most 60000 encoded characters) and `signature` (hex HMAC-SHA256 over those
 decoded bytes). Sign with the dedicated reporting key, not any GitHub token.
 Dispatch `candidate-report.yml` with `--ref main` in this repository. The reporter
-checks current PR/head/base/tree and schema/gates/coverage, then publishes
+checks the trusted plan variable, current PR/head/base/tree and
+schema/gates/coverage, then publishes
 `candidate-qualification-shadow` on that head. Invalid authenticated qualification
 publishes failure; invalid authentication or stale identity cannot publish success.
 Receipt re-delivery updates the original same-application check. Neither the key,
@@ -112,6 +162,7 @@ and merge identities while leaving embedded source identities untouched.
 ```sh
 python3 scripts/ci/candidate.py promote --receipt receipt.json \
   --head <qualified-head> --base <qualified-base> --required-gate rust-tests \
+  --plan independently-frozen-applicability.json \
   --repo-root <repository> --artifact-root <artifact-directory> \
   --merge-sha <actual-merge>
 ```
