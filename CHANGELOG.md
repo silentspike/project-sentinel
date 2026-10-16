@@ -1,5 +1,10 @@
 # Changelog
 
+- Reuse validation of an exact immutable leadership context only at the same
+  entity-validation boundary; preserve standalone context, persisted membership
+  and authority checks. No runtime speedup is claimed before target comparison
+  (#856).
+
 - Allow an optional, protected standing operator policy to propose a distinct
   zero-addition funding epoch after a genuine funded Defer. Issue at most once
   per policy generation and exact execution head, retain the original decision

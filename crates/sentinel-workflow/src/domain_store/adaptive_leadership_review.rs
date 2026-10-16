@@ -809,6 +809,11 @@ fn require_planning_policy(
     Ok(())
 }
 
+#[derive(Debug)]
+struct ValidatedLeadershipCallContext<'a> {
+    call: &'a AdaptiveLeadershipReviewCallV1,
+}
+
 fn validate_continuation(
     call: &AdaptiveLeadershipReviewCallV1,
     decision: &crate::AdaptiveLeadershipReviewDecisionV1,
@@ -816,6 +821,26 @@ fn validate_continuation(
     model_response_digest: &str,
     resolution: Option<Uuid>,
     continuation: Option<&crate::adaptive::AdaptiveContinuationAuthorizationV1>,
+) -> Result<(), WorkflowError> {
+    validate_continuation_with_context(
+        call,
+        decision,
+        request_digest,
+        model_response_digest,
+        resolution,
+        continuation,
+        None,
+    )
+}
+
+fn validate_continuation_with_context(
+    call: &AdaptiveLeadershipReviewCallV1,
+    decision: &crate::AdaptiveLeadershipReviewDecisionV1,
+    request_digest: &str,
+    model_response_digest: &str,
+    resolution: Option<Uuid>,
+    continuation: Option<&crate::adaptive::AdaptiveContinuationAuthorizationV1>,
+    validated_context: Option<&ValidatedLeadershipCallContext<'_>>,
 ) -> Result<(), WorkflowError> {
     decision.validate_subject(&call.grant)?;
     let AdaptiveLeadershipReviewDecisionKindV1::Continue {
@@ -860,7 +885,7 @@ fn validate_continuation(
             return Err(unauthorized());
         }
     }
-    require_adaptive_allowance_source(call)?;
+    require_adaptive_allowance_source_with_context(call, validated_context)?;
     let source = &call.context.source_session;
     let current = call
         .context
@@ -1209,6 +1234,13 @@ fn commit_continuation_allowance(
 fn require_adaptive_allowance_source(
     call: &AdaptiveLeadershipReviewCallV1,
 ) -> Result<(), WorkflowError> {
+    require_adaptive_allowance_source_with_context(call, None)
+}
+
+fn require_adaptive_allowance_source_with_context(
+    call: &AdaptiveLeadershipReviewCallV1,
+    validated_context: Option<&ValidatedLeadershipCallContext<'_>>,
+) -> Result<(), WorkflowError> {
     let source = &call.context.source_session;
     let prior = call
         .context
@@ -1264,7 +1296,14 @@ fn require_adaptive_allowance_source(
     }
     // Context validation binds either the exact unknown effect/proof refs or the
     // recorded model-result digest and blocked reason/resolution at this journal head.
-    call.context.validate(&call.grant)?;
+    match validated_context {
+        Some(proof) => {
+            if !std::ptr::eq(proof.call, call) {
+                return Err(unauthorized());
+            }
+        }
+        None => call.context.validate(&call.grant)?,
+    }
     Ok(())
 }
 
@@ -1623,6 +1662,7 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
 
     fn validate_entity(&self) -> Result<(), WorkflowError> {
         self.validate_entity_with_context_digest(&mut || self.context_digest())
+            .map(|_| ())
     }
 
     fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
@@ -1658,9 +1698,11 @@ impl AdaptiveLeadershipReviewCallV1 {
     fn validate_entity_with_context_digest(
         &self,
         context_digest: &mut impl FnMut() -> Result<String, WorkflowError>,
-    ) -> Result<(), WorkflowError> {
+    ) -> Result<ValidatedLeadershipCallContext<'_>, WorkflowError> {
         self.grant.validate(self.grant_issued_at_unix_ms)?;
         self.context.validate(&self.grant)?;
+        // This proof borrows the exact immutable call; it is not a persisted-source proof.
+        let validated_context = ValidatedLeadershipCallContext { call: self };
         validate_project(&self.context.source_project)?;
         validate_identifier(&self.allowance_id)?;
         if self.schema_version != self.grant.schema_version
@@ -1727,13 +1769,18 @@ impl AdaptiveLeadershipReviewCallV1 {
             decision.validate(&self.context.evidence_refs)?;
             validate_digest(self.model_response_digest.as_deref().ok_or_else(corrupt)?)?;
             let dispatch = self.dispatch.as_ref().ok_or_else(corrupt)?;
-            validate_continuation(
+            validate_continuation_with_context(
                 self,
                 decision,
                 &dispatch.request_digest,
                 self.model_response_digest.as_deref().ok_or_else(corrupt)?,
                 self.resolution_event_id,
                 self.continuation.as_ref(),
+                matches!(
+                    &decision.decision,
+                    AdaptiveLeadershipReviewDecisionKindV1::Continue { .. }
+                )
+                .then_some(&validated_context),
             )?;
             if self.dispatch.is_none()
                 || (decision.resolves_blocked() || self.continuation.is_some())
@@ -1746,7 +1793,7 @@ impl AdaptiveLeadershipReviewCallV1 {
             return Err(corrupt());
         }
         require_subject_time(self, self.grant_issued_at_unix_ms)?;
-        Ok(())
+        Ok(validated_context)
     }
 
     fn validate_persisted_with_context_digest(
@@ -2998,6 +3045,10 @@ mod tests {
 
     mod continuation_row_shape_tests {
         include!("adaptive_leadership_review/continuation_row_shape_tests.rs");
+    }
+
+    mod context_validation_once_tests {
+        include!("adaptive_leadership_review/context_validation_once_tests.rs");
     }
 
     #[test]
