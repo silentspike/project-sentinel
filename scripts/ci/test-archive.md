@@ -117,6 +117,12 @@ log and JUnit SHA-256. The aggregate verifier must additionally require the
 external gates. `verify` always reports `aggregate_pass: false` deliberately.
 The summary's `owner_inventory` binds each owner's `test_count` and
 `test_inventory_digest` to exact compiled IDs, including zero-count owners.
+If a separately frozen applicability plan excludes the entire `lab-ignored`
+owner, `verify --not-applicable-owner lab-ignored` accepts only the required
+normal shard receipts. It preserves full compiled counts and owner hashes,
+reports the omitted owner with zero observed tests and zero executed partitions,
+and emits `not_applicable_owners`. This flag is not an N/A authorization or PASS.
+Partial-owner waivers and skipping normal tests are unsupported and fail closed.
 
 ## Execution Owners
 

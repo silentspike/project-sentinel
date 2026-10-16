@@ -393,7 +393,9 @@ def run(args):
 def verify(args):
     data = load(args.plan)
     validate_plan(data)
-    expected = {s["id"]: s for s in data["shards"]}
+    not_applicable = set(getattr(args, "not_applicable_owner", []) or [])
+    require(not_applicable <= {"lab-ignored"}, "only whole lab-ignored owner can be declared not applicable")
+    expected = {s["id"]: s for s in data["shards"] if s["owner"] not in not_applicable}
     require(expected, "empty plan")
     receipts = [load(Path(p) / "receipt.json") for p in args.receipts]
     require(Counter(r["id"] for r in receipts) == Counter({k: 1 for k in expected}), "missing or duplicate shard receipts")
@@ -423,7 +425,7 @@ def verify(args):
                "archive_shards_verified": len(receipts), "observed_count": sum(observed_owners.values()),
                "expected_owners": dict(expected_owners), "observed_owners": dict(observed_owners),
                "owners": {owner: {"expected_count": expected_owners[owner], "observed_count": observed_owners[owner],
-                                  "partitions": sum(s["owner"] == owner for s in data["shards"])} for owner in ("lab-normal", "lab-ignored")},
+                                  "partitions": sum(r["owner"] == owner for r in receipts)} for owner in ("lab-normal", "lab-ignored")},
                "owner_inventory": {owner: {"test_count": expected_owners[owner],
                                            "test_inventory_digest": object_digest(sorted(
                                                [r for s in data["shards"] if s["owner"] == owner for r in s["tests"]]
@@ -434,6 +436,7 @@ def verify(args):
                "pending_non_sharded": pending,
                "blocked": [{"owner": name, "tests": data["non_sharded"][name]} for name in pending if name != "builder-compiler"],
                "external_gates": data["external_gates"], "aggregate_pass": False}
+    summary["not_applicable_owners"] = {owner: summary["owner_inventory"][owner] for owner in sorted(not_applicable)}
     if getattr(args, "output", None):
         write(args.output, summary)
     print(json.dumps(summary, sort_keys=True))
@@ -488,6 +491,8 @@ def main():
     verifying = commands.add_parser("verify")
     verifying.add_argument("--plan", required=True)
     verifying.add_argument("--output")
+    verifying.add_argument("--not-applicable-owner", action="append", choices=["lab-ignored"],
+                           help="Omit only this whole owner; acceptance still requires a separately frozen applicability decision")
     verifying.add_argument("receipts", nargs="+")
     verifying.set_defaults(action=verify)
     args = parser.parse_args()
