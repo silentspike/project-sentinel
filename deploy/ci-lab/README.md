@@ -27,10 +27,28 @@ registered Proxmox lab host** with explicit private config and durable state:
 
 ```sh
 python3 control.py --config /work/lab/site.json --state /work/lab/state.json telemetry
-python3 control.py --config /work/lab/site.json --state /work/lab/state.json lease --vmid 8601 --holder qualification-1 --seconds 1800
+python3 control.py --config /work/lab/site.json --state /work/lab/state.json lease --vmid 8601 --holder qualification-1 --seconds 1800 --purpose functional
 python3 control.py --config /work/lab/site.json --state /work/lab/state.json start --vmid 8601 --holder qualification-1 --memory-mib 2048
 python3 control.py --config /work/lab/site.json --state /work/lab/state.json resize --vmid 8601 --holder qualification-1 --memory-mib 3072
+python3 control.py --config /work/lab/site.json --state /work/lab/state.json defer-start --vmid 8602 --holder qualification-2 --seconds 1800 --memory-mib 2048 --purpose functional
 ```
+
+Lease contract version 2 requires explicit `--purpose functional|measurement`
+on every `lease` or `defer-start` request. Functional archives and kernel tests
+use `functional`; actual benchmark windows require `measurement`. Purpose is
+immutable for a live generation and for a deduplicated deferred request.
+`start` and `resize` inherit the stored lease purpose, not a caller override.
+Renewal must supply the same effective purpose. Missing or unrecognized stored
+purpose remains strict measurement semantics; renewal never silently adds or
+changes it. Legacy pending requests without purpose cannot create a new lease:
+use a new explicit-purpose request identity after safe cleanup. A reconnect to
+an already accepted legacy start remains strict and task-fenced.
+
+These CLI/state semantics require the reviewed version-2 controller. They are
+not a compatibility fallback for an older deployed controller. Do not rewrite
+the purpose of an active qualification or infer benchmark eligibility from a
+functional lease. Caller handoff must bind the activated controller hash and
+fresh lease generation before using this contract.
 
 The config requires `owner=sentinel-ci-v1`, `runtime_target_class=LAB`, `node`,
 `pool`, `storage`, `bridge`, private IPv4 `network`, `gateway`, disjoint `template`
@@ -90,7 +108,10 @@ Starts and balloon increases reserve their request, the named 1536-MiB growth
 allowance, and **owned** outstanding current/pending targets minus measured
 residency. Accepted stopped starting intents also remain promises after a crash.
 Pending balloon requests remain committed until actual convergence; residency
-is not counted twice. All foreign potential headroom is reported as external
+is not counted twice. A larger actual balloon during boot remains committed,
+even if the configured target is smaller. Accepted stopped promises remain
+reserved until task-fenced quiescence; missing cluster entries trigger fresh
+owned readback rather than zero commitment. All foreign potential headroom is reported as external
 risk, not subtracted as an unbounded blanket reservation. This policy does not
 guarantee capacity against uncontrolled foreign bursts. Lab automatic balloon
 growth is disabled; requests use the 2-8 GiB envelope.
@@ -109,14 +130,33 @@ concurrent load. Each QEMU entry includes PVE byte fields `balloon` (actual),
 `pending_target_mib`. Unknown process measurements are null with an explicit
 error, never fabricated zeros. The private site interface publishes the exact
 SSH command. It does not allocate a measurement lease.
+Schema 2 also publishes `lease_contract_version=2`, explicit stored `lease.purpose`
+when present, and owned `effective_purpose`/`legacy_purpose` readback. Legacy
+strictness is visible, not written back as an invented explicit purpose.
 
 Maintenance samples actual managed QEMU RSS/PSS with PID-reuse protection.
 Admission requires a preceding sample at most 45 seconds old and stable process
 identity. An active lab window retains its initial managed-RSS baseline;
-cumulative builder growth above 1024 MiB or agent growth above 512 MiB invalidates
-it. Memory PSI avg10 `some>=1.0` or `full>=0.1`, unavailable telemetry and host
-availability below reserve+256 MiB also trip the guard. These are provisional
-safety thresholds, not empirically proven maximum growth or performance SLAs.
+cumulative builder growth above 1024 MiB or agent growth above 512 MiB remains
+fatal for measurement and legacy leases. For an explicit functional lease,
+growth alone is a retained-baseline telemetry warning only when fresh complete
+retention accounting and all hard safety checks pass. Growth warnings do not
+reset the baseline, refresh rejected admission, or become a global pressure hold.
+Mixed-purpose windows still invalidate strict measurement leases without
+silently suppressing their growth failures.
+
+Admission and retention share fresh owned commitment accounting. Retention
+requires `min(sample available, fresh available) - owned outstanding - 1536 MiB
+>= reserve + 256 MiB`; starts and balloon growth also reserve their increment.
+Already resident actor growth is reflected in actual host availability, not
+subtracted a second time as cumulative growth. The named 1536-MiB future managed
+allowance is still reserved. This is conservative sampled headroom, never a
+guarantee against uncontrolled external bursts between observations.
+Memory PSI avg10 `some>=1.0` or `full>=0.1`, stale/missing telemetry, managed
+PID/start-identity changes, unknown owned commitments, insufficient retention
+headroom and actual availability below reserve+256 MiB remain fatal. Prior
+invalidations stay sticky even after recovery. These are provisional safety
+thresholds, not empirically proven maximum growth or performance SLAs.
 
 Run `guard` and `reap` from a host-local timer, without an agent session.
 An unsafe sample gracefully stops only owned labs, durably invalidating

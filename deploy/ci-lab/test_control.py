@@ -158,11 +158,270 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             c.Lab(config(), self.path)
 
+    def activity(self, vmid=8601, actual=2048, resident=1024, status="running", phase="running"):
+        return {vmid: {"status": status, "phase": phase, "promise": phase in {"starting", "running"},
+                       "status_data": {"status": status, "balloon": actual * c.MIB,
+                                       "balloon_min": 2048 * c.MIB, "memhost": resident * c.MIB,
+                                       "maxmem": 8192 * c.MIB, "pid": vmid}}}
+
+    def test_new_lease_and_deferred_require_explicit_purpose(self):
+        for purpose in (None, "", "unknown"):
+            with self.subTest(purpose=purpose), patch.object(self.lab, "owned") as owned:
+                with self.assertRaises(ValueError):
+                    self.lab.lease(8601, "job", 1800, purpose)
+                with self.assertRaises(ValueError):
+                    self.lab.defer_start(8601, "job", 1800, 2048, purpose)
+                owned.assert_not_called()
+
+    def test_cli_missing_purpose_fails_before_config_or_state_access(self):
+        for action in ("lease", "defer-start"):
+            result = subprocess.run([sys.executable, c.__file__, "--config", "/nonexistent/config",
+                                     "--state", "/nonexistent/state", action], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--purpose is required", result.stderr)
+
+    def test_purpose_immutable_for_generation_and_legacy_not_converted(self):
+        with patch.object(self.lab, "owned"), patch.object(self.lab, "status", return_value={"status": "stopped"}):
+            first = self.lab.lease(8601, "job", 1800, "functional")
+            renewed = self.lab.lease(8601, "job", 1800, "functional")
+            self.assertEqual(first["generation"], renewed["generation"])
+            with self.assertRaises(RuntimeError):
+                self.lab.lease(8601, "job", 1800, "measurement")
+            self.lab.state["leases"]["8601"].pop("purpose")
+            with self.assertRaises(RuntimeError):
+                self.lab.lease(8601, "job", 1800, "functional")
+            legacy = self.lab.lease(8601, "job", 1800, "measurement")
+            self.assertNotIn("purpose", legacy)
+            self.assertEqual(legacy["generation"], first["generation"])
+            self.assertEqual(self.lab.lease_purpose(8601), "measurement")
+
+    def test_deferred_identity_and_live_lease_purpose_cannot_change(self):
+        with patch.object(self.lab, "owned"), patch.object(self.lab, "status", return_value={"status": "stopped"}):
+            request = self.lab.defer_start(8601, "job", 1800, 2048, "functional")
+            for memory, purpose in ((4096, "functional"), (2048, "measurement")):
+                with self.assertRaises(RuntimeError):
+                    self.lab.defer_start(8601, "job", 1800, memory, purpose)
+            self.assertEqual(request["purpose"], "functional")
+            self.lab.state["deferred"] = {}
+            self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "g", "expires": 9999999999}
+            with self.assertRaises(RuntimeError):
+                self.lab.defer_start(8601, "job", 1800, 2048, "functional")
+
+    def test_functional_growth_revalidates_retained_headroom_without_resetting_baseline(self):
+        self.lab.state["leases"]["8601"] = {"holder": "job", "purpose": "functional", "expires": 9999999999}
+        baseline = copy.deepcopy(self.sample)
+        self.lab.state["capacity_baseline"] = baseline
+        self.sample["managed"]["agent"]["rss_bytes"] += 555 * c.MIB
+        with patch.object(self.lab, "owned_activity", return_value=self.activity()), \
+                patch.object(c, "available_mib", return_value=12528), patch.object(self.lab, "stop") as stop:
+            result = self.lab.guard()
+        stop.assert_not_called()
+        self.assertEqual(result["retention"]["projected_available_mib"], 12528 - 1024 - 1536)
+        self.assertEqual(result["capacity_safety"]["reasons"], [])
+        self.assertEqual(result["capacity_safety"]["warnings"], ["agent-growth-envelope-exceeded"])
+        self.assertEqual(self.lab.state["capacity_baseline"], baseline)
+        self.assertNotIn("capacity_hold_until", self.lab.state)
+        self.assertEqual(self.lab.state.get("invalidated_leases", []), [])
+
+    def test_measurement_and_missing_legacy_purpose_keep_strict_growth_guard(self):
+        for purpose in ("measurement", None):
+            with self.subTest(purpose=purpose):
+                self.lab.state.pop("invalidated_leases", None)
+                lease = {"holder": "job", "expires": 9999999999}
+                if purpose:
+                    lease["purpose"] = purpose
+                self.lab.state["leases"]["8601"] = lease
+                self.lab.state["capacity_baseline"] = copy.deepcopy(self.sample)
+                sample = copy.deepcopy(self.sample)
+                sample["managed"]["agent"]["rss_bytes"] += 555 * c.MIB
+                with patch.object(self.lab, "capacity_sample", return_value=sample), \
+                        patch.object(self.lab, "owned_activity", return_value=self.activity()), \
+                        patch.object(c, "available_mib", return_value=12528), \
+                        patch.object(self.lab, "owned"), patch.object(self.lab, "stop") as stop:
+                    result = self.lab.guard()
+                stop.assert_called_once_with(8601)
+                self.assertIn("agent-growth-envelope-exceeded", result["capacity_safety"]["reasons"])
+                self.assertEqual("purpose" in self.lab.state["leases"]["8601"], bool(purpose))
+
+    def test_mixed_purpose_shared_sample_does_not_hide_strict_growth_failure(self):
+        self.lab.state["leases"] = {"8601": {"holder": "functional", "purpose": "functional"},
+                                     "8602": {"holder": "legacy"}}
+        self.lab.state["capacity_baseline"] = copy.deepcopy(self.sample)
+        self.sample["managed"]["builder"]["rss_bytes"] += 1025 * c.MIB
+        activity = {**self.activity(), **self.activity(8602)}
+        with patch.object(self.lab, "owned_activity", return_value=activity), \
+                patch.object(c, "available_mib", return_value=12528), \
+                patch.object(self.lab, "owned"), patch.object(self.lab, "stop") as stop:
+            result = self.lab.guard()
+        stop.assert_called_once_with(8602)
+        self.assertEqual(result["pressure_stopped"], [8602])
+        self.assertIn("capacity_baseline", self.lab.state)
+        self.assertNotIn("capacity_hold_until", self.lab.state)
+
+    def test_functional_retention_exact_boundary_includes_promises_allowance_and_guard(self):
+        for available, stops in ((8960, False), (8959, True), (6144, True)):
+            with self.subTest(available=available):
+                self.lab.state.pop("invalidated_leases", None)
+                self.lab.state["leases"]["8601"] = {"holder": "job", "purpose": "functional"}
+                with patch.object(self.lab, "owned_activity", return_value=self.activity()), \
+                        patch.object(c, "available_mib", return_value=available), \
+                        patch.object(self.lab, "owned"), patch.object(self.lab, "stop") as stop:
+                    result = self.lab.guard()
+                self.assertEqual(stop.call_count, int(stops))
+                self.assertEqual("owned-retention-headroom" in result["capacity_safety"]["reasons"], stops)
+
+    def test_functional_stopped_pending_promise_retention_failure_stays_invalidated(self):
+        self.lab.state["leases"]["8601"] = {"holder": "job", "purpose": "functional"}
+        self.lab.state["balloon_requests"] = {"8601": 8192}
+        self.lab.state["capacity_baseline"] = copy.deepcopy(self.sample)
+        with patch.object(self.lab, "owned_activity", return_value=self.activity(status="stopped", phase="starting")), \
+                patch.object(c, "available_mib", return_value=12528), patch.object(self.lab, "owned"), \
+                patch.object(self.lab, "stop", side_effect=c.CapacityUnavailable("active qmstart")):
+            result = self.lab.guard()
+        self.assertEqual(result["retention"]["outstanding_commitments_mib"], 8192)
+        self.assertEqual(result["quiescence_pending"][0]["vmid"], 8601)
+        self.assertEqual(self.lab.state["balloon_requests"]["8601"], 8192)
+        self.assertIn("capacity_baseline", self.lab.state)
+
+    def test_actual_boot_peak_not_configured_minimum_or_stale_resident_credit(self):
+        self.lab.state["balloon_requests"] = {"8601": 2048}
+        guest = {"vmid": 8601, "node": "lab-host", "type": "qemu", "status": "running"}
+        status = self.activity(actual=7532, resident=2000)[8601]["status_data"]
+        with patch.object(c, "api", side_effect=lambda p: [guest] if p == "/cluster/resources" else status), \
+                patch.object(c, "process_memory", return_value={"rss_bytes": 590 * c.MIB}), \
+                patch.object(c, "available_mib", return_value=14200):
+            result = self.lab.resources(2048, purpose="functional")
+        self.assertEqual(result["outstanding_commitments_mib"], 6942)
+        self.assertEqual(result["projected_available_mib"], 3674)
+        self.assertFalse(result["allowed"])
+
+    def test_missing_cluster_promised_running_guest_gets_fresh_own_peak_sample(self):
+        self.lab.state["runs"] = {"8601": {"phase": "starting"}}
+        self.lab.state["balloon_requests"] = {"8601": 2048}
+        status = self.activity(actual=7532, resident=590)[8601]["status_data"]
+        with patch.object(c, "api", side_effect=lambda p: [] if p == "/cluster/resources" else status) as query, \
+                patch.object(c, "process_memory", return_value={"rss_bytes": 590 * c.MIB}), \
+                patch.object(c, "available_mib", return_value=14200):
+            self.assertEqual(self.lab.resources(2048)["outstanding_commitments_mib"], 6942)
+        self.assertEqual([call.args[0] for call in query.call_args_list],
+                         ["/cluster/resources", "/nodes/lab-host/qemu/8601/status/current"])
+
+    def test_unknown_owned_commitments_or_activity_fail_closed_without_clearing_state(self):
+        self.lab.state["runs"] = {"8601": {"phase": "starting"}}
+        self.lab.state["balloon_requests"] = {"8601": 8192}
+        before = copy.deepcopy(self.lab.state)
+        with patch.object(c, "api", return_value=[]):
+            with self.assertRaises(c.CapacityUnavailable):
+                self.lab.resources(2048, purpose="functional")
+        self.assertEqual(self.lab.state, before)
+        activity = self.activity()
+        activity[8601]["status_data"].pop("memhost")
+        self.lab.state["leases"]["8601"] = {"holder": "job", "purpose": "functional"}
+        with patch.object(self.lab, "owned_activity", return_value=activity), \
+                patch.object(c, "available_mib", return_value=30000), \
+                patch.object(self.lab, "owned"), patch.object(self.lab, "stop") as stop:
+            result = self.lab.guard()
+        stop.assert_called_once_with(8601)
+        self.assertIn("owned-commitment-measurement-unavailable", result["capacity_safety"]["reasons"])
+
+    def test_functional_hard_failures_and_prior_invalidation_never_become_warnings(self):
+        for cause in ("psi", "stale", "pid", "invalidated"):
+            with self.subTest(cause=cause):
+                self.lab.state.pop("invalidated_leases", None)
+                self.lab.state["leases"]["8601"] = {"holder": "job", "purpose": "functional"}
+                sample = copy.deepcopy(self.sample)
+                if cause == "psi":
+                    sample["memory_psi"]["some"]["avg10"] = 1.0
+                elif cause == "stale":
+                    sample["timestamp"] += 46
+                elif cause == "pid":
+                    sample["managed"]["agent"]["start_ticks"] = "changed"
+                else:
+                    self.lab.state["invalidated_leases"] = [{"vmid": 8601, "lease": {"holder": "job"}}]
+                with patch.object(self.lab, "capacity_sample", return_value=sample), \
+                        patch.object(self.lab, "owned_activity", return_value=self.activity()), \
+                        patch.object(c, "available_mib", return_value=30000), \
+                        patch.object(self.lab, "owned"), patch.object(self.lab, "stop") as stop:
+                    self.lab.guard()
+                stop.assert_called_once_with(8601)
+
+    def test_measurement_admission_does_not_reset_functional_window_baseline(self):
+        self.lab.state["capacity_baseline"] = copy.deepcopy(self.sample)
+        baseline = copy.deepcopy(self.lab.state["capacity_baseline"])
+        self.sample["managed"]["agent"]["rss_bytes"] += 555 * c.MIB
+        with patch.object(c, "api", return_value=[]), patch.object(c, "available_mib", return_value=30000):
+            self.assertTrue(self.lab.resources(2048, purpose="functional")["allowed"])
+            self.assertFalse(self.lab.resources(2048, purpose="measurement")["allowed"])
+        self.assertEqual(self.lab.state["capacity_baseline"], baseline)
+
+    def test_functional_deferred_recovery_propagates_purpose_without_generation_conversion(self):
+        with patch.object(self.lab, "owned"), patch.object(self.lab, "status", return_value={"status": "stopped"}):
+            self.lab.defer_start(8601, "job", 1800, 2048, "functional")
+        recovered = c.Lab(config(), self.path)
+        with patch.object(recovered, "resources", return_value={"allowed": True}) as resources, \
+                patch.object(recovered, "owned"), patch.object(recovered, "status", return_value={"status": "stopped"}), \
+                patch.object(recovered, "start", return_value={"allowed": True}) as start:
+            recovered.process_deferred()
+            generation = recovered.state["leases"]["8601"]["generation"]
+            recovered.process_deferred()
+        resources.assert_called_once_with(2048, purpose="functional")
+        start.assert_called_once_with(8601, "job", 2048)
+        self.assertEqual(recovered.state["leases"]["8601"]["purpose"], "functional")
+        self.assertEqual(recovered.state["leases"]["8601"]["generation"], generation)
+
+    def test_deferred_reconnect_cannot_relabel_different_purpose_generation(self):
+        self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "new", "expires": 9999999999,
+                                               "purpose": "measurement"}
+        self.lab.state["runs"] = {"8601": {"holder": "job", "generation": "new", "phase": "starting"}}
+        request = {"holder": "job", "purpose": "functional", "memory_mib": 2048,
+                   "state": "pending", "expires": 9999999999}
+        self.lab.state["deferred"] = {"8601": request}
+        with patch.object(self.lab, "start") as start:
+            self.lab.process_deferred()
+        start.assert_not_called()
+        self.assertEqual(request["state"], "blocked")
+        self.assertEqual(self.lab.state["leases"]["8601"]["purpose"], "measurement")
+
+    def test_legacy_pending_request_cannot_create_explicit_purpose_lease(self):
+        request = {"holder": "job", "memory_mib": 2048, "state": "pending", "expires": 9999999999}
+        self.lab.state["deferred"] = {"8601": request}
+        with patch.object(self.lab, "resources", return_value={"allowed": True}), patch.object(self.lab, "start") as start:
+            self.lab.process_deferred()
+        start.assert_not_called()
+        self.assertEqual(request["state"], "blocked")
+        self.assertNotIn("purpose", request)
+        self.assertEqual(self.lab.state["leases"], {})
+
+    def test_functional_admission_guard_boundary_and_settled_balloon_revalidation(self):
+        guest = {"vmid": 8601, "node": "lab-host", "type": "qemu", "status": "running"}
+        status = self.activity()[8601]["status_data"]
+        for available, allowed in ((11008, True), (11007, False)):
+            with self.subTest(available=available), \
+                    patch.object(c, "api", side_effect=lambda p: [guest] if p == "/cluster/resources" else status), \
+                    patch.object(c, "available_mib", return_value=available):
+                result = self.lab.resources(2048, purpose="functional")
+            self.assertEqual(result["allowed"], allowed)
+            self.assertEqual(result["required_available_mib"], 6400)
+        with patch.object(c, "api", side_effect=lambda p: [guest] if p == "/cluster/resources" else status), \
+                patch.object(c, "available_mib", return_value=14200):
+            settled = self.lab.resources(2048, purpose="functional")
+        self.assertTrue(settled["allowed"])
+        self.assertEqual(settled["outstanding_commitments_mib"], 1024)
+
+    def test_large_observed_functional_growth_not_subtracted_twice_but_future_allowance_stays(self):
+        self.lab.state["capacity_baseline"] = copy.deepcopy(self.sample)
+        self.sample["managed"]["agent"]["rss_bytes"] += 2048 * c.MIB
+        with patch.object(c, "api", return_value=[]), patch.object(c, "available_mib", return_value=10000):
+            result = self.lab.resources(2048, purpose="functional")
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["growth_margin_mib"], 1536)
+        self.assertEqual(result["projected_available_mib"], 10000 - 2048 - 1536)
+
     def test_lease_survives_restart_and_blocks_second_holder(self):
         with patch.object(self.lab, "owned", return_value={}), patch.object(self.lab, "status", return_value={"status": "stopped"}):
-            self.lab.lease(8601, "archive-job-1", 1800)
+            self.lab.lease(8601, "archive-job-1", 1800, "measurement")
             with self.assertRaises(RuntimeError):
-                self.lab.lease(8601, "archive-job-2", 1800)
+                self.lab.lease(8601, "archive-job-2", 1800, "measurement")
         reloaded = c.Lab(config(), self.path)
         reloaded.require_lease(8601, "archive-job-1")
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
@@ -379,7 +638,7 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.lab.release(8601, "foreign-job")
             self.lab.release(8601, "job")
-            lease = self.lab.lease(8601, "new-job", 1800)
+            lease = self.lab.lease(8601, "new-job", 1800, "measurement")
         self.assertNotEqual(lease["generation"], "old")
         self.lab.require_lease(8601, "new-job")
         self.assertEqual(len(self.lab.state["invalidated_leases"]), 1)
@@ -417,7 +676,8 @@ class LifecycleTests(unittest.TestCase):
     def test_missing_cluster_entry_retains_accepted_running_promise(self):
         self.lab.state["runs"] = {"8601": {"phase": "running"}}
         self.lab.state["balloon_requests"] = {"8601": 8192}
-        with patch.object(c, "api", return_value=[]), patch.object(c, "available_mib", return_value=12000):
+        with patch.object(c, "api", side_effect=lambda p: [] if p == "/cluster/resources" else {"status": "stopped"}), \
+                patch.object(c, "available_mib", return_value=12000):
             result = self.lab.resources(2048)
         self.assertFalse(result["allowed"])
         self.assertEqual(result["outstanding_commitments_mib"], 8192)
@@ -458,12 +718,12 @@ class LifecycleTests(unittest.TestCase):
                         self.assertEqual(self.lab.state["snapshots"], base["snapshots"])
                         self.lab.state = copy.deepcopy(base)
                         if phase == "stopped" and lease_state == "expired":
-                            self.assertNotEqual(self.lab.lease(8601, "new-job", 1800)["generation"], "old-gen")
+                            self.assertNotEqual(self.lab.lease(8601, "new-job", 1800, "measurement")["generation"], "old-gen")
                             with self.assertRaises(RuntimeError):
                                 self.lab.release(8601, "old-job")
                         else:
                             with self.assertRaises(RuntimeError):
-                                self.lab.lease(8601, "new-job", 1800)
+                                self.lab.lease(8601, "new-job", 1800, "measurement")
                             self.assertEqual(self.lab.state["runs"], base["runs"])
                     self.lab.state = copy.deepcopy(base)
                     unsafe = {**self.sample, "available_mib": 6143}
@@ -484,17 +744,17 @@ class LifecycleTests(unittest.TestCase):
         with patch.object(self.lab, "owned", return_value={"lock": "create"}), \
                 patch.object(self.lab, "status", return_value={"status": "stopped"}), patch.object(c, "api", return_value=[]):
             with self.assertRaises(c.CapacityUnavailable):
-                self.lab.lease(8601, "new", 1800)
+                self.lab.lease(8601, "new", 1800, "measurement")
         self.assertEqual(self.lab.state["balloon_requests"]["8601"], 4096)
         with patch.object(self.lab, "owned", return_value={}), \
                 patch.object(self.lab, "status", side_effect=[{"status": "stopped"}, {"status": "running"}]), \
                 patch.object(c, "api", return_value=[]):
             with self.assertRaises(c.CapacityUnavailable):
-                self.lab.lease(8601, "new", 1800)
+                self.lab.lease(8601, "new", 1800, "measurement")
         with patch.object(self.lab, "owned", return_value={}), \
                 patch.object(self.lab, "status", return_value={"status": "stopped"}), \
                 patch.object(c, "api", return_value=[{"id": "8601", "type": "qmstart", "endtime": 1}]):
-            self.lab.lease(8601, "new", 1800)
+            self.lab.lease(8601, "new", 1800, "measurement")
         self.assertNotIn("8601", self.lab.state["balloon_requests"])
 
     def test_guard_and_reap_find_running_owned_work_despite_stopped_or_missing_cluster_entry(self):
@@ -582,7 +842,7 @@ class LifecycleTests(unittest.TestCase):
             with patch.object(self.lab, "owned", return_value={}), \
                     patch.object(self.lab, "status", return_value={"status": "running"}), patch.object(c, "run") as command:
                 with self.assertRaises(RuntimeError):
-                    self.lab.lease(8601, holder, 1800)
+                    self.lab.lease(8601, holder, 1800, "measurement")
                 command.assert_not_called()
                 self.assertEqual(self.lab.state["leases"]["8601"]["generation"], "old")
 
@@ -603,7 +863,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_nonresident_current_targets_are_reserved(self):
         guest = {"vmid": 8601, "node": "lab-host", "type": "qemu", "status": "running", "maxmem": 8192 * c.MIB}
-        status = {"balloon": 8192 * c.MIB, "memhost": 1024 * c.MIB, "maxmem": 8192 * c.MIB}
+        status = {"status": "running", "balloon": 8192 * c.MIB, "memhost": 1024 * c.MIB, "maxmem": 8192 * c.MIB}
         with patch.object(c, "available_mib", return_value=10000), \
                 patch.object(c, "api", side_effect=lambda path: [guest] if path == "/cluster/resources" else status):
             result = self.lab.resources(2048)
@@ -615,8 +875,8 @@ class LifecycleTests(unittest.TestCase):
         guests = [{"vmid": v, "node": "lab-host", "type": "qemu", "status": "running", "maxmem": 8192 * c.MIB}
                   for v in (8601, 8602)]
         self.lab.state["balloon_requests"] = {"8601": 4096, "8602": 2048}
-        statuses = {"8601": {"balloon": 2048 * c.MIB, "memhost": 2048 * c.MIB},
-                    "8602": {"balloon": 4096 * c.MIB, "memhost": 3072 * c.MIB}}
+        statuses = {"8601": {"status": "running", "balloon": 2048 * c.MIB, "memhost": 2048 * c.MIB},
+                    "8602": {"status": "running", "balloon": 4096 * c.MIB, "memhost": 3072 * c.MIB}}
         def api(path):
             return guests if path == "/cluster/resources" else statuses[path.split("/")[-3]]
         with patch.object(c, "available_mib", return_value=12000), patch.object(c, "api", side_effect=api), \
@@ -664,7 +924,8 @@ class LifecycleTests(unittest.TestCase):
     def test_stopped_starting_intent_remains_reserved_except_its_own_retry(self):
         self.lab.state["runs"] = {"8601": {"phase": "starting"}}
         self.lab.state["balloon_requests"] = {"8601": 4096}
-        with patch.object(c, "api", return_value=[]), patch.object(c, "available_mib", return_value=14000):
+        with patch.object(c, "api", side_effect=lambda p: [] if p == "/cluster/resources" else {"status": "stopped"}), \
+                patch.object(c, "available_mib", return_value=14000):
             self.assertEqual(self.lab.resources(2048)["outstanding_commitments_mib"], 4096)
             self.assertEqual(self.lab.resources(4096, 8601)["outstanding_commitments_mib"], 0)
 
@@ -784,8 +1045,8 @@ with c.state_lock(Path(sys.argv[2])):
 
     def test_deferred_capacity_retry_is_durable_and_deduplicated(self):
         with patch.object(self.lab, "owned", return_value={}), patch.object(self.lab, "status", return_value={"status": "stopped"}):
-            self.lab.defer_start(8601, "pilot", 1800, 2048)
-            self.lab.defer_start(8601, "pilot", 1800, 2048)
+            self.lab.defer_start(8601, "pilot", 1800, 2048, "measurement")
+            self.lab.defer_start(8601, "pilot", 1800, 2048, "measurement")
         with patch.object(self.lab, "resources", return_value={"allowed": False}), patch.object(self.lab, "start") as start:
             self.lab.process_deferred()
             start.assert_not_called()
