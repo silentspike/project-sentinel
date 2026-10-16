@@ -181,7 +181,7 @@ An invalidation durably records the pre-stop capacity sample, retention terms,
 and fresh owned status before shutdown. A shutdown error cannot erase that
 evidence. Retention details include both PVE residency and PID-bound process RSS;
 credit is their minimum, and already-resident pages are not subtracted twice.
-An absent actual balloon is labelled `maxmem-fallback`, with null `actual_mib`,
+An absent actual balloon is labeled `maxmem-fallback`, with null `actual_mib`,
 not reported as a measured maximum. Incomplete historical samples remain unknown.
 
 Run `guard` and `reap` from a host-local timer, without an agent session.
