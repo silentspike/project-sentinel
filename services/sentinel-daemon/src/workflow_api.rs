@@ -35,7 +35,9 @@ mod adaptive_review_epoch;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/budget_window.rs"]
 mod budget_window_tests;
+mod collaboration_publication;
 mod company_reconciliation_worker;
+use collaboration_publication::publish_collaboration_publications;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/completion_priority.rs"]
 mod completion_priority_tests;
@@ -105,13 +107,13 @@ use sentinel_workflow::{
     ArtifactExpectationV1, ArtifactInputV1, AuthenticatedCompanyPrincipalV1,
     CollaborationAdmissionBudgetV1, CollaborationAdmissionFenceV1, CollaborationAdmissionInputV1,
     CollaborationCandidateV1, CollaborationProgressDispositionV1, CollaborationProgressV1,
-    CollaborationPublicationV1, CommandRuleV1, CompanyPrincipalKindV1, CompanyRoleV1,
-    CompanyWorkflowCommandV1, CompanyWorkflowResponseV1, CompletionEvidencePort,
-    DependencyReadiness, ExecutionPlanV1, ExecutionReconcileState, ExecutionResourceBoundsV1,
-    ExecutionStepV1, ExecutionToolV1, GateEvidencePort, GateExpectationV1, OutputExpectationV1,
-    PendingCompletionEvidenceV1, PendingExecutionV1, PrincipalAuthorityV1, ProjectId,
-    ReversibilityV1, RuntimeAuthoritySnapshotV1, SealedArtifactEvidenceV1, SealedOutputEvidenceV1,
-    TenantId, TerminalExecutionEvidence, UnavailableGateEvidencePort, WorkExecutionObservation,
+    CommandRuleV1, CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkflowCommandV1,
+    CompanyWorkflowResponseV1, CompletionEvidencePort, DependencyReadiness, ExecutionPlanV1,
+    ExecutionReconcileState, ExecutionResourceBoundsV1, ExecutionStepV1, ExecutionToolV1,
+    GateEvidencePort, GateExpectationV1, OutputExpectationV1, PendingCompletionEvidenceV1,
+    PendingExecutionV1, PrincipalAuthorityV1, ProjectId, ReversibilityV1,
+    RuntimeAuthoritySnapshotV1, SealedArtifactEvidenceV1, SealedOutputEvidenceV1, TenantId,
+    TerminalExecutionEvidence, UnavailableGateEvidencePort, WorkExecutionObservation,
     WorkExecutionPort, WorkItemId, WorkflowCore, WorkflowError, WorkflowErrorCode,
     WorkflowPortError, WorkflowStore, COLLABORATION_ADMISSION_SCHEMA_VERSION,
     COLLABORATION_POLICY_MAX_PARTICIPANTS, COLLABORATION_POLICY_MAX_ROUNDS,
@@ -120,7 +122,9 @@ use sentinel_workflow::{
     COLLABORATION_POLICY_WINDOW_MS, EXECUTION_PLAN_SCHEMA_VERSION, WORKFLOW_SCHEMA_VERSION,
 };
 #[cfg(test)]
-use sentinel_workflow::{AmbiguityClassV1, TaskRiskV1, UncertaintyClassV1};
+use sentinel_workflow::{
+    AmbiguityClassV1, CollaborationPublicationV1, TaskRiskV1, UncertaintyClassV1,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -3399,6 +3403,7 @@ pub struct WorkflowApi {
     reconciliation_status: Mutex<ReconciliationStatus>,
     company_reconciliation_worker_failed: AtomicBool,
     collaboration_publication_pending: AtomicUsize,
+    collaboration_publication_fence: Mutex<()>,
     company_sync_cursor: Mutex<Option<(TenantId, ProjectId, WorkItemId)>>,
     #[cfg(feature = "llm")]
     adaptive_tool_progress_cursor: Mutex<Option<(TenantId, ProjectId, WorkItemId, AgentId)>>,
@@ -3662,6 +3667,7 @@ impl WorkflowApi {
             reconciliation_status: Mutex::new(ReconciliationStatus::default()),
             company_reconciliation_worker_failed: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(usize::MAX),
+            collaboration_publication_fence: Mutex::new(()),
             company_sync_cursor: Mutex::new(None),
             #[cfg(feature = "llm")]
             adaptive_tool_progress_cursor: Mutex::new(None),
@@ -3720,6 +3726,7 @@ impl WorkflowApi {
             reconciliation_status: Mutex::new(ReconciliationStatus::default()),
             company_reconciliation_worker_failed: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(0),
+            collaboration_publication_fence: Mutex::new(()),
             company_sync_cursor: Mutex::new(None),
             #[cfg(feature = "llm")]
             adaptive_tool_progress_cursor: Mutex::new(None),
@@ -3882,6 +3889,27 @@ impl WorkflowApi {
                 return response;
             }
         }
+        let collaboration_guard = if is_collaboration_command_v1(&envelope.command) {
+            match self.lock_collaboration_publication() {
+                Ok(guard) => {
+                    if !operation_exists {
+                        self.collaboration_publication_pending
+                            .store(usize::MAX, Ordering::Release);
+                    }
+                    Some(guard)
+                }
+                Err(_) => {
+                    return json_error(
+                        503,
+                        "workflow_unavailable",
+                        "publication state unavailable",
+                        true,
+                    )
+                }
+            }
+        } else {
+            None
+        };
         match self.core.apply_company_command(
             &principal.principal,
             envelope.operation_id,
@@ -3901,8 +3929,8 @@ impl WorkflowApi {
                         );
                     }
                 }
-                if is_collaboration_command_v1(&envelope.command) {
-                    if let Err(error) = self.publish_collaboration_backlog() {
+                if let Some(guard) = collaboration_guard.as_ref() {
+                    if let Err(error) = self.publish_collaboration_backlog_locked(guard) {
                         self.publish_reconciliation_status(Some(error));
                         return json_error(
                             503,
@@ -4062,6 +4090,19 @@ impl WorkflowApi {
             Ok(command) => command,
             Err(error) => return workflow_error(error),
         };
+        let publication_guard = match self.lock_collaboration_publication() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return json_error(
+                    503,
+                    "workflow_unavailable",
+                    "publication state unavailable",
+                    true,
+                )
+            }
+        };
+        self.collaboration_publication_pending
+            .store(usize::MAX, Ordering::Release);
         match self.core.apply_company_command(
             &principal.principal,
             envelope.operation_id,
@@ -4069,7 +4110,7 @@ impl WorkflowApi {
             now_unix_ms(),
         ) {
             Ok(value) => {
-                if let Err(error) = self.publish_collaboration_backlog() {
+                if let Err(error) = self.publish_collaboration_backlog_locked(&publication_guard) {
                     self.publish_reconciliation_status(Some(error));
                     return json_error(
                         503,
@@ -4232,56 +4273,47 @@ impl WorkflowApi {
     }
 
     fn publish_collaboration_backlog(&self) -> Result<(), String> {
-        let event_store = self
-            .event_store
-            .as_ref()
-            .ok_or_else(|| "collaboration event store is unavailable".to_owned())?;
-        let registry = collaboration_event_schema_registry()
-            .map_err(|error| format!("collaboration schema registry is invalid: {error}"))?;
-        let publications = self.store.collaboration_publications().map_err(|error| {
-            log_reconciliation_failure("collaboration_ledger", "publication ledger invalid");
-            format!("collaboration publication ledger is unavailable: {error}")
-        })?;
-        publish_collaboration_publications(
-            event_store,
-            &registry,
-            &publications,
-            &self.collaboration_publication_pending,
-        )
-        .map(|_| ())
+        let guard = self.lock_collaboration_publication()?;
+        self.publish_collaboration_backlog_locked(&guard)
     }
-}
 
-fn publish_collaboration_publications(
-    event_store: &sentinel_limbo::EventStore,
-    registry: &sentinel_common::EventSchemaRegistry,
-    publications: &[CollaborationPublicationV1],
-    pending: &AtomicUsize,
-) -> Result<Vec<sentinel_common::AppendDispositionV2>, String> {
-    pending.store(publications.len(), Ordering::Release);
-    let mut dispositions = Vec::with_capacity(publications.len());
-    for (index, publication) in publications.iter().enumerate() {
-        let authority_scope_digest = publication
-            .proposal
-            .causal_context
-            .authority_scope_digest()
-            .map_err(|error| format!("collaboration authority is invalid: {error}"))?;
-        let caller = sentinel_limbo::AuthenticatedEventCallerV1 {
-            service_id: "sentinel-daemon-workflow".to_owned(),
-            producer: publication.proposal.producer.clone(),
-            authority_scope_digest,
-        };
-        let outcome = event_store
-            .append_gateway(registry)
-            .append(&caller, &publication.proposal)
-            .map_err(|error| {
-                log_reconciliation_failure("collaboration_append", "canonical append rejected");
-                format!("collaboration publication failed: {error}")
-            })?;
-        dispositions.push(outcome.disposition);
-        pending.store(publications.len() - index - 1, Ordering::Release);
+    fn lock_collaboration_publication(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        self.collaboration_publication_fence.lock().map_err(|_| {
+            self.collaboration_publication_pending
+                .store(usize::MAX, Ordering::Release);
+            "collaboration publication fence is poisoned".to_owned()
+        })
     }
-    Ok(dispositions)
+
+    fn publish_collaboration_backlog_locked(
+        &self,
+        _guard: &std::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), String> {
+        let result = (|| {
+            let event_store = self
+                .event_store
+                .as_ref()
+                .ok_or_else(|| "collaboration event store is unavailable".to_owned())?;
+            let registry = collaboration_event_schema_registry()
+                .map_err(|error| format!("collaboration schema registry is invalid: {error}"))?;
+            let publications = self.store.collaboration_publications().map_err(|error| {
+                log_reconciliation_failure("collaboration_ledger", "publication ledger invalid");
+                format!("collaboration publication ledger is unavailable: {error}")
+            })?;
+            publish_collaboration_publications(
+                event_store,
+                &registry,
+                &publications,
+                &self.collaboration_publication_pending,
+            )
+            .map(|_| ())
+        })();
+        if result.is_err() {
+            self.collaboration_publication_pending
+                .store(usize::MAX, Ordering::Release);
+        }
+        result
+    }
 }
 
 impl WorkflowApi {
@@ -5659,7 +5691,17 @@ impl WorkflowApi {
         }
         let result =
             self.trace_reconciliation_phase("full_scan", || self.reconcile_batch(&should_stop));
-        if result.is_ok() && should_stop() {
+        if !self.reconciliation_status_snapshot().scan_succeeded {
+            tracing::info!(
+                completed = result.is_ok() && !yielded.get(),
+                yielded = yielded.get(),
+                failed = result.is_err(),
+                "Company initial reconciliation pass finished"
+            );
+        }
+        // Every actual phase boundary already latches cancellation. A new
+        // completion intent after the final phase cannot undo completed work.
+        if result.is_ok() && yielded.get() {
             return;
         }
         self.publish_reconciliation_status(result.err().map(|error| format!("{:?}", error.code)));
@@ -6230,18 +6272,26 @@ impl WorkflowApi {
         let delivery_publication_pending = delivery_snapshot
             .as_ref()
             .map(|snapshot| snapshot.pending_publication_count);
-        let collaboration_publication_pending = self
-            .collaboration_publication_pending
-            .load(Ordering::Acquire);
+        let publication_error = self
+            .collaboration_publication_fence
+            .is_poisoned()
+            .then(|| "collaboration_publication_fence_poisoned".to_owned());
+        let collaboration_publication_pending = if publication_error.is_some() {
+            usize::MAX
+        } else {
+            self.collaboration_publication_pending
+                .load(Ordering::Acquire)
+        };
         let dependencies_ready = self.core.dependencies_ready() && delivery_ready;
         // Sample both fields together after durable checks, outside their expensive work.
         let reconciliation_status = self.reconciliation_status_snapshot();
         #[cfg(feature = "llm")]
         let last_error = durable_error
             .or(reconciliation_status.last_error)
+            .or(publication_error)
             .or_else(|| self.adaptive_tool_progress_health_error());
         #[cfg(not(feature = "llm"))]
-        let last_error = reconciliation_status.last_error;
+        let last_error = reconciliation_status.last_error.or(publication_error);
         let ready = self.enabled
             && dependencies_ready
             && reconciliation_status.scan_succeeded
