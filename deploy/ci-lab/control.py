@@ -187,10 +187,12 @@ def address_inventory(config: dict, address: str, vmid: int | None = None) -> di
         checked += 1
         content = path.read_text(errors="replace")
         if (vmid in [config["template"], *config["slots"]]
-                and path.name == f"{vmid}.conf" and path.parent.name == "qemu-server"
-                and f"description: {OWNER}" in content.splitlines()
-                and f"ipconfig0: ip={address}/24,gw={config['gateway']}" in content.splitlines()):
-            continue
+                and path == Path(f"/etc/pve/nodes/{config['node']}/qemu-server/{vmid}.conf")):
+            # PVE stores descriptions as encoded comments, not config keys.
+            reservation = api(f"/nodes/{config['node']}/qemu/{vmid}/config")
+            if (reservation.get("description") == OWNER
+                    and reservation.get("ipconfig0") == f"ip={address}/24,gw={config['gateway']}"):
+                continue
         for line in content.splitlines():
             if address not in re.findall(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])", line):
                 continue
@@ -272,9 +274,9 @@ class Lab:
         for guest in guests:
             if guest.get("node") != self.config["node"] or guest.get("status") != "running" or guest.get("type") != "qemu":
                 continue
-            status = api(f"/nodes/{self.config['node']}/qemu/{guest['vmid']}/status/current")
             owned = guest["vmid"] in [self.config["template"], *self.config["slots"]]
-            actual = status.get("balloon")
+            status = api(f"/nodes/{self.config['node']}/qemu/{guest['vmid']}/status/current") if owned else guest
+            actual = status.get("balloon") if owned else guest.get("maxmem")
             actual = status.get("maxmem") if actual is None else actual
             resident = status.get("memhost")
             if actual is None or resident is None or actual <= 0 or resident < 0:
@@ -294,8 +296,9 @@ class Lab:
                 headroom += outstanding
             else:
                 external += outstanding
-            balloons.append({"vmid": guest["vmid"], "actual_mib": actual // MIB,
+            balloons.append({"vmid": guest["vmid"], "actual_mib": actual // MIB if owned else None,
                              "owned": owned,
+                             "potential_basis": "current-owned-target" if owned else "cluster-maxmem-not-current-target",
                              "committed_mib": committed // MIB, "resident_mib": resident // MIB,
                              "outstanding_mib": outstanding, "max_mib": guest["maxmem"] // MIB})
         # Stopped, accepted starting intents remain promises after a crash.
@@ -689,12 +692,14 @@ class Lab:
     def reap(self) -> dict:
         now = time.time()
         stopped, removed = [], []
+        running = {v["vmid"] for v in api("/cluster/resources")
+                   if v.get("node") == self.config["node"] and v.get("status") == "running"}
         for vmid in self.config["slots"]:
             lease = self.state["leases"].get(str(vmid), {})
             if lease.get("expires", 0) > now:
                 continue
             last = self.state["last_used"].get(str(vmid), now)
-            if now - last >= self.config.get("idle_seconds", 900):
+            if vmid in running and now - last >= self.config.get("idle_seconds", 900):
                 self.stop(vmid)
                 stopped.append(vmid)
         for key, snapshot in list(self.state["snapshots"].items()):
