@@ -453,28 +453,59 @@ fn ac_75_vm_full_cage_distinct_netns() {
 #[test]
 #[ignore]
 fn ac_75_vm_only_loopback_inside_cage() {
-    use std::process::Stdio;
+    use std::io::Read;
     let config = BwrapConfig::for_agent("vm-cage-lo");
-    // `ip` must be reachable via the /usr ro-bind on the VM.
-    let mut args = config.to_args();
-    args.extend([
-        "/usr/sbin/ip".to_string(),
-        "-o".to_string(),
-        "link".to_string(),
-    ]);
-    let output = std::process::Command::new("bwrap")
-        .args(&args)
-        .stderr(Stdio::null())
-        .output()
-        .expect("bwrap spawn must succeed on the VM");
-    let links = String::from_utf8_lossy(&output.stdout);
-    // Only the loopback interface should be present in the agent netns.
-    for line in links.lines().filter(|l| !l.trim().is_empty()) {
-        assert!(
-            line.contains(" lo:") || line.contains(": lo:"),
-            "full-caged agent must only have loopback, found:\n{links}"
-        );
-    }
+    // Use the production bind filtering and owned process-group cleanup. The
+    // short-lived ip init may already be reaped before it can be proc-pinned.
+    let mut cage = OwnedCage {
+        process: config
+            .spawn(&[
+                "/usr/sbin/ip".to_string(),
+                "-o".to_string(),
+                "link".to_string(),
+            ])
+            .expect("bwrap spawn must succeed on the VM"),
+        init: None,
+        cleanup_attempted: false,
+    };
+    let mut output = Vec::new();
+    cage.process
+        .child
+        .stdout
+        .take()
+        .expect("sandbox stdout must be piped")
+        .take(65537)
+        .read_to_end(&mut output)
+        .expect("read sandbox link output");
+    let status = cage.process.child.wait().expect("wait for sandbox ip");
+    cage.cleanup().expect("loopback test process must be reaped");
+    assert!(
+        status.success(),
+        "sandbox ip failed: {status}, stdout={output:?}"
+    );
+    assert!(output.len() <= 65536, "unexpectedly large link output");
+    let links = std::str::from_utf8(&output).expect("ip link output must be UTF-8");
+    let lines = links
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "expected exactly one loopback link: {links}");
+    let fields = lines[0].split_whitespace().collect::<Vec<_>>();
+    assert_eq!(fields.first(), Some(&"1:"), "unexpected link index: {links}");
+    assert_eq!(fields.get(1), Some(&"lo:"), "unexpected interface: {links}");
+    let flags = fields.get(2).expect("loopback link flags");
+    assert!(
+        flags.starts_with('<')
+            && flags.ends_with('>')
+            && flags[1..flags.len() - 1]
+                .split(',')
+                .any(|flag| flag == "LOOPBACK"),
+        "missing loopback flag: {links}"
+    );
+    assert!(
+        fields.contains(&"link/loopback"),
+        "unexpected link kind: {links}"
+    );
 }
 
 // VM-only (AC-4): deliberately sharing the host network must be detected as a
