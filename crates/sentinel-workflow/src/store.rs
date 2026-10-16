@@ -2884,7 +2884,7 @@ mod tests {
         }
         for pass in 1..=repeat {
             let started = std::time::Instant::now();
-            let (result, failures) =
+            let validate = || {
                 crate::domain_store::validation_scope::with_validation_failures(|| {
                     if mode == "adaptive_health_inventory" {
                         return store
@@ -2913,7 +2913,17 @@ mod tests {
                             now,
                         )
                         .map(|_| true)
-                });
+                })
+            };
+            let ((result, failures), digest_costs) = if std::env::var(
+                "SENTINEL_DIAGNOSTIC_DIGEST_COSTS",
+            )
+            .is_ok_and(|value| value == "1")
+            {
+                crate::digest::with_digest_diagnostics(validate)
+            } else {
+                (validate(), Vec::new())
+            };
             {
                 let connection = store.connection.lock().unwrap();
                 let after: i64 = connection
@@ -2923,6 +2933,26 @@ mod tests {
                 assert_eq!(after, 0);
             }
             let elapsed = started.elapsed();
+            // Test-only, bounded static domains and counters; never payloads or IDs.
+            for cost in digest_costs {
+                for (encoding, value) in [
+                    ("canonical", cost.canonical),
+                    ("numeric_bytes", cost.byte_array),
+                ] {
+                    if value.calls > 0 {
+                        eprintln!(
+                            "READ_ONLY_DIGEST_COST pass={pass} domain={} encoding={encoding} calls={} cache_hits={} failures={} serialized_bytes={} hashed_bytes={} inclusive_us={}",
+                            cost.domain.unwrap_or("overflow"),
+                            value.calls,
+                            value.cache_hits,
+                            value.failures,
+                            value.serialized_bytes,
+                            value.hashed_bytes,
+                            value.elapsed.as_micros(),
+                        );
+                    }
+                }
+            }
             eprintln!(
                 "READ_ONLY_FUNDING_DIAGNOSTIC mode={} selected={:?} elapsed_ms={} error_code={:?} failures={:?} writes=0",
                 mode,
