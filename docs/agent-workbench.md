@@ -145,6 +145,24 @@ remain fail-closed. Public endpoints, events and projections do not expose
 private source snapshots, credentials or model observations. Unit evidence
 does not prove that a paused live employee has resumed or delivered work.
 
+For funded leadership schemas 5/6, the current head envelope remains bounded
+to 128 KiB. The serialized historical authorization array is accounted
+separately: at most 128 windows and 16 MiB, derived from the existing 128-window
+ceiling and 128 KiB context unit. Only that typed array is separately charged;
+project data, tool catalog, evidence references, continuation flags and ceilings
+still count toward the head limit. Legacy schemas 1-4 retain their whole-context
+128 KiB limit. The actual rendered model prompt has its own unchanged 128 KiB
+limit, including private observation and perception.
+
+This is a bounded proof-accounting policy, not removal or truncation of history,
+not an RSS limit, and not new spending authority. The complete continuation
+digest, every authorization and authoritative journal/store membership remain
+validated. Serialized bytes and digest domains are unchanged, and counting does
+not allocate another full JSON buffer. The separate validation-scope and read
+cache budgets are not enlarged. Once a proof above the legacy whole-context
+limit is committed, an older binary cannot safely replay it: use a compatible
+forward repair, not a binary-only downgrade or deletion of business history.
+
 ### Opt-in model work proposals
 
 The first M1 bridge is selected by `SENTINEL_MODEL_WORKBENCH_ENABLED=true`.
