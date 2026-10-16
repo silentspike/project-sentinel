@@ -65,8 +65,8 @@ Required fields:
   The last two match the archive verifier's exact-ID owner inventory, never a
   regex/source count. Diagnostics or optional hardware contracts may be explicitly
   not applicable with reviewed rationale; this does not claim they passed.
-  Required compiler-dependent tests need separate `builder-compiler-tests` gate
-  evidence. Doctests and explicit eBPF feature gates also remain independently
+  Required compiler-dependent tests need separate `rust-compiler-tests` gate
+  evidence. `rust-doctests` and explicit eBPF feature gates remain independently
   required by the static policy; the applicability plan cannot omit those gates.
 - `archive`: compact projection of the archive verifier's mechanism-only summary,
   including source/archive/manifest/plan/inventory hashes, original summary hash,
@@ -75,6 +75,8 @@ Required fields:
   counts and verified shard totals. `aggregate_pass` must remain false. The
   controller runs archive verification against actual exact test IDs and JUnit
   before signing; a self-report from a test VM is not sufficient.
+  Empty archive inventories, empty shard sets and zero observed totals are not
+  qualification. A package-scoped pilot does not prove full workspace coverage.
 - `shards`: the verifier's compact shards, exactly once in the envelope. They bind
   owner, nextest version, archive plan/inventory, original receipt/JUnit/log hashes,
   command and successful exit code. Partitions are contiguous and complete
