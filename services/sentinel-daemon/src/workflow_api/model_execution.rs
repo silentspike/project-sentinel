@@ -3,6 +3,9 @@
 mod known_rejection;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+#[path = "model_execution/model_work_grant_due_tests.rs"]
+mod model_work_grant_due_tests;
 pub(super) mod tool_catalog;
 mod working_memory;
 
@@ -197,7 +200,7 @@ mod adaptive_tool_progress_cursor_tests {
     }
 }
 
-const ADAPTIVE_MODEL_WORK_MAX_CALLS: u16 = 16;
+pub(super) const ADAPTIVE_MODEL_WORK_MAX_CALLS: u16 = 16;
 const QA_SCHEMA_ERROR: &str = "source review is not strict JSON";
 const QA_SCHEMA_RECOVERY_REASON: &str = "strict-json-correction";
 const QA_SCHEMA_MAX_CORRECTIONS: usize = 2;
@@ -561,6 +564,9 @@ pub struct AdaptiveModelContext {
     pub agent_context: AdaptiveAgentContextV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) working_memory: Option<working_memory::AdaptiveWorkingMemoryV1>,
+    /// Request presentation only; absence preserves pre-contract reservation bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_qa_contract_version: Option<u16>,
 }
 
 struct ExactAdaptiveProviderSource {
@@ -574,6 +580,18 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl AdaptiveModelContext {
+    fn native_qa_contract(&self) -> Result<Option<&'static str>, &'static str> {
+        match self.native_qa_contract_version {
+            None => Ok(None),
+            Some(1) => super::model_work::native_qa_package_contract(
+                &self.binding.grant.authority.profile_id,
+            )
+            .map(Some)
+            .ok_or("native QA contract requires a native coding profile"),
+            Some(_) => Err("native QA contract version is unsupported"),
+        }
+    }
+
     fn fit_optional_failure_output_to_prompt(&mut self) -> Result<bool, &'static str> {
         if self
             .working_memory
@@ -605,6 +623,7 @@ impl AdaptiveModelContext {
     }
 
     pub fn validate_dispatch(&self, now_ms: u64) -> Result<(), &'static str> {
+        self.native_qa_contract()?;
         let grant = &self.binding.grant;
         grant
             .authority
@@ -680,6 +699,7 @@ impl AdaptiveModelContext {
     }
 
     pub fn prompt(&self) -> Result<String, &'static str> {
+        let native_qa_contract = self.native_qa_contract()?;
         let task =
             serde_json::to_string(&self.task).map_err(|_| "adaptive task encoding failed")?;
         let contract = serde_json::to_string(&self.accepted_customer_contract)
@@ -738,6 +758,9 @@ impl AdaptiveModelContext {
              unresolved collaboration context: {agent_context}. A question or handoff is a \
              request to the company workflow, not a direct permission or recipient identity."
         );
+        if let Some(contract) = native_qa_contract {
+            prompt.push_str(contract);
+        }
         if let Some(memory) = &self.working_memory {
             prompt.push_str(&memory.prompt()?);
         }
@@ -1048,7 +1071,7 @@ fn validate_adaptive_usage(
     validate_adaptive_usage_binding(&context.binding, admissible, event)
 }
 
-fn validate_adaptive_usage_binding(
+pub(super) fn validate_adaptive_usage_binding(
     binding: &AdaptiveProviderAuthority,
     admissible: bool,
     event: &DomainEvent,
@@ -2676,6 +2699,7 @@ impl WorkflowApi {
                 binding.grant.authority.assignment_version,
             )?,
             working_memory: None,
+            native_qa_contract_version: None,
         };
         let reservation = self
             .event_store
@@ -2756,6 +2780,11 @@ impl WorkflowApi {
                 return Err("adaptive adopted funding receipt changed");
             }
         }
+        let native_qa_enabled = super::model_work::native_qa_package_contract(
+            &binding.grant.authority.profile_id,
+        )
+        .is_some();
+        let mut numeric_memory = None;
         context.working_memory = Some({
             let _phase = AdaptiveContextReadPhase::start("historical_observations");
             source
@@ -2794,6 +2823,9 @@ impl WorkflowApi {
                 )?;
                 let mut retained = context.clone();
                 retained.working_memory = Some(legacy.clone());
+                if native_qa_enabled {
+                    numeric_memory = Some(legacy.clone());
+                }
                 // A reservation seals presentation bytes as well as authority.
                 // Match numeric-only history before deriving any new excerpts.
                 if digest(&retained)? == reserved.context_digest {
@@ -2813,6 +2845,27 @@ impl WorkflowApi {
                 )?
             }
         });
+        // Exhaust the historical unmarked presentations before trying the new
+        // contract. A reserved digest selects bytes, never an implicit upgrade.
+        let retained_unmarked = if native_qa_enabled {
+            reservation
+                .as_ref()
+                .map(|reserved| digest(&context).map(|value| value == reserved.context_digest))
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if native_qa_enabled && !retained_unmarked {
+            context.native_qa_contract_version = Some(1);
+            if let (Some(reserved), Some(numeric)) = (&reservation, numeric_memory) {
+                let mut retained = context.clone();
+                retained.working_memory = Some(numeric);
+                if digest(&retained)? == reserved.context_digest {
+                    context = retained;
+                }
+            }
+        }
         let prompt_checked = context.fit_optional_failure_output_to_prompt()?;
         if reservation
             .as_ref()
@@ -3311,7 +3364,13 @@ impl WorkflowApi {
             })
             .ok_or("adaptive completion principal changed")?;
         let admission = authority
-            .plan_from_intent(&principal, operation_id, &intent, now_unix_ms())
+            .plan_from_intent_revision(
+                &principal,
+                operation_id,
+                &intent,
+                context.correction.as_ref().map(|value| &value.revision),
+                now_unix_ms(),
+            )
             .map_err(|_| "adaptive completion plan rejected")?;
         if admission.authority != context.binding.grant.authority {
             return Err("adaptive completion authority changed");
@@ -3319,7 +3378,57 @@ impl WorkflowApi {
         authority
             .validate_plan_contract(&admission.plan)
             .map_err(|_| "adaptive completion contract changed")?;
-        if admission.replay {
+        if let Some(correction) = &context.correction {
+            let project = self
+                .store
+                .company_project(&context.binding.grant.authority.tenant_id, &intent.project_id)
+                .map_err(|_| "adaptive correction project unavailable")?
+                .ok_or("adaptive correction project missing")?;
+            let record = project
+                .work_corrections
+                .iter()
+                .find(|record| {
+                    record.correction_id == correction.correction_id
+                        && record.previous.spec.work_item_id == intent.work_item_id
+                        && record.execution_revision == correction.revision
+                        && record.feedback_ref == correction.feedback_ref
+                        && record.feedback == correction.feedback
+                })
+                .ok_or("adaptive correction authority changed")?;
+            let previous = self
+                .store
+                .work_item_for_plan(
+                    &project.tenant_id,
+                    &project.project_id,
+                    &intent.work_item_id,
+                    record.execution_revision.previous_plan_id,
+                )
+                .map_err(|_| "adaptive correction history unavailable")?
+                .ok_or("adaptive correction predecessor missing")?;
+            if previous
+                .plan
+                .steps
+                .iter()
+                .map(|step| &step.tool)
+                .ne(correction.previous_tools.iter())
+            {
+                return Err("adaptive correction input changed");
+            }
+            if admission.replay {
+                self.store.admit_revision_plan(
+                    &admission.plan,
+                    &correction.revision,
+                    &admission.authority,
+                    now_unix_ms(),
+                )
+            } else {
+                self.core.admit_revision_plan(
+                    &admission.plan,
+                    &correction.revision,
+                    now_unix_ms(),
+                )
+            }
+        } else if admission.replay {
             self.store
                 .admit_plan(&admission.plan, &admission.authority, now_unix_ms())
         } else {
@@ -5035,9 +5144,11 @@ impl WorkflowApi {
         let Some(allowance) = project.subscription_call.as_ref() else {
             return true;
         };
-        if allowance.dispatch.is_none() {
-            return now_ms >= allowance.grant.expires_at_unix_ms;
+        if allowance.dispatch.is_none() && now_ms >= allowance.grant.expires_at_unix_ms {
+            return true;
         }
+        // Discovery only: an adaptive completion without a legacy dispatch
+        // still requires the store's same-transaction producer proof at grant.
         project.source_review_previous_call.is_none()
             && project
                 .work_items
@@ -5361,8 +5472,19 @@ impl WorkflowApi {
             .company_project(&project.tenant_id, &project.project_id)
             .map_err(|_| "model-planned project unavailable")?
             .ok_or("model-planned project missing")?;
+        // Completion is a successor candidate, never a renewal of spent work.
+        // The store authenticates an undispatched producer in the grant transaction.
+        let completed = current.subscription_call.as_ref().filter(|allowance| {
+            current.source_review_previous_call.is_none()
+                && current
+                    .work_items
+                    .get(&allowance.grant.work_item_id)
+                    .is_some_and(|work| work.state == CompanyWorkStateV1::Done)
+        });
         let renewal = current.subscription_call.as_ref().and_then(|allowance| {
-            (allowance.dispatch.is_none() && now_ms >= allowance.grant.expires_at_unix_ms)
+            (completed.is_none()
+                && allowance.dispatch.is_none()
+                && now_ms >= allowance.grant.expires_at_unix_ms)
                 .then(|| allowance.clone())
         });
         if let Some(allowance) = renewal.as_ref() {
@@ -5392,14 +5514,6 @@ impl WorkflowApi {
                 return Ok(current);
             }
         }
-        let completed = current.subscription_call.as_ref().filter(|allowance| {
-            allowance.dispatch.is_some()
-                && current.source_review_previous_call.is_none()
-                && current
-                    .work_items
-                    .get(&allowance.grant.work_item_id)
-                    .is_some_and(|work| work.state == CompanyWorkStateV1::Done)
-        });
         if current.subscription_call.is_some() && renewal.is_none() && completed.is_none() {
             return Ok(current);
         }

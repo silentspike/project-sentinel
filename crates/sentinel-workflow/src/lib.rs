@@ -55,6 +55,7 @@ pub use standing_work_funding::*;
 pub use store::{
     AdaptiveHealthReadError, AdaptiveModelAdoptionRead, AdaptiveModelAdoptionReadError,
     AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot, ExecutionRevisionV1,
+    AdaptiveSourceCompletionV1,
     WorkflowDiagnosticSpan, WorkflowDiagnosticStage, WorkflowStore, WORKFLOW_STORE_SCHEMA_VERSION,
 };
 

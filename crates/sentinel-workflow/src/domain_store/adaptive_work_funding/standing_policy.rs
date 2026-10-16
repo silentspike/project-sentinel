@@ -3,7 +3,14 @@
 use super::*;
 use crate::{AdaptiveCursorV1, AdaptiveLeadershipReviewDecisionKindV1, AdaptiveSessionV1};
 
-fn terminal_funded_defer(
+struct StandingProposalSource<'a> {
+    project_id: &'a ProjectId,
+    session_id: Uuid,
+    current: &'a RuntimeAuthoritySnapshotV1,
+    observed: Option<(&'a ProjectV1, &'a AdaptiveSessionV1)>,
+}
+
+pub(super) fn terminal_funded_defer(
     call: &AdaptiveLeadershipReviewCallV1,
     session: &AdaptiveSessionV1,
 ) -> bool {
@@ -63,6 +70,57 @@ impl WorkflowStore {
         project_id: &ProjectId,
         session_id: Uuid,
         current: &RuntimeAuthoritySnapshotV1,
+        clock: Clock,
+        before_commit: Check,
+    ) -> Result<Option<(bool, AdaptiveWorkFundingReceiptV1)>, WorkflowError>
+    where
+        Clock: FnMut() -> u64,
+        Check: FnMut() -> Result<(), WorkflowError>,
+    {
+        self.propose_standing_work_funding_from_source(
+            issuer,
+            policy,
+            StandingProposalSource { project_id, session_id, current, observed: None },
+            clock,
+            before_commit,
+        )
+    }
+
+    /// Observations are descriptive, not authority. New issuance compares both
+    /// complete values to authenticated SQL state before running external checks.
+    /// Sealed replay deliberately ignores stale observations, clocks and callbacks.
+    /// The callback MUST NOT call WorkflowStore while its SQL mutex is held.
+    pub fn propose_standing_work_funding_observed_with_clock<Clock, Check>(
+        &self,
+        issuer: &AuthenticatedCompanyPrincipalV1,
+        policy: &crate::StandingWorkFundingPolicyV1,
+        observed: (&ProjectV1, &AdaptiveSessionV1),
+        clock: Clock,
+        before_commit: Check,
+    ) -> Result<Option<(bool, AdaptiveWorkFundingReceiptV1)>, WorkflowError>
+    where
+        Clock: FnMut() -> u64,
+        Check: FnMut() -> Result<(), WorkflowError>,
+    {
+        self.propose_standing_work_funding_from_source(
+            issuer,
+            policy,
+            StandingProposalSource {
+                project_id: &observed.0.project_id,
+                session_id: observed.1.grant.session_id,
+                current: &observed.1.grant.authority,
+                observed: Some(observed),
+            },
+            clock,
+            before_commit,
+        )
+    }
+
+    fn propose_standing_work_funding_from_source<Clock, Check>(
+        &self,
+        issuer: &AuthenticatedCompanyPrincipalV1,
+        policy: &crate::StandingWorkFundingPolicyV1,
+        source: StandingProposalSource<'_>,
         mut clock: Clock,
         mut before_commit: Check,
     ) -> Result<Option<(bool, AdaptiveWorkFundingReceiptV1)>, WorkflowError>
@@ -70,6 +128,7 @@ impl WorkflowStore {
         Clock: FnMut() -> u64,
         Check: FnMut() -> Result<(), WorkflowError>,
     {
+        let StandingProposalSource { project_id, session_id, current, observed } = source;
         policy.validate_for(issuer)?;
         current.validate()?;
         project_id.validate()?;
@@ -131,18 +190,41 @@ impl WorkflowStore {
             {
                 return Err(funding_conflict());
             }
+            // New terminal-manual history is still authenticated on replay;
+            // this uses the receipt's immutable cut, never a fresh clock/check.
+            terminal_manual_defer::excluded_by_standing_receipts(
+                &transaction, &receipts, &calls, &session,
+            )?;
             let prior = prior.clone();
             scope.finish()?;
             return Ok(Some((true, prior)));
         }
 
+        if let Some((observed_project, observed_session)) = observed {
+            let project: ProjectV1 = get_entity(
+                &transaction, &current.tenant_id, "project", &project_id.0,
+            )?.ok_or_else(not_found)?;
+            if project != *observed_project || session != *observed_session {
+                return Err(WorkflowError::new(
+                    WorkflowErrorCode::AuthorityConflict,
+                    false,
+                    "standing funding observed source changed",
+                ));
+            }
+        }
+
         // Authenticate all retained history before treating a manual pending
         // proposal or an exhausted bound as ordinary ineligibility.
-        let pending = receipts.iter().any(|receipt| {
-            !adopted.iter().any(|epoch| epoch.receipt == *receipt)
+        let historical_terminal = terminal_manual_defer::excluded_by_standing_receipts(
+            &transaction, &receipts, &calls, &session,
+        )?;
+        let pending: Vec<_> = receipts.iter().filter(|receipt| {
+            !adopted.iter().any(|epoch| epoch.receipt == **receipt)
                 && !consumed.contains(&receipt.funding_id)
-        });
-        if pending
+                && !historical_terminal.contains(&receipt.funding_id)
+        }).collect();
+        if pending.len() > 1
+            || pending.iter().any(|receipt| terminal_manual_defer::candidate(receipt, &calls, &session).is_none())
             || receipts.len() >= 128
             || !matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
             || session.active_work_funding().is_none()
@@ -195,11 +277,25 @@ impl WorkflowStore {
             scope.finish()?;
             return Ok(None);
         }
+        if pending.iter().any(|receipt| {
+            terminal_manual_defer::candidate(receipt, &calls, &session)
+                .is_none_or(|manual_defer| manual_defer.grant.review_id != cause.grant.review_id)
+        }) {
+            scope.finish()?;
+            return Ok(None);
+        }
         let eligible_at = clock();
         if eligible_at < session.updated_at_ms || eligible_at < cause.updated_at_unix_ms {
             return Err(transition());
         }
         if !session.model_window_exhausted_at(eligible_at) {
+            scope.finish()?;
+            return Ok(None);
+        }
+        let terminal = terminal_manual_defer::excluded_at_head(
+            &transaction, &receipts, &calls, &session, &head_digest, eligible_at,
+        )?;
+        if pending.iter().any(|receipt| !terminal.contains(&receipt.funding_id)) {
             scope.finish()?;
             return Ok(None);
         }
@@ -214,13 +310,13 @@ impl WorkflowStore {
         )?;
         // Provisional limits prove eligibility only; they never become a receipt.
         let probe_limits = policy.limits(session.grant.max_call_duration_ms, eligible_at)?;
-        let (source, duration) = require_unfunded_source(
+        let (source, duration) = require_unfunded_source_with_candidate(
             &transaction,
             &current.tenant_id,
             project_id,
             session_id,
             eligible_at,
-            None,
+            Some(PendingFundingReplacement::StandingAfterManualDefer),
             &probe_limits,
         )?;
         if source.resume_source != fresh || duration != probe_limits.max_call_duration_ms {

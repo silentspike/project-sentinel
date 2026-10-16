@@ -22,6 +22,7 @@ pub(crate) mod adaptive;
 pub use adaptive::{
     AdaptiveModelAdoptionRead, AdaptiveModelAdoptionReadError,
     AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot,
+    AdaptiveSourceCompletionV1,
 };
 mod read_cache;
 mod revisions;
