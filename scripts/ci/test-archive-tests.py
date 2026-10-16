@@ -76,7 +76,7 @@ class ArchiveTests(unittest.TestCase):
                 with self.subTest(marker=marker), self.assertRaises(archive.ArchiveError):
                     archive.junit_tests(path)
 
-    def fixture_plan(self, root):
+    def fixture_plan(self, root, with_ignored=False):
         bundle, extracted = root / "bundle", root / "extracted"
         bundle.mkdir()
         extracted.mkdir()
@@ -85,9 +85,13 @@ class ArchiveTests(unittest.TestCase):
                     "head_sha": "a" * 40, "tree_sha": "b" * 40, "base_sha": "c" * 40,
                     "inputs": {"toolchain": "1.99.0", "profile": "linux-gnu-sentinel", "image": "d" * 64, "input_digest": "e" * 64}}
         archive.write(bundle / "manifest.json", manifest)
-        archive.write(bundle / "source-inventory.json", {"ignored_definitions": {}, "external_gates": {"doctests": {"owner": "builder"}}})
-        archive.write(extracted / "test-list.json", listing(["a", "b", "c", "d", "e"]))
-        archive.write(extracted / "extracted.json", {"manifest_sha256": archive.digest(bundle / "manifest.json"), "test_inventory_digest": archive.object_digest(archive.test_rows(listing(["a", "b", "c", "d", "e"])))})
+        archive.write(bundle / "source-inventory.json", {"ignored_definitions": {"f_ignored": [{"owner": "lab-ignored"}]}, "external_gates": {"doctests": {"owner": "builder"}}})
+        test_listing = listing(["a", "b", "c", "d", "e"])
+        if with_ignored:
+            test_listing["rust-suites"]["sentinel-bio"]["testcases"]["f_ignored"] = {"ignored": True, "filter-match": {"status": "matches"}}
+            test_listing["test-count"] += 1
+        archive.write(extracted / "test-list.json", test_listing)
+        archive.write(extracted / "extracted.json", {"manifest_sha256": archive.digest(bundle / "manifest.json"), "test_inventory_digest": archive.object_digest(archive.test_rows(test_listing))})
         args = type("Args", (), {"bundle": str(bundle), "extracted": str(extracted), "shards": 2, "output": str(root / "plan.json")})
         with patch.object(archive, "check_bundle", return_value=manifest):
             archive.plan(args)
@@ -128,6 +132,37 @@ class ArchiveTests(unittest.TestCase):
             with patch("builtins.print") as output:
                 archive.verify(args)
             self.assertFalse(json.loads(output.call_args.args[0])["aggregate_pass"])
+
+    def test_not_applicable_ignored_owner_retains_inventory_without_pass(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data, path = self.fixture_plan(root, with_ignored=True)
+            folders = [p for p in self.fixture_receipts(root, data, path) if "lab-normal-" in p]
+            args = type("Args", (), {"plan": path, "receipts": folders, "not_applicable_owner": ["lab-ignored"]})
+            with patch("builtins.print") as output:
+                archive.verify(args)
+            summary = json.loads(output.call_args.args[0])
+            self.assertEqual(summary["test_count"], 6)
+            self.assertEqual(summary["observed_count"], 5)
+            self.assertEqual(summary["owners"]["lab-ignored"], {"expected_count": 1, "observed_count": 0, "partitions": 0})
+            self.assertEqual(summary["not_applicable_owners"]["lab-ignored"], summary["owner_inventory"]["lab-ignored"])
+            self.assertFalse(summary["aggregate_pass"])
+            self.assertEqual(summary["test_inventory_digest"], data["test_inventory_digest"])
+            args.not_applicable_owner = []
+            with self.assertRaisesRegex(archive.ArchiveError, "missing"):
+                archive.verify(args)
+
+    def test_normal_owner_cannot_be_skipped_or_partial_ignored_shard_waived(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data, path = self.fixture_plan(root, with_ignored=True)
+            folders = self.fixture_receipts(root, data, path)
+            args = type("Args", (), {"plan": path, "receipts": folders, "not_applicable_owner": ["lab-normal"]})
+            with self.assertRaisesRegex(archive.ArchiveError, "only whole"):
+                archive.verify(args)
+            args.not_applicable_owner = ["lab-ignored"]
+            with self.assertRaisesRegex(archive.ArchiveError, "missing or duplicate"):
+                archive.verify(args)
 
     def test_verify_rejects_missing_duplicate_corrupt_receipts(self):
         for defect in ("missing", "duplicate", "log", "junit", "head", "count", "inventory", "partition", "version"):
