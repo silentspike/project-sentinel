@@ -122,6 +122,7 @@ together on the declared target. Config keys:
 ```text
 runtime_target_class: LAB | SINGLE_NODE
 expected_hostname, manifest_sha256 (installed runtime pin)
+run_id: actual shared guest/hypervisor measurement window ID (1 to 64 safe characters)
 root: absolute owned input directory below /work/tmp/project-sentinel
 baseline, candidate, image, metadata: each {file: relative name, sha256: digest}
 abba_blocks: 1 to 3 (each block is baseline/candidate/candidate/baseline)
@@ -139,6 +140,25 @@ tests are failure. Child time/output are bounded; only owned children are killed
 on failure and raw native output is not exported. Frozen inputs, runtime manifest
 and service identity are rechecked between legs. Each child has exact wait4
 CPU/peak-RSS/block-I/O metrics with concurrent target resource sidecars.
+
+Each leg records its observed PID, zero-based leg/block index and two-clock
+anchors immediately around `Popen` and terminal `wait4`. Each anchor brackets
+one wall-clock read with monotonic reads. The last nonterminal wait's preceding
+anchor is retained when present; it is null for immediately reaped children.
+These are spawn/exec and waitability observation brackets, not exact child exit,
+first Rust instruction or the three internal pass boundaries. `wall_ms` spans
+the outer launch/reap monotonic anchors, excluding input hashing and parsing.
+Guest samples have explicit collection brackets; initial/final samples enclose
+all legs. Run ID, actual guest boot ID and both collector source hashes bind
+the evidence; a boot/service/manifest/source change fails closed.
+
+Join hypervisor samples only using the real shared run ID and observed clock
+brackets. Guest and host monotonic clocks are different domains; wall-clock
+offset/drift and SSH/startup uncertainty require separate evidence. The runner
+leaves the cross-host offset bound null and alignment unverified. Do not infer
+per-leg load causality from order, whole-window overlap, or an assumed zero
+offset. Balloon state remains hypervisor-endpoint-only, never continuous, and
+the sampling window must actually cover launch through reap including overhead.
 
 Report first process-cold pass separately from the two same-process warm passes;
 do not claim OS-cache-cold after image-hash reads. Default ABBA yields only two

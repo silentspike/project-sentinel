@@ -100,6 +100,140 @@ class NativeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 native.compare({"runtime_target_class": "LAB", "expected_hostname": "other"})
 
+    @staticmethod
+    def anchor(value):
+        return {"wall_unix_ns": 100000 + value, "monotonic_before_ns": value,
+                "monotonic_after_ns": value + 2}
+
+    def test_clock_anchor_brackets_actual_wall_read(self):
+        with mock.patch.object(native.time, "monotonic_ns", side_effect=[100, 120]), \
+                mock.patch.object(native.time, "time_ns", return_value=1000):
+            self.assertEqual(native.clock_anchor(),
+                             {"wall_unix_ns": 1000, "monotonic_before_ns": 100, "monotonic_after_ns": 120})
+        with mock.patch.object(native.time, "monotonic_ns", side_effect=[120, 100]):
+            with self.assertRaises(ValueError):
+                native.clock_anchor()
+
+    def test_resource_sample_retains_counter_and_collection_brackets(self):
+        before, after = self.anchor(100), self.anchor(200)
+        with mock.patch.object(native, "clock_anchor", side_effect=[before, after]), \
+                mock.patch.object(native, "counters", return_value={"monotonic_ns": 150, "memory": {}}):
+            value = native.resource_sample({})
+        self.assertEqual(value["monotonic_ns"], 150)
+        self.assertEqual(value["collection_timing"], {"before": before, "after": after})
+        with mock.patch.object(native, "clock_anchor", side_effect=[after, before]), \
+                mock.patch.object(native, "counters", return_value={"monotonic_ns": 150}):
+            with self.assertRaises(ValueError):
+                native.resource_sample({})
+
+    def child_fixture(self, anchors, wait_results, *, timeout_ns=0, expect_error=False):
+        process = mock.Mock(pid=4321, returncode=None)
+        usage = mock.Mock(ru_utime=.001, ru_stime=.002, ru_maxrss=128, ru_inblock=2, ru_oublock=3)
+        results = [(pid, status, usage if pid else None) for pid, status in wait_results]
+        def launch(argv, **kwargs):
+            self.assertEqual(argv[1], native.TEST)
+            kwargs["stdout"].write(self.text().encode())
+            kwargs["stdout"].flush()
+            return process
+        with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP", "/work/tmp/project-sentinel"),
+                                         prefix="native-anchor-test-") as root, \
+                mock.patch.object(native, "clock_anchor", side_effect=anchors), \
+                mock.patch.object(native.subprocess, "Popen", side_effect=launch), \
+                mock.patch.object(native.os, "wait4", side_effect=results) as wait, \
+                mock.patch.object(native.os, "killpg") as kill, \
+                mock.patch.object(native.time, "monotonic_ns", return_value=timeout_ns), \
+                mock.patch.object(native.time, "sleep"):
+            if expect_error:
+                with self.assertRaises(ValueError):
+                    native.child(Path("synthetic-not-executed"), {}, Path(root), 1)
+                value = None
+            else:
+                value = native.child(Path("synthetic-not-executed"), {}, Path(root), 1)
+        return value, process, wait, kill
+
+    def test_child_records_launch_and_polled_reap_not_fabricated_exact_exit(self):
+        anchors = [self.anchor(n) for n in (100, 200, 300, 400, 500)]
+        value, process, wait, kill = self.child_fixture(anchors, [(0, 0), (4321, 0)])
+        self.assertEqual(value["pid"], 4321)
+        self.assertEqual(value["timing"]["launch_before"], anchors[0])
+        self.assertEqual(value["timing"]["launch_returned"], anchors[1])
+        self.assertEqual(value["timing"]["last_nonterminal_wait_before"], anchors[2])
+        self.assertEqual(value["timing"]["terminal_wait_before"], anchors[3])
+        self.assertEqual(value["timing"]["terminal_wait_after"], anchors[4])
+        self.assertEqual(value["wall_ms"], 402 / 1e6)
+        self.assertEqual(value["cpu_ms"], 3)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(wait.call_count, 2)
+        kill.assert_not_called()
+
+    def test_immediate_reap_has_no_invented_prior_running_observation(self):
+        value, _, _, _ = self.child_fixture([self.anchor(n) for n in (100, 200, 300, 400)], [(4321, 0)])
+        self.assertIsNone(value["timing"]["last_nonterminal_wait_before"])
+
+    def test_timeout_still_kills_and_reaps_only_owned_child(self):
+        _, process, wait, kill = self.child_fixture([self.anchor(n) for n in (100, 200, 300)],
+                                                   [(0, 0), (4321, 9)], timeout_ns=2_000_000_000,
+                                                   expect_error=True)
+        kill.assert_called_once_with(4321, native.signal.SIGKILL)
+        self.assertEqual(wait.call_count, 2)
+        self.assertEqual(process.returncode, -9)
+
+    def test_clock_failure_after_launch_does_not_leak_child(self):
+        _, _, _, kill = self.child_fixture([self.anchor(100), ValueError("synthetic clock failure")],
+                                           [(4321, 9)], expect_error=True)
+        kill.assert_called_once_with(4321, native.signal.SIGKILL)
+
+    def test_clock_failure_after_reap_never_signals_a_recycled_pid(self):
+        _, process, wait, kill = self.child_fixture(
+            [self.anchor(n) for n in (100, 200, 300)] + [ValueError("synthetic clock failure")],
+            [(4321, 0)], expect_error=True)
+        self.assertEqual(process.returncode, 0)
+        wait.assert_called_once()
+        kill.assert_not_called()
+
+    def test_missing_or_unsafe_run_id_rejected_before_readback(self):
+        for run_id in (None, False, 1, "", "../foreign", "x" * 65):
+            with mock.patch.object(native.socket, "gethostname", return_value="test"), \
+                    mock.patch.object(native, "boot_id") as read:
+                with self.assertRaises(ValueError):
+                    native.compare({"runtime_target_class": "LAB", "expected_hostname": "test",
+                                    **({"run_id": run_id} if run_id is not None else {})})
+                read.assert_not_called()
+
+    def test_comparison_binds_run_legs_and_unknown_host_clock_without_execution(self):
+        manifest = b"synthetic installed manifest"
+        config = {"runtime_target_class": "SINGLE_NODE", "expected_hostname": "synthetic",
+                  "run_id": "synthetic-window", "root": "/work/tmp/project-sentinel/synthetic-not-read",
+                  "manifest_sha256": hashlib.sha256(manifest).hexdigest()}
+        for name in ("baseline", "candidate", "image", "metadata"):
+            config[name] = {"file": name, "sha256": "a" * 64}
+        original_read = Path.read_bytes
+        def read(path):
+            return manifest if str(path) == "/opt/sentinel/release-manifest.json" else original_read(path)
+        counter = {"monotonic_ns": 150, "collection_timing":
+                   {"before": self.anchor(100), "after": self.anchor(900)}}
+        leg = {"passes": [{"elapsed_ms": 1}, {"elapsed_ms": 2}, {"elapsed_ms": 3}],
+               "timing": {"launch_before": self.anchor(200), "terminal_wait_after": self.anchor(800)}}
+        with mock.patch.object(native.socket, "gethostname", return_value="synthetic"), \
+                mock.patch.object(native, "boot_id", return_value="00000000-0000-0000-0000-000000000001"), \
+                mock.patch.object(native, "service_identity", return_value={}), \
+                mock.patch.object(Path, "read_bytes", read), \
+                mock.patch.object(native, "checked_file", side_effect=lambda root, ref, limit: root / ref["file"]) as checked, \
+                mock.patch.object(native, "resource_sample", return_value=counter), \
+                mock.patch.object(native, "child", return_value=leg) as child:
+            result = native.compare(config)
+        self.assertEqual(result["run_id"], "synthetic-window")
+        self.assertEqual([r["leg_index"] for r in result["trials"]], [0, 1, 2, 3])
+        self.assertEqual([r["block_index"] for r in result["trials"]], [0, 0, 0, 0])
+        self.assertEqual(result["order"], ["baseline", "candidate", "candidate", "baseline"])
+        self.assertEqual(result["clock_alignment"]["status"], "UNVERIFIED_WITHOUT_EXTERNAL_CLOCK_BOUND")
+        self.assertIsNone(result["clock_alignment"]["cross_host_offset_bound_ns"])
+        self.assertEqual(result["clock_alignment"]["balloon_observation"], "HYPERVISOR_ENDPOINTS_ONLY_NOT_CONTINUOUS")
+        self.assertEqual(set(result["collector_sha256"]), {"remote_parallel_native.py", "remote_parallel_probe.py"})
+        self.assertGreaterEqual(len(result["sidecars"]), 2)
+        self.assertEqual(child.call_count, 4)
+        self.assertEqual(sum(call.args[1]["file"] == "metadata" for call in checked.call_args_list), 9)
+
 
 def measurement():
     return {"kind": "release_benchmark", "release_stable": True, "manifest_sha256": "a" * 64,
