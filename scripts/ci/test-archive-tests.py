@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -67,6 +68,38 @@ class ArchiveTests(unittest.TestCase):
         with patch.object(archive.subprocess, "check_output", return_value="cargo-nextest 0.9.14\n"):
             with self.assertRaisesRegex(archive.ArchiveError, "version"):
                 archive.nextest("cargo-nextest")
+
+    def test_extract_creates_nextest_destination_before_invocation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            fixture = root / "Cargo.toml"
+            fixture.write_text("[workspace]\n")
+            with tarfile.open(bundle / "sources.tar.gz", "w:gz") as tar:
+                tar.add(fixture, arcname="Cargo.toml")
+            archive.write(bundle / "manifest.json", {"synthetic": True})
+            manifest = {"sources": [{"path": "Cargo.toml", "sha256": archive.digest(fixture)}]}
+            destination = root / "extracted"
+
+            def list_archive(command, **kwargs):
+                build = Path(command[command.index("--extract-to") + 1])
+                self.assertEqual(build, destination / "build")
+                self.assertTrue(build.is_dir(), "nextest requires an existing extraction destination")
+                self.assertTrue((destination / "source/Cargo.toml").is_file())
+                (build / "target/ci").mkdir(parents=True)
+                (build / "target/ci/breakout-helper").write_bytes(b"synthetic helper")
+                return json.dumps(listing(["synthetic_test"]))
+
+            args = type("Args", (), {"bundle": str(bundle), "destination": str(destination), "nextest": "synthetic-tool"})
+            with patch.object(archive, "check_bundle", return_value=manifest), \
+                    patch.object(archive, "nextest", return_value=["synthetic-tool", "nextest"]), \
+                    patch.object(archive.subprocess, "check_output", side_effect=list_archive):
+                archive.extract(args)
+            self.assertTrue((destination / "source/target").samefile(destination / "build/target"))
+            self.assertTrue((destination / "build/target/debug").samefile(destination / "build/target/ci"))
+            self.assertEqual(archive.load(destination / "extracted.json")["test_inventory_digest"],
+                             archive.object_digest(archive.test_rows(listing(["synthetic_test"]))))
 
     def test_junit_failures_and_skips_cannot_pass(self):
         with tempfile.TemporaryDirectory() as temporary:
