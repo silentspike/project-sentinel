@@ -1,0 +1,15 @@
+nextest-version = { required = "0.9.145" }
+
+[profile.ci]
+retries = 0
+test-threads = 2
+fail-fast = false
+failure-output = "immediate-final"
+success-output = "never"
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "sentinel-archive"
+store-success-output = false
+store-failure-output = true
