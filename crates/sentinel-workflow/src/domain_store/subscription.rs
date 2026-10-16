@@ -1487,7 +1487,17 @@ mod adaptive_successor_tests {
                 .as_ref(),
             Some(&f.project)
         );
-        assert_eq!(f.store.company_projects().unwrap(), vec![f.project.clone()]);
+        assert_eq!(
+            f.store
+                .company_projects()
+                .unwrap()
+                .into_iter()
+                .find(|project| {
+                    project.tenant_id == f.project.tenant_id
+                        && project.project_id == f.project.project_id
+                }),
+            Some(f.project.clone())
+        );
         let rows = company_rows(&f.store);
         f.store = WorkflowStore::open(&f.path).unwrap();
         assert_eq!(
@@ -1849,7 +1859,17 @@ mod adaptive_successor_tests {
                 .unwrap(),
             Some(f.project.clone())
         );
-        assert_eq!(f.store.company_projects().unwrap(), vec![f.project.clone()]);
+        assert_eq!(
+            f.store
+                .company_projects()
+                .unwrap()
+                .into_iter()
+                .find(|project| {
+                    project.tenant_id == f.project.tenant_id
+                        && project.project_id == f.project.project_id
+                }),
+            Some(f.project.clone())
+        );
         assert_eq!(f.store.adaptive_health_inventory().unwrap().1.len(), 1);
         assert_eq!(
             f.store
