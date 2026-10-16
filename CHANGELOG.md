@@ -1,5 +1,17 @@
 # Changelog
 
+- Bind mixed ignored-test applicability to independently frozen exact IDs,
+  reasons and original partitions. Preserve schema-1 receipts and distinguish
+  unexecuted tests from passing assertions throughout archive and signed
+  candidate verification. Document three exact dependency-version exceptions
+  required by the security-fixed runtime graph without relaxing advisory or
+  duplicate-version policy (#856).
+
+- Require a successful, nonempty and exact loopback result in sandbox network
+  acceptance. Recognize Linux ENOENT and ESRCH only when observing disappearance
+  through an already pinned process directory; preserve process identity,
+  reaping deadlines and failures for all other errors (#856).
+
 - Update the WASM engine and WASI integration to 49.0.3. Resolve native and
   component filesystem operations relative to pinned directory descriptors;
   reject escaping symlinks, substituted file grants, hardlinks and non-regular
