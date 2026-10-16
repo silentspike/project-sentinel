@@ -234,6 +234,7 @@ fn fixture() -> Fixture {
         }
     );
     let context = AdaptiveLeadershipReviewContextV1 {
+        presentation_version: None,
         source_project: project.clone(),
         source_session: blocked.clone(),
         tool_catalog: serde_json::json!({"tools": [{"name": "file.inspect"}]}),

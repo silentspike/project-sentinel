@@ -306,7 +306,7 @@ fn funded_retry_no_io_denies_usage_after_completion_row_cleanup() {
     assert!(api.validate_funded_recovery_no_io(&source, &guard).is_err());
 }
 
-fn live_fixture() -> (
+pub(crate) fn live_fixture() -> (
     tempfile::TempDir,
     WorkflowApi,
     AdaptiveFundedReviewRecoveryVerificationSourceV1,
@@ -1227,7 +1227,7 @@ fn funded_retry_source_metadata_rechecks_changed_assignment_and_corrupt_head() {
     }
 }
 
-fn issue_retry(
+pub(crate) fn issue_retry(
     api: &WorkflowApi,
     source: &AdaptiveFundedReviewRecoveryVerificationSourceV1,
 ) -> AdaptiveFundedReviewRecoveryRequestV1 {
