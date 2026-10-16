@@ -168,6 +168,15 @@ accepted matched comparison. A diagnostic win does not prove that reconciliation
 response adoption or full-product latency improved. Use passive post-rollout
 phase observations to verify that the measured domain is the actual bottleneck.
 
+The phase parser also recognizes the product's existing request-bound
+`adaptive_adoption_read` and `adaptive_model_commit` completion stages, retaining
+their actual request ID and success/failure. These can describe adoption reads
+and model-journal commit only after joining that exact request to protected
+original-task metadata. An absent request ID remains process-only evidence.
+The commit stage is not provider latency, complete customer delivery, or the
+entire historical response-persistence workload. Context/funding markers without
+request identity remain unattributed, and missing provider phases stay unmeasured.
+
 ## Shared Product Pilot Bundle
 
 The product owner supplies a protected, read-only exporter. There is no generic
