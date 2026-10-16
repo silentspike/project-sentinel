@@ -1486,10 +1486,14 @@ impl WorkflowApi {
         if session.as_ref().is_some_and(|session| {
             session.continuation.is_some()
                 && session.active_provider_allowance_id() != binding.reservation_id
+                && !matches!(session.cursor, AdaptiveCursorV1::CompletionProposed { .. })
         }) {
             return Err("adaptive continuation allowance changed");
         }
-        Ok(session.is_some_and(|session| session.continuation.is_some()))
+        Ok(session.is_some_and(|session| {
+            session.continuation.is_some()
+                && session.active_provider_allowance_id() == binding.reservation_id
+        }))
     }
 
     #[cfg(test)]
@@ -1538,6 +1542,13 @@ impl WorkflowApi {
         let Some(session) = session else {
             return Ok(Some((2, 0)));
         };
+        // Rank a fresh correction without mutating the completed predecessor.
+        // Session admission still authenticates its exact persisted correction edge.
+        if session.active_provider_allowance_id() != binding.reservation_id
+            && matches!(session.cursor, AdaptiveCursorV1::CompletionProposed { .. })
+        {
+            return Ok(Some((2, 0)));
+        }
         if session.continuation.is_some()
             && session.active_provider_allowance_id() != binding.reservation_id
         {

@@ -707,11 +707,14 @@ fn fund_and_continue(f: &mut FamilyFixture) {
     let call = f.api.leadership_review_for_agent(leader).unwrap().unwrap();
     let authority = f.api.authority.as_ref().unwrap();
     let (profile, digest) = authority.profile_for_binding(&f.session.grant.authority.profile_id).unwrap();
-    let context = with_private_observation_store_for_test(
+    let (context, id, digest) = with_private_observation_store_for_test(
         Arc::clone(&f.tools), profile.clone(), digest.into(),
-        || f.api.prepare_leadership_review(&LeadershipAuthority::from_call(&call)),
-    ).unwrap();
-    let (id, digest) = claim_review(&f.api, &context);
+        || {
+            let context = f.api.prepare_leadership_review(&LeadershipAuthority::from_call(&call)).unwrap();
+            let (id, digest) = claim_review(&f.api, &context);
+            (context, id, digest)
+        },
+    );
     let completion = ModelExecutionCompletion {
         context: ModelExecutionContext::AdaptiveLeadershipReview(Box::new(context.clone())),
         content: serde_json::json!({"schema_version":5,"decision":{
@@ -776,6 +779,12 @@ fn negative_qa_correction(funded: bool) {
     assert_eq!(restarted.reserved_cost_micros, blocked.reserved_cost_micros);
     assert_eq!(restarted.committed_cost_micros, blocked.committed_cost_micros);
     assert_eq!(restarted.work_items[&next.grant.work_item_id].state, CompanyWorkStateV1::Assigned);
+    let queue_binding = select_provider_usage_binding(
+        std::slice::from_ref(&restarted), next.grant.agent_id, Some(&next.allowance_id),
+    ).unwrap().unwrap();
+    assert_eq!(f.api.adaptive_subscription_queue_order(&queue_binding).unwrap(), Some((2, 0)));
+    assert!(!f.api.binding_has_continued_adaptive_session(&queue_binding).unwrap());
+    assert_eq!(f.api.store.adaptive_session_for_authority(&original.grant.authority).unwrap().unwrap(), original);
     let binding = f.api.adaptive_provider_authority_for_claim(next.grant.agent_id).unwrap().unwrap();
     assert_ne!(binding.grant.session_id, original.grant.session_id);
     f.session = f.api.store.adaptive_session(binding.grant.session_id, &binding.grant.authority).unwrap().unwrap();
