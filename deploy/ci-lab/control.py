@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from copy import deepcopy
 import fcntl
 import ipaddress
 import json
@@ -18,6 +19,7 @@ import uuid
 from typing import Any
 
 MIB = 1024 * 1024
+BOOT_MEMORY_MIB = 8192
 OWNER = "sentinel-ci-v1"
 
 
@@ -270,11 +272,13 @@ class Lab:
         for vmid, current in activity.items():
             key = str(vmid)
             requested = self.state.get("balloon_requests", {}).get(key, 8192)
+            run_record = self.state.get("runs", {}).get(key, {})
+            startup = run_record.get("startup_memory_mib", BOOT_MEMORY_MIB if current["promise"] else 0)
             if current["status"] == "stopped":
                 # An accepted effect can resume after its cluster hint vanished.
                 if current["promise"] and vmid != starting_vmid:
                     active += 1
-                    headroom += requested
+                    headroom += max(requested, startup)
                 continue
             active += 1
             status = current["status_data"]
@@ -287,19 +291,27 @@ class Lab:
                 measured = process_memory(status.get("pid"))
             except (OSError, RuntimeError, ValueError, IndexError) as error:
                 raise CapacityUnavailable("owned QEMU process sample unavailable") from error
-            resident = min(resident, measured["rss_bytes"])
+            pve_resident = resident
+            resident = min(pve_resident, measured["rss_bytes"])
             target = self.state.get("balloon_requests", {}).get(key, 0) * MIB
-            committed = max(actual, status.get("balloon_min") or 0, target)
+            committed = max(actual, status.get("balloon_min") or 0, target,
+                            startup * MIB if current["phase"] == "starting" else 0)
             outstanding = (max(0, committed - resident) + MIB - 1) // MIB
             headroom += outstanding
-            balloons.append({"vmid": vmid, "actual_mib": actual // MIB, "owned": True,
+            balloons.append({"vmid": vmid, "actual_mib": status["balloon"] // MIB if status.get("balloon") is not None else None,
+                             "commitment_basis": "reported-balloon" if status.get("balloon") is not None else "maxmem-fallback",
+                             "pve_resident_bytes": pve_resident, "process": measured,
+                             "requested_mib": target // MIB, "startup_commitment_mib": startup,
+                             "owned": True,
                              "potential_basis": "current-owned-target", "committed_mib": committed // MIB,
                              "resident_mib": resident // MIB, "outstanding_mib": outstanding,
                              "max_mib": status.get("maxmem", 8192 * MIB) // MIB})
         return {"active": active, "outstanding_commitments_mib": headroom, "balloons": balloons}
 
     def resources(self, target_mib: int, starting_vmid: int | None = None,
-                  purpose: str = "measurement") -> dict:
+                  purpose: str = "measurement", cold_start: bool = False) -> dict:
+        if not 2048 <= target_mib <= BOOT_MEMORY_MIB:
+            raise ValueError("invalid memory request")
         guests = api("/cluster/resources")
         sample = self.capacity_sample()
         safety = self.capacity_safety(sample, purpose=purpose)
@@ -322,13 +334,17 @@ class Lab:
                              "potential_basis": "cluster-maxmem-not-current-target",
                              "committed_mib": actual // MIB, "resident_mib": resident // MIB,
                              "outstanding_mib": outstanding, "max_mib": actual // MIB})
-        decision = admission(min(sample["available_mib"], available_mib()), own["active"], target_mib,
+        # QEMU exposes the full launch RAM before the guest balloon driver converges.
+        launch_mib = BOOT_MEMORY_MIB if cold_start else target_mib
+        decision = admission(min(sample["available_mib"], available_mib()), own["active"], launch_mib,
                              margin + own["outstanding_commitments_mib"], self.config)
         decision["allowed"] = decision["allowed"] and not safety["reasons"]
         decision["required_available_mib"] = self.config["reserve_mib"] + 256
         decision["allowed"] = (decision["allowed"]
                                and decision["projected_available_mib"] >= decision["required_available_mib"])
-        return {**decision, "growth_margin_mib": margin,
+        return {**decision, "requested_target_mib": target_mib, "cold_start": cold_start,
+                "startup_commitment_mib": launch_mib if cold_start else 0,
+                "growth_margin_mib": margin,
                 "outstanding_commitments_mib": own["outstanding_commitments_mib"],
                 "external_potential_mib": external, "external_risk": "uncontrolled foreign bursts are not reserved or guaranteed",
                 "capacity_safety": safety, "capacity_sample": sample, "purpose": purpose, "balloons": balloons}
@@ -445,25 +461,26 @@ class Lab:
         if config.get("template"):
             raise RuntimeError("template cannot be started")
         self.fence_starting(vmid)
-        decision = self.resources(memory_mib, vmid, self.lease_purpose(vmid))
+        decision = self.resources(memory_mib, vmid, self.lease_purpose(vmid), cold_start=True)
         if not decision["allowed"]:
             raise CapacityUnavailable("capacity unavailable: " + json.dumps(decision))
         if not self.config.get("network_check"):
             raise RuntimeError("live network policy check is required before start")
         run(*self.config["network_check"])
         address_inventory(self.config, self.config["addresses"][str(vmid)], vmid)
-        decision = self.resources(memory_mib, vmid, self.lease_purpose(vmid))
+        decision = self.resources(memory_mib, vmid, self.lease_purpose(vmid), cold_start=True)
         if not decision["allowed"]:
             raise CapacityUnavailable("capacity changed during network preflight: " + json.dumps(decision))
         self.state.setdefault("runs", {})[str(vmid)] = {
-            "holder": holder, "generation": lease["generation"], "vmgenid": config.get("vmgenid"), "phase": "starting"}
+            "holder": holder, "generation": lease["generation"], "vmgenid": config.get("vmgenid"),
+            "phase": "starting", "startup_memory_mib": BOOT_MEMORY_MIB}
         self.state.setdefault("balloon_requests", {})[str(vmid)] = memory_mib
         self.state.setdefault("capacity_baseline", decision["capacity_sample"])
         self.state["capacity_sample"] = decision["capacity_sample"]
         self.save()
         # Proxmox sends this explicit balloon target before resuming QEMU.
         # Disable pvestatd automatic growth; later increases require admission.
-        run("qm", "set", str(vmid), "--memory", "8192", "--balloon", str(memory_mib), "--shares", "0")
+        run("qm", "set", str(vmid), "--memory", str(BOOT_MEMORY_MIB), "--balloon", str(memory_mib), "--shares", "0")
         run("qm", "start", str(vmid))
         self.state["runs"][str(vmid)]["phase"] = "running"
         self.state["last_used"][str(vmid)] = time.time()
@@ -481,14 +498,16 @@ class Lab:
         current_target = max(int(actual) // MIB, int(status.get("balloon_min") or 0) // MIB,
                              self.state.get("balloon_requests", {}).get(str(vmid), 0))
         delta = max(0, memory_mib - current_target)
+        actual_growth = max(0, memory_mib - int(actual) // MIB)
         # resources() validates whole start requests; resize admits only growth.
         decision = self.resources(2048, purpose=self.lease_purpose(vmid))
-        decision.update(target_mib=memory_mib, growth_request_mib=delta)
+        decision.update(target_mib=memory_mib, growth_request_mib=delta, actual_growth_mib=actual_growth)
         decision["projected_available_mib"] = (decision["available_mib"] - delta
                                                - decision["reserved_growth_mib"])
         decision["allowed"] = (decision["projected_available_mib"] >= self.config["reserve_mib"] + 256
-                               and not decision.get("capacity_safety", {}).get("reasons"))
-        if delta and not decision["allowed"]:
+                               and not decision.get("capacity_safety", {}).get("reasons")
+                               and decision.get("active", 0) <= self.config["max_active"])
+        if (delta or actual_growth) and not decision["allowed"]:
             raise CapacityUnavailable("balloon growth capacity unavailable: " + json.dumps(decision))
         if decision["allowed"]:
             self.state["capacity_sample"] = decision["capacity_sample"]
@@ -559,7 +578,8 @@ class Lab:
                     results[key] = self.start(vmid, request["holder"], request["memory_mib"])
                     request["state"] = "started"
                     continue
-                decision = self.resources(request["memory_mib"], purpose=request.get("purpose", "measurement"))
+                decision = self.resources(request["memory_mib"], purpose=request.get("purpose", "measurement"),
+                                          cold_start=True)
                 if not decision["allowed"]:
                     request["last_wait"] = decision
                     continue
@@ -796,7 +816,9 @@ class Lab:
                 if not invalidated:
                     self.state.setdefault("invalidated_leases", []).append({
                         "vmid": vmid, "time": time.time(), "reasons": reasons,
-                        "available_mib": available_mib(), "lease": dict(lease) if lease else None})
+                        "available_mib": available_mib(), "lease": dict(lease) if lease else None,
+                        "capacity_evidence": deepcopy({"sample": sample, "retention": retention,
+                                                       "owned_activity": activity})})
                 self.save()
                 try:
                     self.stop(vmid)
@@ -873,7 +895,7 @@ def main():
         elif args.action == "telemetry":
             result = lab.telemetry()
         elif args.action == "admit":
-            result = lab.resources(args.memory_mib, purpose=args.purpose or "measurement")
+            result = lab.resources(args.memory_mib, purpose=args.purpose or "measurement", cold_start=True)
         elif args.action == "lease":
             result = lab.lease(args.vmid, args.holder, args.seconds, args.purpose)
         elif args.action == "start":

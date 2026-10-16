@@ -3,9 +3,11 @@
 import importlib.util
 import copy
 import json
+import os
 from pathlib import Path
 import socket
 import struct
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,6 +18,60 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location("control", Path(__file__).with_name("control.py"))
 c = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(c)
+
+LOCAL_SCRATCH = Path("/work/tmp/project-sentinel")
+
+
+def test_scratch_root():
+    base = Path(os.environ.get("RUNNER_TEMP") or os.environ.get("TMPDIR") or LOCAL_SCRATCH)
+    if not base.is_absolute():
+        raise ValueError("test scratch must be absolute")
+    root = base / "ci-lab-python-tests"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = root.lstat()
+    if (root.resolve() != root or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+        raise RuntimeError("test scratch must be a private owned directory")
+    return root
+
+
+class ScratchTests(unittest.TestCase):
+    def test_hosted_scratch_does_not_require_local_workspace_parent(self):
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as directory:
+            root = Path(directory)
+            missing = root / "missing-workspace"
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(root / "runner"), "TMPDIR": str(root / "tmp")}), \
+                    patch.object(sys.modules[__name__], "LOCAL_SCRATCH", missing):
+                parent = test_scratch_root()
+                with tempfile.TemporaryDirectory(dir=parent) as fixture:
+                    self.assertEqual(Path(fixture).parent, root / "runner/ci-lab-python-tests")
+                self.assertFalse(missing.exists())
+                self.assertFalse((root / "tmp").exists())
+
+    def test_tmpdir_and_local_defaults_never_use_implicit_system_tmp(self):
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as directory:
+            root = Path(directory)
+            with patch.dict(os.environ, {}, clear=True), patch.object(sys.modules[__name__], "LOCAL_SCRATCH", root):
+                self.assertEqual(test_scratch_root(), root / "ci-lab-python-tests")
+                with patch.dict(os.environ, {"TMPDIR": str(root / "tmpdir")}):
+                    self.assertEqual(test_scratch_root(), root / "tmpdir/ci-lab-python-tests")
+
+    def test_scratch_rejects_symlinks_shared_permissions_and_relative_paths(self):
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as directory:
+            base = Path(directory)
+            shared = base / "ci-lab-python-tests"
+            shared.mkdir(mode=0o755)
+            shared.chmod(0o755)
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(base)}):
+                with self.assertRaises(RuntimeError):
+                    test_scratch_root()
+                shared.rmdir()
+                shared.symlink_to(base, target_is_directory=True)
+                with self.assertRaises(RuntimeError):
+                    test_scratch_root()
+            with patch.dict(os.environ, {"RUNNER_TEMP": "relative"}):
+                with self.assertRaises(ValueError):
+                    test_scratch_root()
 
 
 def config():
@@ -99,7 +155,7 @@ class ProcessTelemetryTests(unittest.TestCase):
 
 class AddressInventoryTests(unittest.TestCase):
     def test_pve_comment_owner_uses_structured_exact_reservation(self):
-        with tempfile.TemporaryDirectory(dir="/work/tmp/project-sentinel") as directory:
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as directory:
             root = Path(directory)
             path = root / "etc/pve/nodes/lab-host/qemu-server/8601.conf"
             path.parent.mkdir(parents=True)
@@ -120,7 +176,7 @@ class AddressInventoryTests(unittest.TestCase):
 
     def test_same_basename_other_node_and_other_reservations_still_conflict(self):
         for relative in ("etc/pve/nodes/other-node/qemu-server/8601.conf", "etc/network/other-reservation"):
-            with self.subTest(relative=relative), tempfile.TemporaryDirectory(dir="/work/tmp/project-sentinel") as directory:
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory(dir=test_scratch_root()) as directory:
                 root = Path(directory)
                 path = root / relative
                 path.parent.mkdir(parents=True)
@@ -136,7 +192,7 @@ class AddressInventoryTests(unittest.TestCase):
 
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(dir="/work/tmp/project-sentinel")
+        self.directory = tempfile.TemporaryDirectory(dir=test_scratch_root())
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "state.json"
         self.lab = c.Lab(config(), self.path)
@@ -295,6 +351,99 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result["projected_available_mib"], 3674)
         self.assertFalse(result["allowed"])
 
+    def test_cold_admission_reserves_launch_ram_not_requested_balloon(self):
+        with patch.object(c, "api", return_value=[]), patch.object(c, "available_mib", return_value=13499):
+            steady = self.lab.resources(2048, purpose="functional")
+            cold = self.lab.resources(2048, purpose="functional", cold_start=True)
+        self.assertTrue(steady["allowed"])
+        self.assertFalse(cold["allowed"])
+        self.assertEqual(cold["requested_target_mib"], 2048)
+        self.assertEqual(cold["target_mib"], 8192)
+        self.assertEqual(cold["projected_available_mib"], 13499 - 8192 - 1536)
+        for invalid in (0, 2047, 8193):
+            with self.assertRaises(ValueError):
+                self.lab.resources(invalid, cold_start=True)
+
+    def test_cold_exact_boundary_preserves_reaction_and_future_allowance(self):
+        for available, allowed in ((16128, True), (16127, False)):
+            with self.subTest(available=available), patch.object(c, "api", return_value=[]), \
+                    patch.object(c, "available_mib", return_value=available):
+                result = self.lab.resources(2048, purpose="functional", cold_start=True)
+            self.assertEqual(result["allowed"], allowed)
+            self.assertEqual(result["required_available_mib"], 6400)
+            self.assertEqual(result["growth_margin_mib"], 1536)
+
+    def test_denied_cold_start_cannot_run_network_or_vm_effects(self):
+        self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "gen",
+                                                 "purpose": "functional", "expires": 9999999999}
+        with patch.object(self.lab, "status", return_value={"status": "stopped"}), \
+                patch.object(self.lab, "owned", return_value={}), patch.object(c, "api", return_value=[]), \
+                patch.object(c, "available_mib", return_value=13499), patch.object(c, "run") as effect:
+            with self.assertRaises(c.CapacityUnavailable):
+                self.lab.start(8601, "job", 2048)
+        effect.assert_not_called()
+        self.assertNotIn("runs", self.lab.state)
+
+    def test_boot_residency_is_credited_once_not_subtracted_twice(self):
+        self.lab.state["balloon_requests"] = {"8601": 2048}
+        for resident in (590, 2000):
+            with self.subTest(resident=resident), \
+                    patch.object(c, "process_memory", return_value={"rss_bytes": resident * c.MIB}):
+                own = self.lab.owned_commitments(self.activity(actual=8192, resident=resident))
+            available = 18000 - resident
+            self.assertEqual(available - own["outstanding_commitments_mib"] - 1536, 18000 - 8192 - 1536)
+        with patch.object(c, "process_memory", return_value={"rss_bytes": 590 * c.MIB}):
+            own = self.lab.owned_commitments(self.activity(actual=8192, resident=2000))
+        self.assertEqual(own["outstanding_commitments_mib"], 8192 - 590)
+        self.assertEqual(own["balloons"][0]["pve_resident_bytes"], 2000 * c.MIB)
+        self.assertEqual(own["balloons"][0]["process"]["rss_bytes"], 590 * c.MIB)
+
+    def test_uncertain_cold_start_reserves_launch_even_with_small_pending_target(self):
+        for phase in ("starting", "running"):
+            self.lab.state["runs"] = {"8601": {"phase": phase, "startup_memory_mib": 8192}}
+            self.lab.state["balloon_requests"] = {"8601": 2048}
+            result = self.lab.owned_commitments(self.activity(status="stopped", phase=phase))
+            self.assertEqual(result["outstanding_commitments_mib"], 8192)
+            self.assertEqual(result["active"], 1)
+        for phase in ("starting", "running"):
+            self.lab.state["runs"] = {"8601": {"phase": phase}}
+            before = copy.deepcopy(self.lab.state)
+            self.assertEqual(self.lab.owned_commitments(self.activity(status="stopped", phase=phase))[
+                "outstanding_commitments_mib"], 8192)
+            self.assertEqual(self.lab.state, before)
+
+    def test_authoritative_running_balloon_convergence_releases_only_cold_envelope(self):
+        self.lab.state["runs"] = {"8601": {"phase": "running", "startup_memory_mib": 8192}}
+        self.lab.state["balloon_requests"] = {"8601": 2048}
+        result = self.lab.owned_commitments(self.activity(actual=2048, resident=1024))
+        self.assertEqual(result["outstanding_commitments_mib"], 1024)
+        self.assertEqual(result["balloons"][0]["committed_mib"], 2048)
+        self.assertEqual(result["balloons"][0]["startup_commitment_mib"], 8192)
+        self.assertEqual(result["balloons"][0]["commitment_basis"], "reported-balloon")
+
+    def test_missing_balloon_uses_maximum_without_fabricating_actual_measurement(self):
+        activity = self.activity()
+        activity[8601]["status_data"].pop("balloon")
+        result = self.lab.owned_commitments(activity)
+        self.assertEqual(result["outstanding_commitments_mib"], 8192 - 1024)
+        self.assertIsNone(result["balloons"][0]["actual_mib"])
+        self.assertEqual(result["balloons"][0]["commitment_basis"], "maxmem-fallback")
+
+    def test_invalidating_capacity_evidence_survives_shutdown_failure(self):
+        self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "gen", "purpose": "functional"}
+        activity = self.activity(actual=8192, resident=1024)
+        with patch.object(self.lab, "owned_activity", return_value=activity), \
+                patch.object(c, "available_mib", return_value=12646), patch.object(self.lab, "owned"), \
+                patch.object(self.lab, "stop", side_effect=subprocess.CalledProcessError(255, ["qm", "shutdown"])):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.lab.guard()
+        activity[8601]["status"] = "stopped"
+        evidence = json.loads(self.path.read_text())["invalidated_leases"][0]["capacity_evidence"]
+        self.assertEqual(evidence["owned_activity"]["8601"]["status"], "running")
+        self.assertEqual(evidence["retention"]["outstanding_commitments_mib"], 7168)
+        self.assertEqual(evidence["retention"]["projected_available_mib"], 12646 - 7168 - 1536)
+        self.assertEqual(evidence["sample"], self.sample)
+
     def test_missing_cluster_promised_running_guest_gets_fresh_own_peak_sample(self):
         self.lab.state["runs"] = {"8601": {"phase": "starting"}}
         self.lab.state["balloon_requests"] = {"8601": 2048}
@@ -302,7 +451,7 @@ class LifecycleTests(unittest.TestCase):
         with patch.object(c, "api", side_effect=lambda p: [] if p == "/cluster/resources" else status) as query, \
                 patch.object(c, "process_memory", return_value={"rss_bytes": 590 * c.MIB}), \
                 patch.object(c, "available_mib", return_value=14200):
-            self.assertEqual(self.lab.resources(2048)["outstanding_commitments_mib"], 6942)
+            self.assertEqual(self.lab.resources(2048)["outstanding_commitments_mib"], 7602)
         self.assertEqual([call.args[0] for call in query.call_args_list],
                          ["/cluster/resources", "/nodes/lab-host/qemu/8601/status/current"])
 
@@ -364,7 +513,7 @@ class LifecycleTests(unittest.TestCase):
             recovered.process_deferred()
             generation = recovered.state["leases"]["8601"]["generation"]
             recovered.process_deferred()
-        resources.assert_called_once_with(2048, purpose="functional")
+        resources.assert_called_once_with(2048, purpose="functional", cold_start=True)
         start.assert_called_once_with(8601, "job", 2048)
         self.assertEqual(recovered.state["leases"]["8601"]["purpose"], "functional")
         self.assertEqual(recovered.state["leases"]["8601"]["generation"], generation)
@@ -390,7 +539,7 @@ class LifecycleTests(unittest.TestCase):
                 patch.object(self.lab, "start", return_value={"allowed": True}) as start:
             self.lab.process_deferred()
         start.assert_called_once_with(8601, "job", 2048)
-        resources.assert_called_once_with(2048, purpose="measurement")
+        resources.assert_called_once_with(2048, purpose="measurement", cold_start=True)
         self.assertEqual(request["state"], "started")
         self.assertNotIn("purpose", request)
         self.assertNotIn("purpose", self.lab.state["leases"]["8601"])
@@ -516,6 +665,7 @@ class LifecycleTests(unittest.TestCase):
             if args[:2] == ("qm", "start"):
                 saved = json.loads(self.path.read_text())
                 self.assertEqual(saved["runs"]["8601"]["phase"], "starting")
+                self.assertEqual(saved["runs"]["8601"]["startup_memory_mib"], 8192)
                 self.assertEqual(saved["capacity_baseline"], self.sample)
                 self.assertEqual(saved["capacity_sample"], self.sample)
                 self.assertEqual(saved["balloon_requests"]["8601"], 2048)
@@ -525,6 +675,7 @@ class LifecycleTests(unittest.TestCase):
                 patch.object(c, "address_inventory"), patch.object(c, "run", side_effect=command):
             self.lab.start(8601, "job", 2048)
         self.assertEqual(capacity.call_count, 2)
+        self.assertEqual(capacity.call_args_list, [unittest.mock.call(2048, 8601, "measurement", cold_start=True)] * 2)
         self.assertEqual(self.lab.state["runs"]["8601"]["phase"], "running")
 
     def test_capacity_loss_during_dad_cannot_boot(self):
@@ -652,6 +803,66 @@ class LifecycleTests(unittest.TestCase):
                 patch.object(c, "run") as command:
             self.lab.resize(8601, "job", 2048)
             command.assert_called_once_with("qm", "set", "8601", "--balloon", "2048", "--shares", "0")
+
+    def test_resize_noop_shrink_and_one_gib_growth_keep_absolute_contract(self):
+        for before, target, delta in ((2048, 2048, 0), (4096, 2048, 0), (2048, 3072, 1024)):
+            with self.subTest(before=before, target=target), patch.object(self.lab, "require_lease"), \
+                    patch.object(self.lab, "status", return_value={"status": "running", "balloon": before * c.MIB}), \
+                    patch.object(self.lab, "resources", return_value={"available_mib": 20000,
+                        "reserved_growth_mib": 2560, "capacity_sample": self.sample, "active": 3}) as capacity, \
+                    patch.object(c, "run") as effect:
+                self.lab.state.pop("balloon_requests", None)
+                result = self.lab.resize(8601, "job", target)
+            capacity.assert_called_once_with(2048, purpose="measurement")
+            self.assertEqual(result["growth_request_mib"], delta)
+            self.assertEqual(result["projected_available_mib"], 20000 - delta - 2560)
+            self.assertTrue(result["allowed"])
+            effect.assert_called_once_with("qm", "set", "8601", "--balloon", str(target), "--shares", "0")
+
+    def test_resize_growth_honors_retention_psi_and_excess_active_without_blocking_shrink(self):
+        for decision in ({"available_mib": 9983, "reserved_growth_mib": 2560},
+                         {"available_mib": 30000, "reserved_growth_mib": 2560, "active": 4},
+                         {"available_mib": 30000, "reserved_growth_mib": 2560,
+                          "capacity_safety": {"reasons": ["host-memory-psi"]}}):
+            with self.subTest(decision=decision), patch.object(self.lab, "require_lease"), \
+                    patch.object(self.lab, "status", return_value={"status": "running", "balloon": 2048 * c.MIB}), \
+                    patch.object(self.lab, "resources", return_value={"capacity_sample": self.sample, **decision}), \
+                    patch.object(c, "run") as effect:
+                with self.assertRaises(c.CapacityUnavailable):
+                    self.lab.resize(8601, "job", 3072)
+                effect.assert_not_called()
+                self.lab.resize(8601, "job", 2048)
+                effect.assert_called_once()
+
+    def test_resize_growth_exact_reaction_boundary(self):
+        for available, allowed in ((9984, True), (9983, False)):
+            with self.subTest(available=available), patch.object(self.lab, "require_lease"), \
+                    patch.object(self.lab, "status", return_value={"status": "running", "balloon": 2048 * c.MIB}), \
+                    patch.object(self.lab, "resources", return_value={"available_mib": available,
+                        "reserved_growth_mib": 2560, "capacity_sample": self.sample}), patch.object(c, "run") as effect:
+                self.lab.state.pop("balloon_requests", None)
+                if allowed:
+                    self.assertTrue(self.lab.resize(8601, "job", 3072)["allowed"])
+                else:
+                    with self.assertRaises(c.CapacityUnavailable):
+                        self.lab.resize(8601, "job", 3072)
+                    effect.assert_not_called()
+
+    def test_pending_balloon_growth_retry_cannot_bypass_hard_guards(self):
+        self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "gen"}
+        self.lab.state["balloon_requests"] = {"8601": 4096}
+        before = copy.deepcopy(self.lab.state)
+        for denied in ({"available_mib": 7000, "reserved_growth_mib": 3584},
+                       {"available_mib": 30000, "reserved_growth_mib": 3584,
+                        "capacity_safety": {"reasons": ["host-memory-psi"]}}):
+            with self.subTest(denied=denied), patch.object(self.lab, "require_lease"), \
+                    patch.object(self.lab, "status", return_value={"status": "running", "balloon": 2048 * c.MIB,
+                                                                   "balloon_min": 4096 * c.MIB}), \
+                    patch.object(self.lab, "resources", return_value=denied), patch.object(c, "run") as effect:
+                with self.assertRaises(c.CapacityUnavailable):
+                    self.lab.resize(8601, "job", 4096)
+                effect.assert_not_called()
+                self.assertEqual(self.lab.state, before)
 
     def test_unknown_balloon_cannot_be_resized(self):
         with patch.object(self.lab, "require_lease"), patch.object(self.lab, "status", return_value={"status": "running"}), \
@@ -984,7 +1195,7 @@ class LifecycleTests(unittest.TestCase):
         self.lab.state["balloon_requests"] = {"8601": 4096}
         with patch.object(c, "api", side_effect=lambda p: [] if p == "/cluster/resources" else {"status": "stopped"}), \
                 patch.object(c, "available_mib", return_value=14000):
-            self.assertEqual(self.lab.resources(2048)["outstanding_commitments_mib"], 4096)
+            self.assertEqual(self.lab.resources(2048)["outstanding_commitments_mib"], 8192)
             self.assertEqual(self.lab.resources(4096, 8601)["outstanding_commitments_mib"], 0)
 
     def test_managed_growth_and_psi_invalidate_only_owned_work(self):
