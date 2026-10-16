@@ -37,6 +37,11 @@
   and recoverable snapshot intents. Keep sanitized guest identities separate
   from production data and preserve investigation/rollback snapshots (#856).
 
+- Revalidate functional lab headroom using fresh owned commitments while
+  retaining strict growth checks for measurement windows. Bind explicit purpose
+  to each new lease, preserve legacy strict recovery and generations, and never
+  replace missing memory observations with invented capacity (#856).
+
 - Add counted, pinned nextest archives and an optimized CI test profile with
   debug assertions and overflow checks retained. Bind source fixtures, helper
   binaries, exact test inventories, disjoint lab partitions and JUnit receipts;
