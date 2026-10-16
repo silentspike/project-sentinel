@@ -494,7 +494,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		}
 	}
 	agentRole := req.Metadata["agent_role"]
-	ph.injectPerception(&req, agentName, agentRole, providerName, snap)
+	ph.injectPerception(&req, agentName, agentRole, providerName, snap, modelWork)
 
 	// --- Step 7.5: Traffic Control — Synthesis Check ---
 	if !modelWork && ph.synthesis != nil && snap.SynthesisEnabled && !isAnthropicStreamingRequest(&req) {
@@ -1038,7 +1038,7 @@ func (ph *PipelineHandler) applyOutboundInterception(requestID, agentName, provi
 
 // buildStructuredPrompt assembles tagged system blocks for providers that support
 // structured Anthropic-style system arrays.
-func (ph *PipelineHandler) buildStructuredPrompt(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot) []SystemBlock {
+func (ph *PipelineHandler) buildStructuredPrompt(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot, modelWork bool) []SystemBlock {
 	perception := compiler.StructuredPerception{
 		CircadianText:   req.Metadata["circadian"],
 		BodyText:        req.Metadata["body"],
@@ -1069,6 +1069,9 @@ func (ph *PipelineHandler) buildStructuredPrompt(req *LLMRequest, agentName, age
 		compiled = ph.compiler.CompileStructured(ph.modelKey(providerName), agentName, agentRole, perception)
 	}
 
+	if modelWork {
+		compiled = compiler.WithResponseFormat(compiled, governedResponseFormat)
+	}
 	if nudge := snap.NarrativeNudge; nudge != "" {
 		compiled = compiler.AppendNarrativeNudge(compiled, nudge)
 		ph.logger.Debug("structured narrative nudge injected", "agent", agentName)
@@ -1089,23 +1092,27 @@ func (ph *PipelineHandler) buildStructuredPrompt(req *LLMRequest, agentName, age
 }
 
 // buildSystemPrompt assembles the legacy flat system prompt via 3-source assembly or fallback.
-func (ph *PipelineHandler) buildSystemPrompt(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot) string {
+func (ph *PipelineHandler) buildSystemPrompt(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot, modelWork bool) string {
 	perception := req.Metadata["perception"]
 	agentIDStr := req.Metadata["agent_id"]
 	agentID, parseErr := strconv.Atoi(agentIDStr)
 
 	var compiled string
+	responseFormat := ""
+	if modelWork {
+		responseFormat = governedResponseFormat
+	}
 
 	if parseErr == nil && agentID > 0 {
 		evolution := compiler.EvolutionFromMetadata(req.Metadata)
-		result, compileErr := ph.compiler.CompileFromSources(agentID, providerName, evolution, perception)
+		result, compileErr := ph.compiler.CompileFromSourcesWithResponseFormat(agentID, providerName, evolution, perception, responseFormat)
 		if compileErr != nil {
 			ph.logger.Warn("3-source assembly failed, using fallback",
 				"agent_id", agentID,
 				"error", compileErr,
 			)
 			modelKey := ph.modelKey(providerName)
-			compiled = ph.compiler.Compile(modelKey, agentName, agentRole, perception)
+			compiled = ph.compiler.CompileWithResponseFormat(modelKey, agentName, agentRole, perception, responseFormat)
 		} else {
 			if !evolution.IsEmpty() {
 				ph.logger.Info("evolution injected",
@@ -1119,7 +1126,7 @@ func (ph *PipelineHandler) buildSystemPrompt(req *LLMRequest, agentName, agentRo
 		}
 	} else if perception != "" {
 		modelKey := ph.modelKey(providerName)
-		compiled = ph.compiler.Compile(modelKey, agentName, agentRole, perception)
+		compiled = ph.compiler.CompileWithResponseFormat(modelKey, agentName, agentRole, perception, responseFormat)
 	}
 
 	// Narrative Nudge injection (#144 AC-1)
@@ -1160,7 +1167,8 @@ func isLocalLoopActive(snap control.ConfigSnapshot) bool {
 }
 
 // injectPerception assembles and prepends the system prompt when an agent name is present.
-func (ph *PipelineHandler) injectPerception(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot) {
+// modelWork is the already validated classification, never a raw metadata flag.
+func (ph *PipelineHandler) injectPerception(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot, modelWork bool) {
 	if req.Format == RequestFormatAnthropic && len(req.SystemBlocks) > 0 {
 		return
 	}
@@ -1168,12 +1176,12 @@ func (ph *PipelineHandler) injectPerception(req *LLMRequest, agentName, agentRol
 		return
 	}
 	if ph.caps != nil && ph.caps.HasCapability(providerName, capability.CapStructuredSystem) {
-		if blocks := ph.buildStructuredPrompt(req, agentName, agentRole, providerName, snap); len(blocks) > 0 {
+		if blocks := ph.buildStructuredPrompt(req, agentName, agentRole, providerName, snap, modelWork); len(blocks) > 0 {
 			req.SystemBlocks = blocks
 			return
 		}
 	}
-	if systemPrompt := ph.buildSystemPrompt(req, agentName, agentRole, providerName, snap); systemPrompt != "" {
+	if systemPrompt := ph.buildSystemPrompt(req, agentName, agentRole, providerName, snap, modelWork); systemPrompt != "" {
 		req.Messages = prependSystemMessage(req.Messages, systemPrompt)
 	}
 }
