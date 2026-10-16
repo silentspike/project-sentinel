@@ -1,5 +1,12 @@
 # Changelog
 
+- Preserve bounded private diagnostics from the latest failed command or test
+  across a later source inspection. Bind excerpts to the existing authenticated
+  observation and journal, keep legacy reserved context bytes before enrichment,
+  and use only spare working-memory capacity. Historical output never grants
+  execution authority, dictates a correction or proves a current test result
+  (#856).
+
 - Recheck leadership completion and local-adoption clocks after source proofs
   and immediately before committing durable effects; roll back expired staged
   changes without renewing audited timestamps. Start a first unsealed
