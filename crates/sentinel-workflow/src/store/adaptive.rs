@@ -1472,11 +1472,10 @@ pub(crate) fn continue_adaptive_session_in_transaction(
             WorkflowStore::require_funded_local_adoption(tx, review, adoption)?;
         }
     }
-    let stored_review: AdaptiveLeadershipReviewCallV1 = read_company_entity(
+    let stored_review = WorkflowStore::adaptive_leadership_review_row_in_snapshot(
         tx,
-        &current.tenant_id.0,
-        "adaptive_leadership_review_call",
-        &review.grant.review_id.to_string(),
+        &current.tenant_id,
+        review.grant.review_id,
         review.version,
     )?;
     if stored_review != *review
@@ -4512,6 +4511,7 @@ mod continuation_tests {
             "version": 1, "created_at_unix_ms": NOW, "updated_at_unix_ms": NOW
         })).unwrap();
         let context = AdaptiveLeadershipReviewContextV1 {
+            presentation_version: None,
             source_project: project,
             source_session: source,
             tool_catalog: serde_json::json!({"tools": ["file.inspect"]}),

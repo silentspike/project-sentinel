@@ -284,6 +284,9 @@ pub struct AdaptiveLeadershipReviewContextV1 {
     pub source_session: AdaptiveSessionV1,
     pub tool_catalog: Value,
     pub evidence_refs: Vec<String>,
+    /// Future funded presentation only; absence preserves retained context bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_version: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1036,6 +1039,17 @@ impl AdaptiveLeadershipReviewContextV1 {
     }
 
     pub fn validate(&self, grant: &AdaptiveLeadershipReviewGrantV1) -> Result<(), WorkflowError> {
+        if self.presentation_version.is_some_and(|version| {
+            version != 2
+                || !matches!(grant.schema_version, 5 | 6)
+                || grant.work_funding.is_none()
+                || !matches!(
+                    &grant.subject,
+                    Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. })
+                )
+        }) {
+            return Err(invalid());
+        }
         grant.validate_work_funding()?;
         if !matches!(
             (&grant.subject, grant.schema_version),
@@ -1292,6 +1306,9 @@ mod budget_tests {
     }
     mod work_funding_tests {
         include!("adaptive_leadership_review/work_funding_tests.rs");
+        mod presentation_tests {
+            include!("adaptive_leadership_review/presentation_tests.rs");
+        }
     }
 
     fn fixture() -> AdaptiveLeadershipReviewCallV1 {
@@ -1401,6 +1418,7 @@ mod budget_tests {
             source_session: session,
             tool_catalog: serde_json::json!({"tools": ["list_directory"]}),
             evidence_refs,
+            presentation_version: None,
         };
         let leader_authority = PrincipalAuthorityV1::derive("pm-01", 1, &[1; 32]).unwrap();
         let fingerprint =

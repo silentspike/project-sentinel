@@ -181,6 +181,15 @@ impl WorkflowStore {
         request: &AdaptiveLeadershipLocalAdoptionRequestV1,
         now_ms: u64,
     ) -> Result<(bool, AdaptiveLeadershipLocalAdoptionV1), WorkflowError> {
+        self.authorize_adaptive_leadership_local_adoption_with_clock(operator, request, || now_ms)
+    }
+
+    pub fn authorize_adaptive_leadership_local_adoption_with_clock<Clock: FnMut() -> u64>(
+        &self,
+        operator: &AuthenticatedCompanyPrincipalV1,
+        request: &AdaptiveLeadershipLocalAdoptionRequestV1,
+        mut clock: Clock,
+    ) -> Result<(bool, AdaptiveLeadershipLocalAdoptionV1), WorkflowError> {
         operator.validate()?;
         if operator.kind != CompanyPrincipalKindV1::Operator
             || !matches!(
@@ -209,7 +218,8 @@ impl WorkflowStore {
             }
             return Ok((true, prior));
         }
-        request.validate(operator, now_ms)?;
+        let admission_ms = clock();
+        request.validate(operator, admission_ms)?;
         let operation_exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM company_events WHERE tenant_id=?1 AND event_type=?2 AND operation_id=?3)",
             params![request.tenant_id.0, EVENT, request.operation_id.to_string()],
@@ -250,21 +260,7 @@ impl WorkflowStore {
         else {
             return Err(unauthorized());
         };
-        let record = AdaptiveLeadershipLocalAdoptionV1 {
-            adoption_key: key,
-            request: request.clone(),
-            issuer_principal: operator.clone(),
-            issuer_authority: PrincipalAuthorityV1 {
-                schema_version: 1,
-                principal_id: operator.principal_id.clone(),
-                principal_generation: operator.authority_generation,
-                authority_digest: operator.authority_digest.clone(),
-            },
-            issued_at_unix_ms: now_ms,
-            continuation_deadline_ms: now_ms.checked_add(*window_ms).ok_or_else(transition)?,
-        };
         if request.is_funded() {
-            record.validate_funded_against(&call)?;
             let epoch = call
                 .grant
                 .work_funding
@@ -278,8 +274,6 @@ impl WorkflowStore {
                 call.operation_id,
             )?;
             super::adaptive_work_funding::require_fresh_funding_review_source(&transaction, &call)?;
-        } else {
-            record.validate_against(legacy_epoch.as_ref().ok_or_else(not_found)?, &call)?;
         }
         let project: ProjectV1 = get_entity(
             &transaction,
@@ -298,6 +292,31 @@ impl WorkflowStore {
             return Err(transition());
         }
         call.validate_continuation_source()?;
+        // Only an unsealed receipt gets a fresh issuance clock, after the full
+        // source proof. Replays above retain their original authority and window.
+        let now_ms = clock();
+        if now_ms < admission_ms {
+            return Err(transition());
+        }
+        request.validate(operator, now_ms)?;
+        let record = AdaptiveLeadershipLocalAdoptionV1 {
+            adoption_key: key,
+            request: request.clone(),
+            issuer_principal: operator.clone(),
+            issuer_authority: PrincipalAuthorityV1 {
+                schema_version: 1,
+                principal_id: operator.principal_id.clone(),
+                principal_generation: operator.authority_generation,
+                authority_digest: operator.authority_digest.clone(),
+            },
+            issued_at_unix_ms: now_ms,
+            continuation_deadline_ms: now_ms.checked_add(*window_ms).ok_or_else(transition)?,
+        };
+        if request.is_funded() {
+            record.validate_funded_against(&call)?;
+        } else {
+            record.validate_against(legacy_epoch.as_ref().ok_or_else(not_found)?, &call)?;
+        }
         put_entity(
             &transaction,
             &request.tenant_id,
@@ -316,6 +335,18 @@ impl WorkflowStore {
             &record,
             now_ms,
         )?;
+        let commit_ms = clock();
+        if commit_ms < now_ms
+            || commit_ms >= request.expires_at_unix_ms
+            || commit_ms >= record.continuation_deadline_ms
+            || call
+                .grant
+                .work_funding
+                .as_deref()
+                .is_some_and(|epoch| commit_ms >= epoch.binding.limits.expires_at_unix_ms)
+        {
+            return Err(transition());
+        }
         transaction.commit()?;
         Ok((false, record))
     }

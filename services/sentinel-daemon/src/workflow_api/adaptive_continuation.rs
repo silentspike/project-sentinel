@@ -209,6 +209,26 @@ fn audit_envelope_matches(
     )
 }
 
+pub(super) fn recover_continuation_audit(
+    call: &AdaptiveLeadershipReviewCallV1,
+    expected_result: &CompleteAdaptiveLeadershipReviewCallV1,
+    event: &sentinel_common::EventEnvelopeV2,
+) -> Result<CompleteAdaptiveLeadershipReviewCallV1, &'static str> {
+    validate_audit(&event.payload).map_err(|_| "continuation historical audit invalid")?;
+    let recorded: ContinuationAudit = serde_json::from_slice(&event.payload)
+        .map_err(|_| "continuation historical audit invalid")?;
+    let mut comparable = expected_result.clone();
+    comparable.continuation = recorded.result.continuation.clone();
+    let expected = continuation_proposal(&recorded.call, &recorded.result)?;
+    if recorded.call != *call
+        || recorded.result != comparable
+        || !audit_envelope_matches(event, &expected)?
+    {
+        return Err("continuation historical audit binding changed");
+    }
+    Ok(recorded.result)
+}
+
 impl WorkflowApi {
     pub(super) fn append_continuation_audit(
         &self,
@@ -233,19 +253,7 @@ impl WorkflowApi {
             .event_v2_by_id(&id)
             .map_err(|_| "continuation audit read failed")?
         {
-            validate_audit(&event.payload).map_err(|_| "continuation historical audit invalid")?;
-            let recorded: ContinuationAudit = serde_json::from_slice(&event.payload)
-                .map_err(|_| "continuation historical audit invalid")?;
-            let mut comparable = proposed.clone();
-            comparable.continuation = recorded.result.continuation.clone();
-            let expected = continuation_proposal(&recorded.call, &recorded.result)?;
-            if recorded.call != *call
-                || recorded.result != comparable
-                || !audit_envelope_matches(&event, &expected)?
-            {
-                return Err("continuation historical audit binding changed");
-            }
-            return Ok(recorded.result);
+            return recover_continuation_audit(call, proposed, &event);
         }
         let proposal = continuation_proposal(call, proposed)?;
         let registry = EventSchemaRegistry::new([EventSchemaDefinition {

@@ -809,11 +809,13 @@ impl WorkflowApi {
                 .adaptive_leadership_local_adoption(&request.tenant_id, request.review_id)
             {
                 Ok(Some(_)) => {
-                    return match self.store.authorize_adaptive_leadership_local_adoption(
-                        &principal.principal,
-                        &request,
-                        now_unix_ms(),
-                    ) {
+                    return match self
+                        .store
+                        .authorize_adaptive_leadership_local_adoption_with_clock(
+                            &principal.principal,
+                            &request,
+                            now_unix_ms,
+                        ) {
                         Ok((replayed, record)) => json(
                             200,
                             &serde_json::json!({"schema_version":record.request.schema_version,
@@ -843,11 +845,13 @@ impl WorkflowApi {
                 }
                 Err(reason) => return json_error(409, "adaptive_recovery_conflict", reason, false),
             }
-            match self.store.authorize_adaptive_leadership_local_adoption(
-                &principal.principal,
-                &request,
-                now_unix_ms(),
-            ) {
+            match self
+                .store
+                .authorize_adaptive_leadership_local_adoption_with_clock(
+                    &principal.principal,
+                    &request,
+                    now_unix_ms,
+                ) {
                 Ok((replayed, record)) => json(
                     200,
                     &serde_json::json!({"schema_version":record.request.schema_version,

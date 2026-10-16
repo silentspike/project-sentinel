@@ -29,6 +29,93 @@ const ABANDONED_KIND: &str = "adaptive_leadership_abandoned_allowance";
 const EXPIRED_CONTINUATION_KIND: &str = "adaptive_leadership_expired_continuation";
 const BUDGET_LIMIT_KIND: &str = "adaptive_budget_window_limit";
 
+fn adaptive_leadership_review_row_with_observer(
+    connection: &Connection,
+    tenant: &TenantId,
+    review_id: Uuid,
+    expected_version: u64,
+    mut before_payload_copy: impl FnMut(usize),
+) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
+    let id = review_id.to_string();
+    // Share the existing authenticated shape, not a new cache or an authority proof.
+    let owner: Option<EntityShape<AdaptiveLeadershipReviewCallV1>> = validation_scope::memoize(
+        connection,
+        "entity-shape",
+        &(tenant, KIND, &id),
+        || {
+            let mut statement = connection.prepare(
+                "SELECT tenant_id,entity_kind,entity_id,version,payload,payload_digest FROM company_entities
+                 WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3",
+            )?;
+            let mut rows = statement.query(params![tenant.0, KIND, id])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let row_tenant: String = row.get(0)?;
+            let row_kind: String = row.get(1)?;
+            let row_id: String = row.get(2)?;
+            let version: i64 = row.get(3)?;
+            let payload_value = row.get_ref(4)?;
+            let rusqlite::types::ValueRef::Blob(payload) = payload_value else {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    4,
+                    "payload".into(),
+                    payload_value.data_type(),
+                )
+                .into());
+            };
+            let digest: String = row.get(5)?;
+            validation_scope::charge_bytes(connection, payload.len())?;
+            before_payload_copy(payload.len());
+            // Preserve the old continuation reader's digest/version/decode order.
+            if !constant_time_eq(
+                &bytes_digest("sentinel.workflow.company-entity-row.v1", payload)?,
+                &digest,
+            ) {
+                return Err(WorkflowError::corrupt_store());
+            }
+            let version = u64::try_from(version).map_err(|_| WorkflowError::corrupt_store())?;
+            if version != expected_version {
+                return Err(WorkflowError::new(
+                    WorkflowErrorCode::VersionConflict,
+                    false,
+                    "adaptive continuation source row changed",
+                ));
+            }
+            let value: AdaptiveLeadershipReviewCallV1 = decode(payload)?;
+            let (value_tenant, value_kind, value_id, value_version) = value.row_binding();
+            // A cold reader must establish every invariant of the shared shape slot.
+            if row_tenant != tenant.0
+                || row_kind != KIND
+                || row_id != id
+                || value_tenant != tenant
+                || value_kind != KIND
+                || value_id != id
+                || value_version != version
+                || version == 0
+            {
+                return Err(WorkflowError::corrupt_store());
+            }
+            Ok(Some(EntityShape(std::sync::Arc::new(value))))
+        },
+    )?;
+    let value = owner.ok_or_else(|| {
+        WorkflowError::new(
+            WorkflowErrorCode::NotFound,
+            false,
+            "adaptive session was not found",
+        )
+    })?;
+    if value.0.version != expected_version {
+        return Err(WorkflowError::new(
+            WorkflowErrorCode::VersionConflict,
+            false,
+            "adaptive continuation source row changed",
+        ));
+    }
+    Ok(value.0.as_ref().clone())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum AdaptiveBudgetWindowLimitCauseV1 {
@@ -943,6 +1030,47 @@ fn require_subject_time(
     Ok(())
 }
 
+fn require_completion_clock(
+    call: &AdaptiveLeadershipReviewCallV1,
+    result: &CompleteAdaptiveLeadershipReviewCallV1,
+    audit: Option<&sentinel_common::EventEnvelopeV2>,
+    now_ms: u64,
+) -> Result<(), WorkflowError> {
+    if now_ms < call.updated_at_unix_ms {
+        return Err(transition());
+    }
+    if call.grant.work_funding.as_deref().is_some_and(|epoch| {
+        now_ms < epoch.receipt.issued_at_unix_ms
+            || now_ms >= epoch.binding.limits.expires_at_unix_ms
+    }) {
+        return Err(transition());
+    }
+    if let Some(event) = audit {
+        if now_ms < u64::try_from(event.appended_at_ms).map_err(|_| transition())? {
+            return Err(transition());
+        }
+    }
+    if let Some(authorization) = &result.continuation {
+        if now_ms < authorization.issued_at_ms || now_ms >= authorization.deadline_ms {
+            return Err(transition());
+        }
+        if let Some(adoption) = authorization.local_adoption.as_deref() {
+            if now_ms < adoption.issued_at_unix_ms
+                || (audit.is_none() && now_ms >= adoption.request.expires_at_unix_ms)
+            {
+                return Err(transition());
+            }
+        }
+        // A sealed continuation can outlive review admission, never its fixed
+        // productive window or funding epoch. This check performs no SQL reads.
+        require_subject_time(call, now_ms)?;
+    } else if matches!(call.grant.schema_version, 2..=6) && now_ms >= call.grant.expires_at_unix_ms
+    {
+        return Err(transition());
+    }
+    Ok(())
+}
+
 fn commit_continuation_allowance(
     transaction: &Transaction<'_>,
     call: &AdaptiveLeadershipReviewCallV1,
@@ -1668,6 +1796,22 @@ impl AdaptiveLeadershipReviewCallV1 {
 }
 
 impl WorkflowStore {
+    /// Exact row proof only; continuation still compares the full call and authority.
+    pub(crate) fn adaptive_leadership_review_row_in_snapshot(
+        connection: &Connection,
+        tenant: &TenantId,
+        review_id: Uuid,
+        expected_version: u64,
+    ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
+        adaptive_leadership_review_row_with_observer(
+            connection,
+            tenant,
+            review_id,
+            expected_version,
+            |_| {},
+        )
+    }
+
     /// System-policy disposition only: no provider reservation or invented model decision.
     pub fn record_adaptive_budget_window_limit(
         &self,
@@ -2609,7 +2753,16 @@ impl WorkflowStore {
         result: &CompleteAdaptiveLeadershipReviewCallV1,
         now_ms: u64,
     ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
-        self.complete_adaptive_leadership_review_call_impl(leader, result, None, now_ms)
+        self.complete_adaptive_leadership_review_call_with_clock(leader, result, || now_ms)
+    }
+
+    pub fn complete_adaptive_leadership_review_call_with_clock<Clock: FnMut() -> u64>(
+        &self,
+        leader: &AuthenticatedCompanyPrincipalV1,
+        result: &CompleteAdaptiveLeadershipReviewCallV1,
+        clock: Clock,
+    ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
+        self.complete_adaptive_leadership_review_call_impl(leader, result, None, clock)
     }
 
     /// Replay using the actual authoritative envelope read by the trusted daemon from EventStore.
@@ -2622,15 +2775,32 @@ impl WorkflowStore {
         audit: &sentinel_common::EventEnvelopeV2,
         now_ms: u64,
     ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
-        self.complete_adaptive_leadership_review_call_impl(leader, result, Some(audit), now_ms)
+        self.complete_adaptive_leadership_review_call_with_local_adoption_audit_and_clock(
+            leader,
+            result,
+            audit,
+            || now_ms,
+        )
     }
 
-    fn complete_adaptive_leadership_review_call_impl(
+    pub fn complete_adaptive_leadership_review_call_with_local_adoption_audit_and_clock<
+        Clock: FnMut() -> u64,
+    >(
+        &self,
+        leader: &AuthenticatedCompanyPrincipalV1,
+        result: &CompleteAdaptiveLeadershipReviewCallV1,
+        audit: &sentinel_common::EventEnvelopeV2,
+        clock: Clock,
+    ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
+        self.complete_adaptive_leadership_review_call_impl(leader, result, Some(audit), clock)
+    }
+
+    fn complete_adaptive_leadership_review_call_impl<Clock: FnMut() -> u64>(
         &self,
         leader: &AuthenticatedCompanyPrincipalV1,
         result: &CompleteAdaptiveLeadershipReviewCallV1,
         audit: Option<&sentinel_common::EventEnvelopeV2>,
-        now_ms: u64,
+        mut clock: Clock,
     ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
         leader.validate()?;
         validate_digest(&result.request_digest)?;
@@ -2667,13 +2837,14 @@ impl WorkflowStore {
                 pending.model_response_digest = None;
                 pending.resolution_event_id = None;
                 pending.continuation = None;
-                require_local_adoption_audit(&pending, result, event, now_ms)?;
+                require_local_adoption_audit(&pending, result, event, clock())?;
             }
             if let Some(scope) = preflight.take() {
                 scope.finish()?;
             }
             return Ok(call);
         }
+        let now_ms = clock();
         if let Some(epoch) = &call.grant.work_funding {
             super::adaptive_work_funding::require_fresh_epoch_eligibility(&transaction, epoch)?;
         }
@@ -2809,6 +2980,9 @@ impl WorkflowStore {
         call.version = 3;
         call.updated_at_unix_ms = now_ms;
         store_call(&transaction, &call, "adaptive_leadership_review_completed")?;
+        // Post-write proofs can consume the remaining window. Roll back all
+        // transaction-local effects if the fresh boundary clock is no longer valid.
+        require_completion_clock(&call, result, audit, clock())?;
         transaction.commit()?;
         Ok(call)
     }
@@ -2820,6 +2994,10 @@ mod tests {
 
     mod issue856_local_context_digest_tests {
         include!("adaptive_leadership_review/issue856_local_context_digest_tests.rs");
+    }
+
+    mod continuation_row_shape_tests {
+        include!("adaptive_leadership_review/continuation_row_shape_tests.rs");
     }
 
     #[test]
@@ -3445,6 +3623,10 @@ mod tests {
 
         mod issue856_funded_local_adoption_tests {
             include!("adaptive_leadership_review/issue856_funded_local_adoption_tests.rs");
+
+            mod clock_boundary_tests {
+                include!("adaptive_leadership_review/continuation_clock_boundary_tests.rs");
+            }
         }
 
         mod completion_validation_tests {

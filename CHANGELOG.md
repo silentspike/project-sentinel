@@ -1,5 +1,18 @@
 # Changelog
 
+- Recheck leadership completion and local-adoption clocks after source proofs
+  and immediately before committing durable effects; roll back expired staged
+  changes without renewing audited timestamps. Start a first unsealed
+  continuation after exact source reads. Bind a future-only funded review
+  presentation that distinguishes prior execution, leadership review and
+  conditional continuation windows, without changing employee decisions,
+  capabilities, finite budgets or legacy context/prompt bytes (#856).
+
+- Reuse the existing authenticated review-row shape inside a single continuation
+  transaction instead of fetching and decoding the same payload again. Retain
+  exact call equality, row/version/digest binding, invalidation after writes and
+  independent authority and post-write proofs; no new cache quota is added (#856).
+
 - Count collaboration publications as pending only when no exact validated
   canonical append receipt exists. Serialize publication-producing mutations
   with ledger validation and publication; retain fail-closed unknown/error
