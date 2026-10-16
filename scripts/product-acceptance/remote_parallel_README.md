@@ -209,9 +209,13 @@ config: runtime_target_class, origin (HTTPS), ssh_target, manifest_sha256,
 ```
 
 It reads only the dashboard login key and public certificate into memory through
-SSH, checks the release pin, compares the TLS peer certificate, uses a Chromium
-SPKI-specific exception, and compares the `/api/cert-hash` API with that exact
-certificate. No global TLS bypass, credential file, storage state, trace or
+SSH, checks the release pin, and uses that certificate as the sole TLS trust
+anchor with chain, validity and hostname validation enabled. It also compares
+the exact TLS peer certificate, uses a Chromium SPKI-specific exception, and
+compares the `/api/cert-hash` API with that exact certificate. The HTTPS origin
+must match a certificate DNS/IP subject alternative name, including when using
+an SSH tunnel; a mismatch fails closed. No global TLS bypass, credential file,
+storage state, trace or
 secret output is created. Normal login and ticket POSTs are allowed; all other
 non-GET requests and cross-origin requests are blocked. No editor save, chat,
 funding, provider or workflow command is clicked.

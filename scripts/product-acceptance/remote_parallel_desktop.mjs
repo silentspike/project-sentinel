@@ -38,13 +38,13 @@ print(json.dumps(result))
     maxBuffer: 65536, stdio: ['pipe', 'pipe', 'pipe'], cwd: process.cwd() }));
 }
 
-async function verifyPeer(origin, certificate) {
+export async function verifyPeer(origin, certificate) {
   const url = new URL(origin);
   const expected = createHash('sha256').update(certificate.raw).digest('hex');
   await new Promise((resolve, reject) => {
     const socket = tls.connect({ host: url.hostname, port: Number(url.port || 443),
-      rejectUnauthorized: false }, () => {
-      // A single pinned self-signed connection, never a global TLS override.
+      ca: certificate.toString(), rejectUnauthorized: true }, () => {
+      // The SSH-read anchor retains chain, validity and hostname validation.
       const raw = socket.getPeerCertificate().raw;
       if (!raw || createHash('sha256').update(raw).digest('hex') !== expected) {
         socket.destroy(); reject(new Error('certificate pin mismatch')); return;
