@@ -517,23 +517,32 @@ pub(crate) fn authenticated_project_snapshot_shape(
         };
         std::str::from_utf8(&row.payload).map_err(|_| corrupt())?;
         let key = project_snapshot_memo_key(&row)?;
-        validation_scope::memoize(connection, "project-snapshot-authenticated-shape", &key, || {
-            let (sequence, project) = validate_project_snapshot_event_row(connection, &row, false)?;
-            let principal = company_event_principal(&row)?;
-            Ok(Some((CompanyProjectEventViewV1 {
-                sequence,
-                event_id: row.event_id.clone(),
-                tenant_id: project.tenant_id.clone(),
-                project_id: project.project_id.clone(),
-                event_type: row.event_type.clone(),
-                operation_id: Uuid::parse_str(&row.operation_id).map_err(|_| corrupt())?,
-                principal_id: row.principal_id.clone(),
-                principal_kind: parse_principal_kind(&row.principal_kind)?,
-                principal_role: parse_company_role(&row.principal_role)?,
-                created_at_unix_ms: stored_u64(row.created_at_ms)?,
-                project,
-            }, principal)))
-        })
+        validation_scope::memoize(
+            connection,
+            "project-snapshot-authenticated-shape",
+            &key,
+            || {
+                let (sequence, project) =
+                    validate_project_snapshot_event_row(connection, &row, false)?;
+                let principal = company_event_principal(&row)?;
+                Ok(Some((
+                    CompanyProjectEventViewV1 {
+                        sequence,
+                        event_id: row.event_id.clone(),
+                        tenant_id: project.tenant_id.clone(),
+                        project_id: project.project_id.clone(),
+                        event_type: row.event_type.clone(),
+                        operation_id: Uuid::parse_str(&row.operation_id).map_err(|_| corrupt())?,
+                        principal_id: row.principal_id.clone(),
+                        principal_kind: parse_principal_kind(&row.principal_kind)?,
+                        principal_role: parse_company_role(&row.principal_role)?,
+                        created_at_unix_ms: stored_u64(row.created_at_ms)?,
+                        project,
+                    },
+                    principal,
+                )))
+            },
+        )
     })
 }
 
@@ -8103,7 +8112,9 @@ mod tests {
     fn authenticated_snapshot_shape_and_full_proof_use_distinct_memo_domains() {
         let (_temp, _path, store, _principal, project) = accepted_project_fixture();
         let connection = store.connection.lock().unwrap();
-        let before: i64 = connection.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+        let before: i64 = connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
         validation_scope::with_scope(&connection, || {
             let row = project_snapshot_row(&connection, &project);
             let sequence = stored_u64(row.sequence)?;
@@ -8112,44 +8123,96 @@ mod tests {
             assert_eq!(first.1, company_event_principal(&row)?);
             assert_eq!(first.0.event_id, row.event_id);
             assert_eq!(first.0.operation_id.to_string(), row.operation_id);
-            assert_eq!(authenticated_project_snapshot_shape(&connection, sequence)?, Some(first));
-            assert_eq!(validation_scope::validations("project-snapshot-authenticated-shape"), 1);
+            assert_eq!(
+                authenticated_project_snapshot_shape(&connection, sequence)?,
+                Some(first)
+            );
+            assert_eq!(
+                validation_scope::validations("project-snapshot-authenticated-shape"),
+                1
+            );
             assert_eq!(validation_scope::validations("project-snapshot"), 0);
-            assert_eq!(validate_project_snapshot_event(&connection, &row)?, (sequence, project.clone()));
+            assert_eq!(
+                validate_project_snapshot_event(&connection, &row)?,
+                (sequence, project.clone())
+            );
             assert_eq!(validation_scope::validations("project-snapshot"), 1);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert!(authenticated_project_snapshot_shape(&connection, u64::MAX).is_err());
-        assert_eq!(connection.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0)).unwrap(), before);
+        assert_eq!(
+            connection
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
     }
 
     #[test]
     fn authenticated_snapshot_shape_rejects_changed_headers_payload_and_operation_response() {
-        for column in ["payload", "payload_digest", "event_id", "principal_id", "operation_digest", "response"] {
+        for column in [
+            "payload",
+            "payload_digest",
+            "event_id",
+            "principal_id",
+            "operation_digest",
+            "response",
+        ] {
             let (_temp, _path, store, _principal, project) = accepted_project_fixture();
             let connection = store.connection.lock().unwrap();
             let row = project_snapshot_row(&connection, &project);
             let sequence = stored_u64(row.sequence).unwrap();
-            assert!(authenticated_project_snapshot_shape(&connection, sequence).unwrap().is_some());
+            assert!(authenticated_project_snapshot_shape(&connection, sequence)
+                .unwrap()
+                .is_some());
             if column == "response" {
-                assert_eq!(connection.execute(
-                    "UPDATE company_operations SET response=X'00' WHERE operation_id=?1",
-                    [&row.operation_id],
-                ).unwrap(), 1);
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE company_operations SET response=X'00' WHERE operation_id=?1",
+                            [&row.operation_id],
+                        )
+                        .unwrap(),
+                    1
+                );
             } else if column == "payload" {
-                assert_eq!(connection.execute(
-                    "UPDATE company_events SET payload=X'00' WHERE sequence=?1", [row.sequence],
-                ).unwrap(), 1);
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE company_events SET payload=X'00' WHERE sequence=?1",
+                            [row.sequence],
+                        )
+                        .unwrap(),
+                    1
+                );
             } else {
                 assert_eq!(connection.execute(
                     &format!("UPDATE company_events SET {column}='changed-fixture' WHERE sequence=?1"),
                     [row.sequence],
                 ).unwrap(), 1);
             }
-            let before: i64 = connection.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
-            assert!(authenticated_project_snapshot_shape(&connection, sequence).is_err(), "{column}");
-            assert!(validate_project_snapshot_event(&connection, &project_snapshot_row(&connection, &project)).is_err(), "{column}");
-            assert_eq!(connection.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0)).unwrap(), before);
+            let before: i64 = connection
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            assert!(
+                authenticated_project_snapshot_shape(&connection, sequence).is_err(),
+                "{column}"
+            );
+            assert!(
+                validate_project_snapshot_event(
+                    &connection,
+                    &project_snapshot_row(&connection, &project)
+                )
+                .is_err(),
+                "{column}"
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                before
+            );
         }
     }
 

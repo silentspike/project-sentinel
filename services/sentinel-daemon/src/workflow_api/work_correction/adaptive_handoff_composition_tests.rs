@@ -91,6 +91,14 @@ fn planned_fixture_with_initial_calls(successor: bool, calls: Option<u16>) -> (F
         "schema_version":1, "rationale":"Scripted handoff composition", "tasks":tasks,
     })).unwrap();
     let planner = &planning.binding.grant.planner_principal;
+    let planning_call = api.store.project_planning_call(
+        &planner.tenant_id, &planning.source_project.project_id,
+    ).unwrap().unwrap();
+    api.store.claim_project_planning_call(planner, &sentinel_workflow::ClaimProjectPlanningCallV1 {
+        project_id: planning.source_project.project_id.clone(),
+        allowance_id: planning_call.allowance_id.clone(), request_id: planning_call.request_id(),
+        request_digest: "a".repeat(64), context_digest: "b".repeat(64),
+    }, now_unix_ms()).unwrap();
     let apply = |command| {
         let outcome = api.core.apply_company_command(
             planner, Uuid::new_v4(), &command, now_unix_ms(),
@@ -131,6 +139,10 @@ fn planned_fixture_with_initial_calls(successor: bool, calls: Option<u16>) -> (F
         ).unwrap()
     };
     let allowance = project.subscription_call.as_ref().unwrap();
+    api.store.complete_project_planning_call(
+        planner, &project.project_id, &planning_call.allowance_id,
+        &"a".repeat(64), &"c".repeat(64), &project, now_unix_ms(),
+    ).unwrap();
     assert_eq!(allowance.grant.max_calls, calls.unwrap_or(16));
     let binding = api.adaptive_provider_authority_for_claim(allowance.grant.agent_id)
         .unwrap().unwrap();
@@ -648,11 +660,65 @@ fn complete_negative_qa(f: &FamilyFixture) -> model_review::ValidatedProjectRevi
 
 #[test]
 fn negative_independent_qa_starts_new_default_correction_and_admits_exact_revision() {
+    negative_qa_correction(false);
+}
+
+#[test]
+fn completed_funded_continuation_starts_a_new_correction_without_inheriting_its_epoch() {
+    negative_qa_correction(true);
+}
+
+fn fund_and_continue(f: &mut FamilyFixture) {
+    use crate::workflow_api::adaptive_leadership_review::{tests::{persist, reconcile_review_at}, LeadershipAuthority};
+    use crate::workflow_api::adaptive_resume_policy::tests::claim_review;
+    for _ in 0..4 {
+        f.inspect("main.py", "scripted prior observation\n");
+    }
+    let now = now_unix_ms();
+    let operator = f.api.principals.principal("operator").unwrap();
+    let request = f.api.store.adaptive_work_funding_draft(
+        &operator.principal, &f.session.grant.authority.project_id,
+        f.session.grant.session_id, Uuid::new_v4(), "scripted-completed-campaign-regression",
+        sentinel_workflow::AdaptiveWorkFundingLimitsV1 {
+            additional_model_calls: 4, additional_tool_calls: 4,
+            additional_reviews: 4, additional_windows: 4,
+            max_window_ms: 300_000, max_call_duration_ms: 120_000,
+            dispatch_margin_ms: sentinel_workflow::ADAPTIVE_RESUME_DISPATCH_MARGIN_MS,
+            expires_at_unix_ms: now + 600_000,
+        }, now,
+    ).unwrap();
+    let (_, receipt) = f.api.store.authorize_adaptive_work_funding(
+        &operator.principal, &request, now,
+    ).unwrap();
+    assert!(reconcile_review_at(&f.api, &project(f), now_unix_ms()));
+    let leader = f.api.principals.principal("pm").unwrap().principal.agent_id.unwrap();
+    let call = f.api.leadership_review_for_agent(leader).unwrap().unwrap();
+    let context = f.api.prepare_leadership_review(&LeadershipAuthority::from_call(&call)).unwrap();
+    let (id, digest) = claim_review(&f.api, &context);
+    let completion = ModelExecutionCompletion {
+        context: ModelExecutionContext::AdaptiveLeadershipReview(Box::new(context.clone())),
+        content: serde_json::json!({"schema_version":5,"decision":{
+            "kind":"continue", "additional_model_calls":4, "window_ms":300_000,
+            "rationale":"Scripted new funded source window", "evidence_refs":[context.source.evidence_refs[0]],
+        }}).to_string(),
+        admissible: true,
+    };
+    persist(&f.api, &completion, &context, &id, &digest, true);
+    f.api.accept_leadership_review_at(&completion, &context, &id, &digest, now_unix_ms()).unwrap();
+    f.session = f.api.store.adaptive_session_for_authority(&f.session.grant.authority)
+        .unwrap().unwrap();
+    assert_eq!(f.session.active_work_funding().unwrap().receipt, receipt);
+}
+
+fn negative_qa_correction(funded: bool) {
     let (mut f, _) = planned_fixture_with_initial_calls(false, Some(4));
+    if funded {
+        fund_and_continue(&mut f);
+    }
     let original_done = complete_source(&mut f, true);
     let original = f.session.clone();
     assert_eq!(original.grant.max_model_calls, 4);
-    assert_eq!(original.model_calls, 3);
+    assert_eq!(original.model_calls, if funded { 7 } else { 3 });
     let completed = project(&f);
     let original_allowance = completed.subscription_call.clone().unwrap();
     let authority = f.api.authority.as_ref().unwrap();

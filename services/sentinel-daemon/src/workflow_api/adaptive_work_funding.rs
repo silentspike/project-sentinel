@@ -36,24 +36,41 @@ impl crate::workbench::WorkbenchAuthoritySource for FundingObservationAuthority<
         &self,
         record: &crate::workbench::WorkbenchInvocationRecord,
     ) -> anyhow::Result<WorkbenchAuthoritySnapshot> {
-        let caller = self.authority.principals.principal(&record.caller_id)
+        let caller = self
+            .authority
+            .principals
+            .principal(&record.caller_id)
             .ok_or_else(|| anyhow::anyhow!("workbench principal is unavailable"))?;
         let project_id = ProjectId::parse(&record.project_id)?;
         let work_item_id = WorkItemId::parse(&record.work_item_id)?;
-        let runtime = self.authority.snapshot_from_validated_project(
-            self.project, &caller.principal.tenant_id, &project_id,
-            &work_item_id, record.agent_id, false,
-        ).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let principal = self.authority.principals.principal(&runtime.principal.principal_id)
+        let runtime = self
+            .authority
+            .snapshot_from_validated_project(
+                self.project,
+                &caller.principal.tenant_id,
+                &project_id,
+                &work_item_id,
+                record.agent_id,
+                false,
+            )
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let principal = self
+            .authority
+            .principals
+            .principal(&runtime.principal.principal_id)
             .filter(|principal| {
                 principal.execution_authority == runtime.principal
                     && principal.principal.agent_id == Some(record.agent_id)
                     && principal.principal.tenant_id == caller.principal.tenant_id
-            }).ok_or_else(|| anyhow::anyhow!("workbench principal authority changed"))?;
+            })
+            .ok_or_else(|| anyhow::anyhow!("workbench principal authority changed"))?;
         let role = principal.principal.role;
-        let (profile, _) = self.authority.profile_for_binding(&runtime.profile_id)
+        let (profile, _) = self
+            .authority
+            .profile_for_binding(&runtime.profile_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let role_capabilities = role_capabilities(role, &profile.capabilities, &profile.capabilities);
+        let role_capabilities =
+            role_capabilities(role, &profile.capabilities, &profile.capabilities);
         Ok(WorkbenchAuthoritySnapshot {
             agent_id: record.agent_id,
             caller_id: runtime.principal.principal_id,
@@ -83,7 +100,8 @@ pub(super) fn funding_observation_projection_for_test(
     record: &crate::workbench::WorkbenchInvocationRecord,
 ) -> anyhow::Result<WorkbenchAuthoritySnapshot> {
     crate::workbench::WorkbenchAuthoritySource::current_for_record(
-        &FundingObservationAuthority { authority, project }, record,
+        &FundingObservationAuthority { authority, project },
+        record,
     )
 }
 
@@ -451,13 +469,18 @@ impl WorkflowApi {
         session: &AdaptiveSessionV1,
         now: u64,
     ) -> Result<(), WorkflowError> {
-        self.work_funding_current_source_with_observation_reader(project, session, now, |reference| {
-            self.workbench
-                .as_ref()
-                .ok_or_else(source_conflict)?
-                .private_observation(reference.effect.id, &session.grant.authority.profile_id)
-                .map_err(|_| source_conflict())
-        })
+        self.work_funding_current_source_with_observation_reader(
+            project,
+            session,
+            now,
+            |reference| {
+                self.workbench
+                    .as_ref()
+                    .ok_or_else(source_conflict)?
+                    .private_observation(reference.effect.id, &session.grant.authority.profile_id)
+                    .map_err(|_| source_conflict())
+            },
+        )
     }
 
     // Only the observed standing-store entry point may call this under its SQL
@@ -468,21 +491,26 @@ impl WorkflowApi {
         session: &AdaptiveSessionV1,
         now: u64,
     ) -> Result<(), WorkflowError> {
-        self.work_funding_current_source_with_observation_reader(project, session, now, |reference| {
-            self.workbench.as_ref().ok_or_else(source_conflict)?;
-            let authority = self.authority.as_ref().ok_or_else(source_conflict)?;
-            let (profile, digest) = authority
-                .profile_for_binding(&session.grant.authority.profile_id)
-                .map_err(|_| source_conflict())?;
-            crate::workbench::read_workbench_private_observation(
-                &reference.effect.id.to_string(),
-                &FundingObservationAuthority { authority, project },
-                profile,
-                digest,
-            )
-            .map_err(|_| source_conflict())?
-            .ok_or_else(source_conflict)
-        })
+        self.work_funding_current_source_with_observation_reader(
+            project,
+            session,
+            now,
+            |reference| {
+                self.workbench.as_ref().ok_or_else(source_conflict)?;
+                let authority = self.authority.as_ref().ok_or_else(source_conflict)?;
+                let (profile, digest) = authority
+                    .profile_for_binding(&session.grant.authority.profile_id)
+                    .map_err(|_| source_conflict())?;
+                crate::workbench::read_workbench_private_observation(
+                    &reference.effect.id.to_string(),
+                    &FundingObservationAuthority { authority, project },
+                    profile,
+                    digest,
+                )
+                .map_err(|_| source_conflict())?
+                .ok_or_else(source_conflict)
+            },
+        )
     }
 
     fn work_funding_current_source_with_observation_reader(
@@ -490,8 +518,12 @@ impl WorkflowApi {
         project: &sentinel_workflow::ProjectV1,
         session: &AdaptiveSessionV1,
         now: u64,
-        read_observation: impl FnOnce(&sentinel_workflow::AdaptiveObservationRefV1)
-            -> Result<sentinel_common::WorkbenchPrivateObservation, WorkflowError>,
+        read_observation: impl FnOnce(
+            &sentinel_workflow::AdaptiveObservationRefV1,
+        ) -> Result<
+            sentinel_common::WorkbenchPrivateObservation,
+            WorkflowError,
+        >,
     ) -> Result<(), WorkflowError> {
         if project.tenant_id != session.grant.authority.tenant_id
             || project.project_id != session.grant.authority.project_id

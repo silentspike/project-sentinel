@@ -23,9 +23,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 mod adoption_read;
-pub(crate) mod completion_proof;
 #[cfg(test)]
 mod company_claim_tests;
+pub(crate) mod completion_proof;
 #[cfg(test)]
 mod health_inventory_tests;
 mod read_sources;
@@ -180,16 +180,26 @@ impl WorkflowStore {
                 previous.cursor,
                 crate::AdaptiveCursorV1::BlockedResolved { .. }
             );
-            let completed = matches!(previous.cursor,crate::AdaptiveCursorV1::CompletionProposed { .. });
+            let completed = matches!(
+                previous.cursor,
+                crate::AdaptiveCursorV1::CompletionProposed { .. }
+            );
             if completed {
                 let mut initial = AdaptiveSessionV1::initial(grant.clone())?;
                 initial.updated_at_ms = now_ms;
-                let next = Entry {previous_digest:None,command:None,session:initial,recovery_feedback:None};
-                let valid = crate::domain_store::validation_scope::with_scope(&tx,|| {
-                    require_canonical_journal_lineage(&tx,current)?;
-                    corrective_successor(&tx,&previous,&next,true)
+                let next = Entry {
+                    previous_digest: None,
+                    command: None,
+                    session: initial,
+                    recovery_feedback: None,
+                };
+                let valid = crate::domain_store::validation_scope::with_scope(&tx, || {
+                    require_canonical_journal_lineage(&tx, current)?;
+                    corrective_successor(&tx, &previous, &next, true)
                 })?;
-                if !valid { return Err(authority_conflict()); }
+                if !valid {
+                    return Err(authority_conflict());
+                }
             } else if previous.continuation.is_some()
                 || !(never_claimed || rejected_first_model || blocked_resolved)
                 || previous.grant.provider_allowance_id == grant.provider_allowance_id
@@ -234,8 +244,12 @@ impl WorkflowStore {
             return Err(authority_conflict());
         }
         let recovery_feedback = if let Some((previous, previous_digest, feedback)) = previous {
-            if !matches!(previous.cursor,crate::AdaptiveCursorV1::CompletionProposed { .. }) {
-                let cancelled = previous.transition(&AdaptiveTransitionV1::Cancel, session.updated_at_ms)?;
+            if !matches!(
+                previous.cursor,
+                crate::AdaptiveCursorV1::CompletionProposed { .. }
+            ) {
+                let cancelled =
+                    previous.transition(&AdaptiveTransitionV1::Cancel, session.updated_at_ms)?;
                 append(
                     &tx,
                     &self::namespace(previous.grant.session_id),
@@ -1984,15 +1998,22 @@ fn corrective_successor(
     next: &Entry,
     require_current: bool,
 ) -> Result<bool, WorkflowError> {
-    if !matches!(prior.cursor, crate::AdaptiveCursorV1::CompletionProposed { .. })
-        || prior.grant.authority != next.session.grant.authority
+    if !matches!(
+        prior.cursor,
+        crate::AdaptiveCursorV1::CompletionProposed { .. }
+    ) || prior.grant.authority != next.session.grant.authority
         || prior.grant.session_id == next.session.grant.session_id
         || prior.active_provider_allowance_id() == next.session.grant.provider_allowance_id
         || next.recovery_feedback.is_some()
         || next.session.updated_at_ms < prior.updated_at_ms
-    { return Ok(false); }
-    let prior_root = journal_entry(connection,prior.grant.session_id,1)?.ok_or_else(corrupt_store)?;
-    if next.session.updated_at_ms <= prior_root.0.entry.session.updated_at_ms { return Ok(false); }
+    {
+        return Ok(false);
+    }
+    let prior_root =
+        journal_entry(connection, prior.grant.session_id, 1)?.ok_or_else(corrupt_store)?;
+    if next.session.updated_at_ms <= prior_root.0.entry.session.updated_at_ms {
+        return Ok(false);
+    }
     let authority = &prior.grant.authority;
     let sequences = {
         let mut statement = connection.prepare(
@@ -2000,49 +2021,113 @@ fn corrective_successor(
              AND event_type IN ('project_work_correction_requested','project_source_review_rework_started','project_subscription_call_granted')
              AND created_at_ms<=?3 ORDER BY sequence LIMIT ?4",
         ).map_err(map_sqlite_error)?;
-        let rows = statement.query_map(params![authority.tenant_id.0,authority.project_id.0,sql_u64(next.session.updated_at_ms)?,(MAX_LOCATOR_SCAN_ROWS + 1) as i64],|row|row.get::<_,i64>(0)).map_err(map_sqlite_error)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_sqlite_error)?
+        let rows = statement
+            .query_map(
+                params![
+                    authority.tenant_id.0,
+                    authority.project_id.0,
+                    sql_u64(next.session.updated_at_ms)?,
+                    (MAX_LOCATOR_SCAN_ROWS + 1) as i64
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_sqlite_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_sqlite_error)?
     };
-    if sequences.len() > MAX_LOCATOR_SCAN_ROWS { return Err(corrupt_store()); }
+    if sequences.len() > MAX_LOCATOR_SCAN_ROWS {
+        return Err(corrupt_store());
+    }
     let mut found = false;
     for sequence in sequences {
-        let (event, principal) = crate::domain_store::authenticated_project_snapshot_shape(connection,stored_u64(sequence)?)?.ok_or_else(corrupt_store)?;
+        let (event, principal) = crate::domain_store::authenticated_project_snapshot_shape(
+            connection,
+            stored_u64(sequence)?,
+        )?
+        .ok_or_else(corrupt_store)?;
         let project = &event.project;
-        let Some(allowance) = project.subscription_call.as_ref().filter(|allowance| allowance.allowance_id == next.session.grant.provider_allowance_id) else { continue; };
-        let record = project.work_corrections.iter().rev().find(|record|record.previous.spec.work_item_id == authority.work_item_id).ok_or_else(corrupt_store)?;
-        let old = record.previous_subscription_call.as_ref().ok_or_else(corrupt_store)?;
+        let Some(allowance) = project
+            .subscription_call
+            .as_ref()
+            .filter(|allowance| allowance.allowance_id == next.session.grant.provider_allowance_id)
+        else {
+            continue;
+        };
+        let record = project
+            .work_corrections
+            .iter()
+            .rev()
+            .find(|record| record.previous.spec.work_item_id == authority.work_item_id)
+            .ok_or_else(corrupt_store)?;
+        let old = record
+            .previous_subscription_call
+            .as_ref()
+            .ok_or_else(corrupt_store)?;
         // Other completed predecessors can share an authority after several
         // revisions. Only this exact consumed allowance may name this edge.
-        if old.allowance_id != prior.active_provider_allowance_id() { continue; }
+        if old.allowance_id != prior.active_provider_allowance_id() {
+            continue;
+        }
         let principal_matches = principal.kind == crate::CompanyPrincipalKindV1::Agent
-            && matches!(principal.role,crate::CompanyRoleV1::ProjectManager | crate::CompanyRoleV1::TechnicalLead)
+            && matches!(
+                principal.role,
+                crate::CompanyRoleV1::ProjectManager | crate::CompanyRoleV1::TechnicalLead
+            )
             && principal.tenant_id == authority.tenant_id
-            && project.governance.participants.iter().any(|member|member.principal_id == principal.principal_id
-                && Some(member.agent_id) == principal.agent_id && member.role == principal.role);
-        let requester_matches = project.governance.participants.iter().any(|member|member.principal_id == record.requested_by
-            && matches!(member.role,crate::CompanyRoleV1::ProjectManager | crate::CompanyRoleV1::TechnicalLead));
-        let work = project.work_items.get(&authority.work_item_id).ok_or_else(corrupt_store)?;
-        let assignments: Vec<_> = work.assignments.iter().filter(|assignment|assignment.active).collect();
-        if !principal_matches || !requester_matches || assignments.len() != 1
+            && project.governance.participants.iter().any(|member| {
+                member.principal_id == principal.principal_id
+                    && Some(member.agent_id) == principal.agent_id
+                    && member.role == principal.role
+            });
+        let requester_matches = project.governance.participants.iter().any(|member| {
+            member.principal_id == record.requested_by
+                && matches!(
+                    member.role,
+                    crate::CompanyRoleV1::ProjectManager | crate::CompanyRoleV1::TechnicalLead
+                )
+        });
+        let work = project
+            .work_items
+            .get(&authority.work_item_id)
+            .ok_or_else(corrupt_store)?;
+        let assignments: Vec<_> = work
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.active)
+            .collect();
+        if !principal_matches
+            || !requester_matches
+            || assignments.len() != 1
             || assignments[0].assignment_id != allowance.grant.assignment_id
             || assignments[0].canonical_digest()? != authority.assignment_digest
-            || !matches!(work.state,crate::CompanyWorkStateV1::Assigned | crate::CompanyWorkStateV1::InProgress)
+            || !matches!(
+                work.state,
+                crate::CompanyWorkStateV1::Assigned | crate::CompanyWorkStateV1::InProgress
+            )
             || record.requested_at_unix_ms < prior.updated_at_ms
             || record.requested_at_unix_ms > allowance.created_at_unix_ms
             || (event.event_type != "project_subscription_call_granted"
-                && (record.requested_at_unix_ms != event.created_at_unix_ms || record.requested_by != principal.principal_id))
+                && (record.requested_at_unix_ms != event.created_at_unix_ms
+                    || record.requested_by != principal.principal_id))
             || allowance.created_by != principal.principal_id
             || allowance.created_at_unix_ms != event.created_at_unix_ms
             || next.session.grant.created_at_ms != allowance.created_at_unix_ms
             || next.session.grant.deadline_ms != allowance.grant.expires_at_unix_ms
-            || allowance.allowance_id != crate::domain::stable_domain_id("subscription",&authority.tenant_id,event.operation_id)?
+            || allowance.allowance_id
+                != crate::domain::stable_domain_id(
+                    "subscription",
+                    &authority.tenant_id,
+                    event.operation_id,
+                )?
             || allowance.grant.max_duration_ms != 120_000
             || next.session.grant.max_model_calls != allowance.grant.max_calls
             || next.session.grant.max_tool_calls != allowance.grant.max_calls
             || next.session.grant.max_call_duration_ms != allowance.grant.max_duration_ms
-            || !completion_proof::allowance_matches(&next.session,allowance)?
-        { return Err(corrupt_store()); }
-        completion_proof::correction_source(connection,prior,project,record)?;
+            || !completion_proof::allowance_matches(&next.session, allowance)?
+        {
+            return Err(corrupt_store());
+        }
+        completion_proof::correction_source(connection, prior, project, record)?;
         if require_current {
             // The canonical latest project snapshot and full entity bytes must
             // agree. No recursive Project::validate_persisted call is made.
@@ -2051,20 +2136,51 @@ fn corrective_successor(
                  AND event_type NOT IN ('project_planning_call_authorized','project_planning_call_renewed','project_planning_call_dispatched','project_planning_call_completed')
                  ORDER BY sequence DESC LIMIT 1",params![authority.tenant_id.0,authority.project_id.0],|row|row.get(0),
             ).map_err(map_sqlite_error)?;
-            let (latest,_) = crate::domain_store::authenticated_project_snapshot_shape(connection,stored_u64(sequence)?)?.ok_or_else(corrupt_store)?;
+            let (latest, _) = crate::domain_store::authenticated_project_snapshot_shape(
+                connection,
+                stored_u64(sequence)?,
+            )?
+            .ok_or_else(corrupt_store)?;
             let bytes: i64 = connection.query_row("SELECT length(payload) FROM company_entities WHERE tenant_id=?1 AND entity_kind='project' AND entity_id=?2",params![authority.tenant_id.0,authority.project_id.0],|row|row.get(0)).map_err(map_sqlite_error)?;
-            crate::domain_store::validation_scope::charge_bytes(connection,usize::try_from(bytes).map_err(|_|corrupt_store())?)?;
-            let current: crate::ProjectV1 = read_company_entity(connection,&authority.tenant_id.0,"project",&authority.project_id.0,latest.project.version)?;
-            let current_work = current.work_items.get(&authority.work_item_id).ok_or_else(authority_conflict)?;
-            if current != latest.project || current.subscription_call.as_ref() != Some(allowance)
+            crate::domain_store::validation_scope::charge_bytes(
+                connection,
+                usize::try_from(bytes).map_err(|_| corrupt_store())?,
+            )?;
+            let current: crate::ProjectV1 = read_company_entity(
+                connection,
+                &authority.tenant_id.0,
+                "project",
+                &authority.project_id.0,
+                latest.project.version,
+            )?;
+            let current_work = current
+                .work_items
+                .get(&authority.work_item_id)
+                .ok_or_else(authority_conflict)?;
+            if current != latest.project
+                || current.subscription_call.as_ref() != Some(allowance)
                 || current.lifecycle_state != crate::ProjectLifecycleStateV1::Active
-                || current.work_corrections.iter().rev().find(|item|item.previous.spec.work_item_id == authority.work_item_id) != Some(record)
-                || current_work.spec != work.spec || current_work.assignments != work.assignments
-                || !matches!(current_work.state,crate::CompanyWorkStateV1::Assigned | crate::CompanyWorkStateV1::InProgress)
-                || !current_work.output_receipts.is_empty() || current_work.gate_receipt.is_some()
-            { return Err(authority_conflict()); }
+                || current
+                    .work_corrections
+                    .iter()
+                    .rev()
+                    .find(|item| item.previous.spec.work_item_id == authority.work_item_id)
+                    != Some(record)
+                || current_work.spec != work.spec
+                || current_work.assignments != work.assignments
+                || !matches!(
+                    current_work.state,
+                    crate::CompanyWorkStateV1::Assigned | crate::CompanyWorkStateV1::InProgress
+                )
+                || !current_work.output_receipts.is_empty()
+                || current_work.gate_receipt.is_some()
+            {
+                return Err(authority_conflict());
+            }
         }
-        if found { return Err(corrupt_store()); }
+        if found {
+            return Err(corrupt_store());
+        }
         found = true;
     }
     Ok(found)
@@ -2160,7 +2276,7 @@ fn adaptive_health_inventory(
     for id in ids {
         let (session, _, _) = load_with_feedback(connection, id)?.ok_or_else(corrupt_store)?;
         let (_, root) = evidence_entry(connection, &namespace(id), 1)?;
-        require_journal_command_membership(connection,&session,head_ids.contains(&id))?;
+        require_journal_command_membership(connection, &session, head_ids.contains(&id))?;
         let scope = health_scope(&session)?;
         if roots
             .insert((scope.clone(), root.session.updated_at_ms), id)
@@ -2178,60 +2294,104 @@ fn adaptive_health_inventory(
         );
     }
 
-    validate_canonical_rollovers(connection,&journals,&heads,&roots)?;
+    validate_canonical_rollovers(connection, &journals, &heads, &roots)?;
     Ok(heads
         .values()
         .map(|id| journals[id].session.clone())
         .collect())
 }
 
-fn require_journal_command_membership(connection: &Connection, session: &AdaptiveSessionV1, is_head: bool) -> Result<(), WorkflowError> {
-    let versions = validated_journal_operations(connection,session)?.into_iter()
-        .map(|(record,_)|record.session_version).collect::<BTreeSet<_>>();
-    validate_health_dispositions(connection,session)?;
-    let cancellation = !is_head && matches!(session.cursor,crate::AdaptiveCursorV1::Cancelled);
-    let completed = matches!(session.cursor,crate::AdaptiveCursorV1::CompletionProposed { .. });
+fn require_journal_command_membership(
+    connection: &Connection,
+    session: &AdaptiveSessionV1,
+    is_head: bool,
+) -> Result<(), WorkflowError> {
+    let versions = validated_journal_operations(connection, session)?
+        .into_iter()
+        .map(|(record, _)| record.session_version)
+        .collect::<BTreeSet<_>>();
+    validate_health_dispositions(connection, session)?;
+    let cancellation = !is_head && matches!(session.cursor, crate::AdaptiveCursorV1::Cancelled);
+    let completed = matches!(
+        session.cursor,
+        crate::AdaptiveCursorV1::CompletionProposed { .. }
+    );
     // The caller must prove the canonical rollover graph before accepting the
     // cancellation exception or a retained non-head completed producer.
-    if (!is_head && !cancellation && !completed) || (2..=session.version).any(|version|
-        !versions.contains(&version) && !(cancellation && version == session.version))
-    { return Err(corrupt_store()); }
+    if (!is_head && !cancellation && !completed)
+        || (2..=session.version).any(|version| {
+            !versions.contains(&version) && !(cancellation && version == session.version)
+        })
+    {
+        return Err(corrupt_store());
+    }
     Ok(())
 }
 
-fn require_canonical_journal_lineage(connection: &Connection, authority: &RuntimeAuthoritySnapshotV1) -> Result<(), WorkflowError> {
+fn require_canonical_journal_lineage(
+    connection: &Connection,
+    authority: &RuntimeAuthoritySnapshotV1,
+) -> Result<(), WorkflowError> {
     use std::collections::BTreeMap;
-    let head = read_head(connection,authority)?.ok_or_else(corrupt_store)?;
-    let (current,_) = load(connection,head.session_id)?.ok_or_else(corrupt_store)?;
-    validate_head(&head,&current)?;
-    if current.grant.authority != *authority { return Err(corrupt_store()); }
-    let canonical_head: i64 = connection.query_row("SELECT count(*) FROM workflow_adaptive_heads WHERE session_id=?1",[head.session_id.to_string()],|row|row.get(0)).map_err(map_sqlite_error)?;
-    if canonical_head != 1 { return Err(corrupt_store()); }
+    let head = read_head(connection, authority)?.ok_or_else(corrupt_store)?;
+    let (current, _) = load(connection, head.session_id)?.ok_or_else(corrupt_store)?;
+    validate_head(&head, &current)?;
+    if current.grant.authority != *authority {
+        return Err(corrupt_store());
+    }
+    let canonical_head: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM workflow_adaptive_heads WHERE session_id=?1",
+            [head.session_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_error)?;
+    if canonical_head != 1 {
+        return Err(corrupt_store());
+    }
     let mut journals = BTreeMap::new();
     let mut roots = BTreeMap::new();
     for id in completion_proof::journal_ids(connection)? {
-        let root = journal_entry(connection,id,1)?.ok_or_else(corrupt_store)?;
-        require_journal_step(connection,&root,None)?;
-        if root.0.entry.session.grant.authority != *authority { continue; }
-        if journals.len() >= MAX_SCOPED_ADAPTIVE_HEADS { return Err(corrupt_store()); }
-        let (session,_) = load(connection,id)?.ok_or_else(corrupt_store)?;
-        require_journal_command_membership(connection,&session,id == head.session_id)?;
+        let root = journal_entry(connection, id, 1)?.ok_or_else(corrupt_store)?;
+        require_journal_step(connection, &root, None)?;
+        if root.0.entry.session.grant.authority != *authority {
+            continue;
+        }
+        if journals.len() >= MAX_SCOPED_ADAPTIVE_HEADS {
+            return Err(corrupt_store());
+        }
+        let (session, _) = load(connection, id)?.ok_or_else(corrupt_store)?;
+        require_journal_command_membership(connection, &session, id == head.session_id)?;
         let scope = health_scope(&session)?;
-        if roots.insert((scope.clone(),root.0.entry.session.updated_at_ms),id).is_some() { return Err(corrupt_store()); }
-        journals.insert(id,HealthJournal {session,root:root.0.entry.clone(),scope});
+        if roots
+            .insert((scope.clone(), root.0.entry.session.updated_at_ms), id)
+            .is_some()
+        {
+            return Err(corrupt_store());
+        }
+        journals.insert(
+            id,
+            HealthJournal {
+                session,
+                root: root.0.entry.clone(),
+                scope,
+            },
+        );
     }
-    if !journals.contains_key(&head.session_id) { return Err(corrupt_store()); }
-    let heads = BTreeMap::from([(health_scope(&current)?,head.session_id)]);
-    validate_canonical_rollovers(connection,&journals,&heads,&roots)
+    if !journals.contains_key(&head.session_id) {
+        return Err(corrupt_store());
+    }
+    let heads = BTreeMap::from([(health_scope(&current)?, head.session_id)]);
+    validate_canonical_rollovers(connection, &journals, &heads, &roots)
 }
 
 fn validate_canonical_rollovers(
     connection: &Connection,
-    journals: &std::collections::BTreeMap<Uuid,HealthJournal>,
-    heads: &std::collections::BTreeMap<HealthScope,Uuid>,
-    roots: &std::collections::BTreeMap<(HealthScope,u64),Uuid>,
+    journals: &std::collections::BTreeMap<Uuid, HealthJournal>,
+    heads: &std::collections::BTreeMap<HealthScope, Uuid>,
+    roots: &std::collections::BTreeMap<(HealthScope, u64), Uuid>,
 ) -> Result<(), WorkflowError> {
-    use std::collections::{BTreeMap,BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet};
     let head_ids = heads.values().copied().collect::<BTreeSet<_>>();
     let mut successors = BTreeMap::new();
     let mut predecessors = BTreeSet::new();
@@ -2243,19 +2403,27 @@ fn validate_canonical_rollovers(
         if !heads.contains_key(&journal.scope) {
             return Err(corrupt_store());
         }
-        let next = if matches!(journal.session.cursor,crate::AdaptiveCursorV1::CompletionProposed { .. }) {
+        let next = if matches!(
+            journal.session.cursor,
+            crate::AdaptiveCursorV1::CompletionProposed { .. }
+        ) {
             let mut selected = None;
-            for (candidate_id,candidate) in journals {
-                if candidate.scope == journal.scope && candidate_id != id
-                    && corrective_successor(connection,&journal.session,&candidate.root,false)?
-                    && selected.is_none_or(|(_,at)|candidate.root.session.updated_at_ms < at)
-                { selected = Some((*candidate_id,candidate.root.session.updated_at_ms)); }
+            for (candidate_id, candidate) in journals {
+                if candidate.scope == journal.scope
+                    && candidate_id != id
+                    && corrective_successor(connection, &journal.session, &candidate.root, false)?
+                    && selected.is_none_or(|(_, at)| candidate.root.session.updated_at_ms < at)
+                {
+                    selected = Some((*candidate_id, candidate.root.session.updated_at_ms));
+                }
             }
-            selected.map(|(id,_)|id).ok_or_else(corrupt_store)?
+            selected.map(|(id, _)| id).ok_or_else(corrupt_store)?
         } else {
-            let next = roots.get(&(journal.scope.clone(),journal.session.updated_at_ms))
-                .filter(|next|*next != id).ok_or_else(corrupt_store)?;
-            validate_health_rollover(connection,journal,&journals[next])?;
+            let next = roots
+                .get(&(journal.scope.clone(), journal.session.updated_at_ms))
+                .filter(|next| *next != id)
+                .ok_or_else(corrupt_store)?;
+            validate_health_rollover(connection, journal, &journals[next])?;
             *next
         };
         if !predecessors.insert(next) {

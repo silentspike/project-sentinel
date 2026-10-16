@@ -476,6 +476,20 @@ capacity. They cannot borrow an unadopted proposal, refund spending, replace a
 pending manual proposal or bypass an unknown provider outcome. Existing global
 review, window, receipt and call bounds remain operative.
 
+An expired, unadopted manual proposal whose exact funded review durably chose
+Defer is terminal history, not a live proposal. A standing successor may exclude
+that manual proposal from selection only after authenticating the completion
+event, closed review history, unchanged journal head and authority. The manual
+receipt and Defer remain immutable; only a new genuine Continue may adopt the
+new epoch. Undispatched, unknown, unreviewed or still-live manual proposals remain
+barriers. A standing proposal cannot use this exclusion to replace another
+standing proposal, even after expiry or a configured generation change.
+
+The terminal-manual relationship remains necessary after successor adoption.
+Older binaries that count both receipts as pending are not compatible rollback
+targets once that successor exists. Preserve the records and use a compatible
+forward repair rather than restoring or deleting business history.
+
 The immutable proposal identity depends on the tenant, session, exact journal
 head, policy ID and explicitly configured generation, not on changing review
 history or the current clock. A later Defer at the same head therefore cannot

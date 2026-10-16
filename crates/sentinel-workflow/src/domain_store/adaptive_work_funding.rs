@@ -22,7 +22,14 @@ pub(super) fn terminal_manual_exclusions_for_test(
 ) -> Result<BTreeSet<String>, WorkflowError> {
     let receipts = funding_receipts(connection, tenant, session_id)?;
     let calls = adaptive_leadership_review::calls_for_session(connection, tenant, session_id)?;
-    terminal_manual_defer::excluded_at_head(connection, &receipts, &calls, source, head_digest, now_ms)
+    terminal_manual_defer::excluded_at_head(
+        connection,
+        &receipts,
+        &calls,
+        source,
+        head_digest,
+        now_ms,
+    )
 }
 
 struct HistoricalRecoveryJournal {
@@ -1558,8 +1565,10 @@ fn require_unfunded_source_with_candidate(
     limits: &AdaptiveWorkFundingLimitsV1,
 ) -> Result<(AdaptiveWorkFundingSourceV1, u64), WorkflowError> {
     let scope = validation_scope::enter(connection)?;
-    if matches!(replacement, Some(PendingFundingReplacement::StandingAfterManualDefer))
-        && (limits.additional_model_calls != 0 || limits.additional_tool_calls != 0)
+    if matches!(
+        replacement,
+        Some(PendingFundingReplacement::StandingAfterManualDefer)
+    ) && (limits.additional_model_calls != 0 || limits.additional_tool_calls != 0)
     {
         return Err(unauthorized());
     }
@@ -1584,8 +1593,12 @@ fn require_unfunded_source_with_candidate(
     let superseded = consumed_validated_receipts(connection, tenant, session_id, &receipts)?;
     // Top-level source preparation only: never enter call discovery from a
     // receipt/membership validator, which can itself be replaying this journal.
-    let calls = if matches!(replacement, Some(PendingFundingReplacement::StandingAfterManualDefer))
-        || receipts.iter().any(|receipt| receipt.request.reason_ref.starts_with("standing-funding:"))
+    let calls = if matches!(
+        replacement,
+        Some(PendingFundingReplacement::StandingAfterManualDefer)
+    ) || receipts
+        .iter()
+        .any(|receipt| receipt.request.reason_ref.starts_with("standing-funding:"))
     {
         adaptive_leadership_review::calls_for_session(connection, tenant, session_id)?
     } else {
@@ -1594,10 +1607,17 @@ fn require_unfunded_source_with_candidate(
     let mut terminal = terminal_manual_defer::excluded_by_standing_receipts(
         connection, &receipts, &calls, &session,
     )?;
-    if matches!(replacement, Some(PendingFundingReplacement::StandingAfterManualDefer)) {
+    if matches!(
+        replacement,
+        Some(PendingFundingReplacement::StandingAfterManualDefer)
+    ) {
         terminal.extend(terminal_manual_defer::excluded_at_head(
-            connection, &receipts, &calls, &session,
-            &resume_source.head_entry_digest, now_ms,
+            connection,
+            &receipts,
+            &calls,
+            &session,
+            &resume_source.head_entry_digest,
+            now_ms,
         )?);
     }
     if terminal.iter().any(|id| superseded.contains(id)) {
@@ -1905,7 +1925,10 @@ impl WorkflowStore {
         let adopted = adopted_epochs(&session);
         let superseded = consumed_validated_receipts(&transaction, tenant, session_id, &receipts)?;
         let terminal = terminal_manual_defer::excluded_by_standing_receipts(
-            &transaction, &receipts, &calls, &session,
+            &transaction,
+            &receipts,
+            &calls,
+            &session,
         )?;
         let pending: Vec<_> = receipts
             .iter()

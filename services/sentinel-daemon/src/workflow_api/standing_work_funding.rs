@@ -90,7 +90,8 @@ impl WorkflowApi {
         project: &sentinel_workflow::ProjectV1,
         session: &AdaptiveSessionV1,
     ) -> Result<(), WorkflowError> {
-        let live_operator = binding.current_operator(&self.principals)?
+        let live_operator = binding
+            .current_operator(&self.principals)?
             .ok_or_else(source_conflict)?;
         if live_operator.principal != operator.principal
             || live_operator.execution_authority != operator.execution_authority
@@ -99,11 +100,19 @@ impl WorkflowApi {
         }
         self.validate_work_funding_operator(&live_operator)?;
         self.work_funding_current_source_in_snapshot(project, session, now_unix_ms())?;
-        let current = self.authority.as_ref().ok_or_else(workflow_unavailable)?
+        let current = self
+            .authority
+            .as_ref()
+            .ok_or_else(workflow_unavailable)?
             .snapshot_from_validated_project(
-                project, &project.tenant_id, &project.project_id,
-                &session.grant.authority.work_item_id, session.grant.authority.agent_id, true,
-            ).map_err(execution_intent_port_error)?;
+                project,
+                &project.tenant_id,
+                &project.project_id,
+                &session.grant.authority.work_item_id,
+                session.grant.authority.agent_id,
+                true,
+            )
+            .map_err(execution_intent_port_error)?;
         if current != session.grant.authority {
             return Err(source_conflict());
         }
@@ -140,11 +149,7 @@ impl WorkflowApi {
             {
                 continue;
             }
-            match self.work_funding_current_source_from_observed(
-                project,
-                &session,
-                now_unix_ms(),
-            ) {
+            match self.work_funding_current_source_from_observed(project, &session, now_unix_ms()) {
                 Ok(()) => {}
                 Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => continue,
                 Err(error) => return Err(error),
@@ -156,7 +161,11 @@ impl WorkflowApi {
                     &binding.policy,
                     (project, &session),
                     now_unix_ms,
-                    || self.recheck_standing_work_funding_source(binding, &operator, project, &session),
+                    || {
+                        self.recheck_standing_work_funding_source(
+                            binding, &operator, project, &session,
+                        )
+                    },
                 )?;
             if proposal.is_some_and(|(replayed, _)| !replayed) {
                 return Ok(true);

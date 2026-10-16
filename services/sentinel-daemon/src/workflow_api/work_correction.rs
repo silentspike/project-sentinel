@@ -183,7 +183,9 @@ impl WorkflowApi {
             return Err("delivery already consumes this project");
         }
         if allowance.dispatch.is_none() {
-            let previous = self.store.work_item(tenant, project_id, work_id)
+            let previous = self
+                .store
+                .work_item(tenant, project_id, work_id)
                 .map_err(|_| "execution predecessor unavailable")?
                 .ok_or("execution predecessor missing")?;
             return self.validate_adaptive_source_completion(
@@ -343,19 +345,31 @@ impl WorkflowApi {
         }
         let revision_matches = if let Some(revision) = revision {
             sentinel_workflow::ExecutionRevisionV1::from_completed_work(
-                execution, revision.feedback_digest.clone(),
-            ).map_err(|_| "execution predecessor invalid")? == *revision
+                execution,
+                revision.feedback_digest.clone(),
+            )
+            .map_err(|_| "execution predecessor invalid")?
+                == *revision
         } else {
             execution.state == sentinel_workflow::WorkItemState::Done
                 && execution.terminal_execution_evidence.is_some()
-                && execution.gate_evidence.as_ref().is_some_and(|gate| gate.passed)
+                && execution
+                    .gate_evidence
+                    .as_ref()
+                    .is_some_and(|gate| gate.passed)
         };
         if !revision_matches {
             return Err("adaptive source execution is not complete");
         }
-        let proof = self.store.adaptive_source_completion(
-            &project.tenant_id, &project.project_id, allowance, execution.plan.plan_id,
-        ).map_err(|_| "adaptive source completion proof unavailable")?
+        let proof = self
+            .store
+            .adaptive_source_completion(
+                &project.tenant_id,
+                &project.project_id,
+                allowance,
+                execution.plan.plan_id,
+            )
+            .map_err(|_| "adaptive source completion proof unavailable")?
             .ok_or("adaptive source completion proof missing")?;
         let source = &proof.provider_source;
         if !execution.plan.authority_matches(&source.grant.authority) {
@@ -379,33 +393,58 @@ impl WorkflowApi {
         execution: &sentinel_workflow::WorkItemExecutionV1,
     ) -> Result<sentinel_common::WorkbenchPrivateObservation, &'static str> {
         let source = &proof.provider_source;
-        let reference = source.last_observation.as_ref()
+        let reference = source
+            .last_observation
+            .as_ref()
             .ok_or("adaptive source package observation missing")?;
-        let authority = self.authority.as_ref().ok_or("adaptive source authority unavailable")?;
-        let (profile, digest) = authority.profile_for_binding(&source.grant.authority.profile_id)
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or("adaptive source authority unavailable")?;
+        let (profile, digest) = authority
+            .profile_for_binding(&source.grant.authority.profile_id)
             .map_err(|_| "adaptive source package profile unavailable")?;
         // Historical evidence reads only: no Poll/Submit, fresh model admission,
         // or renewed execution window is needed to inspect a completed package.
         let record = crate::workbench::read_workbench_invocation_status(
-            &reference.effect.id.to_string(), authority.as_ref(), profile, digest,
-        ).map_err(|_| "adaptive source package record unavailable")?
-            .ok_or("adaptive source package record missing")?;
+            &reference.effect.id.to_string(),
+            authority.as_ref(),
+            profile,
+            digest,
+        )
+        .map_err(|_| "adaptive source package record unavailable")?
+        .ok_or("adaptive source package record missing")?;
         let observation = crate::workbench::read_workbench_private_observation(
-            &reference.effect.id.to_string(), authority.as_ref(), profile, digest,
-        ).map_err(|_| "adaptive source package observation unavailable")?
-            .ok_or("adaptive source package observation missing")?;
-        observation.validate(&reference.effect.id.to_string(), &reference.effect.request_digest)
+            &reference.effect.id.to_string(),
+            authority.as_ref(),
+            profile,
+            digest,
+        )
+        .map_err(|_| "adaptive source package observation unavailable")?
+        .ok_or("adaptive source package observation missing")?;
+        observation
+            .validate(
+                &reference.effect.id.to_string(),
+                &reference.effect.request_digest,
+            )
             .map_err(|_| "adaptive source package observation changed")?;
         let [step] = execution.plan.steps.as_slice() else {
             return Err("adaptive source completion plan changed");
         };
-        let ExecutionToolV1::PackageArtifact { artifact_kind, media_type, paths } = &step.tool else {
+        let ExecutionToolV1::PackageArtifact {
+            artifact_kind,
+            media_type,
+            paths,
+        } = &step.tool
+        else {
             return Err("adaptive source completion tool changed");
         };
         let [artifact] = record.artifacts.as_slice() else {
             return Err("adaptive source package artifact changed");
         };
-        let terminal = execution.terminal_execution_evidence.as_ref()
+        let terminal = execution
+            .terminal_execution_evidence
+            .as_ref()
             .ok_or("adaptive source terminal evidence missing")?;
         let [sealed] = terminal.artifacts.as_slice() else {
             return Err("adaptive source sealed artifact changed");
@@ -451,34 +490,49 @@ impl WorkflowApi {
         observation: &sentinel_common::WorkbenchPrivateObservation,
     ) -> Result<(), &'static str> {
         let request_id = binding.request_id();
-        let events = self.event_store.as_ref().ok_or("adaptive source EventStore unavailable")?;
-        if events.has_event_operation_id(&format!("llm_resolution_{request_id}"))
-            .map_err(|_| "adaptive source resolution unavailable")? {
+        let events = self
+            .event_store
+            .as_ref()
+            .ok_or("adaptive source EventStore unavailable")?;
+        if events
+            .has_event_operation_id(&format!("llm_resolution_{request_id}"))
+            .map_err(|_| "adaptive source resolution unavailable")?
+        {
             return Err("adaptive source provider was operator-resolved");
         }
-        let usage = events.event_by_operation_id(&format!("llm_usage_{request_id}"))
+        let usage = events
+            .event_by_operation_id(&format!("llm_usage_{request_id}"))
             .map_err(|_| "adaptive source usage unavailable")?
             .ok_or("adaptive source usage missing")?;
         super::model_execution::validate_adaptive_usage_binding(binding, true, &usage)?;
-        let Some(row) = events.get_llm_completion(&request_id)
-            .map_err(|_| "adaptive source provider result unavailable")? else {
+        let Some(row) = events
+            .get_llm_completion(&request_id)
+            .map_err(|_| "adaptive source provider result unavailable")?
+        else {
             // Normal cleanup removes the reservation/payload together. The
             // authenticated journal, execution and canonical usage remain.
             return Ok(());
         };
-        let owner = sentinel_common::StateTransferScope::for_agent(binding.grant.authority.agent_id.to_string());
-        if row.status != "action_claimed" || row.request_id != request_id
-            || row.request_digest != proof.effect.request_digest || row.owner_scope != owner
+        let owner = sentinel_common::StateTransferScope::for_agent(
+            binding.grant.authority.agent_id.to_string(),
+        );
+        if row.status != "action_claimed"
+            || row.request_id != request_id
+            || row.request_digest != proof.effect.request_digest
+            || row.owner_scope != owner
             || row.payload.len() > 1024 * 1024
         {
             return Err("adaptive source provider result unresolved or changed");
         }
-        let reservation = events.llm_model_reservation(&request_id, &owner)
+        let reservation = events
+            .llm_model_reservation(&request_id, &owner)
             .map_err(|_| "adaptive source reservation unavailable")?
             .ok_or("adaptive source reservation missing")?;
-        let provider = super::model_execution::ProviderExecutionAuthority::Adaptive(Box::new(binding.clone()));
-        let authority_digest = hex_sha256(&serde_json::to_vec(&provider)
-            .map_err(|_| "adaptive source authority invalid")?);
+        let provider =
+            super::model_execution::ProviderExecutionAuthority::Adaptive(Box::new(binding.clone()));
+        let authority_digest = hex_sha256(
+            &serde_json::to_vec(&provider).map_err(|_| "adaptive source authority invalid")?,
+        );
         let expected_usage = sentinel_limbo::LlmModelUsageBindingV1 {
             agent_id: binding.grant.authority.agent_id,
             tenant_id: binding.grant.authority.tenant_id.0.clone(),
@@ -487,37 +541,50 @@ impl WorkflowApi {
             reservation_id: binding.grant.provider_allowance_id.clone(),
             assignment_id: binding.assignment_id.clone(),
             assignment_version: binding.grant.authority.assignment_version,
-            provider: binding.grant.provider.clone(), model: binding.grant.model.clone(),
+            provider: binding.grant.provider.clone(),
+            model: binding.grant.model.clone(),
         };
         if reservation.request_digest != proof.effect.request_digest
-            || reservation.request_id != request_id || reservation.owner_scope != owner
+            || reservation.request_id != request_id
+            || reservation.owner_scope != owner
             || reservation.allowance_id != binding.grant.provider_allowance_id
             || reservation.authority_digest != authority_digest
             || reservation.usage_binding != expected_usage
-            || reservation.subject != (sentinel_limbo::LlmModelSubjectV1::Adaptive {
-                session_id: binding.grant.session_id, effect_id: binding.effect_id,
-                session_version: binding.session_version,
-            })
+            || reservation.subject
+                != (sentinel_limbo::LlmModelSubjectV1::Adaptive {
+                    session_id: binding.grant.session_id,
+                    effect_id: binding.effect_id,
+                    session_version: binding.session_version,
+                })
         {
             return Err("adaptive source reservation changed");
         }
         let stored: StoredModelResult = serde_json::from_str(&row.payload)
             .map_err(|_| "adaptive source provider payload invalid")?;
-        let completion = stored.model_work.as_ref().ok_or("adaptive source model result missing")?;
+        let completion = stored
+            .model_work
+            .as_ref()
+            .ok_or("adaptive source model result missing")?;
         let ModelExecutionContext::Adaptive(context) = &completion.context else {
             return Err("adaptive source provider subject changed");
         };
-        if stored.version != 2 || !completion.admissible
-            || stored.request_id != request_id || stored.request_digest != proof.effect.request_digest
-            || context.binding != *binding || context.observation.as_ref() != Some(observation)
+        if stored.version != 2
+            || !completion.admissible
+            || stored.request_id != request_id
+            || stored.request_digest != proof.effect.request_digest
+            || context.binding != *binding
+            || context.observation.as_ref() != Some(observation)
             || hex_sha256(completion.content.as_bytes()) != proof.model_response_digest
-            || hex_sha256(&serde_json::to_vec(&completion.context)
-                .map_err(|_| "adaptive source context invalid")?) != reservation.context_digest
+            || hex_sha256(
+                &serde_json::to_vec(&completion.context)
+                    .map_err(|_| "adaptive source context invalid")?,
+            ) != reservation.context_digest
             || super::model_execution::parse_adaptive_decision(&completion.content)?
                 != (sentinel_workflow::AdaptiveModelDecisionV1::ProposeCompletion {
                     artifact_digest: proof.artifact_digest.clone(),
                 })
-            || serde_json::to_value(&stored.usage_event).map_err(|_| "adaptive source usage invalid")?
+            || serde_json::to_value(&stored.usage_event)
+                .map_err(|_| "adaptive source usage invalid")?
                 != serde_json::to_value(&usage).map_err(|_| "adaptive source usage invalid")?
         {
             return Err("adaptive source retained result changed");
