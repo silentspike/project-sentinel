@@ -354,7 +354,7 @@ impl WorkflowApi {
         Ok(())
     }
 
-    fn work_funding_current_source(
+    pub(super) fn work_funding_current_source(
         &self,
         operator: &BoundPrincipal,
         project_id: &ProjectId,

@@ -409,6 +409,44 @@ commit and roll back staged effects if their applicable window has expired.
 Once a marked context is retained, a binary unable to decode it is not a valid
 rollback target: preserve business history and use a compatible forward repair.
 
+### Standing operator proposals
+
+An operator can delegate a bounded proposal policy in the optional protected
+`company-standing-funding.json` configuration file. The example file is not
+enabled automatically. Its tenant and issuer must match an actually registered
+operator with funding authority; neither an employee request nor a policy DTO
+establishes that authority. Missing configuration preserves the existing manual
+funding behavior. Changed policy contents require an explicit configuration
+reload; removing the file stops future automatic proposals without rewriting
+already issued finite receipts.
+
+After a genuine funded Defer at the current execution head, reconciliation may
+propose one distinct successor epoch under that standing delegation. This is
+not a retry or correction of the original decision. For example, leadership can
+independently decide whether a newly offered six-hour epoch makes another
+bounded work window useful. It remains free to decline. The old Defer, actual
+usage, original grant, assignment and workspace history remain unchanged.
+
+Automatic proposals add zero model calls and zero tool calls: they preserve
+the already adopted lifetime ceilings and require remaining model and tool
+capacity. They cannot borrow an unadopted proposal, refund spending, replace a
+pending manual proposal or bypass an unknown provider outcome. Existing global
+review, window, receipt and call bounds remain operative.
+
+The immutable proposal identity depends on the tenant, session, exact journal
+head, policy ID and explicitly configured generation, not on changing review
+history or the current clock. A later Defer at the same head therefore cannot
+create another proposal under the same generation. Restart and retry recover
+the original receipt and expiry. Policy generations are not advanced by the
+daemon. The actual refused review is retained as a cause reference.
+
+The policy and live issuer/runtime authority are checked again around issuance.
+The workflow transaction writes only the funding receipt and its existing
+canonical event. The ordinary, separate schema-5 leadership inference must
+produce a genuine Continue; existing adoption then verifies receipt membership
+and appends `ContinueGoverned` to the same employee journal. A proposal alone
+does not permit provider dispatch, reset a deadline or declare work complete.
+
 ### Productive workflow service
 
 The daemon exposes the bounded workflow through separate authenticated customer and agent command surfaces. Caller-supplied display names, roles, tenant IDs, assignment IDs, and authority digests are never credentials. A root-owned principal binding maps independent systemd credentials to one tenant, principal kind, company role, and authority generation; the daemon derives the authority digest from the credential bytes and rejects missing, aliased, mutable, or ambiguous bindings.
