@@ -1,5 +1,11 @@
 # Changelog
 
+- Update the WASM engine and WASI integration to 49.0.3. Resolve native and
+  component filesystem operations relative to pinned directory descriptors;
+  reject escaping symlinks, substituted file grants, hardlinks and non-regular
+  writes before truncation while retaining safe in-root relative symlinks.
+  Remove the implicit ambient filesystem root from native tools (#856).
+
 - Authenticate completed adaptive producer journals before transferring work
   to independent QA or a bounded correction. Preserve unknown effects, original
   producer proof and immutable review history while allowing a fresh authorized
