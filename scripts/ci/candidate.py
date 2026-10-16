@@ -86,14 +86,15 @@ def validate_archive(receipt, expected_plan_digest):
     for field in ("expected_owners", "observed_owners"):
         require(set(archive[field]) <= ARCHIVE_OWNERS, "unknown archive owner")
         require(all(type(n) is int and n >= 0 for n in archive[field].values()), "invalid archive owner counts")
-    require(type(archive["test_count"]) is int and archive["test_count"] == sum(archive["expected_owners"].values()), "incomplete archive owner inventory")
+    require(type(archive["test_count"]) is int and archive["test_count"] > 0 and
+            archive["test_count"] == sum(archive["expected_owners"].values()), "incomplete or empty archive owner inventory")
     require(set(archive["pending_non_sharded"]) <= ARCHIVE_OWNERS - LAB_OWNERS, "unexpected pending owner")
     require(all(type(n) is int and n >= 0 for n in archive["pending_non_sharded"].values()), "invalid pending owner count")
     exclusions = archive["not_applicable_owners"]
     require(isinstance(exclusions, dict) and set(exclusions) <= {"lab-ignored"}, "unsupported archive owner exclusion")
     require(all(inventory == archive["owner_inventory"][name] for name, inventory in exclusions.items()), "excluded owner inventory changed")
     shards = receipt["shards"]
-    require(isinstance(shards, list), "invalid shards")
+    require(isinstance(shards, list) and shards, "missing archive shards")
     require(all(s["owner"] in LAB_OWNERS for s in shards), "compiler or protected tests cannot be lab shards")
     for owner in owners:
         name = owner["owner"]
@@ -110,7 +111,8 @@ def validate_archive(receipt, expected_plan_digest):
             require(archive["pending_non_sharded"].get(name, 0) == owner["expected_count"], "non-sharded inventory mismatch")
             require(observed == 0, "archive cannot claim non-sharded execution")
             if owner["required"] and owner["expected_count"]:
-                gate = next((g for g in receipt["gates"] if g["name"] == f"{name}-tests"), None)
+                gate_name = "rust-compiler-tests" if name == "builder-compiler" else f"{name}-tests"
+                gate = next((g for g in receipt["gates"] if g["name"] == gate_name), None)
                 require(gate is not None and gate["counts"]["passed"] == owner["expected_count"], "required non-sharded evidence missing")
             # No claim that an unexecuted diagnostic/manual group passed.
             continue
@@ -139,7 +141,8 @@ def validate_archive(receipt, expected_plan_digest):
             require(digest(shard["evidence_sha"]) and digest(shard["junit_sha256"]) and digest(shard["receipt_sha256"]), "unbound shard evidence")
             require(isinstance(shard["command"], list) and shard["command"] and all(isinstance(p, str) and p for p in shard["command"]), "missing shard command")
     require(type(archive["archive_shards_verified"]) is int and archive["archive_shards_verified"] == len(shards), "unverified archive shards")
-    require(type(archive["observed_count"]) is int and archive["observed_count"] == sum(s["observed_count"] for s in shards), "archive observed total mismatch")
+    require(type(archive["observed_count"]) is int and archive["observed_count"] > 0 and
+            archive["observed_count"] == sum(s["observed_count"] for s in shards), "archive observed total mismatch")
     require(archive["observed_count"] == sum(archive["observed_owners"].values()), "archive observed owner mismatch")
 
 

@@ -169,13 +169,37 @@ class CandidateTests(unittest.TestCase):
             candidate.validate(data, required_gates=["rust-tests"], expected_head="a" * 40, expected_base="c" * 40,
                                expected_plan_digest=plan_digest(data))
         gate = copy.deepcopy(data["gates"][0])
-        gate.update(name="builder-compiler-tests", counts={"passed": 1, "failed": 0})
+        gate.update(name="rust-compiler-tests", counts={"passed": 1, "failed": 0})
         data["gates"].append(gate)
-        candidate.validate(data, required_gates=["rust-tests", "builder-compiler-tests"], expected_head="a" * 40, expected_base="c" * 40,
+        candidate.validate(data, required_gates=["rust-tests", "rust-compiler-tests"], expected_head="a" * 40, expected_base="c" * 40,
                            expected_plan_digest=plan_digest(data))
         data["gates"].pop(0)
         with self.assertRaisesRegex(ValueError, "gate inventory mismatch"):
-            candidate.validate(data, required_gates=["rust-tests", "builder-compiler-tests"], expected_head="a" * 40, expected_base="c" * 40,
+            candidate.validate(data, required_gates=["rust-tests", "rust-compiler-tests"], expected_head="a" * 40, expected_base="c" * 40,
+                               expected_plan_digest=plan_digest(data))
+
+    def test_all_zero_archive_is_not_qualification_even_with_matching_frozen_plan(self):
+        data = receipt()
+        data["shards"] = []
+        data["archive"].update(test_count=0, archive_shards_verified=0, observed_count=0, observed_owners={})
+        for owner in data["qualification_plan"]["owners"]:
+            owner["expected_count"] = 0
+            data["archive"]["expected_owners"][owner["owner"]] = 0
+            data["archive"]["owner_inventory"][owner["owner"]]["test_count"] = 0
+        with self.assertRaisesRegex(ValueError, "empty archive owner inventory"):
+            candidate.validate(data, required_gates=["rust-tests"], expected_head="a" * 40, expected_base="c" * 40,
+                               expected_plan_digest=plan_digest(data))
+
+    def test_static_external_gate_names_cannot_be_omitted(self):
+        policy = json.loads((ROOT / "scripts/ci/qualification-policy.json").read_text())
+        required = policy["required_gates"]
+        self.assertIn("rust-doctests", required)
+        self.assertIn("rust-compiler-tests", required)
+        self.assertNotIn("doctests", required)
+        self.assertNotIn("builder-compiler-tests", required)
+        data = receipt()
+        with self.assertRaisesRegex(ValueError, "gate inventory mismatch"):
+            candidate.validate(data, required_gates=required, expected_head="a" * 40, expected_base="c" * 40,
                                expected_plan_digest=plan_digest(data))
 
     def test_per_owner_partition_ranges_are_independent(self):
