@@ -4,5 +4,5 @@ project_id = "61ad3ece-e0a7-4bf3-a565-9a862f785059"
 profile = "linux-gnu-sentinel"
 toolchain = "1.99.0"
 targets = []
-resources = "large"
+resources = "normal"
 image = "fc98be79dbdd0640719ed2bcda1f3729adbc3f254096eb2a3733cda9983c554b"
