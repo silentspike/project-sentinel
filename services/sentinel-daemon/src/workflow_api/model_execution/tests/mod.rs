@@ -5,6 +5,7 @@ use sentinel_workflow::CustomerRequestStateV1;
 
 mod durable_health;
 mod fresh_observation;
+mod funded_dispatch_liveness;
 pub(super) mod read_cohorts;
 
 thread_local! {
