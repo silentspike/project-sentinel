@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Component fixtures only. Descriptive DTOs here do not prove a completed
 //! workflow journal; the store proof and full handoff are tested independently.
 use super::super::model_execution::{AdaptiveProviderAuthority, ProviderExecutionAuthority};
