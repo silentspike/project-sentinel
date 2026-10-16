@@ -31,6 +31,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("self-hosted", text)
         self.assertIn("persist-credentials: false", text)
         self.assertIn("ref: ${{ github.sha }}", text)
+        self.assertIn("PLAN_SHA256: ${{ vars.SENTINEL_CI_PLAN_SHA256 }}", text)
 
     def test_node_reporter_regressions(self):
         result = subprocess.run(["node", "--test", "scripts/ci/tests/test-report.cjs"], cwd=ROOT,
