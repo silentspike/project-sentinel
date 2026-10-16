@@ -80,12 +80,29 @@ verified by the lease owner. Supply:
 
 Each fixture owns a random project directory. Its direct workspace and
 WorkbenchExecutor request both resolve to `WORKSPACE_ROOT/<project>/workspace`.
-Inputs resolve to `INPUT_ROOT/<project>/workspace`. Requests bind those same
-project/work/workspace IDs before computing their canonical digest. Artifacts
+The broker input scope is `INPUT_ROOT/<project>/workspace`. Declared test data
+uses its `declared` child; fixture scripts use a separate `fixture-code` child.
+Requests bind those same project/work/workspace IDs before computing their
+canonical digest. Artifacts
 and foreign data remain separate private state. The broker's exact two-component
 scope, declared-input and child-cgroup validators are unchanged.
 The Python fixture rule explicitly grants its existing `-I` prefix; ungranted
 flags remain rejected for both Python and Node by unchanged production policy.
+
+Direct Python/Node test source is staged byte-for-byte as one temporary script
+in that input scope and passed as an exact declared read-only file. Multiline
+`-c`/`-e` source is not valid production command argv; never weaken the parser
+or encode source to bypass it. Script bytes stay outside the writable FUSE
+budget and outside the declared-data directory's visibility assertions. When
+`inputs=false`, only the script is declared, not `source.txt` or other retained
+inputs. The child positive checks that its script is readable but cannot be
+mutated. Temporary scripts are removed after command quiescence and setup proof.
+
+Setup failures retain the captured facade status/code/signal and bounded,
+escaped stdout/stderr plus the setup error. Fixture canary values are redacted;
+no provider credentials or production state belong in this environment. The
+candidate status still comes exclusively from the broker's terminal channel,
+not from the facade status, including genuine candidate exit 126.
 
 The two normal negative tests and local layout/cleanup regressions use
 `Fixture::new`, which never reads the privileged environment. They remain

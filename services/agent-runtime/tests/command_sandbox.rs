@@ -16,6 +16,35 @@ use sentinel_common::{
 };
 
 static INVOCATION: AtomicU64 = AtomicU64::new(1);
+const TEST_ENV_CANARY: &str = "must-not-survive";
+const SETUP_DIAGNOSTIC_BYTES: usize = 4096;
+
+fn diagnostic_output(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes).replace(TEST_ENV_CANARY, "[redacted-test-canary]");
+    let mut end = text.len().min(SETUP_DIAGNOSTIC_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{:?} (captured_bytes={}, truncated={})",
+        &text[..end],
+        bytes.len(),
+        end < text.len()
+    )
+}
+
+fn setup_diagnostic(output: &Output, phase: &str, error: &dyn std::fmt::Display) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    format!(
+        "fixture {phase}: {}; facade_status={} code={:?} signal={:?}; stdout={}; stderr={}",
+        diagnostic_output(error.to_string().as_bytes()),
+        output.status,
+        output.status.code(),
+        output.status.signal(),
+        diagnostic_output(&output.stdout),
+        diagnostic_output(&output.stderr),
+    )
+}
 
 fn limits() -> WorkbenchResourceLimits {
     WorkbenchResourceLimits {
@@ -44,8 +73,15 @@ struct Fixture {
     project_id: String,
     workspace: PathBuf,
     inputs: PathBuf,
+    scripts: PathBuf,
     artifacts: PathBuf,
     foreign: PathBuf,
+}
+
+struct FixtureCommand {
+    arguments: Vec<String>,
+    inputs: Vec<PathBuf>,
+    _script: Option<tempfile::NamedTempFile>,
 }
 
 impl Fixture {
@@ -106,10 +142,13 @@ impl Fixture {
             .join("workspace");
         let input_project = input_root.join(&project_id);
         fs::create_dir(&input_project).unwrap();
-        let inputs = input_project.join("workspace");
+        let input_scope = input_project.join("workspace");
+        fs::create_dir(&input_scope).unwrap();
+        let inputs = input_scope.join("declared");
+        let scripts = input_scope.join("fixture-code");
         let artifacts = root.join("artifacts");
         let foreign = root.join("foreign");
-        for path in [&workspace, &inputs, &artifacts, &foreign] {
+        for path in [&workspace, &inputs, &scripts, &artifacts, &foreign] {
             fs::create_dir(path).unwrap();
         }
         fs::write(inputs.join("source.txt"), "declared source").unwrap();
@@ -124,6 +163,7 @@ impl Fixture {
             project_id,
             workspace,
             inputs,
+            scripts,
             artifacts,
             foreign,
         }
@@ -150,14 +190,11 @@ impl Fixture {
     }
 
     fn run(&self, program: &str, arguments: &[&str], inputs: bool) -> Output {
+        let prepared = self.prepare_command(program, arguments, inputs);
         let scoped = launch_command(
             &runtime_binary(),
             &self.workspace,
-            &if inputs {
-                vec![self.inputs.join("source.txt")]
-            } else {
-                Vec::new()
-            },
+            &prepared.inputs,
             program,
             &limits(),
             &self.boundary(),
@@ -165,26 +202,82 @@ impl Fixture {
         .unwrap();
         let mut command = scoped.command;
         let mut result = command
-            .args(arguments)
-            .env("SENTINEL_FORBIDDEN_SECRET", "must-not-survive")
-            .env("SENTINEL_WORKBENCH_ATTESTATION_NONCE", "must-not-survive")
+            .args(&prepared.arguments)
+            .env("SENTINEL_FORBIDDEN_SECRET", TEST_ENV_CANARY)
+            .env("SENTINEL_WORKBENCH_ATTESTATION_NONCE", TEST_ENV_CANARY)
             .output()
             .unwrap();
         drop(command);
-        scoped.membership.kill_and_wait().unwrap();
+        scoped
+            .membership
+            .kill_and_wait()
+            .unwrap_or_else(|error| panic!("{}", setup_diagnostic(&result, "quiescence", &error)));
         let mut setup = scoped.setup;
+        let confirmed = setup.poll().unwrap_or_else(|error| {
+            panic!(
+                "{}",
+                setup_diagnostic(&result, "setup/exec/terminal", &error)
+            )
+        });
         assert!(
-            setup.poll().unwrap(),
-            "isolation/exec channel did not confirm execution"
+            confirmed,
+            "{}",
+            setup_diagnostic(
+                &result,
+                "setup/exec/terminal",
+                &"channel did not confirm execution"
+            )
         );
-        result.status = setup
-            .terminal_status()
-            .expect("broker did not prove the candidate status");
+        result.status = setup.terminal_status().unwrap_or_else(|| {
+            panic!(
+                "{}",
+                setup_diagnostic(
+                    &result,
+                    "terminal",
+                    &"broker did not prove candidate status"
+                )
+            )
+        });
         result
     }
 
+    fn prepare_command(&self, program: &str, arguments: &[&str], inputs: bool) -> FixtureCommand {
+        let mut prepared = FixtureCommand {
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            inputs: if inputs {
+                vec![self.inputs.join("source.txt")]
+            } else {
+                Vec::new()
+            },
+            _script: None,
+        };
+        let (source, suffix, prefix) = match (program, arguments) {
+            ("python3", ["-I", "-c", source]) => (*source, ".py", vec!["-I".to_owned()]),
+            ("node", ["-e", source]) => (*source, ".js", Vec::new()),
+            _ => return prepared,
+        };
+        // Inline multiline argv violates the real command grammar. Declare the
+        // exact script as a RO input, outside both the FUSE budget and data view.
+        let script = tempfile::Builder::new()
+            .prefix("command-")
+            .suffix(suffix)
+            .tempfile_in(&self.scripts)
+            .unwrap();
+        fs::write(script.path(), source.as_bytes()).unwrap();
+        prepared.arguments = prefix;
+        prepared
+            .arguments
+            .push(script.path().to_str().unwrap().to_owned());
+        prepared.inputs.push(script.path().to_owned());
+        prepared._script = Some(script);
+        prepared
+    }
+
     fn require_command_support(&self) {
-        let result = self.python("print('strict command sandbox active')");
+        let result = self.python("from pathlib import Path\np = Path(__file__)\nassert p.read_text()\ntry:\n    p.write_text('must not mutate RO fixture code')\n    raise AssertionError('fixture script was writable')\nexcept OSError:\n    pass\nprint('strict command sandbox active')\n");
         assert!(
             result.status.success(),
             "strict child positive did not execute: {:?}: {}",
@@ -285,7 +378,10 @@ fn fixture_local_paths_match_broker_scope_and_executor_binding() {
             relative,
             Path::new(&request.project_id).join(&request.work_item_id)
         );
-        assert_eq!(fixture.inputs, fixture.input_root.join(relative));
+        assert_eq!(
+            fixture.inputs,
+            fixture.input_root.join(relative).join("declared")
+        );
         assert_eq!(request.input_digest, request.canonical_digest().unwrap());
         assert!(fixture.workspace.join(script).is_file());
         assert!(!fixture.workspace.join("project-01/work-04").exists());
@@ -299,11 +395,103 @@ fn fixture_local_paths_match_broker_scope_and_executor_binding() {
             ungranted.validate_for_replay(),
             Err(sentinel_common::WorkbenchValidationError::CommandDenied)
         );
+
+        let (source, inline) = if program == "python3" {
+            (
+                "print('exact python source')\n",
+                vec!["-I", "-c", "print('exact python source')\n"],
+            )
+        } else {
+            (
+                "console.log('exact node source');\n",
+                vec!["-e", "console.log('exact node source');\n"],
+            )
+        };
+        assert_eq!(
+            WorkbenchTool::RunCommand {
+                program: program.into(),
+                args: inline
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+            }
+            .validate_shape(),
+            Err(sentinel_common::WorkbenchValidationError::CommandArgumentEscape),
+            "real broker grammar must keep rejecting multiline command arguments"
+        );
+        for declare_data in [false, true] {
+            let prepared = fixture.prepare_command(program, &inline, declare_data);
+            let script = prepared._script.as_ref().unwrap().path().to_owned();
+            assert_eq!(fs::read(&script).unwrap(), source.as_bytes());
+            assert!(script.starts_with(fixture.input_root.join(relative)));
+            assert!(!script.starts_with(&fixture.workspace_root));
+            assert!(!script.starts_with(&fixture.inputs));
+            assert_eq!(prepared.inputs.last(), Some(&script));
+            assert_eq!(prepared.inputs.len(), if declare_data { 2 } else { 1 });
+            assert_eq!(
+                prepared.inputs.contains(&fixture.inputs.join("source.txt")),
+                declare_data
+            );
+            assert_eq!(prepared.arguments.last().unwrap(), script.to_str().unwrap());
+            // Mirror only the broker's exact-declared-path transport form;
+            // undeclared absolute arguments remain forbidden by production.
+            let arguments = prepared
+                .arguments
+                .iter()
+                .map(|argument| {
+                    if prepared
+                        .inputs
+                        .iter()
+                        .any(|input| input == Path::new(argument))
+                    {
+                        Path::new(argument)
+                            .strip_prefix("/")
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_owned()
+                    } else {
+                        argument.clone()
+                    }
+                })
+                .collect();
+            WorkbenchTool::RunCommand {
+                program: program.into(),
+                args: arguments,
+            }
+            .validate_shape()
+            .unwrap();
+            drop(prepared);
+            assert!(
+                !script.exists(),
+                "private RO script staging must be cleaned up"
+            );
+        }
     }
 }
 
 #[test]
 fn fixture_local_cleanup_preserves_foreign_project_scopes() {
+    use std::os::unix::process::ExitStatusExt;
+    let captured = Output {
+        status: std::process::ExitStatus::from_raw(126 << 8),
+        stdout: format!("observed stdout {TEST_ENV_CANARY}").into_bytes(),
+        stderr: format!(
+            "actual client failure\n{}",
+            "x".repeat(SETUP_DIAGNOSTIC_BYTES + 1)
+        )
+        .into_bytes(),
+    };
+    let diagnostic = setup_diagnostic(&captured, "setup/exec/terminal", &"unconfirmed");
+    assert!(diagnostic.contains("code=Some(126)"));
+    assert!(diagnostic.contains("observed stdout"));
+    assert!(diagnostic.contains("actual client failure"));
+    assert!(diagnostic.contains("truncated=true"));
+    assert!(diagnostic.contains("[redacted-test-canary]"));
+    assert!(!diagnostic.contains(TEST_ENV_CANARY));
+    assert!(diagnostic.len() < 2 * SETUP_DIAGNOSTIC_BYTES);
+    assert!(diagnostic_output(&[0xff, 0xfe]).contains("captured_bytes=2"));
+
     let root = tempfile::tempdir().unwrap();
     let workspace_root = root.path().join("workspaces");
     let input_root = root.path().join("inputs");
