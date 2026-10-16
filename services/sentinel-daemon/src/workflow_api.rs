@@ -22,6 +22,9 @@ mod batched_reads_tests;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/budget_review_extension.rs"]
 mod budget_review_extension_tests;
+#[cfg(all(test, feature = "llm"))]
+#[path = "workflow_api/tests/leadership_audit_clock_replay.rs"]
+mod leadership_audit_clock_replay_tests;
 
 #[cfg(feature = "llm")]
 pub(crate) mod adaptive_leadership_review;
@@ -37,6 +40,8 @@ mod adaptive_review_epoch;
 mod budget_window_tests;
 mod collaboration_publication;
 mod company_reconciliation_worker;
+#[cfg(feature = "llm")]
+mod leadership_window_projection;
 use collaboration_publication::publish_collaboration_publications;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/completion_priority.rs"]

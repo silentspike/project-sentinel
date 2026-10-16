@@ -348,6 +348,35 @@ The daemon validates authorization before dispatch. The runtime validates reques
 
 Stdout/stderr are bounded and redacted. Full private logs may live in protected runtime storage; public events carry structured summaries and safe references.
 
+### Bounded leadership windows
+
+An employee's previous execution window, the leadership review call, and a
+prospective continuation are separate authorities with separate clocks. An
+expired execution window prohibits another dispatch under that window. It
+does not itself decide whether leadership should propose a new finite window.
+A genuine Continue must be adopted into the same session before productive
+work resumes; Defer remains an independent, retained decision. Funding, calls
+already spent, capabilities, assignment and absolute epoch expiry never reset.
+
+New funded budget reviews bind `presentation_version: 2` in the retained
+context. Their model-facing projection distinguishes historical execution,
+the review grant and conditional continuation bounds as of review issuance.
+It promises no future deadline or dispatch and grants no new tools. Fresh
+private inspection is required after adoption, within the new window, before
+further productive tools. For example, an old window with 80 seconds remaining
+cannot admit a 120-second model call; a proposed new window is considered
+against its own finite bounds, not those old 80 seconds. Leadership still
+decides independently whether inspection and useful work fit.
+
+Absent presentation markers preserve legacy context and prompt bytes. Existing
+calls and decisions are not upgraded or retried for a different answer. A first
+unsealed continuation takes its issuance sample after exact source reads;
+audited authorizations and local-adoption receipts retain their original
+timestamps. Completion and local adoption recheck the clock before durable
+commit and roll back staged effects if their applicable window has expired.
+Once a marked context is retained, a binary unable to decode it is not a valid
+rollback target: preserve business history and use a compatible forward repair.
+
 ### Productive workflow service
 
 The daemon exposes the bounded workflow through separate authenticated customer and agent command surfaces. Caller-supplied display names, roles, tenant IDs, assignment IDs, and authority digests are never credentials. A root-owned principal binding maps independent systemd credentials to one tenant, principal kind, company role, and authority generation; the daemon derives the authority digest from the credential bytes and rejects missing, aliased, mutable, or ambiguous bindings.

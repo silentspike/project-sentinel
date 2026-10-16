@@ -299,6 +299,7 @@ fn review(
         dispatch_slack_insufficient: false,
     };
     let context = AdaptiveLeadershipReviewContextV1 {
+        presentation_version: None,
         source_project: f.project.clone(),
         source_session: f.session.clone(),
         tool_catalog: serde_json::json!({"tools": [{"name": "file.inspect"}]}),
