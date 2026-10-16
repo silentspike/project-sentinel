@@ -22,12 +22,14 @@ use crate::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+mod adoption_read;
 #[cfg(test)]
 mod company_claim_tests;
 #[cfg(test)]
 mod health_inventory_tests;
 mod read_sources;
 mod recovery_lineage;
+pub use adoption_read::{AdaptiveModelAdoptionRead, AdaptiveModelAdoptionReadError};
 pub use read_sources::AdaptiveModelPreparationReadSnapshot;
 #[cfg(test)]
 mod rejected_model_tests;
@@ -629,58 +631,21 @@ impl WorkflowStore {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(map_sqlite_error)?;
-        let (session, _) = load(&tx, grant.session_id)?.ok_or_else(not_found)?;
-        authorize(&session.grant, &grant.authority)?;
-        if session.effective_grant() != *grant {
-            return Err(idempotency_conflict());
-        }
-        require_head(&tx, &session)?;
-        if session.is_abandoned_model_effect(effect) {
-            return Err(authority_conflict());
-        }
-
-        let mut statement = tx
-            .prepare(
-                "SELECT response FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2",
-            )
-            .map_err(map_sqlite_error)?;
-        let mut rows = statement
-            .query(params![
-                namespace(grant.session_id),
-                MAX_JOURNAL_ENTRIES as i64
-            ])
-            .map_err(map_sqlite_error)?;
-        let mut collaboration_digest = None;
-        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-            let bytes: Vec<u8> = row.get(0).map_err(map_sqlite_error)?;
-            let entry: Entry = decode(&bytes)?;
-            match entry.command {
-                Some(AdaptiveTransitionV1::ResolveModel {
-                    effect: recorded_effect,
-                    result_digest: recorded_digest,
-                    decision: recorded_decision,
-                }) if recorded_effect == *effect
-                    && recorded_digest == result_digest
-                    && recorded_decision == *decision =>
-                {
-                    if let AdaptiveModelDecisionV1::Collaborate { action } = &recorded_decision {
-                        collaboration_digest = Some(adaptive_collaboration_digest(action)?);
-                    } else {
-                        return Ok(true);
-                    }
-                }
-                Some(AdaptiveTransitionV1::CommitCollaboration {
-                    effect: recorded_effect,
-                    action_digest,
-                }) if recorded_effect == *effect
-                    && collaboration_digest.as_ref() == Some(&action_digest) =>
-                {
-                    return Ok(true);
-                }
-                _ => {}
+        crate::domain_store::validation_scope::with_scope(&tx, || {
+            let (session, _) = load(&tx, grant.session_id)?.ok_or_else(not_found)?;
+            authorize(&session.grant, &grant.authority)?;
+            if session.effective_grant() != *grant {
+                return Err(idempotency_conflict());
             }
-        }
-        Ok(false)
+            require_head(&tx, &session)?;
+            adoption_read::model_result_is_adopted_from_loaded(
+                &tx,
+                &session,
+                effect,
+                result_digest,
+                decision,
+            )
+        })
     }
 
     /// State and idempotent response commit together, before any caller dispatches an effect.
@@ -3768,6 +3733,10 @@ mod continuation_tests {
     use crate::{
         AdaptiveCursorV1, AdaptiveLeadershipReviewContextV1, AdaptiveLeadershipReviewGrantV1,
     };
+
+    mod adoption_read_tests {
+        include!("adaptive/adoption_read_tests.rs");
+    }
 
     fn persisted_unknown(store: &WorkflowStore) -> AdaptiveSessionV1 {
         let root = grant();

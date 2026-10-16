@@ -139,6 +139,35 @@ where
         self.store.adaptive_session(session_id, &current)
     }
 
+    /// Acquire fresh organization authority before reading exact historical result facts.
+    pub fn adaptive_model_adoption_read(
+        &self,
+        grant: &crate::AdaptiveSessionGrantV1,
+        effect: &crate::AdaptiveEffectV1,
+        result_digest: &str,
+        decision: &crate::AdaptiveModelDecisionV1,
+    ) -> Result<crate::AdaptiveModelAdoptionRead, crate::AdaptiveModelAdoptionReadError> {
+        use crate::AdaptiveModelAdoptionReadError;
+
+        require_ready(
+            self.organization.readiness(),
+            WorkflowErrorCode::OrganizationUnavailable,
+        )
+        .map_err(AdaptiveModelAdoptionReadError::Session)?;
+        let current = self
+            .organization
+            .authority_snapshot(
+                &grant.authority.tenant_id,
+                &grant.authority.project_id,
+                &grant.authority.work_item_id,
+                grant.authority.agent_id,
+            )
+            .map_err(map_organization_error)
+            .map_err(AdaptiveModelAdoptionReadError::Session)?;
+        self.store
+            .adaptive_model_adoption_read(grant, &current, effect, result_digest, decision)
+    }
+
     pub fn adaptive_working_memory_source(
         &self,
         session_id: uuid::Uuid,
