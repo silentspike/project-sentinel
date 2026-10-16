@@ -22,9 +22,9 @@ def config():
             "max_active": 3, "template": 8600, "slots": [8601, 8602],
             "managed_growth": {"builder": {"vmid": 9101, "allowance_mib": 1024},
                                "agent": {"vmid": 9102, "allowance_mib": 512}},
-            "network": "172.30.86.0/24", "gateway": "172.30.86.1",
-            "addresses": {"8600": "172.30.86.10", "8601": "172.30.86.11", "8602": "172.30.86.12"},
-            "bridge": "vmbr86", "pool": "sentinel-ci", "storage": "sentinel-ci-zfs", "node": "lab-host"}
+            "network": "192.0.2.0/24", "gateway": "192.0.2.1",
+            "addresses": {"8600": "192.0.2.10", "8601": "192.0.2.11", "8602": "192.0.2.12"},
+            "bridge": "labbr0", "pool": "sentinel-ci", "storage": "sentinel-ci-zfs", "node": "lab-host"}
 
 
 class AdmissionTests(unittest.TestCase):
@@ -47,8 +47,8 @@ class AdmissionTests(unittest.TestCase):
         for change in ({"owner": "foreign"}, {"runtime_target_class": "SINGLE_NODE"},
                        {"reserve_mib": 6000}, {"max_active": 6}, {"template": 8601},
                        {"slots": [8601, 8601]}, {"bridge": "br0;reboot"},
-                       {"gateway": "192.0.2.1"}, {"gateway": "172.30.86.255"},
-                       {"addresses": {"8601": "172.30.86.11"}}):
+                       {"gateway": "198.51.100.1"}, {"gateway": "192.0.2.255"},
+                       {"addresses": {"8601": "192.0.2.11"}}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 c.validate_config({**config(), **change})
 
@@ -57,23 +57,23 @@ class ArpTests(unittest.TestCase):
     own = bytes.fromhex("020000000001")
     other = bytes.fromhex("020000000002")
 
-    def frame(self, sender="172.30.86.11", target="172.30.86.1", mac=None):
+    def frame(self, sender="192.0.2.11", target="192.0.2.1", mac=None):
         mac = mac or self.other
         return (b"\xff" * 6 + mac + b"\x08\x06" + struct.pack("!HHBBH", 1, 0x800, 6, 4, 1)
                 + mac + socket.inet_aton(sender) + b"\0" * 6 + socket.inet_aton(target))
 
     def test_existing_owner(self):
-        self.assertTrue(c.arp_conflict(self.frame(), "172.30.86.11", self.own))
+        self.assertTrue(c.arp_conflict(self.frame(), "192.0.2.11", self.own))
 
     def test_simultaneous_probe(self):
-        self.assertTrue(c.arp_conflict(self.frame("0.0.0.0", "172.30.86.11"), "172.30.86.11", self.own))
+        self.assertTrue(c.arp_conflict(self.frame("0.0.0.0", "192.0.2.11"), "192.0.2.11", self.own))
 
     def test_own_probe_ignored(self):
-        self.assertFalse(c.arp_conflict(self.frame("0.0.0.0", "172.30.86.11", self.own), "172.30.86.11", self.own))
+        self.assertFalse(c.arp_conflict(self.frame("0.0.0.0", "192.0.2.11", self.own), "192.0.2.11", self.own))
 
     def test_unrelated_or_truncated_ignored(self):
-        self.assertFalse(c.arp_conflict(self.frame("172.30.86.12"), "172.30.86.11", self.own))
-        self.assertFalse(c.arp_conflict(b"bad", "172.30.86.11", self.own))
+        self.assertFalse(c.arp_conflict(self.frame("192.0.2.12"), "192.0.2.11", self.own))
+        self.assertFalse(c.arp_conflict(b"bad", "192.0.2.11", self.own))
 
 
 class ProcessTelemetryTests(unittest.TestCase):
