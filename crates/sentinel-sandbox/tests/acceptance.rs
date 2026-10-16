@@ -19,6 +19,12 @@ use sentinel_sandbox::{
 const REAP_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+// Only for reads through an already-pinned proc directory. Linux can report
+// ESRCH as well as ENOENT after that exact process has been reaped.
+fn pinned_proc_identity_is_gone(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+}
+
 #[derive(Debug, PartialEq)]
 struct ProcState {
     pid: u32,
@@ -120,7 +126,7 @@ impl InitIdentity {
         let deadline = Instant::now() + REAP_DEADLINE;
         loop {
             match self.read_state() {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) if pinned_proc_identity_is_gone(&error) => return Ok(()),
                 Err(error) => return Err(error),
                 Ok(state) => {
                     if state.pid != self.pid || state.start_ticks != self.start_ticks {
@@ -600,9 +606,27 @@ fn ac_75_vm_60_concurrent_full_cages_are_distinct() {
                 .expect("the burst must reap its supervisor and original init");
         }
         assert!(identities.iter().all(|identity| {
-            matches!(identity.read_state(), Err(error) if error.kind() == io::ErrorKind::NotFound)
+            matches!(identity.read_state(), Err(error) if pinned_proc_identity_is_gone(&error))
         }), "the 60-sandbox burst must leave no sandboxed child behind");
     });
+}
+
+#[test]
+fn pinned_proc_reaping_accepts_only_enoent_and_esrch() {
+    for code in [libc::ENOENT, libc::ESRCH] {
+        assert!(pinned_proc_identity_is_gone(&io::Error::from_raw_os_error(
+            code
+        )));
+    }
+    for code in [libc::EACCES, libc::EPERM, libc::EBADF, libc::EIO, libc::ETIMEDOUT] {
+        assert!(!pinned_proc_identity_is_gone(&io::Error::from_raw_os_error(
+            code
+        )));
+    }
+    assert!(!pinned_proc_identity_is_gone(&io::Error::new(
+        io::ErrorKind::TimedOut,
+        "process remains present"
+    )));
 }
 
 #[test]
