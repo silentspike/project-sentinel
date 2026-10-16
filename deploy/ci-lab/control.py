@@ -271,11 +271,16 @@ class Lab:
         headroom = 0
         external = 0
         balloons = []
+        running = {str(v["vmid"]) for v in guests if v.get("status") == "running" and v.get("node") == self.config["node"]}
         for guest in guests:
             if guest.get("node") != self.config["node"] or guest.get("status") != "running" or guest.get("type") != "qemu":
                 continue
             owned = guest["vmid"] in [self.config["template"], *self.config["slots"]]
             status = api(f"/nodes/{self.config['node']}/qemu/{guest['vmid']}/status/current") if owned else guest
+            if owned and status.get("status") == "stopped":
+                active -= 1
+                running.discard(str(guest["vmid"]))
+                continue
             actual = status.get("balloon") if owned else guest.get("maxmem")
             actual = status.get("maxmem") if actual is None else actual
             resident = status.get("memhost")
@@ -289,7 +294,10 @@ class Lab:
             committed = max(actual, status.get("balloon_min") or 0, requested)
             outstanding = (max(0, committed - resident) + MIB - 1) // MIB
             if owned:
-                measured = process_memory(status.get("pid"))
+                try:
+                    measured = process_memory(status.get("pid"))
+                except (OSError, RuntimeError, ValueError, IndexError) as error:
+                    raise CapacityUnavailable("owned QEMU process sample unavailable; retry fresh admission") from error
                 # Never credit stale PVE telemetry above actual process residency.
                 resident = min(resident, measured["rss_bytes"])
                 outstanding = (max(0, committed - resident) + MIB - 1) // MIB
@@ -302,7 +310,6 @@ class Lab:
                              "committed_mib": committed // MIB, "resident_mib": resident // MIB,
                              "outstanding_mib": outstanding, "max_mib": guest["maxmem"] // MIB})
         # Stopped, accepted starting intents remain promises after a crash.
-        running = {str(v["vmid"]) for v in guests if v.get("status") == "running" and v.get("node") == self.config["node"]}
         for key, intent in self.state.get("runs", {}).items():
             if key not in running and key != str(starting_vmid) and intent.get("phase") == "starting":
                 headroom += self.state.get("balloon_requests", {}).get(key, 8192)
@@ -371,11 +378,11 @@ class Lab:
         self.save()
         return lease
 
-    def require_lease(self, vmid: int, holder: str):
+    def require_lease(self, vmid: int, holder: str, allow_invalidated: bool = False):
         value = self.state["leases"].get(str(vmid), {})
         if value.get("holder") != holder or value.get("expires", 0) <= time.time():
             raise RuntimeError("active matching lab lease required")
-        if any(fault.get("vmid") == vmid and fault.get("lease", {}).get("holder") == holder
+        if not allow_invalidated and any(fault.get("vmid") == vmid and fault.get("lease", {}).get("holder") == holder
                for fault in self.state.get("invalidated_leases", []) if fault.get("lease")):
             raise RuntimeError("lease invalidated by host pressure; use a new job identity")
 
@@ -450,7 +457,7 @@ class Lab:
         return decision
 
     def release(self, vmid: int, holder: str):
-        self.require_lease(vmid, holder)
+        self.require_lease(vmid, holder, allow_invalidated=True)
         if self.status(vmid)["status"] != "stopped":
             raise RuntimeError("stop the guest before releasing its lease")
         self.state["leases"][str(vmid)]["expires"] = time.time()

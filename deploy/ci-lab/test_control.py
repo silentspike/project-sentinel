@@ -366,6 +366,39 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.lab.require_lease(8601, "job")
 
+    def test_invalidated_job_can_release_only_after_stopped_and_new_job_gets_new_generation(self):
+        self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "old", "expires": 9999999999}
+        self.lab.state["invalidated_leases"] = [{"vmid": 8601, "lease": {"holder": "job"}}]
+        with patch.object(self.lab, "status", return_value={"status": "running"}):
+            with self.assertRaises(RuntimeError):
+                self.lab.release(8601, "job")
+        with patch.object(self.lab, "status", return_value={"status": "stopped"}), patch.object(self.lab, "owned"):
+            with self.assertRaises(RuntimeError):
+                self.lab.release(8601, "foreign-job")
+            self.lab.release(8601, "job")
+            lease = self.lab.lease(8601, "new-job", 1800)
+        self.assertNotEqual(lease["generation"], "old")
+        self.lab.require_lease(8601, "new-job")
+        self.assertEqual(len(self.lab.state["invalidated_leases"]), 1)
+
+    def test_stale_cluster_running_view_uses_fresh_own_stopped_status(self):
+        guest = {"vmid": 8601, "node": "lab-host", "type": "qemu", "status": "running", "maxmem": 8192 * c.MIB}
+        self.lab.state["runs"] = {"8601": {"phase": "quiesced"}}
+        with patch.object(c, "api", side_effect=lambda path: [guest] if path == "/cluster/resources" else {"status": "stopped"}), \
+                patch.object(c, "available_mib", return_value=20000):
+            result = self.lab.resources(2048)
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["active"], 0)
+        self.assertEqual(result["outstanding_commitments_mib"], 0)
+
+    def test_transient_missing_own_pid_is_bounded_capacity_wait_not_semantic_block(self):
+        guest = {"vmid": 8601, "node": "lab-host", "type": "qemu", "status": "running", "maxmem": 8192 * c.MIB}
+        status = {"status": "running", "balloon": 2048 * c.MIB, "memhost": 1024 * c.MIB}
+        with patch.object(c, "api", side_effect=lambda path: [guest] if path == "/cluster/resources" else status), \
+                patch.object(c, "process_memory", side_effect=RuntimeError("missing identity")):
+            with self.assertRaises(c.CapacityUnavailable):
+                self.lab.resources(2048)
+
     def test_expired_or_released_running_guest_cannot_transfer(self):
         for holder in ("old-job", "new-job"):
             self.lab.state["leases"]["8601"] = {"holder": "old-job", "expires": 0, "generation": "old"}
