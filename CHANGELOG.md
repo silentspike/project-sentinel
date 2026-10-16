@@ -1,5 +1,10 @@
 # Changelog
 
+- Use the governed company response contract instead of ambient action-format
+  instructions for validated model work across structured and legacy gateway
+  prompts. Preserve employee identity, perception, independent decisions,
+  ambient prompt bytes and existing Anthropic system pass-through (#856).
+
 - Charge complete retained authorization history separately from the unchanged
   128 KiB head-envelope limit for explicitly funded leadership reviews. Keep
   finite history-byte/window budgets, all historical authority and digest
