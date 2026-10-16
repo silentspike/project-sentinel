@@ -37,15 +37,25 @@ The config requires `owner=sentinel-ci-v1`, `runtime_target_class=LAB`, `node`,
 and `slots`, an `addresses` map keyed by VM ID, `reserve_mib>=6144`, and
 `max_active<=3`. Optional `growth_margin_mib` and `idle_seconds` default to 1024
 and 900. Private manifests contain the complete runtime-target declaration.
+Starts also require a private `network_check` argument vector that verifies the
+complete live owned firewall graph without modifying it. Saved configuration
+and partial table presence are never equivalent to live isolation.
 
 Each effect checks VM ID, node, pool membership, owner marker, bridge, storage
 and a bounded matching lease. Start checks configured address reservations and
 three ARP duplicate-address probes immediately before boot. Failed ping is not
 an IP allocation check. Pool and network provisioning also require a fresh
 cluster-wide configuration/interface/route inventory before initial allocation.
+Provisioning, decommission, lifecycle and maintenance share one durable state
+lock. Decommission fences admission before destruction and retains that fence
+across a partial failure. A new lease generation cannot take over a running
+expired/released job; stop it first. A running-start retry succeeds only for
+the same recorded lease generation and VM identity.
 
 Starts and balloon increases reserve their requested memory plus a conservative
-foreign-growth margin. Lab automatic balloon growth is disabled; requests use
+foreign-growth margin **and outstanding current target minus resident memory**
+for every running VM. Pending balloon requests remain committed until actual
+convergence; resident memory is not counted twice. Lab automatic balloon growth is disabled; requests use
 the 2-8 GiB envelope. `telemetry` reports actual balloon, configured minimum,
 maximum, guest/host-used bytes, concurrent guests, host available memory, PSI and
 load. Null telemetry is unknown, not zero. This is shared capacity, not a claim
@@ -55,7 +65,10 @@ Run `guard` and `reap` from a host-local timer, without an agent session.
 Host reserve pressure gracefully stops only owned labs, durably invalidating
 their leases, including active work; interrupted tests cannot count as PASS.
 Released/expired idle slots shut down after the idle interval. `release` ends
-only the caller's lease. Renewal uses the same holder and bounded lease API.
+only the stopped caller's lease. Renewal uses the same holder and bounded lease API.
+`defer-start` records a bounded, deduplicated request rather than bypassing
+capacity. Host-local maintenance automatically retries only capacity/transport
+waits with fresh admission. Semantic failures stay explicitly blocked, not PASS.
 
 ## Snapshots
 
@@ -66,6 +79,9 @@ providing quiesced disks without merging or snapshotting external effects.
 tracked, unpreserved snapshots older than 24 hours when no active lease exists.
 Set `--preserve` for active investigations or a working rollback. A snapshot is
 not an independent backup and never reverses provider effects.
+Creating/deleting intents reconcile the external operation owner, snapshot
+presence, VM lock and active task after reconnect. A completed effect is not
+issued again, and a missing or foreign snapshot cannot satisfy restoration.
 
 ## Verification
 
