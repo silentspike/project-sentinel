@@ -246,6 +246,140 @@ fn failed_scan_error_is_not_suppressed_by_a_later_cancellation() {
     assert_status(&api, false, Some("PersistenceFailure"));
 }
 
+fn publication_api() -> WorkflowApi {
+    let mut api = enabled_api();
+    api.event_store = Some(sentinel_limbo::EventStore::open(":memory:").unwrap());
+    api
+}
+
+fn completed_empty_batch_stop_checks() -> usize {
+    let api = publication_api();
+    let checks = AtomicUsize::new(0);
+    api.reconcile_batch(&|| {
+        checks.fetch_add(1, Ordering::SeqCst);
+        false
+    })
+    .unwrap();
+    checks.load(Ordering::SeqCst)
+}
+
+#[test]
+fn completed_scan_publishes_success_without_sampling_a_new_final_stop() {
+    let boundary_checks = completed_empty_batch_stop_checks();
+    assert!(boundary_checks > 0);
+    for previous in [None, Some(None), Some(Some("existing error"))] {
+        let api = publication_api();
+        if let Some(previous) = previous {
+            api.publish_reconciliation_status(previous.map(str::to_owned));
+        }
+        let checks = AtomicUsize::new(0);
+        // The entry check plus all real batch boundaries allow completion.
+        // Only an extra, post-completion cancellation sample would return true.
+        api.reconcile_pending_until(|| checks.fetch_add(1, Ordering::SeqCst) > boundary_checks);
+        assert_eq!(checks.load(Ordering::SeqCst), boundary_checks + 1);
+        assert_status(&api, true, None);
+    }
+}
+
+#[test]
+fn cancellation_at_every_actual_empty_batch_boundary_preserves_previous_status() {
+    let boundary_checks = completed_empty_batch_stop_checks();
+    for stop_at in 0..=boundary_checks {
+        for previous in [None, Some(None), Some(Some("existing error"))] {
+            let api = publication_api();
+            if let Some(previous) = previous {
+                api.publish_reconciliation_status(previous.map(str::to_owned));
+            }
+            let before = api.reconciliation_status_snapshot();
+            let checks = AtomicUsize::new(0);
+            api.reconcile_pending_until(|| checks.fetch_add(1, Ordering::SeqCst) >= stop_at);
+            let after = api.reconciliation_status_snapshot();
+            assert_eq!(
+                after.scan_succeeded, before.scan_succeeded,
+                "stop {stop_at}"
+            );
+            assert_eq!(after.last_error, before.last_error, "stop {stop_at}");
+        }
+    }
+}
+
+#[test]
+fn poisoned_publication_fence_is_unknown_and_cannot_grant_readiness() {
+    let api = publication_api();
+    api.publish_reconciliation_status(None);
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let _publication = api.collaboration_publication_fence.lock().unwrap();
+        panic!("poison collaboration publication fence");
+    }))
+    .is_err());
+    assert!(api.collaboration_publication_fence.is_poisoned());
+    assert_eq!(
+        api.collaboration_publication_pending
+            .load(Ordering::Acquire),
+        0
+    );
+    let health = api.health();
+    assert!(!health.ready);
+    assert_eq!(health.collaboration_publication_pending, usize::MAX);
+    assert_eq!(
+        health.last_error.as_deref(),
+        Some("collaboration_publication_fence_poisoned")
+    );
+    for _ in 0..2 {
+        api.collaboration_publication_pending
+            .store(0, Ordering::Release);
+        assert!(api.publish_collaboration_backlog().is_err());
+        assert_eq!(
+            api.collaboration_publication_pending
+                .load(Ordering::Acquire),
+            usize::MAX
+        );
+        assert!(!api.health().ready);
+    }
+    api.reconcile_pending_until(|| false);
+    assert_status(&api, false, Some("PersistenceFailure"));
+}
+
+#[test]
+fn contended_publication_fence_preserves_counter_until_snapshot_can_be_read() {
+    let api = publication_api();
+    api.collaboration_publication_pending
+        .store(7, Ordering::Release);
+    let guard = api.collaboration_publication_fence.lock().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let api = &api;
+        scope.spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx.send(api.publish_collaboration_backlog()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(
+            api.collaboration_publication_pending
+                .load(Ordering::Acquire),
+            7
+        );
+        // A writer's unknown marker must survive until the fenced snapshot is verified.
+        api.collaboration_publication_pending
+            .store(usize::MAX, Ordering::Release);
+        drop(guard);
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+    });
+    assert_eq!(
+        api.collaboration_publication_pending
+            .load(Ordering::Acquire),
+        0
+    );
+}
+
 struct PublishDuringDependencyCheck {
     api: OnceLock<Weak<WorkflowApi>>,
     error: Option<String>,

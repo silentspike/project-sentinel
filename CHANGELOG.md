@@ -1,5 +1,18 @@
 # Changelog
 
+- Count collaboration publications as pending only when no exact validated
+  canonical append receipt exists. Serialize publication-producing mutations
+  with ledger validation and publication; retain fail-closed unknown/error
+  states, canonical replay verification and event history. Publish a completed
+  initial reconciliation pass without resampling a new cancellation after its
+  last phase, and distinguish completed work from yielded scans in logs (#856).
+
+- Allow canonical JSON digest entries up to a 1 MiB per-shard spare-capacity
+  budget so valid funded review contexts above 128 KiB can reuse exact digests.
+  Keep the existing 32 MiB aggregate cache bound, numeric-entry priority,
+  domain/encoding/full-byte equality, streaming fallback and authority checks
+  unchanged; no runtime speedup is inferred before target measurement (#856).
+
 - Use the governed company response contract instead of ambient action-format
   instructions for validated model work across structured and legacy gateway
   prompts. Preserve employee identity, perception, independent decisions,

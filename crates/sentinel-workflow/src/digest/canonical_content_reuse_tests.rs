@@ -229,6 +229,70 @@ fn canonical_content_reuses_exact_serialized_bytes_from_distinct_allocations() {
 }
 
 #[test]
+fn canonical_content_reuses_funded_context_sized_json_without_changing_digests() {
+    const SERIALIZED_BYTES: usize = 133_487;
+    const DOMAIN: &str = "canonical-content-funded-size";
+    const OTHER_DOMAIN: &str = "canonical-content-funded-size-other";
+    let cache = ContentDigestCache::new();
+    // Synthetic canonical bytes at the measured installed-context size, not customer data.
+    let value = "x".repeat(SERIALIZED_BYTES - 2);
+    let repeated = value.clone();
+    assert_ne!(value.as_ptr(), repeated.as_ptr());
+    assert_eq!(serde_json::to_vec(&value).unwrap().len(), SERIALIZED_BYTES);
+    const {
+        assert!(SERIALIZED_BYTES > 128 * 1024);
+        assert!(SERIALIZED_BYTES <= CONTENT_DIGEST_CANONICAL_MAX_PAYLOAD);
+    }
+    let expected = legacy(DOMAIN, &value);
+    with_canonical_digest_cache_enabled(true, || {
+        let (_, diagnostics) = with_digest_diagnostics(|| {
+            assert_eq!(
+                canonical_sha256_with_cache(DOMAIN, &value, &cache).unwrap(),
+                expected
+            );
+            assert_eq!(computations(&cache), 1);
+            assert_eq!(
+                canonical_sha256_with_cache(DOMAIN, &repeated, &cache).unwrap(),
+                expected
+            );
+            assert_eq!(computations(&cache), 1);
+        });
+        assert_eq!(diagnostics.len(), 1);
+        let cost = &diagnostics[0].canonical;
+        assert_eq!(diagnostics[0].domain, Some(DOMAIN));
+        assert_eq!(cost.calls, 2);
+        assert_eq!(cost.cache_hits, 1);
+        assert_eq!(cost.failures, 0);
+        assert_eq!(cost.serialized_bytes, (SERIALIZED_BYTES * 2) as u64);
+        assert_eq!(
+            cost.hashed_bytes,
+            (SERIALIZED_BYTES + DOMAIN.len() + 1) as u64
+        );
+
+        let mut changed = repeated;
+        let last = changed.len() - 1;
+        changed.replace_range(last.., "y");
+        assert_eq!(
+            serde_json::to_vec(&changed).unwrap().len(),
+            SERIALIZED_BYTES
+        );
+        let edited = canonical_sha256_with_cache(DOMAIN, &changed, &cache).unwrap();
+        assert_eq!(edited, legacy(DOMAIN, &changed));
+        assert_ne!(edited, expected);
+        assert_eq!(computations(&cache), 2);
+        let other = canonical_sha256_with_cache(OTHER_DOMAIN, &value, &cache).unwrap();
+        assert_eq!(other, legacy(OTHER_DOMAIN, &value));
+        assert_ne!(other, expected);
+        assert_eq!(computations(&cache), 3);
+        assert_eq!(
+            canonical_sha256_with_cache(DOMAIN, &value, &cache).unwrap(),
+            expected
+        );
+        assert_eq!(computations(&cache), 3);
+    });
+}
+
+#[test]
 fn canonical_content_collisions_compare_encoding_domain_length_and_every_byte() {
     let cache = ContentDigestCache::new();
     let first = b"[0,1,255]";
@@ -305,8 +369,10 @@ fn canonical_content_collisions_compare_encoding_domain_length_and_every_byte() 
 fn canonical_content_and_numeric_arrays_share_existing_eviction_byte_and_entry_budgets() {
     const CANONICAL_BYTES: usize = CONTENT_DIGEST_CANONICAL_SHARD_BYTES;
     const CANONICAL_ENTRIES: usize = CONTENT_DIGEST_CANONICAL_SHARD_ENTRIES;
-    assert_eq!(CANONICAL_BYTES, 128 * 1024);
+    assert_eq!(CANONICAL_BYTES, 1024 * 1024);
     assert_eq!(CANONICAL_ENTRIES, 32);
+    assert_eq!(CONTENT_DIGEST_SHARD_BYTES, 4 * 1024 * 1024);
+    assert_eq!(CONTENT_DIGEST_SHARD_ENTRIES, 256);
     assert_eq!(
         CONTENT_DIGEST_CANONICAL_MAX_PAYLOAD + ContentDigestEntry::payload_cost(0),
         CANONICAL_BYTES
@@ -363,14 +429,26 @@ fn canonical_content_and_numeric_arrays_share_existing_eviction_byte_and_entry_b
                 .iter()
                 .all(|entry| entry.bytes.len() <= CONTENT_DIGEST_MAX_PAYLOAD));
         }
-        assert!(cache.shards[shard_index]
+        let canonical_before = {
+            let shard = cache.shards[shard_index].lock().unwrap();
+            assert_eq!(shard.bytes, CONTENT_DIGEST_SHARD_BYTES);
+            shard
+                .entries
+                .iter()
+                .filter(|entry| entry.encoding == DigestEncoding::CanonicalJson)
+                .count()
+        };
+        assert!(canonical_before > 0);
+        // Numeric admission under shared byte pressure must evict canonical first.
+        let _ = cache.digest_at(shard_index as u64, "canonical-content-byte-budget", b"new");
+        let canonical_after = cache.shards[shard_index]
             .lock()
             .unwrap()
             .entries
             .iter()
-            .any(|entry| entry.encoding == DigestEncoding::CanonicalJson));
-        // Numeric admission under shared byte pressure must evict canonical first.
-        let _ = cache.digest_at(shard_index as u64, "canonical-content-byte-budget", b"new");
+            .filter(|entry| entry.encoding == DigestEncoding::CanonicalJson)
+            .count();
+        assert!(canonical_after < canonical_before);
         for generation in 0_u8..4 {
             numeric[0] = generation;
             let before = computations(&cache);
@@ -484,6 +562,64 @@ fn canonical_content_and_numeric_arrays_share_existing_eviction_byte_and_entry_b
         .entries
         .iter()
         .all(|entry| entry.encoding == DigestEncoding::NumericByteArray));
+}
+
+#[test]
+fn canonical_content_byte_admission_uses_only_spare_numeric_capacity() {
+    const DOMAIN: &str = "canonical-content-spare-bytes";
+    let cache = ContentDigestCache::new();
+    let mut numeric = vec![0; CONTENT_DIGEST_MAX_PAYLOAD];
+    for generation in 0_u8..3 {
+        numeric[0] = generation;
+        let _ = cache.digest_at(0, DOMAIN, &numeric);
+    }
+    let payload =
+        serde_json::to_vec(&"x".repeat(CONTENT_DIGEST_CANONICAL_MAX_PAYLOAD - 2)).unwrap();
+    assert_eq!(
+        ContentDigestEntry::payload_cost(payload.len()),
+        CONTENT_DIGEST_CANONICAL_SHARD_BYTES
+    );
+    let expected = legacy_json_bytes(DOMAIN, &payload);
+    let before = computations(&cache);
+    for attempt in 1..=2 {
+        let (digest, hit) =
+            cache.digest_encoded_at(0, DigestEncoding::CanonicalJson, DOMAIN, &payload);
+        assert_eq!(digest, expected);
+        assert!(!hit, "canonical content cannot evict numeric bytes to fit");
+        assert_eq!(computations(&cache), before + attempt);
+    }
+    let before = computations(&cache);
+    for generation in 0_u8..3 {
+        numeric[0] = generation;
+        assert!(
+            cache
+                .digest_encoded_at(0, DigestEncoding::NumericByteArray, DOMAIN, &numeric)
+                .1
+        );
+    }
+    assert_eq!(computations(&cache), before);
+    {
+        let shard = cache.shards[0].lock().unwrap();
+        assert_eq!(shard.entries.len(), 3);
+        assert!(shard.bytes <= CONTENT_DIGEST_SHARD_BYTES);
+        assert!(shard
+            .entries
+            .iter()
+            .all(|entry| entry.encoding == DigestEncoding::NumericByteArray));
+    }
+
+    let empty = ContentDigestCache::new();
+    for expected_hit in [false, true] {
+        let (digest, hit) =
+            empty.digest_encoded_at(0, DigestEncoding::CanonicalJson, DOMAIN, &payload);
+        assert_eq!(digest, expected);
+        assert_eq!(hit, expected_hit);
+    }
+    assert_eq!(computations(&empty), 1);
+    assert_eq!(
+        empty.shards[0].lock().unwrap().bytes,
+        CONTENT_DIGEST_CANONICAL_SHARD_BYTES
+    );
 }
 
 #[test]
