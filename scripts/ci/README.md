@@ -122,6 +122,68 @@ large blocked-test lists and recipes, validates the complete envelope and reject
 payloads exceeding the reporter's 60000-character base64 limit. Full exact-ID and
 JUnit evidence stays with the controller and is bound through retained hashes.
 
+## Additive Receipt V2
+
+V2 is next-increment source preparation only. It does not qualify the first
+aggregate, replace required hosted full CI, grant kernel access or establish a
+live signed shadow. V1 validation, canonical bytes, whole-owner rules and HMAC
+encoding remain unchanged. Version2 must be explicit in the envelope, frozen
+qualification plan and archive summary; mixed versions are rejected.
+
+The archive owner keeps the complete compiled ignored inventory and its digest,
+including every reviewed-not-applicable ID. Its schema2 archive plan embeds an
+`applicability` object bound to the exact identity, manifest and full test
+inventory, with exactly one reasoned `{binary_id,name,required,reason}` decision
+per original ignored test. Reasons are nonempty printable ASCII, at most1024
+characters. `applicability_digest` uses the archive's existing object digest
+(SHA256 of `json.dumps(value, sort_keys=True)` bytes), not the candidate's
+compact canonical encoding. Full compiled rows remain `{binary_id,name,ignored}`.
+The map is independently frozen before execution; reason text alone supplies
+no review authority, and a later failed test cannot simply become N/A.
+
+The candidate's independently frozen qualification plan adds exactly:
+
+- `applicability_digest`: digest of the complete frozen reasoned map.
+- `ignored_applicability`: `compiled_count/digest`, `required_count/digest`,
+  `not_applicable_count/digest`, `not_applicable_status` and `partitions`.
+  Status is exactly `NOTEXECUTED_NOTPASS`. Every original ignored partition,
+  including required-zero partitions, has
+  `{partition,total,required_count,required_digest}`. Partitioning remains sorted
+  round-robin over the complete original inventory BEFORE required filtering.
+
+The full archive verifier summary includes the map, its digest, explicit
+`not_applicable_tests` original rows plus reason/status, and
+`owner_applicability.lab-ignored`, which adds the actual
+`observed_required_count` to the expected frozen accounting above. That actual
+count must equal the required count. `owner_inventory`, `expected_owners` and
+`test_count` remain the complete original compiled inventory; `observed_owners`
+counts only actually successful required execution. N/A is not a pass.
+
+Before compaction, `candidate.py assemble` validates all decisions against the
+full ignored inventory digest, uniqueness, required/N/A subset digests, exact
+explicit N/A rows/reasons/status and per-partition required-ID digests. Unknown,
+missing or duplicate decisions and changed reasons are rejected against the
+independently pinned plan. The archive verifier separately checks actual exact
+selected IDs and every JUnit result; a raw LAB count assertion is insufficient.
+Only the canonical trusted controller may authenticate that verified evidence.
+
+Compact archive projection adds only `applicability_digest` and
+`owner_applicability`, not the full decision or N/A lists. Every projected v2
+shard binds `applicability_digest` AND `required_digest` of its selected original
+rows, in addition to all v1 provenance fields. Required ignored shard digests
+must match the independently frozen per-partition subset. A required-zero
+partition emits no execution receipt and is not a passing shard. Required
+partitions remain complete even when an all-N/A partition causes a gap in the
+executed partition numbers. Normal shard rules and separate compiler/doctest
+gates remain unchanged; static policy cannot be self-omitted.
+
+V2 rejects whole-owner exclusion flags/maps. It requires exact accounting:
+full compiled = successful required LAB + explicit ignored N/A + pending
+non-sharded owners. A compact signed receipt is a controller assertion about
+retained exact-ID/JUnit proof, not an independently reconstructed test execution
+or proof that optional hardware was exercised. The existing60000-character
+base64 bound still applies; no additional platform, App or fork credentials.
+
 ## Shadow Reporting
 
 `candidate-report.yml` runs only by dispatch on protected main, on a hosted

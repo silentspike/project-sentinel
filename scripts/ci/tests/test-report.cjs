@@ -88,3 +88,53 @@ test('duplicate receipt delivery updates original Actions check, not foreign app
   await report(f);
   assert.equal(f.calls[0].check_run_id, 44);
 });
+
+function v2Fixture() {
+  const f = fixture();
+  f.receipt.schema_version = 2;
+  f.receipt.qualification_plan = {schema_version: 2, applicability_digest: '1'.repeat(64),
+    ignored_applicability: {required_count: 42, not_applicable_count: 2,
+      not_applicable_status: 'NOTEXECUTED_NOTPASS'}};
+  f.raw = Buffer.from(JSON.stringify(f.receipt));
+  f.env.RECEIPT_B64 = f.raw.toString('base64');
+  f.env.RECEIPT_SIGNATURE = crypto.createHmac('sha256', f.env.RECEIPT_KEY).update(f.raw).digest('hex');
+  return f;
+}
+
+test('v2 authenticates unchanged exact bytes and preserves the independent plan binding', async () => {
+  const f = v2Fixture();
+  f.verify = (raw, receipt, expectedPlan) => {
+    assert.deepEqual(raw, f.raw);
+    assert.equal(receipt.schema_version, 2);
+    assert.equal(expectedPlan, f.env.PLAN_SHA256);
+    return true;
+  };
+  await report(f);
+  assert.equal(f.calls[0].external_id, `receipt:${crypto.createHash('sha256').update(f.raw).digest('hex')}`);
+  assert.equal(f.calls[0].name, NAME);
+});
+
+test('v2 map digest and N/A accounting tampering cannot reach verification with an old HMAC', async () => {
+  for (const mutate of [p => p.applicability_digest = '2'.repeat(64),
+    p => p.ignored_applicability.required_count--,
+    p => p.ignored_applicability.not_applicable_count++,
+    p => p.ignored_applicability.not_applicable_status = 'PASS']) {
+    const f = v2Fixture();
+    mutate(f.receipt.qualification_plan);
+    f.env.RECEIPT_B64 = Buffer.from(JSON.stringify(f.receipt)).toString('base64');
+    let executed = false;
+    f.verify = () => {executed = true; return true;};
+    await assert.rejects(report(f), /authentication/);
+    assert.equal(executed, false);
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test('v2 authenticated but unqualified coverage is a shadow failure, never ci-pass', async () => {
+  const f = v2Fixture();
+  f.verify = () => false;
+  await assert.rejects(report(f), /qualification failed/);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].conclusion, 'failure');
+  assert.notEqual(f.calls[0].name, 'ci-pass');
+});

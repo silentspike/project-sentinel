@@ -51,6 +51,234 @@ def plan_digest(value):
     return hashlib.sha256(candidate.canonical(value["qualification_plan"])).hexdigest()
 
 
+def receipt_v2(required_names=None, count=4):
+    data = receipt()
+    data["schema_version"] = data["qualification_plan"]["schema_version"] = 2
+    rows = sorted([{"binary_id": "sandbox", "name": f"test-{n}", "ignored": True} for n in range(count)], key=lambda r: r["name"])
+    required_names = {"test-0", "test-2"} if required_names is None else required_names
+    required = [r for r in rows if r["name"] in required_names]
+    excluded = [r for r in rows if r["name"] not in required_names]
+    owner = next(o for o in data["qualification_plan"]["owners"] if o["owner"] == "lab-ignored")
+    owner.update(required=bool(required), expected_count=count, inventory_id_digest=candidate.inventory_digest(rows))
+    archive = data["archive"]
+    archive.update(schema_version=2, test_count=5 + count, observed_count=5 + len(required))
+    archive["expected_owners"]["lab-ignored"] = count
+    archive["observed_owners"]["lab-ignored"] = len(required)
+    archive["owner_inventory"]["lab-ignored"] = {"test_count": count, "test_inventory_digest": candidate.inventory_digest(rows)}
+    app = {"schema_version": 2, "identity": copy.deepcopy(archive["identity"]),
+           "manifest_sha256": archive["manifest_sha256"], "test_inventory_digest": archive["test_inventory_digest"],
+           "owner": "lab-ignored", "compiled_owner_count": count, "compiled_owner_digest": candidate.inventory_digest(rows),
+           "decisions": [{"binary_id": r["binary_id"], "name": r["name"], "required": r["name"] in required_names,
+                          "reason": "reviewed affected contract" if r["name"] in required_names else "reviewed unrelated hardware"} for r in rows]}
+    app_digest = hashlib.sha256(json.dumps(app, sort_keys=True).encode("ascii")).hexdigest()
+    parts = []
+    for partition in range(2):
+        selected = [r for r in rows[partition::2] if r["name"] in required_names]
+        parts.append({"partition": partition, "total": 2, "required_count": len(selected), "required_digest": candidate.inventory_digest(selected)})
+        if selected:
+            data["shards"].append(dict(data["shards"][0], id=f"lab-ignored-{partition}", owner="lab-ignored",
+                                       partition=partition, total=2, expected_count=len(selected), observed_count=len(selected),
+                                       required_digest=candidate.inventory_digest(selected)))
+    record = {"compiled_count": count, "compiled_digest": candidate.inventory_digest(rows),
+              "required_count": len(required), "required_digest": candidate.inventory_digest(required),
+              "not_applicable_count": len(excluded), "not_applicable_digest": candidate.inventory_digest(excluded),
+              "not_applicable_status": "NOTEXECUTED_NOTPASS", "observed_required_count": len(required), "partitions": parts}
+    for shard in data["shards"]:
+        shard["applicability_digest"] = app_digest
+        shard.setdefault("required_digest", "8" * 64)
+    archive.update(archive_shards_verified=len(data["shards"]), applicability_digest=app_digest,
+                   owner_applicability={"lab-ignored": record})
+    data["qualification_plan"].update(applicability_digest=app_digest,
+                                      ignored_applicability={k: record[k] for k in candidate.IGNORED_APPLICABILITY_FIELDS})
+    summary = copy.deepcopy(archive)
+    summary.update(applicability=app, shards=copy.deepcopy(data["shards"]),
+                   not_applicable_tests=[{**r, "reason": "reviewed unrelated hardware", "status": "NOTEXECUTED_NOTPASS"} for r in excluded])
+    return data, summary
+
+
+class CandidateV2Tests(unittest.TestCase):
+    def setUp(self):
+        self.original, self.summary = receipt_v2()
+        self.frozen = plan_digest(self.original)
+
+    def validate(self, data):
+        return candidate.validate(data, required_gates=["rust-tests"], expected_head="a" * 40, expected_base="c" * 40,
+                                  expected_plan_digest=self.frozen)
+
+    def assemble(self, summary):
+        data = copy.deepcopy(self.original)
+        data["archive"] = candidate.compact_archive(summary, "a" * 64)
+        data["shards"] = summary["shards"]
+        return self.validate(data)
+
+    def test_v1_canonical_bytes_remain_unchanged(self):
+        self.assertEqual(hashlib.sha256(candidate.canonical(receipt())).hexdigest(),
+                         "9c6ade4abaee77a51e9403b268b0d607a2b6f091d00df84fdcd02c05a8b40724")
+
+    def test_mixed_v2_full_map_then_compact_assertion(self):
+        data = self.assemble(self.summary)
+        self.assertEqual(data["archive"], self.original["archive"])
+        self.assertNotIn("applicability", data["archive"])
+        self.assertNotIn("not_applicable_tests", data["archive"])
+        self.assertEqual(data["archive"]["test_count"], 9)
+        self.assertEqual(data["archive"]["observed_count"], 7)
+        self.assertEqual(data["archive"]["owner_inventory"]["lab-ignored"]["test_count"], 4)
+        self.assertEqual(data["qualification_plan"]["ignored_applicability"]["not_applicable_status"], "NOTEXECUTED_NOTPASS")
+
+    def test_zero_required_partition_has_no_execution_receipt(self):
+        data = self.assemble(self.summary)
+        ignored = [s for s in data["shards"] if s["owner"] == "lab-ignored"]
+        self.assertEqual([(s["partition"], s["total"]) for s in ignored], [(0, 2)])
+        for kind in ("missing", "zero", "duplicate"):
+            bad = copy.deepcopy(data)
+            if kind == "missing":
+                bad["shards"].pop()
+            else:
+                shard = copy.deepcopy(ignored[0])
+                if kind == "zero":
+                    shard.update(id="lab-ignored-1", partition=1, expected_count=0, observed_count=0)
+                bad["shards"].append(shard)
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                self.validate(bad)
+
+    def test_fully_required_and_explicit_all_na_preserve_accounting(self):
+        for selected in (set(), {f"test-{n}" for n in range(4)}):
+            data, summary = receipt_v2(selected)
+            data["archive"] = candidate.compact_archive(summary, "a" * 64)
+            candidate.validate(data, required_gates=["rust-tests"], expected_head="a" * 40, expected_base="c" * 40,
+                               expected_plan_digest=plan_digest(data))
+            self.assertEqual(data["archive"]["test_count"], 9)
+
+    def test_missing_unknown_duplicate_decisions_are_rejected_before_compaction(self):
+        for change in (lambda a: a["decisions"].pop(), lambda a: a["decisions"].append(copy.deepcopy(a["decisions"][0])),
+                       lambda a: a["decisions"][0].update(name="unknown-id"), lambda a: a.update(owner="manual-benchmark")):
+            bad = copy.deepcopy(self.summary)
+            change(bad["applicability"])
+            bad["applicability_digest"] = hashlib.sha256(json.dumps(bad["applicability"], sort_keys=True).encode()).hexdigest()
+            with self.assertRaises(ValueError):
+                self.assemble(bad)
+
+    def test_reason_and_required_decision_changes_cannot_replace_frozen_plan(self):
+        bad = copy.deepcopy(self.summary)
+        bad["applicability"]["decisions"][0]["reason"] = "new reason after failure"
+        bad["applicability_digest"] = hashlib.sha256(json.dumps(bad["applicability"], sort_keys=True).encode()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "frozen applicability changed"):
+            self.assemble(bad)
+        omitted, summary = receipt_v2({"test-0"})
+        # Even a self-consistent new selection cannot replace the enrolled plan.
+        with self.assertRaisesRegex(ValueError, "qualification plan changed"):
+            self.validate(omitted)
+        with self.assertRaises(ValueError):
+            self.assemble(summary)
+
+    def test_invalid_reason_decision_types_and_non_ascii(self):
+        for key, value in (("reason", ""), ("reason", "  "), ("reason", "line\nbreak"),
+                           ("reason", "x" * 1025), ("reason", "\u00e9"), ("required", 1)):
+            bad = copy.deepcopy(self.summary)
+            bad["applicability"]["decisions"][0][key] = value
+            bad["applicability_digest"] = hashlib.sha256(json.dumps(bad["applicability"], sort_keys=True).encode()).hexdigest()
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                self.assemble(bad)
+
+    def test_explicit_na_rows_cannot_change_omit_duplicate_or_claim_pass(self):
+        changes = [lambda rows: rows.pop(), lambda rows: rows.append(copy.deepcopy(rows[0])),
+                   lambda rows: rows[0].update(status="PASS"), lambda rows: rows[0].update(reason="new rationale"),
+                   lambda rows: rows[0].update(name="unknown"), lambda rows: rows[0].update(ignored=1)]
+        for change in changes:
+            bad = copy.deepcopy(self.summary)
+            change(bad["not_applicable_tests"])
+            with self.assertRaises(ValueError):
+                self.assemble(bad)
+
+    def test_compact_accounting_and_source_negative_matrix(self):
+        for field, value in (("compiled_count", 3), ("compiled_count", True), ("compiled_digest", "0" * 64),
+                             ("required_count", 1), ("required_digest", "0" * 64), ("not_applicable_count", 3),
+                             ("observed_required_count", 1), ("not_applicable_status", "PASS"), ("partitions", [])):
+            bad = copy.deepcopy(self.original)
+            bad["archive"]["owner_applicability"]["lab-ignored"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(bad)
+        for field, value in (("head_sha", "d" * 40), ("base_sha", "d" * 40), ("schema_version", 1)):
+            bad = copy.deepcopy(self.original)
+            bad[field] = value
+            with self.assertRaises(ValueError):
+                self.validate(bad)
+
+    def test_partition_digest_and_shard_applicability_cannot_change(self):
+        for field, value in (("applicability_digest", "0" * 64), ("required_digest", "0" * 64),
+                             ("missing", ["test-2"]), ("duplicates", ["test-0"]), ("exit_code", 1)):
+            bad = copy.deepcopy(self.original)
+            bad["shards"][-1][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(bad)
+        bad = copy.deepcopy(self.summary)
+        bad["owner_applicability"]["lab-ignored"]["partitions"][0]["required_digest"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "partition IDs changed"):
+            candidate.compact_archive(bad, "a" * 64)
+
+    def test_v2_cannot_use_v1_whole_owner_waiver_or_omit_static_gates(self):
+        bad = copy.deepcopy(self.original)
+        bad["archive"]["not_applicable_owners"] = {"lab-ignored": copy.deepcopy(bad["archive"]["owner_inventory"]["lab-ignored"])}
+        with self.assertRaisesRegex(ValueError, "whole-owner"):
+            self.validate(bad)
+        policy = json.loads((ROOT / "scripts/ci/qualification-policy.json").read_text())
+        with self.assertRaisesRegex(ValueError, "gate inventory mismatch"):
+            candidate.validate(self.original, required_gates=policy["required_gates"], expected_head="a" * 40,
+                               expected_base="c" * 40, expected_plan_digest=self.frozen)
+
+    def test_v2_cannot_reuse_other_version_plan_or_archive(self):
+        for field in ("qualification_plan", "archive"):
+            bad = copy.deepcopy(self.original)
+            bad[field]["schema_version"] = 1
+            with self.assertRaises(ValueError):
+                self.validate(bad)
+
+    def test_v2_extra_archive_fields_and_non_exact_identity_are_rejected(self):
+        bad = copy.deepcopy(self.original)
+        bad["archive"]["decisions"] = [{"name": "unknown"}]
+        with self.assertRaisesRegex(ValueError, "compact v2 archive shape"):
+            self.validate(bad)
+        bad = copy.deepcopy(self.original)
+        bad["archive"]["identity"]["pr"] = 123.0
+        with self.assertRaisesRegex(ValueError, "v2 archive identity changed"):
+            self.validate(bad)
+        bad = copy.deepcopy(self.original)
+        bad["qualification_plan"]["ignored_applicability"]["required_count"] = 2.0
+        with self.assertRaisesRegex(ValueError, "frozen ignored accounting changed"):
+            candidate.validate(bad, required_gates=["rust-tests"], expected_head="a" * 40, expected_base="c" * 40,
+                               expected_plan_digest=plan_digest(bad))
+
+    def test_compact_v2_does_not_dispatch_full_reasoned_id_map(self):
+        data, summary = receipt_v2(count=400)
+        self.assertGreater(len(candidate.canonical(summary)), 60000)
+        data["archive"] = candidate.compact_archive(summary, "a" * 64)
+        self.assertLess(len(candidate.canonical(data)) * 4 // 3 + 4, 60000)
+        self.assertNotIn("reviewed unrelated hardware", candidate.canonical(data["archive"]).decode())
+        candidate.validate(data, required_gates=["rust-tests"], expected_head="a" * 40, expected_base="c" * 40,
+                           expected_plan_digest=plan_digest(data))
+
+    def test_v2_assembly_cli_checks_full_summary_before_compact_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "plan.json").write_bytes(candidate.canonical(self.original["qualification_plan"]))
+            (root / "summary.json").write_bytes(candidate.canonical(self.summary))
+            draft = {k: v for k, v in self.original.items() if k not in {"qualification_plan", "archive", "shards", "test_inventory_digest"}}
+            (root / "draft.json").write_bytes(candidate.canonical(draft))
+            command = [sys.executable, str(ROOT / "scripts/ci/candidate.py"), "assemble", "--receipt", str(root / "draft.json"),
+                       "--plan", str(root / "plan.json"), "--archive-summary", str(root / "summary.json"),
+                       "--head", "a" * 40, "--base", "c" * 40, "--required-gate", "rust-tests"]
+            result = subprocess.run(command, capture_output=True, cwd=ROOT)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            compact = json.loads(result.stdout)
+            self.assertNotIn("applicability", compact["archive"])
+            self.assertEqual(compact["archive"]["applicability_digest"], self.summary["applicability_digest"])
+            self.summary["not_applicable_tests"][0]["status"] = "PASS"
+            (root / "summary.json").write_bytes(candidate.canonical(self.summary))
+            result = subprocess.run(command, capture_output=True, cwd=ROOT)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"N/A decisions", result.stderr)
+
+
 class CandidateTests(unittest.TestCase):
     def validate(self, value):
         return candidate.validate(value, required_gates=["rust-tests"], expected_head="a" * 40, expected_base="c" * 40,
