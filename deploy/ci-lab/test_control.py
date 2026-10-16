@@ -199,6 +199,7 @@ class LifecycleTests(unittest.TestCase):
                 saved = json.loads(self.path.read_text())
                 self.assertEqual(saved["runs"]["8601"]["phase"], "starting")
                 self.assertEqual(saved["capacity_baseline"], self.sample)
+                self.assertEqual(saved["capacity_sample"], self.sample)
                 self.assertEqual(saved["balloon_requests"]["8601"], 2048)
         with patch.object(self.lab, "status", return_value={"status": "stopped"}), \
                 patch.object(self.lab, "owned", return_value={"vmgenid": "own-id"}), \
@@ -218,6 +219,53 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaises(c.CapacityUnavailable):
                 self.lab.start(8601, "job", 2048)
             command.assert_called_once_with("check-network")
+
+    def test_accepted_start_refreshes_guard_clock_not_window_baseline(self):
+        self.lab.config["network_check"] = ["check-network"]
+        self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "gen", "expires": 9999999999}
+        original = json.loads(json.dumps(self.sample))
+        original["timestamp"] = 0
+        self.lab.state["capacity_sample"] = original
+        self.lab.state["capacity_baseline"] = original
+        accepted = {**self.sample, "timestamp": 40}
+        with patch.object(self.lab, "status", return_value={"status": "stopped"}), \
+                patch.object(self.lab, "owned", return_value={}), patch.object(c, "address_inventory"), \
+                patch.object(self.lab, "resources", return_value={"allowed": True, "capacity_sample": accepted}), \
+                patch.object(c, "run"):
+            self.lab.start(8601, "job", 2048)
+        self.assertEqual(self.lab.state["capacity_baseline"], original)
+        self.assertEqual(self.lab.capacity_safety({**accepted, "timestamp": 60})["reasons"], [])
+
+    def test_rejected_start_or_resize_cannot_refresh_guard_clock(self):
+        original = json.loads(json.dumps(self.lab.state["capacity_sample"]))
+        self.lab.config["network_check"] = ["check-network"]
+        self.lab.state["leases"]["8601"] = {"holder": "job", "generation": "gen", "expires": 9999999999}
+        denied = {"allowed": False, "capacity_sample": {**self.sample, "timestamp": 999999},
+                  "available_mib": 8000, "reserved_growth_mib": 1536}
+        with patch.object(self.lab, "status", return_value={"status": "stopped"}), \
+                patch.object(self.lab, "owned", return_value={}), patch.object(self.lab, "resources", return_value=denied):
+            with self.assertRaises(c.CapacityUnavailable):
+                self.lab.start(8601, "job", 2048)
+        with patch.object(self.lab, "status", return_value={"status": "running", "balloon": 2048 * c.MIB}), \
+                patch.object(self.lab, "resources", return_value=denied):
+            with self.assertRaises(c.CapacityUnavailable):
+                self.lab.resize(8601, "job", 8192)
+        self.assertEqual(self.lab.state["capacity_sample"], original)
+
+    def test_accepted_resize_refreshes_clock_but_pressure_shrink_does_not(self):
+        self.lab.state["leases"]["8601"] = {"holder": "job", "expires": 9999999999}
+        original = json.loads(json.dumps(self.sample))
+        accepted = {**self.sample, "timestamp": self.sample["timestamp"] + 10}
+        with patch.object(self.lab, "status", return_value={"status": "running", "balloon": 2048 * c.MIB}), \
+                patch.object(self.lab, "resources", return_value={"available_mib": 30000, "reserved_growth_mib": 1536,
+                                                                 "capacity_sample": accepted}), patch.object(c, "run"):
+            self.lab.resize(8601, "job", 3072)
+        self.assertEqual(self.lab.state["capacity_sample"], accepted)
+        with patch.object(self.lab, "status", return_value={"status": "running", "balloon": 3072 * c.MIB}), \
+                patch.object(self.lab, "resources", return_value={"available_mib": 5000, "reserved_growth_mib": 1536,
+                                                                 "capacity_sample": original}), patch.object(c, "run"):
+            self.lab.resize(8601, "job", 2048)
+        self.assertEqual(self.lab.state["capacity_sample"], accepted)
 
     def test_telemetry_is_read_only_and_carries_actual_process_and_lease(self):
         guest = {"vmid": 8601, "node": "lab-host", "type": "qemu", "status": "running"}
