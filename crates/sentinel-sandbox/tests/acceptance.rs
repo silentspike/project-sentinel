@@ -4,7 +4,194 @@
 //! Issue #73: IO Delegation (discover_block_device, format_io_max).
 //! Issue #75: Full network cage (no --share-net) + post-spawn isolation verifier.
 
-use sentinel_sandbox::{BwrapConfig, CgroupLimits, IsolationStatus, SandboxEnforcer};
+use std::fs::File;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use sentinel_sandbox::{
+    BwrapConfig, CgroupLimits, IsolationStatus, SandboxEnforcer, SpawnedSandbox,
+};
+
+// Match the spawn-info budget, but inspect state on every poll: a zombie still
+// fails until its host-side parent actually reaps this exact proc identity.
+const REAP_DEADLINE: Duration = Duration::from_secs(5);
+const REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+// Only for reads through an already-pinned proc directory. Linux can report
+// ESRCH as well as ENOENT after that exact process has been reaped.
+fn pinned_proc_identity_is_gone(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+}
+
+#[derive(Debug, PartialEq)]
+struct ProcState {
+    pid: u32,
+    parent: u32,
+    state: char,
+    start_ticks: u64,
+}
+
+fn parse_proc_state(stat: &str) -> io::Result<ProcState> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid proc stat identity");
+    let (pid, rest) = stat.split_once(" (").ok_or_else(invalid)?;
+    // comm may itself contain spaces and closing parentheses.
+    let (_, fields) = rest.rsplit_once(") ").ok_or_else(invalid)?;
+    let fields = fields.split_whitespace().collect::<Vec<_>>();
+    Ok(ProcState {
+        pid: pid.parse().map_err(|_| invalid())?,
+        parent: fields
+            .get(1)
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())?,
+        state: match *fields.first().ok_or_else(invalid)? {
+            "R" => 'R',
+            "S" => 'S',
+            "D" => 'D',
+            "Z" => 'Z',
+            "T" => 'T',
+            "t" => 't',
+            "X" => 'X',
+            "x" => 'x',
+            "I" => 'I',
+            "P" => 'P',
+            _ => return Err(invalid()),
+        },
+        start_ticks: fields
+            .get(19)
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())?,
+    })
+}
+
+#[derive(Debug)]
+struct InitIdentity {
+    pid: u32,
+    start_ticks: u64,
+    proc_dir: File,
+}
+
+impl InitIdentity {
+    fn capture(pid: u32) -> io::Result<Self> {
+        let mut identity = Self {
+            pid,
+            start_ticks: 0,
+            proc_dir: File::open(format!("/proc/{pid}"))?,
+        };
+        let state = identity.read_state()?;
+        if state.pid != pid {
+            return Err(io::Error::other("sandbox init identity changed"));
+        }
+        identity.start_ticks = state.start_ticks;
+        Ok(identity)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        // Pin the original proc directory: never follow a recycled numeric PID.
+        PathBuf::from(format!(
+            "/proc/self/fd/{}/{name}",
+            self.proc_dir.as_raw_fd()
+        ))
+    }
+
+    fn read_state(&self) -> io::Result<ProcState> {
+        parse_proc_state(&std::fs::read_to_string(self.path("stat"))?)
+    }
+
+    fn duplicate(&self) -> io::Result<Self> {
+        Ok(Self {
+            pid: self.pid,
+            start_ticks: self.start_ticks,
+            proc_dir: self.proc_dir.try_clone()?,
+        })
+    }
+
+    fn live_netns(&self) -> io::Result<PathBuf> {
+        let state = self.read_state()?;
+        if state.pid != self.pid
+            || state.start_ticks != self.start_ticks
+            || matches!(state.state, 'Z' | 'X' | 'x')
+        {
+            return Err(io::Error::other(format!(
+                "sandbox init is not live: {state:?}"
+            )));
+        }
+        std::fs::read_link(self.path("ns/net"))
+    }
+
+    fn wait_reaped(&self) -> io::Result<()> {
+        let deadline = Instant::now() + REAP_DEADLINE;
+        loop {
+            match self.read_state() {
+                Err(error) if pinned_proc_identity_is_gone(&error) => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(state) => {
+                    if state.pid != self.pid || state.start_ticks != self.start_ticks {
+                        return Err(io::Error::other(format!(
+                            "pinned init identity changed: {state:?}"
+                        )));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut,
+                            format!("sandbox init not reaped after {REAP_DEADLINE:?}: {state:?}, host parent={}", state.parent)));
+                    }
+                }
+            }
+            std::thread::sleep(REAP_POLL_INTERVAL);
+        }
+    }
+}
+
+struct OwnedCage {
+    process: SpawnedSandbox,
+    init: Option<InitIdentity>,
+    cleanup_attempted: bool,
+}
+
+impl OwnedCage {
+    fn new(process: SpawnedSandbox) -> anyhow::Result<Self> {
+        let mut cage = Self {
+            process,
+            init: None,
+            cleanup_attempted: false,
+        };
+        let pid = cage.process.child_pid.ok_or_else(|| {
+            anyhow::anyhow!("bwrap must report the sandboxed child PID via --info-fd")
+        })?;
+        cage.init = Some(InitIdentity::capture(pid)?);
+        Ok(cage)
+    }
+
+    fn init(&self) -> &InitIdentity {
+        self.init.as_ref().expect("captured sandbox init")
+    }
+
+    fn cleanup(&mut self) -> anyhow::Result<()> {
+        self.cleanup_attempted = true;
+        self.process.terminate();
+        anyhow::ensure!(
+            self.process.child.try_wait()?.is_some(),
+            "owned supervisor must be reaped"
+        );
+        if let Some(init) = &self.init {
+            init.wait_reaped()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OwnedCage {
+    fn drop(&mut self) {
+        if !self.cleanup_attempted {
+            if let Err(error) = self.cleanup() {
+                eprintln!("owned cage cleanup failed during unwinding: {error:#}");
+            }
+        }
+    }
+}
 
 // AC #16.02: to_args() enthaelt --ro-bind, --bind (writable), --tmpfs, --unshare-all
 #[test]
@@ -248,26 +435,23 @@ fn ac_75_n1_existing_invariants_unchanged() {
 #[ignore]
 fn ac_75_vm_full_cage_distinct_netns() {
     let config = BwrapConfig::for_agent("vm-cage-test");
-    let mut spawned = config
-        .spawn(&["/usr/bin/sleep".to_string(), "2".to_string()])
-        .expect("bwrap spawn must succeed on the VM");
-
-    let child_pid = spawned
-        .child_pid
-        .expect("bwrap must report the sandboxed child PID via --info-fd");
+    let mut spawned = OwnedCage::new(
+        config
+            .spawn(&["/usr/bin/sleep".to_string(), "2".to_string()])
+            .expect("bwrap spawn must succeed on the VM"),
+    )
+    .expect("capture full-cage init identity");
 
     let own = std::fs::read_link("/proc/self/ns/net").expect("read own netns");
-    let agent = std::fs::read_link(format!("/proc/{child_pid}/ns/net")).expect("read agent netns");
+    let agent = spawned.init().live_netns().expect("read live agent netns");
     assert_ne!(
         own, agent,
         "agent must run in a distinct net namespace (full cage), own={own:?} agent={agent:?}"
     );
 
-    spawned.terminate();
-    assert!(
-        !std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
-        "full-cage test process must be reaped"
-    );
+    spawned
+        .cleanup()
+        .expect("full-cage test process must be reaped");
 }
 
 // VM-only (AC-2): inside a full-caged agent, only loopback exists — no external
@@ -275,28 +459,68 @@ fn ac_75_vm_full_cage_distinct_netns() {
 #[test]
 #[ignore]
 fn ac_75_vm_only_loopback_inside_cage() {
-    use std::process::Stdio;
+    use std::io::Read;
     let config = BwrapConfig::for_agent("vm-cage-lo");
-    // `ip` must be reachable via the /usr ro-bind on the VM.
-    let mut args = config.to_args();
-    args.extend([
-        "/usr/sbin/ip".to_string(),
-        "-o".to_string(),
-        "link".to_string(),
-    ]);
-    let output = std::process::Command::new("bwrap")
-        .args(&args)
-        .stderr(Stdio::null())
-        .output()
-        .expect("bwrap spawn must succeed on the VM");
-    let links = String::from_utf8_lossy(&output.stdout);
-    // Only the loopback interface should be present in the agent netns.
-    for line in links.lines().filter(|l| !l.trim().is_empty()) {
-        assert!(
-            line.contains(" lo:") || line.contains(": lo:"),
-            "full-caged agent must only have loopback, found:\n{links}"
-        );
-    }
+    // Use the production bind filtering and owned process-group cleanup. The
+    // short-lived ip init may already be reaped before it can be proc-pinned.
+    let mut cage = OwnedCage {
+        process: config
+            .spawn(&[
+                "/usr/sbin/ip".to_string(),
+                "-o".to_string(),
+                "link".to_string(),
+            ])
+            .expect("bwrap spawn must succeed on the VM"),
+        init: None,
+        cleanup_attempted: false,
+    };
+    let mut output = Vec::new();
+    cage.process
+        .child
+        .stdout
+        .take()
+        .expect("sandbox stdout must be piped")
+        .take(65537)
+        .read_to_end(&mut output)
+        .expect("read sandbox link output");
+    let status = cage.process.child.wait().expect("wait for sandbox ip");
+    cage.cleanup()
+        .expect("loopback test process must be reaped");
+    assert!(
+        status.success(),
+        "sandbox ip failed: {status}, stdout={output:?}"
+    );
+    assert!(output.len() <= 65536, "unexpectedly large link output");
+    let links = std::str::from_utf8(&output).expect("ip link output must be UTF-8");
+    let lines = links
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one loopback link: {links}"
+    );
+    let fields = lines[0].split_whitespace().collect::<Vec<_>>();
+    assert_eq!(
+        fields.first(),
+        Some(&"1:"),
+        "unexpected link index: {links}"
+    );
+    assert_eq!(fields.get(1), Some(&"lo:"), "unexpected interface: {links}");
+    let flags = fields.get(2).expect("loopback link flags");
+    assert!(
+        flags.starts_with('<')
+            && flags.ends_with('>')
+            && flags[1..flags.len() - 1]
+                .split(',')
+                .any(|flag| flag == "LOOPBACK"),
+        "missing loopback flag: {links}"
+    );
+    assert!(
+        fields.contains(&"link/loopback"),
+        "unexpected link kind: {links}"
+    );
 }
 
 // VM-only (AC-4): deliberately sharing the host network must be detected as a
@@ -306,25 +530,27 @@ fn ac_75_vm_only_loopback_inside_cage() {
 #[ignore = "requires deploy-VM bwrap/userns support"]
 fn ac_75_vm_shared_net_is_detected_as_not_isolated() {
     let config = BwrapConfig::for_agent("vm-cage-negative").with_shared_net();
-    let mut spawned = config
-        .spawn(&["/usr/bin/sleep".to_string(), "5".to_string()])
-        .expect("shared-net fault-injection sandbox must start on the VM");
-    let child_pid = spawned
-        .child_pid
-        .expect("bwrap must report the sandboxed child PID via --info-fd");
+    let mut spawned = OwnedCage::new(
+        config
+            .spawn(&["/usr/bin/sleep".to_string(), "5".to_string()])
+            .expect("shared-net fault-injection sandbox must start on the VM"),
+    )
+    .expect("capture fault-injection init identity");
+    spawned
+        .init()
+        .live_netns()
+        .expect("fault-injection init must be live");
 
     let (enforcer, _) = SandboxEnforcer::detect();
     assert_eq!(
-        enforcer.verify_agent_netns_isolation(child_pid),
+        enforcer.verify_agent_netns_isolation(spawned.init().pid),
         IsolationStatus::NotIsolated,
         "a deliberately shared host namespace must be classified as NotIsolated"
     );
 
-    spawned.terminate();
-    assert!(
-        !std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
-        "fault-injection process must be reaped"
-    );
+    spawned
+        .cleanup()
+        .expect("fault-injection process must be reaped");
 }
 
 // VM-only (AC-3/AC-6): a 60-agent burst must still produce one isolated
@@ -333,63 +559,192 @@ fn ac_75_vm_shared_net_is_detected_as_not_isolated() {
 #[test]
 #[ignore = "requires deploy-VM bwrap/userns support"]
 fn ac_75_vm_60_concurrent_full_cages_are_distinct() {
-    let workers = (0..60)
-        .map(|index| {
-            std::thread::spawn(move || {
-                BwrapConfig::for_agent(&format!("vm-cage-burst-{index}"))
-                    .spawn(&["/usr/bin/sleep".to_string(), "30".to_string()])
-                    .map_err(|error| error.to_string())
+    std::thread::scope(|scope| {
+        let workers = (0..60)
+            .map(|index| {
+                let (release, released) = std::sync::mpsc::channel::<()>();
+                let (ready, identity) = std::sync::mpsc::channel();
+                let worker = scope.spawn(move || {
+                    let process = BwrapConfig::for_agent(&format!("vm-cage-burst-{index}"))
+                        .spawn(&["/usr/bin/sleep".to_string(), "30".to_string()])
+                        .expect("full-cage burst process must start");
+                    let mut cage = OwnedCage::new(process).expect("capture burst init identity");
+                    // PDEATHSIG follows this creator thread. Keep it alive until
+                    // inspection finishes; sender loss also releases it on panic.
+                    if ready
+                        .send(cage.init().duplicate().expect("pin burst init"))
+                        .is_ok()
+                    {
+                        let _ = released.recv();
+                    }
+                    cage.cleanup()
+                });
+                (release, identity, worker)
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>();
 
-    let spawned = workers
-        .into_iter()
-        .map(|worker| {
+        let daemon_netns = std::fs::read_link("/proc/self/ns/net").expect("read daemon netns");
+        let identities = workers
+            .iter()
+            .map(|(_, identity, _)| {
+                identity
+                    .recv()
+                    .expect("every burst worker must report its pinned init")
+            })
+            .collect::<Vec<InitIdentity>>();
+        let netns = identities
+            .iter()
+            .map(|identity| identity.live_netns().expect("read live burst child netns"))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(netns.len(), 60, "every burst sandbox needs a unique netns");
+        assert!(
+            !netns.contains(&daemon_netns),
+            "no burst sandbox may share the daemon netns"
+        );
+
+        // Release every creator before joining any, including during unwinding
+        // when dropping the senders disconnects every release receiver.
+        for (release, _, _) in &workers {
+            let _ = release.send(());
+        }
+        for (_, _, worker) in workers {
             worker
                 .join()
-                .expect("full-cage spawn worker must not panic")
-                .expect("full-cage burst process must start")
-        })
-        .collect::<Vec<_>>();
+                .expect("sandbox cleanup must not panic")
+                .expect("the burst must reap its supervisor and original init");
+        }
+        assert!(
+            identities.iter().all(|identity| {
+                matches!(identity.read_state(), Err(error) if pinned_proc_identity_is_gone(&error))
+            }),
+            "the 60-sandbox burst must leave no sandboxed child behind"
+        );
+    });
+}
 
-    let daemon_netns = std::fs::read_link("/proc/self/ns/net").expect("read daemon netns");
-    let child_pids = spawned
-        .iter()
-        .map(|process| {
-            process
-                .child_pid
-                .expect("every bwrap process must report its child PID")
-        })
-        .collect::<Vec<_>>();
-    let netns = child_pids
-        .iter()
-        .map(|child_pid| {
-            std::fs::read_link(format!("/proc/{child_pid}/ns/net")).expect("read burst child netns")
-        })
-        .collect::<std::collections::HashSet<_>>();
-
-    assert_eq!(netns.len(), 60, "every burst sandbox needs a unique netns");
-    assert!(
-        !netns.contains(&daemon_netns),
-        "no burst sandbox may share the daemon netns"
-    );
-
-    let cleanup_workers = spawned
-        .into_iter()
-        .map(|mut process| {
-            std::thread::spawn(move || {
-                process.terminate();
-            })
-        })
-        .collect::<Vec<_>>();
-    for worker in cleanup_workers {
-        worker.join().expect("sandbox cleanup must not panic");
+#[test]
+fn pinned_proc_reaping_accepts_only_enoent_and_esrch() {
+    for code in [libc::ENOENT, libc::ESRCH] {
+        assert!(pinned_proc_identity_is_gone(&io::Error::from_raw_os_error(
+            code
+        )));
     }
-    assert!(
-        child_pids
-            .iter()
-            .all(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists()),
-        "the 60-sandbox burst must leave no sandboxed child behind"
+    for code in [
+        libc::EACCES,
+        libc::EPERM,
+        libc::EBADF,
+        libc::EIO,
+        libc::ETIMEDOUT,
+    ] {
+        assert!(!pinned_proc_identity_is_gone(
+            &io::Error::from_raw_os_error(code)
+        ));
+    }
+    assert!(!pinned_proc_identity_is_gone(&io::Error::new(
+        io::ErrorKind::TimedOut,
+        "process remains present"
+    )));
+}
+
+#[test]
+fn proc_identity_parser_handles_parentheses_and_rejects_truncation() {
+    let stat = "42 (sleep (test) name) S 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1234";
+    assert_eq!(
+        parse_proc_state(stat).unwrap(),
+        ProcState {
+            pid: 42,
+            parent: 7,
+            state: 'S',
+            start_ticks: 1234,
+        }
     );
+    for invalid in ["", "42 (sleep) S 7", "42 (sleep) ? 7", "x (sleep) S 7"] {
+        assert!(
+            parse_proc_state(invalid).is_err(),
+            "must reject {invalid:?}"
+        );
+    }
+}
+
+fn owned_sleep_fixture() -> SpawnedSandbox {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new("/usr/bin/sleep");
+    command.arg("30").process_group(0);
+    // SAFETY: only an async-signal-safe prctl is called before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().expect("spawn owned lifecycle fixture");
+    SpawnedSandbox {
+        child_pid: Some(child.id()),
+        child,
+    }
+}
+
+#[test]
+fn owned_cage_cleanup_reaps_on_assertion_unwind_without_touching_foreign_process() {
+    let mut foreign = OwnedCage::new(owned_sleep_fixture()).unwrap();
+    let cage = OwnedCage::new(owned_sleep_fixture()).unwrap();
+    let identity = cage.init().duplicate().unwrap();
+    let result = std::panic::catch_unwind(move || {
+        let _cage = cage;
+        panic!("injected inspection assertion failure");
+    });
+    assert!(result.is_err());
+    identity
+        .wait_reaped()
+        .expect("panic must reap the owned process");
+    foreign
+        .init()
+        .live_netns()
+        .expect("foreign process must remain live");
+    foreign.cleanup().unwrap();
+}
+
+#[test]
+fn creator_thread_stays_alive_until_inspection_and_reaping_finish() {
+    std::thread::scope(|scope| {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (ready, identity) = std::sync::mpsc::channel();
+        let worker = scope.spawn(move || {
+            let mut cage = OwnedCage::new(owned_sleep_fixture()).unwrap();
+            if ready.send(cage.init().duplicate().unwrap()).is_ok() {
+                let _ = released.recv();
+            }
+            cage.cleanup()
+        });
+        let identity = identity.recv().unwrap();
+        identity
+            .live_netns()
+            .expect("creator must remain alive while inspecting its child");
+        assert!(
+            !worker.is_finished(),
+            "creator must await release, not return the handle"
+        );
+        drop(release);
+        worker.join().unwrap().unwrap();
+        identity.wait_reaped().unwrap();
+    });
+}
+
+#[test]
+fn pinned_proc_identity_does_not_follow_a_different_process() {
+    let mut first = OwnedCage::new(owned_sleep_fixture()).unwrap();
+    let retained = first.init().duplicate().unwrap();
+    first.cleanup().unwrap();
+    let mut second = OwnedCage::new(owned_sleep_fixture()).unwrap();
+    retained
+        .wait_reaped()
+        .expect("retained proc directory must stay gone");
+    second
+        .init()
+        .live_netns()
+        .expect("new process must remain live");
+    second.cleanup().unwrap();
 }

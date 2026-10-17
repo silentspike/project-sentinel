@@ -1,5 +1,83 @@
 # Changelog
 
+- Reserve the full physical cold-boot memory promise before starting lab VMs,
+  retain uncertain start commitments and invalidation evidence, and guard actual
+  balloon growth retries. Keep shrink/no-op behavior and use private portable
+  scratch directories for controller tests on hosted CI (#856).
+
+- Bind mixed ignored-test applicability to independently frozen exact IDs,
+  reasons and original partitions. Preserve schema-1 receipts and distinguish
+  unexecuted tests from passing assertions throughout archive and signed
+  candidate verification. Document three exact dependency-version exceptions
+  required by the security-fixed runtime graph without relaxing advisory or
+  duplicate-version policy (#856).
+
+- Require a successful, nonempty and exact loopback result in sandbox network
+  acceptance. Recognize Linux ENOENT and ESRCH only when observing disappearance
+  through an already pinned process directory; preserve process identity,
+  reaping deadlines and failures for all other errors (#856).
+
+- Update the WASM engine and WASI integration to 49.0.3. Resolve native and
+  component filesystem operations relative to pinned directory descriptors;
+  reject escaping symlinks, substituted file grants, hardlinks and non-regular
+  writes before truncation while retaining safe in-root relative symlinks.
+  Remove the implicit ambient filesystem root from native tools (#856).
+
+- Update locked Rust TLS/QUIC security dependencies and their resolver-selected
+  certificate-verification and test-harness dependencies. Update the Go
+  toolchain patch release and Console security dependencies without changing
+  their language or runtime authority contracts (#856).
+
+- Exercise real FUSE-backed command fixtures using exact declared read-only
+  scripts, preserving command grammar, input visibility and writable quotas.
+  Retain sandbox creator threads through inspection and identity-aware cleanup;
+  keep failed original runs distinct from corrected-source results (#856).
+
+- Bind native measurement legs to actual guest clock brackets and retain
+  request-bound adaptive adoption and commit phases. Missing clock alignment,
+  incomplete runtime evidence and telemetry-only results do not imply a
+  performance or product-acceptance verdict (#856).
+
+- Authenticate completed adaptive producer journals before transferring work
+  to independent QA or a bounded correction. Preserve unknown effects, original
+  producer proof and immutable review history while allowing a fresh authorized
+  correction to replace the completed queue head. Validate archived QA rework
+  consistently in ordinary and batch reads (#856).
+
+- Reuse one validated standing-funding source observation across a reconciliation
+  pass. Distinguish an expired unadopted manual deferral from live, adopted or
+  unresolved funding; retain the complete immutable deferral/standing chain
+  instead of issuing duplicate work or dropping historical authority (#856).
+
+- Add isolated, owner-leased lab lifecycle controls with fixed-address conflict
+  checks, balloon admission, guarded host headroom, complete isolation readback
+  and recoverable snapshot intents. Keep sanitized guest identities separate
+  from production data and preserve investigation/rollback snapshots (#856).
+
+- Revalidate functional lab headroom using fresh owned commitments while
+  retaining strict growth checks for measurement windows. Bind explicit purpose
+  to each new lease, preserve legacy strict recovery and generations, and never
+  replace missing memory observations with invented capacity (#856).
+
+- Add counted, pinned nextest archives and an optimized CI test profile with
+  debug assertions and overflow checks retained. Bind source fixtures, helper
+  binaries, exact test inventories, disjoint lab partitions and JUnit receipts;
+  keep compiler, doctest, privileged and optional coverage explicit rather than
+  treating missing or skipped tests as passed (#856).
+
+- Bind aggregate qualification to a separately frozen applicability plan,
+  original build inputs, exact reviewed head and unchanged promoted artifacts.
+  Reject failed routing, incomplete shards, stale receipts and foreign checks;
+  retain existing required CI while authenticated shadow reporting is qualified.
+  Keep untrusted fork jobs on hosted infrastructure and require exact-head
+  matching in the protected merge path (#856).
+
+- Add bounded read-only runtime and desktop probes, separately attributed
+  provider/internal phase observations, comparable release-measurement checks
+  and explicit developer/independent-QA/correction/delivery evidence bindings.
+  Preserve fixture, missing-delivery and low-sample limitations; mechanism tests
+  and infrastructure progress never imply genuine product acceptance (#856).
+
 - Allow an optional, protected standing operator policy to propose a distinct
   zero-addition funding epoch after a genuine funded Defer. Issue at most once
   per policy generation and exact execution head, retain the original decision

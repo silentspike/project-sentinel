@@ -15,10 +15,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+rustix = { version = "1", features = ["fs"] }
 sentinel-common = { path = "../sentinel-common" }
 uuid = { workspace = true }
-wasmtime = { version = "46.0.3", features = ["component-model"], optional = true }
-wasmtime-wasi = { version = "46.0.3", optional = true }
+wasmtime = { version = "49.0.3", features = ["component-model"], optional = true }
+wasmtime-wasi = { version = "49.0.3", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

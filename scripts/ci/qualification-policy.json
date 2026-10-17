@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "required_gates": [
+    "lint",
+    "bans",
+    "rust-static",
+    "rust-doc",
+    "rust-tests",
+    "rust-compiler-tests",
+    "rust-doctests",
+    "rust-ebpf-tests",
+    "go-tests",
+    "console-tests",
+    "schemas",
+    "archive-coverage"
+  ]
+}

@@ -24,7 +24,7 @@ jobs:
   # Detect which parts of the codebase changed
   # ──────────────────────────────────────────────
   changes:
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       go: ${{ steps.filter.outputs.go }}
@@ -34,54 +34,21 @@ jobs:
       bans: ${{ steps.filter.outputs.bans }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
-        id: filter
         with:
-          filters: |
-            rust:
-              - 'crates/**'
-              - 'services/**'
-              - 'schemas/event/**'
-              - 'schemas/inference/**'
-              - 'Cargo.toml'
-              - '**/Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - '.c[a]rgo/config'
-              - '.c[a]rgo/config.toml'
-              - '**/.c[a]rgo/config'
-              - '**/.c[a]rgo/config.toml'
-            go:
-              - 'cmd/**'
-              - 'services/sentinel-judge/**'
-              - 'services/sentinel-nats-bridge/**'
-              - 'pkg/**'
-              - 'schemas/event/**'
-              - 'schemas/inference/**'
-              - 'go.work'
-              - 'go.work.sum'
-            console:
-              - 'console/**'
-            schemas:
-              - 'schemas/**'
-            config:
-              - 'config/**'
-            bans:
-              - 'Cargo.toml'
-              - '**/Cargo.toml'
-              - 'Cargo.lock'
-              - '**/Cargo.lock'
-              - 'deny.toml'
-              - '.c[a]rgo/config'
-              - '.c[a]rgo/config.toml'
-              - '**/.c[a]rgo/config'
-              - '**/.c[a]rgo/config.toml'
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify complete candidate changes
+        id: filter
+        env:
+          CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 scripts/ci/route.py classify --base "$CI_BASE" --head "$CI_HEAD"
 
   # ──────────────────────────────────────────────
   # Always runs - fast checks (<30s)
   # ──────────────────────────────────────────────
   lint:
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -122,6 +89,27 @@ jobs:
         with:
           node-version: '22'
 
+      - name: CI routing, provenance and exact-head merge regressions
+        env:
+          TMPDIR: /work/tmp/sentinel-ci-contracts
+        run: |
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$TMPDIR"
+          python3 -m unittest discover -s scripts/ci/tests -p 'test_*.py'
+
+      - name: Remote parallel-delivery mechanism regressions
+        env:
+          TMPDIR: /work/tmp/sentinel-ci-contracts
+        run: |
+          test -f scripts/ci/test-archive-tests.py
+          test -f scripts/product-acceptance/remote_parallel_test.py
+          test -f scripts/product-acceptance/remote_parallel_desktop_test.mjs
+          test -f deploy/ci-lab/test_control.py
+          python3 -B scripts/ci/test-archive-tests.py -v
+          python3 -B -m unittest discover -s scripts/product-acceptance -p 'remote_parallel_test.py' -v
+          node --test scripts/product-acceptance/remote_parallel_desktop_test.mjs
+          python3 -B -m unittest discover -s deploy/ci-lab -p 'test_*.py' -v
+          bash -n deploy/ci-lab/prepare-guest.sh
+
       - name: Virtual-company M0 product contract (#693)
         env:
           SENTINEL_CI_SCRATCH: /work/tmp/sentinel-ci-product-acceptance
@@ -150,7 +138,7 @@ jobs:
   bans:
     needs: changes
     if: needs.changes.outputs.bans == 'true'
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Enforce duplicate-version bans
@@ -165,9 +153,9 @@ jobs:
   rust-static:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     env:
-      CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
+      CARGO_BUILD_JOBS: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && '2' || '3' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -180,13 +168,13 @@ jobs:
           echo "rustc: $ACTUAL (DEV-010 expects $EXPECT)"
           test "$ACTUAL" = "$EXPECT" || { echo "::error::DEV-010 determinism profile violated: rustc $ACTUAL != $EXPECT"; exit 1; }
       - name: Configure local cache (self-hosted)
-        if: vars.RUNNER_MODE != 'hosted'
+        if: vars.RUNNER_MODE != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: |
           export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/target"
           mkdir -p "$CARGO_TARGET_DIR"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
       - name: Rust cache (hosted)
-        if: vars.RUNNER_MODE == 'hosted'
+        if: ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted')
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: sentinel-hosted-static
@@ -209,9 +197,9 @@ jobs:
   rust-doc:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     env:
-      CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
+      CARGO_BUILD_JOBS: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && '2' || '3' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -223,13 +211,13 @@ jobs:
           echo "rustc: $ACTUAL (DEV-010 expects $EXPECT)"
           test "$ACTUAL" = "$EXPECT" || { echo "::error::DEV-010 determinism profile violated: rustc $ACTUAL != $EXPECT"; exit 1; }
       - name: Configure local cache (self-hosted)
-        if: vars.RUNNER_MODE != 'hosted'
+        if: vars.RUNNER_MODE != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: |
           export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/target"
           mkdir -p "$CARGO_TARGET_DIR"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
       - name: Rust cache (hosted)
-        if: vars.RUNNER_MODE == 'hosted'
+        if: ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted')
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: sentinel-hosted-doc
@@ -245,9 +233,9 @@ jobs:
   rust-test:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     env:
-      CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
+      CARGO_BUILD_JOBS: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && '2' || '3' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -259,19 +247,19 @@ jobs:
           echo "rustc: $ACTUAL (DEV-010 expects $EXPECT)"
           test "$ACTUAL" = "$EXPECT" || { echo "::error::DEV-010 determinism profile violated: rustc $ACTUAL != $EXPECT"; exit 1; }
       - name: Configure local cache (self-hosted)
-        if: vars.RUNNER_MODE != 'hosted'
+        if: vars.RUNNER_MODE != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: |
           export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/target"
           mkdir -p "$CARGO_TARGET_DIR"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
       - name: Rust cache (hosted)
-        if: vars.RUNNER_MODE == 'hosted'
+        if: ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted')
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: sentinel-hosted-test
 
       - name: Install bubblewrap runtime dependency (hosted)
-        if: vars.RUNNER_MODE == 'hosted'
+        if: ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted')
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq bubblewrap
@@ -314,9 +302,9 @@ jobs:
   rust-ebpf:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     env:
-      CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
+      CARGO_BUILD_JOBS: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && '2' || '3' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -329,29 +317,24 @@ jobs:
           echo "rustc: $ACTUAL (DEV-010 expects $EXPECT)"
           test "$ACTUAL" = "$EXPECT" || { echo "::error::DEV-010 determinism profile violated: rustc $ACTUAL != $EXPECT"; exit 1; }
       - name: Configure local cache (self-hosted)
-        if: vars.RUNNER_MODE != 'hosted'
+        if: vars.RUNNER_MODE != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: |
           export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/target"
           mkdir -p "$CARGO_TARGET_DIR"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
       - name: Rust cache (hosted)
-        if: vars.RUNNER_MODE == 'hosted'
+        if: ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted')
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: sentinel-hosted-ebpf
 
-      # eBPF: install kernel headers on hosted, soft-fail if unavailable
-      - name: Install eBPF dependencies (hosted)
-        if: vars.RUNNER_MODE == 'hosted'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq linux-headers-$(uname -r) linux-tools-common linux-tools-$(uname -r) 2>/dev/null || true
-
+      # These userspace feature gates need no host kernel headers/tools.
+      # Actual privileged kernel probes remain a separate lab acceptance path.
       - name: Clippy (eBPF feature)
-        run: cargo clippy -p sentinel-daemon -p sentinel-ebpf --features ebpf -- -D warnings || ${{ vars.RUNNER_MODE == 'hosted' && 'echo "::warning::eBPF clippy failed (kernel headers may be missing)"' || 'exit 1' }}
+        run: cargo clippy -p sentinel-daemon -p sentinel-ebpf --features ebpf -- -D warnings
 
       - name: Tests (eBPF feature)
-        run: cargo test -p sentinel-ebpf --features ebpf || ${{ vars.RUNNER_MODE == 'hosted' && 'echo "::warning::eBPF tests failed (kernel headers may be missing)"' || 'exit 1' }}
+        run: cargo test -p sentinel-ebpf --features ebpf
 
   # ──────────────────────────────────────────────
   # Go - when any shipped Go module or shared schema changes
@@ -359,7 +342,7 @@ jobs:
   go:
     needs: changes
     if: needs.changes.outputs.go == 'true'
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -396,20 +379,20 @@ jobs:
   console:
     needs: changes
     if: needs.changes.outputs.console == 'true'
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       # Self-hosted: manual Bun install (baseline for legacy CPU)
       - name: Install Bun (self-hosted)
-        if: vars.RUNNER_MODE != 'hosted'
+        if: vars.RUNNER_MODE != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: |
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
 
       # Hosted: setup-bun action
       - name: Install Bun (hosted)
-        if: vars.RUNNER_MODE == 'hosted'
+        if: ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted')
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -436,7 +419,7 @@ jobs:
   schemas:
     needs: changes
     if: needs.changes.outputs.schemas == 'true'
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -461,30 +444,15 @@ jobs:
 
   # ──────────────────────────────────────────────
   # Gate - single status check for branch protection
-  # All jobs must pass (skipped counts as pass)
+  # Required jobs must succeed; skips are allowed only for unaffected paths.
   # ──────────────────────────────────────────────
   ci-pass:
     if: always()
-    needs: [lint, bans, rust-static, rust-doc, rust-test, rust-ebpf, go, console, schemas]
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    needs: [changes, lint, bans, rust-static, rust-doc, rust-test, rust-ebpf, go, console, schemas]
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) || vars.RUNNER_MODE == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Evaluate results
-        run: |
-          results=(
-            "${{ needs.lint.result }}"
-            "${{ needs.bans.result }}"
-            "${{ needs.rust-static.result }}"
-            "${{ needs.rust-doc.result }}"
-            "${{ needs.rust-test.result }}"
-            "${{ needs.rust-ebpf.result }}"
-            "${{ needs.go.result }}"
-            "${{ needs.console.result }}"
-            "${{ needs.schemas.result }}"
-          )
-          for r in "${results[@]}"; do
-            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
-              echo "::error::Job failed with result: $r"
-              exit 1
-            fi
-          done
-          echo "All checks passed or were skipped."
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/route.py evaluate

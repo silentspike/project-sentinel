@@ -4,6 +4,7 @@
 //! Native Tools (FileRead/FileWrite) werden gegen `allowed_paths` geprueft.
 //! WASM-Module erhalten Limits via Engine-Konfiguration.
 
+use crate::scoped_fs::ScopedPath;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -41,31 +42,47 @@ impl SandboxConfig {
 
     /// Prueft ob ein Pfad innerhalb der erlaubten Pfade liegt.
     ///
-    /// Fuer existierende Pfade wird `canonicalize()` genutzt (folgt Symlinks).
-    /// Fuer neue Dateien (Schreibzugriff) wird das Parent-Verzeichnis geprueft.
+    /// Advisory only; execution must use the descriptor-bound scoped path.
     pub fn is_path_allowed(&self, path: &Path) -> bool {
-        if self.allowed_paths.is_empty() {
-            return false;
-        }
+        self.scoped_path(path)
+            .is_ok_and(|path| path.exists_or_new_leaf())
+    }
 
-        // Versuche den Pfad zu kanonisieren
-        let check_path = match path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => {
-                // Pfad existiert nicht — prüfe ob Parent erlaubt ist (fuer Schreibzugriff)
-                match path.parent().and_then(|p| p.canonicalize().ok()) {
-                    Some(parent) => parent,
-                    None => return false,
-                }
+    pub(crate) fn scoped_path(&self, path: &Path) -> std::io::Result<ScopedPath> {
+        let absolute = |path: &Path| {
+            if path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                None
+            } else {
+                std::path::absolute(path).ok()
             }
         };
-
-        self.allowed_paths.iter().any(|allowed| {
-            allowed
-                .canonicalize()
-                .map(|canonical| check_path.starts_with(&canonical))
-                .unwrap_or(false)
-        })
+        if let Some(path) = absolute(path) {
+            for allowed in &self.allowed_paths {
+                let Some(root) = absolute(allowed) else {
+                    continue;
+                };
+                if let Ok(relative) = path.strip_prefix(&root) {
+                    if let Ok(scoped) = ScopedPath::new(&root, relative) {
+                        return Ok(scoped);
+                    }
+                }
+                // Preserve exact regular-file grants, without broadening to siblings.
+                if path == root && root.symlink_metadata().is_ok_and(|m| m.is_file()) {
+                    if let (Some(parent), Some(leaf)) = (root.parent(), root.file_name()) {
+                        if let Ok(scoped) = ScopedPath::new(parent, Path::new(leaf)) {
+                            return Ok(scoped.exact_leaf());
+                        }
+                    }
+                }
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Sandbox violation: path is not within an allowed root",
+        ))
     }
 }
 
@@ -126,5 +143,52 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         assert!(!sandbox.is_path_allowed(dir.path()));
+    }
+
+    #[test]
+    fn dangling_external_symlink_is_not_a_new_authorized_file() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(outside.path().join("missing"), &link).unwrap();
+        let sandbox = SandboxConfig::with_paths(vec![root.path().to_path_buf()]);
+        assert!(!sandbox.is_path_allowed(&link));
+        assert!(sandbox
+            .scoped_path(&link)
+            .unwrap()
+            .write(b"escape", false)
+            .is_err());
+        assert!(!outside.path().join("missing").exists());
+    }
+
+    #[test]
+    fn exact_regular_file_grant_does_not_authorize_its_siblings() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("allowed");
+        fs::write(&file, "inside").unwrap();
+        fs::write(root.path().join("other"), "outside").unwrap();
+        let sandbox = SandboxConfig::with_paths(vec![file.clone()]);
+        assert!(sandbox.is_path_allowed(&file));
+        assert_eq!(
+            sandbox.scoped_path(&file).unwrap().read_text().unwrap(),
+            "inside"
+        );
+        assert!(!sandbox.is_path_allowed(&root.path().join("other")));
+    }
+
+    #[test]
+    fn exact_file_grant_rejects_late_symlink_to_an_ungranted_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("allowed");
+        let other = root.path().join("other");
+        fs::write(&file, "inside").unwrap();
+        fs::write(&other, "unchanged").unwrap();
+        let sandbox = SandboxConfig::with_paths(vec![file.clone()]);
+        let scoped = sandbox.scoped_path(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink("other", &file).unwrap();
+        assert!(scoped.read_bytes().is_err());
+        assert!(scoped.write(b"escape", false).is_err());
+        assert_eq!(fs::read_to_string(other).unwrap(), "unchanged");
     }
 }
