@@ -4,6 +4,7 @@
 //! Implements the `sentinel:plugin/host-api` interface, bridging
 //! ECS world-state to WASM plugins via typed host functions.
 
+use crate::scoped_fs::ScopedPath;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -71,7 +72,7 @@ impl wasmtime_wasi::WasiView for PluginState {
 /// Resolves a plugin-provided path safely within agent_home.
 ///
 /// Rejects absolute paths and `..` components to prevent directory traversal.
-fn safe_resolve(agent_home: &std::path::Path, path: &str) -> Result<PathBuf, String> {
+fn safe_resolve(agent_home: &std::path::Path, path: &str) -> Result<ScopedPath, String> {
     let p = std::path::Path::new(path);
     if p.is_absolute() {
         return Err(format!("absolute path not allowed: '{}'", path));
@@ -81,7 +82,7 @@ fn safe_resolve(agent_home: &std::path::Path, path: &str) -> Result<PathBuf, Str
             return Err(format!("path traversal not allowed: '{}'", path));
         }
     }
-    Ok(agent_home.join(p))
+    ScopedPath::new(agent_home, p).map_err(|error| format!("filesystem scope denied: {error}"))
 }
 
 /// Host-API implementation: bridges ECS world-state to WASM plugins.
@@ -92,32 +93,25 @@ fn safe_resolve(agent_home: &std::path::Path, path: &str) -> Result<PathBuf, Str
 impl sentinel::plugin::host_api::Host for PluginState {
     fn fs_read(&mut self, path: String) -> Result<Vec<u8>, String> {
         let full_path = safe_resolve(&self.agent_home, &path)?;
-        std::fs::read(&full_path).map_err(|e| format!("fs-read '{}': {}", path, e))
+        full_path
+            .read_bytes()
+            .map_err(|e| format!("fs-read '{}': {}", path, e))
     }
 
     fn fs_write(&mut self, path: String, data: Vec<u8>) -> Result<u64, String> {
         let full_path = safe_resolve(&self.agent_home, &path)?;
-        if let Some(parent) = full_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("fs-write mkdir '{}': {}", path, e))?;
-        }
         let len = data.len() as u64;
-        std::fs::write(&full_path, &data).map_err(|e| format!("fs-write '{}': {}", path, e))?;
+        full_path
+            .write(&data, true)
+            .map_err(|e| format!("fs-write '{}': {}", path, e))?;
         Ok(len)
     }
 
     fn fs_list(&mut self, path: String) -> Result<Vec<String>, String> {
         let full_path = safe_resolve(&self.agent_home, &path)?;
-        let entries =
-            std::fs::read_dir(&full_path).map_err(|e| format!("fs-list '{}': {}", path, e))?;
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("fs-list entry: {}", e))?;
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-        Ok(names)
+        full_path
+            .list()
+            .map_err(|e| format!("fs-list '{}': {}", path, e))
     }
 
     fn get_agent_info(&mut self) -> sentinel::plugin::types::AgentInfo {
@@ -355,5 +349,36 @@ mod tests {
         let result = state.fs_list("../../".to_string());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("path traversal not allowed"));
+    }
+
+    #[test]
+    fn host_filesystem_rejects_leaf_parent_and_dangling_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"unchanged").unwrap();
+        let mut state = make_state(root.path().to_path_buf());
+        symlink(outside.path().join("secret"), root.path().join("leaf")).unwrap();
+        symlink(outside.path().join("missing"), root.path().join("dangling")).unwrap();
+        symlink(outside.path(), root.path().join("parent")).unwrap();
+        for path in ["leaf", "dangling", "parent/secret", "parent/new/nested"] {
+            assert!(state.fs_read(path.into()).is_err());
+            assert!(state.fs_write(path.into(), b"escape".to_vec()).is_err());
+        }
+        assert!(state.fs_list("parent".into()).is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("secret")).unwrap(),
+            b"unchanged"
+        );
+        assert!(!outside.path().join("missing").exists());
+        assert!(!outside.path().join("new").exists());
+    }
+
+    #[test]
+    fn host_without_authorized_root_has_no_ambient_filesystem_access() {
+        let mut state = make_state(PathBuf::new());
+        assert!(state.fs_read("file".into()).is_err());
+        assert!(state.fs_write("file".into(), b"denied".to_vec()).is_err());
+        assert!(state.fs_list(".".into()).is_err());
     }
 }

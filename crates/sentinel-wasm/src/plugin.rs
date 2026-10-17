@@ -213,12 +213,7 @@ impl PluginHost {
         // Preopened directories for WASI filesystem access.
         for (host_path, guest_path) in &config.allowed_paths {
             let guest_str = guest_path.to_str().unwrap_or("/data");
-            wasi_builder.preopened_dir(
-                host_path,
-                guest_str,
-                wasmtime_wasi::DirPerms::all(),
-                wasmtime_wasi::FilePerms::all(),
-            )?;
+            wasi_builder.preopened_dir(host_path, guest_str, wasmtime_wasi::FsPerms::ReadWrite)?;
         }
 
         let limits = StoreLimitsBuilder::new()

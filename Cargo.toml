@@ -62,3 +62,12 @@ unicode-normalization = "0.1"
 blake3 = "1"
 rayon = "1"
 async-nats = "0.47"
+
+# Test-only optimization; keep assertion and arithmetic checks enabled.
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+debug = 1
+debug-assertions = true
+overflow-checks = true
+incremental = false

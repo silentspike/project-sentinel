@@ -1,4 +1,7 @@
 //! Synthetic typed decisions and journal transitions; no provider or tool execution.
+#[path = "source_reuse_tests.rs"]
+mod source_reuse_tests;
+
 use super::super::adaptive_leadership_review::tests::{
     discovery_state, persist, reconcile_review_at, stop_review_agent,
 };
@@ -259,6 +262,12 @@ fn inspect_at(
 }
 
 fn with_deferred_fixture(run: impl FnOnce(tempfile::TempDir, WorkflowApi, AdaptiveSessionV1)) {
+    with_deferred_fixture_and_tools(|temp, api, source, _tools| run(temp, api, source));
+}
+
+fn with_deferred_fixture_and_tools(
+    run: impl FnOnce(tempfile::TempDir, WorkflowApi, AdaptiveSessionV1, Arc<WorkbenchInvocationStore>),
+) {
     let (temp, mut api, root) = unreviewed_policy_root_with_limits(120_000, false, 4, 4);
     api.workbench = Some(Arc::new(WorkbenchExecutionAdapter {
         store: Arc::clone(&api.store),
@@ -338,7 +347,7 @@ fn with_deferred_fixture(run: impl FnOnce(tempfile::TempDir, WorkflowApi, Adapti
             .unwrap();
         (profile.clone(), digest.to_owned())
     };
-    with_private_observation_store_for_test(tools, profile, digest, || {
+    with_private_observation_store_for_test(Arc::clone(&tools), profile, digest, || {
         assert!(reconcile_review_at(&api, &project(&api, &root), now));
         assert_eq!(
             calls(&api, &root).len(),
@@ -368,7 +377,7 @@ fn with_deferred_fixture(run: impl FnOnce(tempfile::TempDir, WorkflowApi, Adapti
         assert_eq!(deferred, progressed);
         assert_eq!(deferred.grant, root.grant);
         assert_eq!(calls(&api, &root).len(), 2);
-        run(temp, api, deferred);
+        run(temp, api, deferred, tools);
     });
 }
 

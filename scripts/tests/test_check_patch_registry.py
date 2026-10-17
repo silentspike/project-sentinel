@@ -1,8 +1,6 @@
 from datetime import date
-from fnmatch import fnmatchcase
 import importlib.util
 from pathlib import Path
-import re
 import sys
 import tempfile
 import unittest
@@ -15,6 +13,12 @@ checker = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = checker
 SPEC.loader.exec_module(checker)
+ROUTE_SPEC = importlib.util.spec_from_file_location(
+    "ci_route", Path(__file__).parents[1] / "ci" / "route.py"
+)
+route = importlib.util.module_from_spec(ROUTE_SPEC)
+assert ROUTE_SPEC.loader is not None
+ROUTE_SPEC.loader.exec_module(route)
 
 TODAY = date(2026, 7, 24)
 SOURCE = "git=https://example.invalid/upstream/demo;rev=abc123"
@@ -299,16 +303,14 @@ class PatchRegistryTests(unittest.TestCase):
         self.addCleanup(fixture.cleanup)
         self.assert_error(fixture.check(), "UNREGISTERED_OVERRIDE")
 
-    def test_rust_ci_filter_covers_every_checker_cargo_input(self):
+    def test_rust_ci_classifier_covers_every_checker_cargo_input(self):
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
-        rust_filter = workflow.split("            rust:\n", 1)[1].split(
-            "            go:\n",
-            1,
-        )[0]
-        patterns = re.findall(r"- '([^']+)'", rust_filter)
+        self.assertIn("python3 scripts/ci/route.py classify", workflow)
         config_dir = checker.CARGO_CONFIG_DIR
         monitored_paths = (
             "Cargo.toml",
+            "crates/sentinel-workflow/Cargo.toml",
+            "services/agent-runtime/Cargo.toml",
             "deploy/bench/stack-harness/Cargo.toml",
             f"{config_dir}/config",
             f"{config_dir}/config.toml",
@@ -316,10 +318,8 @@ class PatchRegistryTests(unittest.TestCase):
             f"nested/{config_dir}/config.toml",
         )
         for path in monitored_paths:
-            self.assertTrue(
-                any(fnmatchcase(path, pattern) for pattern in patterns),
-                f"Rust CI filter does not match {path}",
-            )
+            with self.subTest(path=path):
+                self.assertEqual(route.classify([path])["rust"], "true")
 
 
 if __name__ == "__main__":

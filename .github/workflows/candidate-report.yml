@@ -1,0 +1,47 @@
+name: Candidate Qualification Report
+
+# This shadow transport does not replace ci-pass. Only trusted main code runs
+# with checks:write; candidate code and private infrastructure are never loaded.
+on:
+  workflow_dispatch:
+    inputs:
+      receipt_b64:
+        description: Authenticated public-safe candidate receipt (base64)
+        required: true
+        type: string
+      signature:
+        description: HMAC-SHA256 of decoded receipt bytes
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+concurrency:
+  group: candidate-report-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: github.ref == 'refs/heads/main' && github.repository == 'silentspike/project-sentinel'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare private transient verification directory
+        run: sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /work/tmp/sentinel-ci-report
+      - name: Authenticate, validate and report exact candidate
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          RECEIPT_B64: ${{ inputs.receipt_b64 }}
+          RECEIPT_SIGNATURE: ${{ inputs.signature }}
+          RECEIPT_KEY: ${{ secrets.SENTINEL_CI_RECEIPT_KEY }}
+          PLAN_SHA256: ${{ vars.SENTINEL_CI_PLAN_SHA256 }}
+        with:
+          script: |
+            const {report, verifyLocal} = require('./scripts/ci/report-candidate.cjs');
+            await report({github, context, verify: verifyLocal});

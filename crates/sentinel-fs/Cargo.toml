@@ -34,6 +34,11 @@ io-uring = { version = "0.7", optional = true }
 criterion = { workspace = true }
 tempfile = "3"
 
+[[bin]]
+name = "sentinel-fs-lab-mount"
+path = "src/bin/sentinel-fs-lab-mount.rs"
+required-features = ["fuse-tests"]
+
 [[bench]]
 name = "sentinel_fs_bench"
 harness = false
