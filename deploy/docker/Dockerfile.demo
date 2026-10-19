@@ -46,7 +46,7 @@ RUN chmod +x /out/sentinel-daemon /out/sentinel-nightrun /out/sentinel-projectio
 # ---------------------------------------------------------------------------
 # Stage 2: Go build (gateway + judge + nats-bridge)
 # ---------------------------------------------------------------------------
-FROM golang:1.26-bookworm AS go-builder
+FROM golang:1.27-bookworm AS go-builder
 
 WORKDIR /src
 
