@@ -271,7 +271,7 @@ impl WorkflowApi {
         Ok(())
     }
 
-    fn verify_accounting_refusal(
+    pub(super) fn verify_accounting_refusal(
         &self,
         call: &AdaptiveLeadershipReviewCallV1,
     ) -> Result<(), &'static str> {

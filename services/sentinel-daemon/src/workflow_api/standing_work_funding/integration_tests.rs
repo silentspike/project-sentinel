@@ -63,7 +63,7 @@ fn pending_context(
         .collect();
     assert_eq!(pending.len(), 1, "{stage}");
     let call = &pending[0];
-    assert_eq!(call.grant.schema_version, 5);
+    assert!(matches!(call.grant.schema_version, 5 | 6));
     assert!(call.grant.work_funding.is_some());
     let binding = LeadershipAuthority::from_call(call);
     // Like the existing historical-clock leadership fixtures, reconstruct the
@@ -455,6 +455,373 @@ fn assert_no_employee_claim(
         )
         .is_err());
     assert_eq!(state(temp), before);
+}
+
+fn with_material_defer(
+    run: impl FnOnce(
+        tempfile::TempDir,
+        WorkflowApi,
+        AdaptiveSessionV1,
+        AdaptiveWorkFundingReceiptV1,
+        AdaptiveLeadershipReviewCallV1,
+    ),
+) {
+    with_deferred_fixture(|temp, mut api, source| {
+        enable(&temp, &mut api);
+        assert!(api
+            .reconcile_standing_work_funding(&project(&api, &source))
+            .unwrap());
+        let declined = proposal(&api, &source);
+        assert!(reconcile_review_at(
+            &api,
+            &project(&api, &source),
+            now_unix_ms()
+        ));
+        let context = pending_context(&api, &source, "material original standing proposal");
+        decide_at(&api, &context, false, now_unix_ms());
+        let refused = calls(&api, &source)
+            .into_iter()
+            .find(|call| call.grant.review_id == context.binding.grant.review_id)
+            .unwrap();
+        run(temp, api, source, declined, refused);
+    });
+}
+
+fn material_query(
+    api: &WorkflowApi,
+    source: &AdaptiveSessionV1,
+    declined: &AdaptiveWorkFundingReceiptV1,
+    refused: &AdaptiveLeadershipReviewCallV1,
+) -> String {
+    let operator = api.principals.principal("operator").unwrap();
+    let verified = api
+        .store
+        .adaptive_material_window_verification_source(
+            &operator.principal,
+            &source.grant.authority.project_id,
+            source.grant.session_id,
+            &declined.receipt_digest().unwrap(),
+            refused.grant.review_id,
+            now_unix_ms(),
+        )
+        .unwrap();
+    let windows = verified.floor.total_window_ceiling + 1;
+    let reviews = verified.floor.total_review_ceiling.max(windows).max(
+        verified.resume_source.base_review_count + windows
+            - verified.resume_source.base_window_count,
+    );
+    format!("{ADAPTIVE_WORK_FUNDING_PATH}?mode=material-window-expansion&project_id={}&session_id={}&operation_id={}&reason_ref=explicit-material-test&declined_funding_receipt_digest={}&refused_review_id={}&additional_model_calls=0&additional_tool_calls=0&additional_reviews={}&additional_windows={}&max_window_ms={}&max_call_duration_ms={}&dispatch_margin_ms={}&expires_at_unix_ms={}",
+        source.grant.authority.project_id, source.grant.session_id, Uuid::new_v4(),
+        declined.receipt_digest().unwrap(), refused.grant.review_id,
+        reviews - verified.resume_source.base_review_count, windows - verified.resume_source.base_window_count,
+        verified.floor.max_window_ms, verified.floor.max_call_duration_ms, verified.floor.dispatch_margin_ms,
+        verified.floor.expires_at_unix_ms.max(now_unix_ms() + 600_000))
+}
+
+#[test]
+fn material_window_http_uses_canonical_refusal_and_normal_independent_decisions() {
+    for continued in [false, true] {
+        with_material_defer(|temp, api, source, declined, refused| {
+            let operator = api.principals.principal("operator").unwrap();
+            let path = material_query(&api, &source, &declined, &refused);
+            let before = state(&temp);
+            let draft = api.adaptive_work_funding_http(&operator, "GET", &path, &[]);
+            assert_eq!(
+                draft.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&draft.body)
+            );
+            let draft: serde_json::Value = serde_json::from_slice(&draft.body).unwrap();
+            assert!(draft["request"].get("source").is_none());
+            assert!(
+                !String::from_utf8_lossy(&serde_json::to_vec(&draft).unwrap())
+                    .contains("private_observation")
+            );
+            assert_eq!(state(&temp), before);
+            let body = serde_json::to_vec(&draft["request"]).unwrap();
+            let post_path = format!("{ADAPTIVE_WORK_FUNDING_PATH}?mode=material-window-expansion");
+            let issued = api.adaptive_work_funding_http(&operator, "POST", &post_path, &body);
+            assert_eq!(
+                issued.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&issued.body)
+            );
+            assert_eq!(session(&api, &source), source);
+            assert_no_employee_claim(&temp, &api, &source);
+            let issued_state = state(&temp);
+            let replay = api.adaptive_work_funding_http(&operator, "POST", &post_path, &body);
+            assert_eq!(replay.status, 200);
+            assert_eq!(state(&temp), issued_state);
+            let operation =
+                Uuid::parse_str(draft["request"]["operation_id"].as_str().unwrap()).unwrap();
+            let offered = api
+                .store
+                .adaptive_work_funding(
+                    &operator.principal.tenant_id,
+                    source.grant.session_id,
+                    operation,
+                )
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                api.adaptive_work_funding_http(
+                    &operator,
+                    "POST",
+                    ADAPTIVE_WORK_FUNDING_PATH,
+                    &serde_json::to_vec(&offered.request).unwrap()
+                )
+                .status,
+                200
+            );
+            assert_ne!(
+                api.adaptive_work_funding_http(
+                    &operator,
+                    "POST",
+                    ADAPTIVE_WORK_FUNDING_PATH,
+                    &body
+                )
+                .status,
+                200
+            );
+            assert!(reconcile_review_at(
+                &api,
+                &project(&api, &source),
+                now_unix_ms()
+            ));
+            let context = pending_context(&api, &source, "material offer actual normal dispatch");
+            let material = offered
+                .request
+                .source
+                .material_window_expansion
+                .as_ref()
+                .unwrap();
+            let rendered = context.prompt().unwrap();
+            assert!(rendered.contains("material_window_expansion"));
+            assert!(rendered.contains("retained_decision_kind"));
+            assert!(rendered.contains(&material.model_response_digest));
+            assert!(rendered.contains(&material.evidence_ref().unwrap()));
+            assert!(
+                rendered.contains("authoritative_floor") && rendered.contains("offered_bounds")
+            );
+            let mut missing = context.clone();
+            missing
+                .source
+                .evidence_refs
+                .retain(|reference| !reference.starts_with("material-window-offer:"));
+            assert!(missing.validate_dispatch(now_unix_ms()).is_err());
+            let mut forged = context.clone();
+            forged
+                .source
+                .evidence_refs
+                .push("material-window-offer:foreign".into());
+            assert!(forged.validate_dispatch(now_unix_ms()).is_err());
+            decide_at(&api, &context, continued, now_unix_ms());
+            let next = session(&api, &source);
+            assert_eq!(
+                (next.model_calls, next.tool_calls),
+                (source.model_calls, source.tool_calls)
+            );
+            assert_eq!(
+                api.store
+                    .adaptive_leadership_review_call(
+                        &operator.principal.tenant_id,
+                        refused.grant.review_id
+                    )
+                    .unwrap(),
+                Some(refused)
+            );
+            if continued {
+                assert!(next.version > source.version && next.requires_fresh_observation());
+                assert_eq!(next.active_work_funding().unwrap().receipt, offered);
+            } else {
+                assert_eq!(next, source);
+                let before = state(&temp);
+                assert!(!api
+                    .reconcile_standing_work_funding(&project(&api, &source))
+                    .unwrap());
+                assert!(
+                    !reconcile_review_at(&api, &project(&api, &source), now_unix_ms())
+                        || api
+                            .store
+                            .adaptive_work_funding_for_review(
+                                &operator.principal.tenant_id,
+                                source.grant.session_id,
+                                now_unix_ms()
+                            )
+                            .unwrap()
+                            .is_none()
+                );
+                assert_eq!(state(&temp), before);
+            }
+        });
+    }
+}
+
+#[test]
+fn material_window_schema6_uses_actual_recovery_template_and_rendered_bounds() {
+    with_material_defer(|_, api, source, declined, refused| {
+        let operator = api.principals.principal("operator").unwrap();
+        let path = material_query(&api, &source, &declined, &refused);
+        let draft = api.adaptive_work_funding_http(&operator, "GET", &path, &[]);
+        assert_eq!(draft.status, 200);
+        let draft: serde_json::Value = serde_json::from_slice(&draft.body).unwrap();
+        let response = api.adaptive_work_funding_http(
+            &operator,
+            "POST",
+            &format!("{ADAPTIVE_WORK_FUNDING_PATH}?mode=material-window-expansion"),
+            &serde_json::to_vec(&draft["request"]).unwrap(),
+        );
+        assert_eq!(response.status, 200);
+        assert!(reconcile_review_at(
+            &api,
+            &project(&api, &source),
+            now_unix_ms()
+        ));
+        let old = calls(&api, &source)
+            .into_iter()
+            .find(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
+            .unwrap();
+        let at = old.grant.expires_at_unix_ms;
+        api.store
+            .expire_adaptive_leadership_review_call(
+                &old.grant.leadership_principal,
+                old.grant.review_id,
+                old.version,
+                at,
+            )
+            .unwrap();
+        let verified = api
+            .store
+            .adaptive_funded_review_recovery_verification_source(
+                &operator.principal,
+                &source.grant.authority.project_id,
+                source.grant.session_id,
+                old.grant.review_id,
+                at,
+            )
+            .unwrap();
+        let request = sentinel_workflow::AdaptiveFundedReviewRecoveryRequestV1 {
+            schema_version: 1,
+            operation_id: Uuid::new_v4(),
+            source_digest: verified.source.canonical_digest().unwrap(),
+            source: Box::new(verified.source.clone()),
+            release: sentinel_workflow::AdaptiveRecoveryReleaseV1 {
+                schema_version: 1,
+                source_git_sha: "a".repeat(40),
+                release_manifest_digest: "b".repeat(64),
+                gateway_binary_digest: "c".repeat(64),
+            },
+            proof_digest: "d".repeat(64),
+            reason_ref: "synthetic-material-pre-io-recovery".into(),
+            expires_at_unix_ms: at + 180_000,
+        };
+        let (grant, context) =
+            super::super::funded_review_recovery::template(&verified, &request).unwrap();
+        api.store
+            .authorize_adaptive_funded_review_recovery(
+                &operator.principal,
+                &request,
+                &grant,
+                &context,
+                at,
+                |actual, request| {
+                    let old = actual
+                        .calls
+                        .iter()
+                        .find(|call| call.grant.review_id == request.source.retired_review_id)
+                        .unwrap();
+                    Ok(sentinel_workflow::AdaptiveFundedReviewRecoveryEvidenceV1 {
+                        source_digest: actual.source.canonical_digest()?,
+                        proof_digest: request.proof_digest.clone(),
+                        release: request.release.clone(),
+                        no_io: sentinel_workflow::AdaptiveFundedReviewNoIoV1::NeverReserved {
+                            request_id: old.request_id(),
+                        },
+                        verified_at_unix_ms: at,
+                    })
+                },
+            )
+            .unwrap();
+        let context = pending_context(&api, &source, "material actual schema6 fixture");
+        assert_eq!(context.binding.grant.schema_version, 6);
+        context.validate_dispatch(at).unwrap();
+        let material = context
+            .binding
+            .grant
+            .work_funding
+            .as_ref()
+            .unwrap()
+            .receipt
+            .request
+            .source
+            .material_window_expansion
+            .as_ref()
+            .unwrap();
+        let rendered = context.prompt().unwrap();
+        for marker in [
+            "material_window_expansion",
+            "retained_decision_kind",
+            "declined_bounds",
+            "authoritative_floor",
+            "offered_bounds",
+            &material.model_response_digest,
+            &material.evidence_ref().unwrap(),
+        ] {
+            assert!(
+                rendered.contains(marker),
+                "missing material schema6 marker {marker}"
+            );
+        }
+    });
+}
+
+#[test]
+fn material_window_http_rejects_ambiguous_modes_and_unverified_native_usage() {
+    with_material_defer(|temp, api, source, declined, refused| {
+        let operator = api.principals.principal("operator").unwrap();
+        let path = material_query(&api, &source, &declined, &refused);
+        let before = state(&temp);
+        for suffix in [
+            "&mode=material-window-expansion",
+            "&supersedes_unused_receipt_digest=foreign",
+            "&source_only=true",
+            "&unknown_field=true",
+        ] {
+            assert_ne!(
+                api.adaptive_work_funding_http(&operator, "GET", &(path.clone() + suffix), &[])
+                    .status,
+                200
+            );
+        }
+        let mut wrong = operator.clone();
+        wrong.principal.authority_generation += 1;
+        assert_ne!(
+            api.adaptive_work_funding_http(&wrong, "GET", &path, &[])
+                .status,
+            200
+        );
+        assert_eq!(state(&temp), before);
+        let digest = refused.dispatch.as_ref().unwrap().request_digest.clone();
+        api.event_store
+            .as_ref()
+            .unwrap()
+            .record_llm_completion_failure(
+                &refused.request_id(),
+                &digest,
+                "synthetic unknown retained result",
+                1,
+            )
+            .unwrap();
+        let failed = state(&temp);
+        assert_ne!(
+            api.adaptive_work_funding_http(&operator, "GET", &path, &[])
+                .status,
+            200
+        );
+        assert_eq!(state(&temp), failed);
+    });
 }
 
 #[test]
