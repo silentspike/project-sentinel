@@ -42,6 +42,9 @@ pub enum WorkflowDiagnosticStage {
     CompanyCursor,
     DeliveryReadiness,
     HealthSerialization,
+    CompanyProjectConnectionWait,
+    CompanyProjectRead,
+    CompanyProjectClone,
 }
 
 impl WorkflowDiagnosticStage {
@@ -57,6 +60,9 @@ impl WorkflowDiagnosticStage {
             Self::CompanyCursor => "company_cursor",
             Self::DeliveryReadiness => "delivery_readiness",
             Self::HealthSerialization => "health_serialization",
+            Self::CompanyProjectConnectionWait => "company_project_connection_wait",
+            Self::CompanyProjectRead => "company_project_read",
+            Self::CompanyProjectClone => "company_project_clone",
         }
     }
 }
@@ -92,8 +98,21 @@ impl WorkflowDiagnosticSpan {
     }
 
     /// Finish observation only; `succeeded` cannot grant readiness or permission.
-    pub fn finish(mut self, succeeded: bool) {
-        if let Some(record) = self.record(true, succeeded) {
+    pub fn finish(self, succeeded: bool) {
+        self.finish_deferred(succeeded).publish();
+    }
+
+    /// Stop this interval now; the owner publishes only after releasing its guards.
+    pub(crate) fn finish_deferred(mut self, succeeded: bool) -> DeferredWorkflowDiagnostic {
+        DeferredWorkflowDiagnostic(self.record(true, succeeded))
+    }
+}
+
+pub(crate) struct DeferredWorkflowDiagnostic(Option<String>);
+
+impl DeferredWorkflowDiagnostic {
+    pub(crate) fn publish(self) {
+        if let Some(record) = self.0 {
             read_cache::publish_record(record);
         }
     }
@@ -3268,6 +3287,9 @@ mod tests {
             WorkflowDiagnosticStage::CompanyCursor,
             WorkflowDiagnosticStage::DeliveryReadiness,
             WorkflowDiagnosticStage::HealthSerialization,
+            WorkflowDiagnosticStage::CompanyProjectConnectionWait,
+            WorkflowDiagnosticStage::CompanyProjectRead,
+            WorkflowDiagnosticStage::CompanyProjectClone,
         ];
         let mut labels = BTreeSet::new();
         for stage in stages {
@@ -3290,6 +3312,60 @@ mod tests {
             .unwrap()
             .contains("completed=false succeeded=false"));
         assert!(incomplete.record(false, false).is_none());
+    }
+
+    #[test]
+    fn project_read_deferred_diagnostic_freezes_time_without_a_live_span() {
+        let mut span = WorkflowDiagnosticSpan::new(
+            WorkflowDiagnosticStage::CompanyProjectConnectionWait,
+            true,
+        );
+        span.started = Some(std::time::Instant::now() - std::time::Duration::from_millis(5));
+        let deferred = span.finish_deferred(true);
+        let record = deferred.0.as_ref().unwrap();
+        assert!(
+            record.contains("stage=company_project_connection_wait completed=true succeeded=true")
+        );
+        let before = record.clone();
+        std::thread::yield_now();
+        assert_eq!(deferred.0.as_ref().unwrap(), &before);
+        let disabled =
+            WorkflowDiagnosticSpan::new(WorkflowDiagnosticStage::CompanyProjectRead, false)
+                .finish_deferred(false);
+        assert!(disabled.0.is_none());
+        // Disabled publication is a no-op; no sink or payload is retained.
+        disabled.publish();
+    }
+
+    #[test]
+    fn project_read_shared_snapshot_charges_the_payload_not_just_its_arc() {
+        let store = WorkflowStore::open(":memory:").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let load = || {
+            let mut connection = store.connection.lock().unwrap();
+            store
+                .validated_read_snapshot_shared_if(
+                    &mut connection,
+                    "project-read-budget-test",
+                    &[],
+                    |_| {
+                        calls.set(calls.get() + 1);
+                        Ok("x".repeat(16 * 1024 * 1024))
+                    },
+                    |_| true,
+                )
+                .unwrap()
+        };
+        let first = load();
+        let second = load();
+        assert_eq!(
+            calls.get(),
+            2,
+            "oversized logical payload must not be retained as a tiny pointer"
+        );
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_ref(), second.as_ref());
+        assert!(store.connection.lock().unwrap().is_autocommit());
     }
 
     #[test]
