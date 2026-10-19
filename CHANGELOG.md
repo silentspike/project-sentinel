@@ -1,5 +1,16 @@
 # Changelog
 
+- Offer one source-bound material continuation window after a verified standing
+  funding deferral without selecting a leadership decision or increasing model
+  and tool call ceilings. Bind the complete adopted/declined limits, immutable
+  relation and usage evidence; preserve replay, public redaction and independent
+  post-offer leadership decisions (#856).
+
+- Reuse the existing shared validated project snapshot and move compatibility
+  cloning outside store guards. Retain full currentness and corruption checks;
+  expose separate connection-wait, held-read and clone diagnostic intervals
+  without treating source checks as runtime performance evidence (#856).
+
 - Reserve the full physical cold-boot memory promise before starting lab VMs,
   retain uncertain start commitments and invalidation evidence, and guard actual
   balloon growth retries. Keep shrink/no-op behavior and use private portable
