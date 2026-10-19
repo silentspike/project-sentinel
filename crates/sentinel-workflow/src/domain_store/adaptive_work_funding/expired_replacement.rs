@@ -537,6 +537,47 @@ fn require_call_review_link(
     Ok(())
 }
 
+/// Historical terminal Defer proof without following later adopted journal heads.
+pub(super) fn sealed_funded_refusal(
+    connection: &Connection,
+    tenant: &TenantId,
+    review: Uuid,
+) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
+    let call = get_entity::<SealedCall>(
+        connection,
+        tenant,
+        "adaptive_leadership_review_call",
+        &review.to_string(),
+    )?
+    .ok_or_else(corrupt)?
+    .0;
+    if !standing_policy::terminal_funded_defer(&call, &call.context.source_session) {
+        return Err(corrupt());
+    }
+    let epoch = call.grant.work_funding.as_ref().ok_or_else(corrupt)?;
+    if sealed_funding(connection, tenant, &epoch.receipt.funding_id)? != epoch.receipt {
+        return Err(corrupt());
+    }
+    require_call_review_link(connection, &call)?;
+    adaptive_resume_policy::require_leaf_event(
+        connection,
+        tenant,
+        &call.grant.project_id,
+        "adaptive_leadership_review_completed",
+        call.operation_id,
+        &canonical_sha256("sentinel.workflow.adaptive-leadership-call.v1", &call)?,
+        &call.grant.leadership_principal,
+        call.updated_at_unix_ms,
+        &call,
+    )?;
+    crate::store::adaptive::require_funding_journal_source(
+        connection,
+        epoch,
+        &call.context.source_session,
+    )?;
+    Ok(call)
+}
+
 pub(super) fn read_sealed_funding(
     connection: &Connection,
     tenant: &TenantId,

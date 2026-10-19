@@ -7135,6 +7135,7 @@ fn private_work_funding_event(name: &str) -> bool {
     matches!(
         name,
         "adaptive_work_funding_issued"
+            | "adaptive_work_funding_material_expansion_issued"
             | "adaptive_work_funding_review_issued"
             | "adaptive_work_funding_adopted"
     )
