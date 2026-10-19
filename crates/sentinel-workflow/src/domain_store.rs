@@ -21,6 +21,7 @@ pub use adaptive_leadership_review::{
 };
 mod historical_allowance;
 mod project_planning;
+mod project_read;
 mod read_sources;
 pub use read_sources::{CustomerOverviewProjectRead, CustomerOverviewReadSnapshot};
 mod request_provider;
@@ -835,13 +836,7 @@ impl WorkflowStore {
         tenant_id: &TenantId,
         project_id: &ProjectId,
     ) -> Result<Option<ProjectV1>, WorkflowError> {
-        tenant_id.validate()?;
-        project_id.validate()?;
-        let mut connection = self.connection.lock().map_err(|_| persistence())?;
-        let query_key = serde_json::to_vec(&(tenant_id, project_id)).map_err(|_| corrupt())?;
-        self.validated_read_snapshot(&mut connection, "company-project", &query_key, |snapshot| {
-            validated_company_project_in_snapshot(snapshot, tenant_id, project_id)
-        })
+        project_read::read(self, tenant_id, project_id)
     }
 
     /// Returns every durable project after validating the complete entity-row
@@ -7732,11 +7727,8 @@ pub(crate) fn validated_company_project_in_snapshot(
 ) -> Result<Option<ProjectV1>, WorkflowError> {
     tenant_id.validate()?;
     project_id.validate()?;
-    let value = get_entity(connection, tenant_id, "project", &project_id.0)?;
-    if let Some(project) = &value {
-        validate_project(project)?;
-    }
-    Ok(value)
+    // ProjectV1::validate_full already includes the identical pure validation.
+    get_entity(connection, tenant_id, "project", &project_id.0)
 }
 
 fn get_entity<T: DeserializeOwned + Serialize + Clone + CompanyEntity + 'static>(
