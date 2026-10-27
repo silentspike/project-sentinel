@@ -7738,7 +7738,7 @@ mod tests {
     #[test]
     fn read_cache_diagnostics_dispatch_is_authorized_even_when_workflow_disabled() {
         let mut api = WorkflowApi::disabled().unwrap();
-        api.principals = diagnostics_principals();
+        api.principals = Arc::new(diagnostics_principals());
         assert!(is_workflow_path(WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH));
         let anonymous = api
             .handle(
