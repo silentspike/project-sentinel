@@ -1,5 +1,9 @@
 # Changelog
 
+- Require the patched Go toolchain and compatible Console build/test tools;
+  remove distrusted bundled certificate roots from both Rust lockfiles without
+  suppressing security audits or changing application capabilities (#856).
+
 - Reuse the canonical material-offer project source without repeating standalone
   discovery. Preserve complete assignee, runtime and native-evidence revalidation;
   add operation-bound preparation intervals without inferring request CPU (#856).

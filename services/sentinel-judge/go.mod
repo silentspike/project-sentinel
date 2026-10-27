@@ -1,8 +1,8 @@
 module github.com/silentspike/project-sentinel/services/sentinel-judge
 
-go 1.26.0
+go 1.26.10
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/BurntSushi/toml v1.6.0
