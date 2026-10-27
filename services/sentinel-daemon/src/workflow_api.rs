@@ -179,6 +179,7 @@ pub const DELIVERY_COMMAND_PATH: &str = "/company/delivery/commands";
 pub const DELIVERY_INTENT_PATH: &str = "/company/delivery/intents";
 pub const DELIVERY_LINEAGE_PATH: &str = "/company/delivery/lineage";
 pub const WORKFLOW_READINESS_PATH: &str = "/company/workflow/readiness";
+pub const WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH: &str = "/operator/workflow/read-cache-diagnostics";
 pub const COLLABORATION_VIEW_PATH: &str = "/company/workflow/collaboration";
 pub const COLLABORATION_ADMISSION_PATH: &str = "/company/workflow/collaboration/admissions";
 pub const MAX_WORKFLOW_BODY_BYTES: usize = 256 * 1024;
@@ -3776,6 +3777,19 @@ impl WorkflowApi {
         if !is_workflow_path(path_only) {
             return None;
         }
+        // This memory-only operator drain must authenticate before consulting
+        // even the disabled-state latch, without invoking workflow health/SQL.
+        if path_only == WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH {
+            return Some(read_cache_diagnostics_response(
+                &self.principals,
+                method,
+                path,
+                headers,
+                body,
+                || self.store.read_cache_diagnostics_enabled(),
+                || self.store.take_read_cache_diagnostics(),
+            ));
+        }
         if !self.enabled {
             return Some(json_error(
                 503,
@@ -7062,6 +7076,80 @@ fn customer_identity(principal: &BoundPrincipal) -> WorkflowHttpResponse {
     )
 }
 
+fn read_cache_diagnostics_response(
+    principals: &PrincipalAuthenticator,
+    method: &str,
+    path: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    enabled: impl FnOnce() -> bool,
+    drain: impl FnOnce() -> Vec<String>,
+) -> WorkflowHttpResponse {
+    let Some(principal) = principals.authenticate(headers) else {
+        return json_error(
+            401,
+            "authentication_failed",
+            "workflow authentication failed",
+            false,
+        );
+    };
+    if principal.principal.kind != CompanyPrincipalKindV1::Operator {
+        return json_error(
+            403,
+            "authority_conflict",
+            "registered operator required",
+            false,
+        );
+    }
+    if method != "POST" {
+        return json_error(
+            405,
+            "method_not_allowed",
+            "diagnostic drain requires POST",
+            false,
+        );
+    }
+    if path != WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH || !body.is_empty() {
+        return json_error(
+            400,
+            "invalid_input",
+            "diagnostic drain requires no query or body",
+            false,
+        );
+    }
+    let diagnostics_enabled = enabled();
+    let records = drain();
+    if records.len() > 64 || records.iter().any(|record| record.len() > 4096) {
+        return json_error(
+            503,
+            "diagnostics_unavailable",
+            "diagnostic bounds invalid",
+            false,
+        );
+    }
+    let response = json(
+        200,
+        &serde_json::json!({
+            "schema_version": 1,
+            "diagnostics_enabled": diagnostics_enabled,
+            "records": records,
+            "record_coverage": "UNKNOWN",
+            "scope": "PROCESS_GLOBAL_LOSSY_NOT_REQUEST_OR_TID",
+            "nested_intervals_additive": false,
+            "authority_or_readiness_proven": false,
+        }),
+    );
+    if response.body.len() > 2 * 1024 * 1024 {
+        return json_error(
+            503,
+            "diagnostics_unavailable",
+            "diagnostic bounds invalid",
+            false,
+        );
+    }
+    response
+}
+
 fn is_workflow_path(path: &str) -> bool {
     matches!(
         path,
@@ -7094,6 +7182,7 @@ fn is_workflow_path(path: &str) -> bool {
             | COLLABORATION_VIEW_PATH
             | COLLABORATION_ADMISSION_PATH
             | WORKFLOW_READINESS_PATH
+            | WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH
     )
 }
 
@@ -7472,6 +7561,213 @@ mod tests {
             agent_id: Some(AgentId(6)),
             authority_generation: 1,
         }
+    }
+
+    fn diagnostics_principals() -> PrincipalAuthenticator {
+        let mut operator = principal_binding("diagnostics-operator");
+        operator.kind = CompanyPrincipalKindV1::Operator;
+        operator.role = CompanyRoleV1::TechnicalLead;
+        operator.agent_id = None;
+        let mut customer = principal_binding("diagnostics-customer");
+        customer.kind = CompanyPrincipalKindV1::Customer;
+        customer.role = CompanyRoleV1::Customer;
+        customer.customer_id = Some("diagnostics-customer".into());
+        customer.agent_id = None;
+        let mut qa = principal_binding("diagnostics-qa");
+        qa.role = CompanyRoleV1::Qa;
+        let mut leader = principal_binding("diagnostics-leader");
+        leader.role = CompanyRoleV1::TechnicalLead;
+        PrincipalAuthenticator::new(vec![
+            ("o".repeat(32), operator),
+            ("c".repeat(32), customer),
+            ("d".repeat(32), principal_binding("diagnostics-developer")),
+            ("q".repeat(32), qa),
+            ("l".repeat(32), leader),
+        ])
+        .unwrap()
+    }
+
+    fn diagnostics_headers(token: &str) -> HashMap<String, String> {
+        HashMap::from([("authorization".into(), format!("Bearer {token}"))])
+    }
+
+    #[test]
+    fn read_cache_diagnostics_auth_precedes_flag_and_destructive_drain() {
+        let principals = diagnostics_principals();
+        let cases = [
+            (HashMap::new(), 401),
+            (HashMap::from([("x-api-key".into(), "o".repeat(32))]), 401),
+            (diagnostics_headers(&"x".repeat(32)), 401),
+            (diagnostics_headers(&"c".repeat(32)), 403),
+            (diagnostics_headers(&"d".repeat(32)), 403),
+            (diagnostics_headers(&"q".repeat(32)), 403),
+            (diagnostics_headers(&"l".repeat(32)), 403),
+        ];
+        for (headers, status) in cases {
+            let response = read_cache_diagnostics_response(
+                &principals,
+                "POST",
+                WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH,
+                &headers,
+                b"",
+                || panic!("unauthorized request consulted enabled flag"),
+                || panic!("unauthorized request drained diagnostics"),
+            );
+            assert_eq!(response.status, status);
+        }
+    }
+
+    #[test]
+    fn read_cache_diagnostics_method_query_and_body_reject_before_drain() {
+        let principals = diagnostics_principals();
+        let headers = diagnostics_headers(&"o".repeat(32));
+        for (method, path, body, status) in [
+            (
+                "GET",
+                WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH,
+                b"".as_slice(),
+                405,
+            ),
+            (
+                "PUT",
+                WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH,
+                b"".as_slice(),
+                405,
+            ),
+            (
+                "POST",
+                "/operator/workflow/read-cache-diagnostics?",
+                b"".as_slice(),
+                400,
+            ),
+            (
+                "POST",
+                "/operator/workflow/read-cache-diagnostics?tenant_id=foreign",
+                b"".as_slice(),
+                400,
+            ),
+            (
+                "POST",
+                WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH,
+                b"{}".as_slice(),
+                400,
+            ),
+            (
+                "POST",
+                WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH,
+                b" ".as_slice(),
+                400,
+            ),
+        ] {
+            let response = read_cache_diagnostics_response(
+                &principals,
+                method,
+                path,
+                &headers,
+                body,
+                || panic!("invalid input consulted enabled flag"),
+                || panic!("invalid input drained diagnostics"),
+            );
+            assert_eq!(response.status, status);
+        }
+    }
+
+    #[test]
+    fn read_cache_diagnostics_schema_is_unknown_for_enabled_and_disabled_sink() {
+        let principals = diagnostics_principals();
+        let headers = diagnostics_headers(&"o".repeat(32));
+        for enabled in [false, true] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let records = if enabled {
+                vec!["workflow_diagnostics dropped_records=2".to_owned()]
+            } else {
+                Vec::new()
+            };
+            let response = read_cache_diagnostics_response(
+                &principals,
+                "POST",
+                WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH,
+                &headers,
+                b"",
+                || {
+                    calls.borrow_mut().push("enabled");
+                    enabled
+                },
+                || {
+                    calls.borrow_mut().push("drain");
+                    records.clone()
+                },
+            );
+            assert_eq!(response.status, 200);
+            assert_eq!(*calls.borrow(), ["enabled", "drain"]);
+            let actual: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(
+                actual,
+                serde_json::json!({
+                    "schema_version": 1, "diagnostics_enabled": enabled, "records": records,
+                    "record_coverage": "UNKNOWN", "scope": "PROCESS_GLOBAL_LOSSY_NOT_REQUEST_OR_TID",
+                    "nested_intervals_additive": false, "authority_or_readiness_proven": false,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn read_cache_diagnostics_bounds_include_json_escape_expansion() {
+        let principals = diagnostics_principals();
+        let headers = diagnostics_headers(&"o".repeat(32));
+        for (records, status) in [
+            (vec!["\0".repeat(4096); 64], 200),
+            (vec!["record".into(); 65], 503),
+            (vec!["x".repeat(4097)], 503),
+        ] {
+            let response = read_cache_diagnostics_response(
+                &principals,
+                "POST",
+                WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH,
+                &headers,
+                b"",
+                || true,
+                || records,
+            );
+            assert_eq!(response.status, status);
+            assert!(response.body.len() <= 2 * 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn read_cache_diagnostics_dispatch_is_authorized_even_when_workflow_disabled() {
+        let mut api = WorkflowApi::disabled().unwrap();
+        api.principals = diagnostics_principals();
+        assert!(is_workflow_path(WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH));
+        let anonymous = api
+            .handle(
+                "POST",
+                WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH,
+                &HashMap::new(),
+                b"",
+            )
+            .unwrap();
+        assert_eq!(anonymous.status, 401);
+        let response = api
+            .handle(
+                "POST",
+                WORKFLOW_READ_CACHE_DIAGNOSTICS_PATH,
+                &diagnostics_headers(&"o".repeat(32)),
+                b"",
+            )
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let actual: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(actual["record_coverage"], "UNKNOWN");
+        assert_eq!(actual["authority_or_readiness_proven"], false);
+        // The additive route does not alter the disabled barrier of other APIs.
+        assert_eq!(
+            api.handle("POST", AGENT_COMMAND_PATH, &HashMap::new(), b"{}")
+                .unwrap()
+                .status,
+            503
+        );
     }
 
     #[test]
