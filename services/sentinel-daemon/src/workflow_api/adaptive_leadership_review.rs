@@ -276,7 +276,7 @@ impl LeadershipContext {
             .collect();
         let funding = grant.work_funding.as_ref().map(|epoch| {
             let facts = &epoch.receipt.request.source;
-            serde_json::json!({
+            let mut projection = serde_json::json!({
                 "binding": &epoch.binding,
                 "receipt_ref": format!("adaptive-work-funding-receipt:{}", epoch.binding.receipt_digest),
                 "issued_at_unix_ms": epoch.receipt.issued_at_unix_ms,
@@ -293,7 +293,21 @@ impl LeadershipContext {
                 "base_window_count": facts.resume_source.base_window_count,
                 "predecessor_receipt_digest": &facts.predecessor_receipt_digest,
                 "supersedes_unused_receipt_digest": &facts.supersedes_unused_receipt_digest,
-            })
+            });
+            if let Some(material) = &facts.material_window_expansion {
+                projection["material_window_expansion"] = serde_json::json!({
+                    "binding": material,
+                    "retained_decision_kind": "defer_budget",
+                    "retained_review_id": material.refused_review_id,
+                    "retained_response_digest": material.model_response_digest,
+                    "declined_bounds": material.declined_limits,
+                    "authoritative_floor": material.authoritative_floor,
+                    "offered_bounds": epoch.binding.limits,
+                    "one_offer_for_this_source_head": true,
+                    "decision_selected_by_operator": false,
+                });
+            }
+            projection
         });
         let subject = match &grant.subject {
             Some(sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted {
@@ -1155,6 +1169,13 @@ impl WorkflowApi {
                         .evidence_ref()
                         .map_err(|_| "leadership funding marker invalid")?,
                 );
+                if let Some(material) = &epoch.receipt.request.source.material_window_expansion {
+                    refs.push(
+                        material
+                            .evidence_ref()
+                            .map_err(|_| "material offer marker invalid")?,
+                    );
+                }
             }
             match &subject {
                 Some(

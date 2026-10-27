@@ -183,7 +183,7 @@ fn receipt_response(
     json(200, &public)
 }
 
-fn template(
+pub(super) fn template(
     source: &AdaptiveFundedReviewRecoveryVerificationSourceV1,
     request: &AdaptiveFundedReviewRecoveryRequestV1,
 ) -> Result<

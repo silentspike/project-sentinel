@@ -51,6 +51,7 @@ fn funded() -> AdaptiveLeadershipReviewCallV1 {
                 predecessor_receipt_digest: None,
                 supersedes_unused_receipt_digest: None,
                 expired_reviewed_replacement: None,
+                material_window_expansion: None,
             },
             limits: crate::AdaptiveWorkFundingLimitsV1 {
                 additional_model_calls: 8, additional_tool_calls: 8,

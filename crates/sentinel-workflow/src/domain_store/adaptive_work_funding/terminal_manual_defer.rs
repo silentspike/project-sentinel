@@ -74,7 +74,7 @@ fn matches_head(
             == crate::adaptive_budget_history_digest(&source.continuation)?)
 }
 
-fn require_completed_before(
+pub(super) fn require_completed_before(
     connection: &Connection,
     call: &AdaptiveLeadershipReviewCallV1,
     time: u64,
@@ -142,7 +142,9 @@ pub(super) fn excluded_at_head(
     Ok(result)
 }
 
-fn standing_cause(receipt: &AdaptiveWorkFundingReceiptV1) -> Result<Option<Uuid>, WorkflowError> {
+pub(super) fn standing_cause(
+    receipt: &AdaptiveWorkFundingReceiptV1,
+) -> Result<Option<Uuid>, WorkflowError> {
     let Some(reason) = receipt.request.reason_ref.strip_prefix(STANDING) else {
         return Ok(None);
     };

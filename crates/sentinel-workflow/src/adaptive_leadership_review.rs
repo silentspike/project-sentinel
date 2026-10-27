@@ -1083,6 +1083,21 @@ impl AdaptiveLeadershipReviewContextV1 {
             let funding_source = &epoch.receipt.request.source;
             let anchor = &funding_source.resume_source;
             let reference = epoch.evidence_ref()?;
+            let material_ref = funding_source
+                .material_window_expansion
+                .as_ref()
+                .map(|binding| binding.evidence_ref())
+                .transpose()?;
+            if material_ref
+                .as_ref()
+                .is_some_and(|reference| !self.evidence_refs.contains(reference))
+                || self.evidence_refs.iter().any(|reference| {
+                    reference.starts_with("material-window-offer:")
+                        && material_ref.as_ref() != Some(reference)
+                })
+            {
+                return Err(invalid());
+            }
             let initial = session.version == anchor.expected_session_version;
             if !matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
                 || funding_source.original_model_call_ceiling != session.grant.max_model_calls
@@ -1114,10 +1129,10 @@ impl AdaptiveLeadershipReviewContextV1 {
                 return Err(invalid());
             }
         } else if session.active_work_funding().is_some()
-            || self
-                .evidence_refs
-                .iter()
-                .any(|value| value.starts_with("adaptive-work-funding:"))
+            || self.evidence_refs.iter().any(|value| {
+                value.starts_with("adaptive-work-funding:")
+                    || value.starts_with("material-window-offer:")
+            })
         {
             return Err(invalid());
         }
