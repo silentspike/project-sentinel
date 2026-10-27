@@ -26,7 +26,7 @@ tracing = { workspace = true }
 fuser = { version = "0.17", optional = true }
 libc = { version = "0.2", optional = true }
 rustix = { version = "1", features = ["fs"] }
-zstd = "0.13"
+zstd = "=0.14.3"
 rayon = { workspace = true }
 io-uring = { version = "0.7", optional = true }
 
