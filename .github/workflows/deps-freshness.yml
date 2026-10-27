@@ -80,7 +80,7 @@ jobs:
       - name: Check outdated dependencies
         run: |
           echo "## Rust Dependencies" >> "$GITHUB_STEP_SUMMARY"
-          if OUTPUT=$(cargo outdated --root-deps-only --depth 1 2>&1); then
+          if OUTPUT=$(python3 scripts/ci/cargo_outdated.py --source "$GITHUB_WORKSPACE" --scratch-dir "$RUNNER_TEMP" 2>&1); then
             STATUS=0
           else
             STATUS=$?
