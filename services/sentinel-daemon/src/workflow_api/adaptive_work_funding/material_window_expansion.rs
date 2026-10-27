@@ -175,16 +175,35 @@ impl WorkflowApi {
         {
             return workflow_error(source_conflict());
         }
+        let os_tid = std::fs::read_link("/proc/thread-self")
+            .ok()
+            .and_then(|path| path.file_name()?.to_str()?.parse::<u32>().ok());
+        let _request_span = tracing::info_span!(
+            "material_work_funding",
+            operation_id = %supplied.operation_id,
+            method,
+            pid = std::process::id(),
+            os_tid,
+            rust_thread_id = ?std::thread::current().id(),
+        )
+        .entered();
+        let _total = FundingPhase::start("material_request_total");
+        let wait = FundingPhase::start("material_mutation_fence_wait");
         let Ok(_fence) = self.mutation_fence.write() else {
             return workflow_error(workflow_unavailable());
         };
+        drop(wait);
         let prepared = (|| -> Result<_, WorkflowError> {
             // Exact historical operation first, without giving it fresh admission or clocks.
-            if let Some(stored) = self.store.adaptive_work_funding(
-                &operator.principal.tenant_id,
-                supplied.session_id,
-                supplied.operation_id,
-            )? {
+            let stored = {
+                let _phase = FundingPhase::start("material_historical_receipt");
+                self.store.adaptive_work_funding(
+                    &operator.principal.tenant_id,
+                    supplied.session_id,
+                    supplied.operation_id,
+                )?
+            };
+            if let Some(stored) = stored {
                 let expected = view(&stored.request)?;
                 if method == "GET" {
                     supplied.source_digest = expected.source_digest.clone();
@@ -195,39 +214,68 @@ impl WorkflowApi {
                 return Ok(Err(stored));
             }
             let now = clock();
-            self.work_funding_current_source(
-                operator,
-                &supplied.project_id,
-                supplied.session_id,
-                now,
-            )?;
-            let source = self.store.adaptive_material_window_verification_source(
-                &operator.principal,
-                &supplied.project_id,
-                supplied.session_id,
-                &supplied.declined_funding_receipt_digest,
-                supplied.refused_review_id,
-                now,
-            )?;
+            let source = {
+                let _phase = FundingPhase::start("material_source_snapshot");
+                self.store.adaptive_material_window_verification_source(
+                    &operator.principal,
+                    &supplied.project_id,
+                    supplied.session_id,
+                    &supplied.declined_funding_receipt_digest,
+                    supplied.refused_review_id,
+                    now,
+                )?
+            };
+            // The SQL source already authenticates this project. Keep full paired
+            // assignee discovery (including ambiguous/invalid neighboring heads),
+            // rather than rereading the standalone project or trusting one head.
+            {
+                let _phase = FundingPhase::start("material_assignee_revalidation");
+                let sessions = self
+                    .review_sessions(&source.project)
+                    .map_err(|_| workflow_unavailable())?;
+                if !sessions.iter().any(|session| session == &source.session) {
+                    return Err(source_conflict());
+                }
+            }
+            {
+                let _phase = FundingPhase::start("material_current_runtime_source");
+                self.work_funding_current_source_from_observed(
+                    &source.project,
+                    &source.session,
+                    clock(),
+                )?;
+            }
             // Full canonical retained-success verification BEFORE acquiring the store SQL mutex.
-            let before = self.material_native_stamp(&source, clock())?;
-            self.verify_accounting_refusal(&source.refused)
-                .map_err(|_| source_conflict())?;
-            let witness = self.material_native_stamp(&source, clock())?;
+            let before = {
+                let _phase = FundingPhase::start("material_native_before");
+                self.material_native_stamp(&source, clock())?
+            };
+            {
+                let _phase = FundingPhase::start("material_retained_refusal");
+                self.verify_accounting_refusal(&source.refused)
+                    .map_err(|_| source_conflict())?;
+            }
+            let witness = {
+                let _phase = FundingPhase::start("material_native_after");
+                self.material_native_stamp(&source, clock())?
+            };
             if witness.outbox != before.outbox
                 || witness.proof.usage_event_digest != before.proof.usage_event_digest
             {
                 return Err(source_conflict());
             }
-            let request = self.store.adaptive_material_window_draft(
-                &operator.principal,
-                &source,
-                supplied.operation_id,
-                &supplied.reason_ref,
-                supplied.limits.clone(),
-                &witness.proof,
-                clock(),
-            )?;
+            let request = {
+                let _phase = FundingPhase::start("material_draft_revalidation");
+                self.store.adaptive_material_window_draft(
+                    &operator.principal,
+                    &source,
+                    supplied.operation_id,
+                    &supplied.reason_ref,
+                    supplied.limits.clone(),
+                    &witness.proof,
+                    clock(),
+                )?
+            };
             let expected = view(&request)?;
             if method == "POST" && supplied != expected {
                 return Err(source_conflict());
@@ -240,6 +288,7 @@ impl WorkflowApi {
             Ok(Ok(value)) => value,
         };
         if method == "GET" {
+            let _phase = FundingPhase::start("material_draft_render");
             return json(
                 200,
                 &serde_json::json!({"schema_version":1,"requires_explicit_submission":true,
@@ -248,6 +297,7 @@ impl WorkflowApi {
                 "model_decision_recorded":false,"developer_window_created":false}),
             );
         }
+        let _phase = FundingPhase::start("material_receipt_transaction");
         let outcome = self.store.authorize_adaptive_material_window(
             &operator.principal,
             &request,

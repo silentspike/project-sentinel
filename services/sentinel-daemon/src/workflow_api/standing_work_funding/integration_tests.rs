@@ -519,6 +519,197 @@ fn material_query(
 }
 
 #[test]
+fn material_window_phase_records_bind_actual_operation_and_cover_finite_get() {
+    #[derive(Clone)]
+    struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    with_material_defer(|temp, api, source, declined, refused| {
+        let operator = api.principals.principal("operator").unwrap();
+        let path = material_query(&api, &source, &declined, &refused);
+        let operation = query_parameter(&path, "operation_id").unwrap();
+        let before = state(&temp);
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Writer(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let response = tracing::subscriber::with_default(subscriber, || {
+            api.adaptive_work_funding_http(&operator, "GET", &path, &[])
+        });
+        assert_eq!(response.status, 200);
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["fields"]["message"] == "Work funding preparation phase")
+            .collect();
+        let expected = std::collections::BTreeSet::from([
+            "material_request_total",
+            "material_mutation_fence_wait",
+            "material_historical_receipt",
+            "material_source_snapshot",
+            "material_assignee_revalidation",
+            "material_current_runtime_source",
+            "material_native_before",
+            "material_retained_refusal",
+            "material_native_after",
+            "material_draft_revalidation",
+            "material_draft_render",
+        ]);
+        assert_eq!(records.len(), expected.len());
+        let phases: std::collections::BTreeSet<_> = records
+            .iter()
+            .map(|row| {
+                assert_eq!(row["span"]["operation_id"], operation);
+                assert_eq!(row["span"]["method"], "GET");
+                assert_eq!(row["span"]["pid"], std::process::id());
+                assert!(row["span"]["os_tid"].as_u64().is_some_and(|tid| tid > 0));
+                assert!(row["span"]["rust_thread_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("ThreadId("));
+                assert!(row["fields"]["elapsed_ms"].as_u64().is_some());
+                row["fields"]["phase"].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(expected, phases);
+        let safe_records = serde_json::to_string(&records).unwrap();
+        assert!(!safe_records.contains(&declined.receipt_digest().unwrap()));
+        assert!(!safe_records.contains("source_digest"));
+        assert_eq!(state(&temp), before);
+    });
+}
+
+#[test]
+fn material_window_reuses_verified_project_without_standalone_rediscovery() {
+    with_material_defer(|temp, api, source, declined, refused| {
+        let operator = api.principals.principal("operator").unwrap();
+        let path = material_query(&api, &source, &declined, &refused);
+        let before = state(&temp);
+        let previous =
+            super::super::adaptive_work_funding::SOURCE_DISCOVERIES.with(|count| count.replace(0));
+        api.work_funding_current_source(
+            &operator,
+            &source.grant.authority.project_id,
+            source.grant.session_id,
+            now_unix_ms(),
+        )
+        .unwrap();
+        let legacy =
+            super::super::adaptive_work_funding::SOURCE_DISCOVERIES.with(|count| count.replace(0));
+        let first = api.adaptive_work_funding_http(&operator, "GET", &path, &[]);
+        let second = api.adaptive_work_funding_http(&operator, "GET", &path, &[]);
+        let standalone = super::super::adaptive_work_funding::SOURCE_DISCOVERIES
+            .with(|count| count.replace(previous));
+        assert_eq!(
+            legacy, 1,
+            "the old standalone discovery is actually counted"
+        );
+        assert_eq!(first.status, 200);
+        assert_eq!(second.status, 200);
+        assert_eq!(first.body, second.body);
+        assert_eq!(
+            standalone, 0,
+            "reuse only the SQL-verified project, not cached admission"
+        );
+        assert_eq!(state(&temp), before, "both drafts remain read-only");
+    });
+}
+
+#[test]
+fn material_window_verified_project_keeps_fresh_external_revocations() {
+    for gate in ["employee", "leader", "profile", "catalog", "observation"] {
+        with_material_defer(|temp, mut api, source, declined, refused| {
+            let operator = api.principals.principal("operator").unwrap();
+            let path = material_query(&api, &source, &declined, &refused);
+            assert_eq!(
+                api.adaptive_work_funding_http(&operator, "GET", &path, &[])
+                    .status,
+                200
+            );
+            match gate {
+                "employee" => stop_review_agent(&api, source.grant.authority.agent_id, true),
+                "leader" => {
+                    for participant in &project(&api, &source).governance.participants {
+                        if matches!(
+                            participant.role,
+                            CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+                        ) {
+                            stop_review_agent(&api, participant.agent_id, true);
+                        }
+                    }
+                }
+                "profile" => {
+                    Arc::make_mut(api.authority.as_mut().unwrap()).workbench_profile_digest =
+                        "0".repeat(64)
+                }
+                "catalog" => {
+                    Arc::make_mut(api.authority.as_mut().unwrap())
+                        .workbench_profile
+                        .network = "allow".into()
+                }
+                "observation" => api.workbench = None,
+                _ => unreachable!(),
+            }
+            let before = state(&temp);
+            assert_ne!(
+                api.adaptive_work_funding_http(&operator, "GET", &path, &[])
+                    .status,
+                200,
+                "{gate}"
+            );
+            assert_eq!(state(&temp), before, "{gate}");
+        });
+    }
+}
+
+#[test]
+fn material_window_verified_source_does_not_hide_corrupt_neighbor_head() {
+    with_material_defer(|temp, api, source, declined, refused| {
+        let operator = api.principals.principal("operator").unwrap();
+        let path = material_query(&api, &source, &declined, &refused);
+        let connection =
+            sentinel_limbo::rusqlite::Connection::open(temp.path().join("company.sqlite")).unwrap();
+        assert_eq!(connection.execute(
+            "INSERT INTO workflow_adaptive_heads(tenant_id,project_id,work_item_id,agent_id,authority_digest,session_id,version,updated_at_ms)
+             SELECT tenant_id,project_id,work_item_id,agent_id,?1,?2,version,updated_at_ms
+             FROM workflow_adaptive_heads WHERE session_id=?3",
+            sentinel_limbo::rusqlite::params!["f".repeat(64), Uuid::from_u128(7316).to_string(), source.grant.session_id.to_string()],
+        ).unwrap(), 1);
+        // This extra corrupt locator is outside the original session's journal.
+        // Its single-session material proof alone must not replace paired discovery.
+        api.store
+            .adaptive_material_window_verification_source(
+                &operator.principal,
+                &source.grant.authority.project_id,
+                source.grant.session_id,
+                &declined.receipt_digest().unwrap(),
+                refused.grant.review_id,
+                now_unix_ms(),
+            )
+            .unwrap();
+        let before = state(&temp);
+        assert_ne!(
+            api.adaptive_work_funding_http(&operator, "GET", &path, &[])
+                .status,
+            200
+        );
+        assert_eq!(state(&temp), before);
+    });
+}
+
+#[test]
 fn material_window_http_uses_canonical_refusal_and_normal_independent_decisions() {
     for continued in [false, true] {
         with_material_defer(|temp, api, source, declined, refused| {
