@@ -276,6 +276,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_zstd_block_decodes_and_retains_one_to_many_references() {
+        // Frozen CLI Zstd 1.5.7 (-q -3 --stdout) over str16(1024 * b'B').
+        // Frame SHA-256: 183f5df9d3562e3301da775d8787823f387bac27e9fb3bf9675653a3bf8ef6a3.
+        let frame = [
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x5d, 0x00, 0x00, 0x20, 0xda, 0x04, 0x00, 0x42,
+            0x01, 0x00, 0xfc, 0x2b, 0x40, 0x04, 0x62, 0x16, 0xbe, 0x8b,
+        ];
+        let mut data = vec![0xda, 0x04, 0x00];
+        data.extend_from_slice(&[b'B'; 1024]);
+        let chunks: Vec<_> = chunk_data(&data).collect();
+        assert_eq!(chunks.len(), 1);
+        let hash = chunks[0].hash;
+        let mut plane = ConsolePlane::new();
+        plane.blocks.insert(hash, frame.to_vec());
+        plane.refcount.insert(hash, 1);
+        plane.log.push(hash);
+        plane.stored_bytes = frame.len() as u64;
+        plane.total_ingested_bytes = data.len() as u64;
+        assert_eq!(plane.read_block(&hash).unwrap(), data);
+        for _ in 0..2 {
+            assert_eq!(plane.ingest(&data), vec![hash]);
+        }
+        assert_eq!(plane.unique_blocks(), 1);
+        assert_eq!(plane.log_manifest(), vec![hash; 3]);
+        assert_eq!(plane.refcount[&hash], 3);
+        assert_eq!(plane.block(&hash).unwrap(), frame.as_slice());
+        assert_eq!(plane.stored_bytes(), frame.len() as u64);
+        assert_eq!(plane.total_ingested_bytes(), 3 * data.len() as u64);
+        let delta = plane.delta(&HashSet::new());
+        assert_eq!(delta.missing, vec![hash]);
+        assert_eq!(delta.blocks, vec![(hash, frame.to_vec())]);
+        let client_has: HashSet<_> = [hash].into_iter().collect();
+        assert!(plane.delta(&client_has).blocks.is_empty());
+        let push = plane.push_for(&plane.log_manifest(), &HashSet::new());
+        assert_eq!(push.event_hashes, vec![hash; 3]);
+        assert_eq!(push.blocks, vec![(hash, frame.to_vec())]);
+    }
+
+    #[test]
     fn delta_empty_when_client_has_everything() {
         let mut plane = ConsolePlane::new();
         plane.ingest(&message(1));

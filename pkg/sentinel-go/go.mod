@@ -1,8 +1,8 @@
 module github.com/silentspike/project-sentinel/pkg/sentinel-go
 
-go 1.26.0
+go 1.26.10
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/nats-io/nats.go v1.48.0

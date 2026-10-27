@@ -323,6 +323,11 @@ impl WorkflowStore {
         WorkflowDiagnosticSpan::new(stage, read_cache::diagnostics_enabled())
     }
 
+    /// Return the startup-latched diagnostic opt-in without acquiring the SQL connection.
+    pub fn read_cache_diagnostics_enabled(&self) -> bool {
+        read_cache::diagnostics_enabled()
+    }
+
     /// Drain at most 64 process-wide, payload-free read-cache diagnostic records.
     /// Requires opt-in at process startup; unavailable/contended observation is empty.
     /// Consumers perform output after this method returns, outside store locks.
@@ -3273,6 +3278,27 @@ mod tests {
     use crate::WorkflowErrorCode;
 
     struct SerializationFailure;
+
+    #[test]
+    fn read_cache_diagnostic_accessors_do_not_wait_for_sql_connection() {
+        let store = Arc::new(WorkflowStore::open(":memory:").unwrap());
+        let connection = store.connection.lock().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let observed = Arc::clone(&store);
+        let worker = std::thread::spawn(move || {
+            let enabled = observed.read_cache_diagnostics_enabled();
+            let records = observed.take_read_cache_diagnostics();
+            sent.send((enabled, records)).unwrap();
+        });
+        let result = received.recv_timeout(std::time::Duration::from_secs(2));
+        // Release SQL even on timeout so a regressed accessor can finish before joining.
+        drop(connection);
+        worker.join().unwrap();
+        let (enabled, records) = result.expect("diagnostic accessors must not wait for SQL");
+        assert_eq!(enabled, super::read_cache::diagnostics_enabled());
+        assert!(records.len() <= 64);
+        assert!(records.iter().all(|record| record.len() <= 4096));
+    }
 
     #[test]
     fn diagnostic_stages_are_finite_optional_and_single_finish() {

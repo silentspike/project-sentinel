@@ -737,6 +737,47 @@ mod tests {
     }
 
     #[test]
+    fn legacy_zstd_blob_preserves_content_hash_prefix_and_dedup() {
+        // Frozen CLI Zstd 1.5.7 (-q -3 --stdout) over str16(1024 * b'B').
+        // Frame SHA-256: 183f5df9d3562e3301da775d8787823f387bac27e9fb3bf9675653a3bf8ef6a3.
+        let frame = [
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x5d, 0x00, 0x00, 0x20, 0xda, 0x04, 0x00, 0x42,
+            0x01, 0x00, 0xfc, 0x2b, 0x40, 0x04, 0x62, 0x16, 0xbe, 0x8b,
+        ];
+        let mut data = vec![0xda, 0x04, 0x00];
+        data.extend_from_slice(&[b'B'; 1024]);
+        let hash =
+            hex_decode_32("5bf61b6d8c2dd7219f10a38ca2486b91a370727fed4707500827a156e6201be6")
+                .unwrap();
+        assert_eq!(CasStore::hash(&data), hash);
+        let mut encoded = vec![PREFIX_ZSTD];
+        encoded.extend_from_slice(&frame);
+        let (store, dir) = temp_cas();
+        let mut wrong_hash = hash;
+        wrong_hash[0] ^= 1;
+        assert!(store
+            .store_pulled_blob(&encoded, &wrong_hash, data.len() as u64)
+            .is_err());
+        assert!(!store.contains(&wrong_hash));
+        assert!(store
+            .store_pulled_blob(&encoded, &hash, data.len() as u64 + 1)
+            .is_err());
+        assert!(!store.contains(&hash));
+        store
+            .store_pulled_blob(&encoded, &hash, data.len() as u64)
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(store.read(&hash).unwrap(), data);
+            assert_eq!(store.store(&data).unwrap(), (hash, true));
+        }
+        assert_eq!(store.stats().unwrap().blob_count, 1);
+        assert_eq!(store.encoded_blob(&hash).unwrap(), encoded);
+        let reopened = CasStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.read(&hash).unwrap(), data);
+        assert_eq!(reopened.encoded_blob(&hash).unwrap(), encoded);
+    }
+
+    #[test]
     fn decode_empty_blob_errors() {
         assert!(decode_blob(&[]).is_err());
     }
