@@ -1,5 +1,26 @@
 # Changelog
 
+- Preserve the registered local dependency patch during freshness inspection by
+  relocating only its address in an authenticated disposable source snapshot;
+  retain original inputs, inspection scope and failure propagation (#856).
+
+- Require the patched Go toolchain and compatible Console build/test tools;
+  remove distrusted bundled certificate roots from both Rust lockfiles without
+  suppressing security audits or changing application capabilities (#856).
+
+- Reuse the canonical material-offer project source without repeating standalone
+  discovery. Preserve complete assignee, runtime and native-evidence revalidation;
+  add operation-bound preparation intervals without inferring request CPU (#856).
+
+- Add an operator-authenticated, bounded in-memory diagnostic drain and optional
+  startup opt-in configuration. Preserve default-off, lossy and unknown-coverage
+  semantics without querying workflow health or changing business state (#856).
+
+- Update security-affected Wasmtime/WASI, Tokio, certificate-verification and Zstd
+  dependencies. Backport the upstream Zstd cache dependency fix through a bounded
+  registered patch without disabling the cache; retain legacy CAS and Console
+  decoding regressions with an independently identified Zstd 1.5.7 frame (#856).
+
 - Offer one source-bound material continuation window after a verified standing
   funding deferral without selecting a leadership decision or increasing model
   and tool call ceilings. Bind the complete adopted/declined limits, immutable

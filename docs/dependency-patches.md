@@ -21,16 +21,63 @@ Governance context:
 
 ## Active State
 
-Repository revision `16c0e353861e29a9b4d181bebd9a9f4a432a49b3` has:
+The current bounded security increment declares:
 
 | Cargo intervention mechanism | Active declarations |
 | --- | ---: |
-| `[patch.<source>]` | 0 |
+| `[patch.<source>]` | 1 |
 | `[replace]` | 0 |
 | Repository Cargo config `source.<name>.replace-with` | 0 |
-| Active registry rows | 0 |
+| Active registry rows | 1 |
 
-No active registry entry is invented.
+The sole override is a manifest-only upstream backport for the Wasmtime cache.
+It preserves the cache implementation and does not exempt any advisory.
+
+### Wasmtime Cache Security Backport (#856)
+
+The vendored basis is the published `wasmtime-internal-cache` 49.0.4 archive,
+SHA-256 `96e4469e885ac50f8dc06337245f9905b22c68d55416267f9afd07f7f76687be`,
+with release source commit `2c2970205fe05d6bbf15b9bff6f1e67874b2db5c`.
+All Rust source, tests, the build script and VCS packaging metadata are unchanged.
+`LICENSE` retains the exact Apache-2.0 WITH LLVM-exception text and copyright.
+The original 12,243-byte license, SHA-256
+`268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5`,
+is preserved in private provenance. Only its excess final blank line is removed
+in the vendor copy: 12,242 bytes, one terminal newline, SHA-256
+`a6c48161a09acc75a0e25503bab66a731eb5fba5392ed4bb4743e4ba5085327a`.
+This one-byte whitespace-only normalization is separate from the six-line
+upstream manifest backport below; no license text or policy is changed.
+
+Upstream [PR15003](https://github.com/bytecodealliance/wasmtime/pull/15003),
+merged as `04f0fcf70248909cc0b6a3ec1d406c7e2d543637`, changes the cache's
+zstd requirement from 0.13.0 to 0.14.0. This backport raises the minimum to
+0.14.3, whose dependency floor is zstd-safe 8.2.0; the workspace lock must also
+resolve zstd-sys 2.1.2 or newer. Both normalized and original manifests carry
+the same change and a local modification notice: six added/removed lines.
+`default-features = false` and all cache/AOT/WASI capabilities are preserved.
+Upstream cargo-vet exemptions are not imported or treated as project approval.
+
+All 14 original package members are retained in private issue-owned provenance.
+The published packaging-only `Cargo.lock` is not copied into the vendor tree;
+the authoritative workspace lock owns resolution. The other 13 members are
+copied byte-for-byte before the two documented manifest modifications and the
+separate license EOF normalization. Original normalized manifest, license and
+lock bytes remain available for independent review.
+
+The unchanged upstream build script uses the enclosing Git HEAD and executable
+mtime when Git metadata is present, or package version 49.0.4 without mtime in
+a Git-free source snapshot. Vendoring can therefore select a different cache
+namespace in those two build contexts. Source and functional compatibility do
+not establish identical warm-cache identity or cache-hit performance. Preserve
+the actual build context and component origin rather than rewriting that script.
+
+Remove the override, workspace exclusion and registry row when a qualified
+49-compatible upstream cache release incorporates PR15003 and the fixed zstd
+closure. Keep the current version pins until their replacement is explicitly
+qualified. Expiry is a hard review boundary, not an automatic waiver. Before
+deployment an unpromoted candidate may be abandoned; after deployment rollback
+means a verified fixed forward replacement under the normal compatibility guard,
+not restoring vulnerable dependencies or rolling back journals/data.
 
 The repository also has four direct Git dependency declarations for `aya`,
 `aya-log`, `aya-ebpf`, and `aya-log-ebpf`, all pointing to the official
@@ -49,7 +96,27 @@ without adding the matching Cargo override in the same commit.
 <!-- patch-registry:toml:start -->
 ```toml
 schema_version = 2
-entries = []
+
+[[entries]]
+id = "cargo-wasmtime-cache-zstd-security-856"
+ecosystem = "cargo"
+package = "wasmtime-internal-cache"
+version = "49.0.4"
+kind = "PATCH_UPSTREAM"
+manifest = "Cargo.toml"
+override_key = "patch:Cargo.toml:crates-io:wasmtime-internal-cache"
+source = "path=vendor/wasmtime-internal-cache"
+reason = "Preserve the complete Wasmtime 49 cache while replacing the vulnerable zstd 0.13 dependency closure; manifest-only upstream backport, no API or security-policy waiver"
+evidence = "https://github.com/silentspike/project-sentinel/issues/856"
+upstream_basis = "Published wasmtime-internal-cache 49.0.4, SHA256 96e4469e885ac50f8dc06337245f9905b22c68d55416267f9afd07f7f76687be; release commit 2c2970205fe05d6bbf15b9bff6f1e67874b2db5c"
+diff_lines = 6
+upstream_pr = "https://github.com/bytecodealliance/wasmtime/pull/15003"
+owner = "component:runtime"
+status = "ACTIVE"
+expires_on = "2026-11-26"
+revisit_condition = "Remove when a qualified 49-compatible upstream cache release includes PR15003 with zstd>=0.14.3, zstd-safe>=8.2.0 and zstd-sys>=2.1.2; reassess immediately on relevant security, cache-format or API changes"
+advisory_ids = ["RUSTSEC-2026-0395", "RUSTSEC-2026-0396", "RUSTSEC-2026-0397", "RUSTSEC-2026-0398", "RUSTSEC-2026-0399", "RUSTSEC-2026-0400", "RUSTSEC-2026-0401", "RUSTSEC-2026-0402", "RUSTSEC-2026-0403", "RUSTSEC-2026-0404", "RUSTSEC-2026-0405", "RUSTSEC-2026-0406", "RUSTSEC-2026-0410"]
+rollback = "Before promotion, abandon only the unpromoted source candidate. After promotion, use a qualified fixed upstream cache/forward replacement through the release compatibility guard; preserve original journals and package provenance, never restore vulnerable zstd versions or roll back databases."
 
 [[direct_git_dependencies]]
 id = "cargo-git-aya-ebpf"

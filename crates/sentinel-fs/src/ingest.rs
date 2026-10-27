@@ -492,6 +492,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_zstd_chunk_respects_compressed_and_raw_prefixes() {
+        // Frozen CLI Zstd 1.5.7 (-q -3 --stdout) over str16(1024 * b'B').
+        // Frame SHA-256: 183f5df9d3562e3301da775d8787823f387bac27e9fb3bf9675653a3bf8ef6a3.
+        let frame = [
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x5d, 0x00, 0x00, 0x20, 0xda, 0x04, 0x00, 0x42,
+            0x01, 0x00, 0xfc, 0x2b, 0x40, 0x04, 0x62, 0x16, 0xbe, 0x8b,
+        ];
+        let mut data = vec![0xda, 0x04, 0x00];
+        data.extend_from_slice(&[b'B'; 1024]);
+        let mut encoded = vec![0x01];
+        encoded.extend_from_slice(&frame);
+        assert_eq!(decompress_chunk(&encoded).unwrap(), data);
+        encoded[0] = 0x00;
+        assert_eq!(decompress_chunk(&encoded).unwrap(), frame);
+        encoded[0] = 0x02;
+        assert!(decompress_chunk(&encoded).is_err());
+    }
+
+    #[test]
     fn session_visible_during_ingest() {
         let (plane, _dir) = temp_plane();
 

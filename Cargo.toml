@@ -6,6 +6,7 @@ exclude = [
     "crates/sentinel-wasm/tests/fixtures/echo-plugin",
     "crates/sentinel-wasm/tests/fixtures/loop-plugin",
     "crates/sentinel-wasm/tests/fixtures/fs-plugin",
+    "vendor/wasmtime-internal-cache",
 ]
 members = [
     "crates/sentinel-ecs",
@@ -42,7 +43,7 @@ members = [
 bevy_ecs = "0.18"
 zenoh = "1.1"
 redb = "3.1"
-tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "net", "process", "signal", "sync", "time", "io-util"] }
+tokio = { version = "=1.53.3", default-features = false, features = ["macros", "rt-multi-thread", "net", "process", "signal", "sync", "time", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 flatbuffers = "25.12"
 thiserror = "2"
@@ -62,6 +63,9 @@ unicode-normalization = "0.1"
 blake3 = "1"
 rayon = "1"
 async-nats = "0.47"
+
+[patch.crates-io]
+wasmtime-internal-cache = { path = "vendor/wasmtime-internal-cache" }
 
 # Test-only optimization; keep assertion and arithmetic checks enabled.
 [profile.ci]
