@@ -158,6 +158,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_zstd_topic_frame_decodes_without_reencoding() {
+        // Frozen CLI Zstd 1.5.7 (-q -3 --stdout) over str16(1024 * b'B').
+        // Frame SHA-256: 183f5df9d3562e3301da775d8787823f387bac27e9fb3bf9675653a3bf8ef6a3.
+        let compressed = [
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x5d, 0x00, 0x00, 0x20, 0xda, 0x04, 0x00, 0x42,
+            0x01, 0x00, 0xfc, 0x2b, 0x40, 0x04, 0x62, 0x16, 0xbe, 0x8b,
+        ];
+        // Fixed topic length, msgpack codec ID and compressed length, not encode_frame().
+        let mut frame = b"\x00\x06legacy\x01\x00\x00\x00\x18".to_vec();
+        frame.extend_from_slice(&compressed);
+        let decoded = decode_frame(&frame).unwrap();
+        let mut msgpack = vec![0xda, 0x04, 0x00];
+        msgpack.extend_from_slice(&[b'B'; 1024]);
+        assert_eq!(decoded.topic, "legacy");
+        assert_eq!(decoded.msgpack, msgpack);
+        let (topic, value): (String, String) = decode_frame_as(&frame).unwrap();
+        assert_eq!(topic, "legacy");
+        assert_eq!(value, "B".repeat(1024));
+    }
+
+    #[test]
     fn truncated_frame_errors_not_panics() {
         let frame = encode_frame("topic", &42u32).unwrap();
         assert!(matches!(
