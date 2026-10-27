@@ -38,9 +38,15 @@ It preserves the cache implementation and does not exempt any advisory.
 The vendored basis is the published `wasmtime-internal-cache` 49.0.4 archive,
 SHA-256 `96e4469e885ac50f8dc06337245f9905b22c68d55416267f9afd07f7f76687be`,
 with release source commit `2c2970205fe05d6bbf15b9bff6f1e67874b2db5c`.
-All Rust source, tests, the build script, VCS packaging metadata and license are
-unchanged. `LICENSE` retains Apache-2.0 WITH LLVM-exception, SHA-256
-`268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5`.
+All Rust source, tests, the build script and VCS packaging metadata are unchanged.
+`LICENSE` retains the exact Apache-2.0 WITH LLVM-exception text and copyright.
+The original 12,243-byte license, SHA-256
+`268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5`,
+is preserved in private provenance. Only its excess final blank line is removed
+in the vendor copy: 12,242 bytes, one terminal newline, SHA-256
+`a6c48161a09acc75a0e25503bab66a731eb5fba5392ed4bb4743e4ba5085327a`.
+This one-byte whitespace-only normalization is separate from the six-line
+upstream manifest backport below; no license text or policy is changed.
 
 Upstream [PR15003](https://github.com/bytecodealliance/wasmtime/pull/15003),
 merged as `04f0fcf70248909cc0b6a3ec1d406c7e2d543637`, changes the cache's
@@ -54,8 +60,9 @@ Upstream cargo-vet exemptions are not imported or treated as project approval.
 All 14 original package members are retained in private issue-owned provenance.
 The published packaging-only `Cargo.lock` is not copied into the vendor tree;
 the authoritative workspace lock owns resolution. The other 13 members are
-copied byte-for-byte before the two documented manifest modifications. Original
-normalized manifest and lock bytes remain available for independent review.
+copied byte-for-byte before the two documented manifest modifications and the
+separate license EOF normalization. Original normalized manifest, license and
+lock bytes remain available for independent review.
 
 The unchanged upstream build script uses the enclosing Git HEAD and executable
 mtime when Git metadata is present, or package version 49.0.4 without mtime in
