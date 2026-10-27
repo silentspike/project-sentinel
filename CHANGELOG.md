@@ -1,5 +1,9 @@
 # Changelog
 
+- Preserve the registered local dependency patch during freshness inspection by
+  relocating only its address in an authenticated disposable source snapshot;
+  retain original inputs, inspection scope and failure propagation (#856).
+
 - Require the patched Go toolchain and compatible Console build/test tools;
   remove distrusted bundled certificate roots from both Rust lockfiles without
   suppressing security audits or changing application capabilities (#856).
