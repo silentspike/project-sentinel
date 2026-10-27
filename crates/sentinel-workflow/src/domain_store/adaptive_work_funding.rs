@@ -8,6 +8,7 @@ use crate::{
 };
 
 mod expired_replacement;
+mod material_expansion;
 mod standing_policy;
 mod terminal_manual_defer;
 
@@ -198,6 +199,8 @@ pub(super) fn require_fresh_epoch_eligibility(
     let source = &epoch.receipt.request.source.resume_source;
     if expired_replacement::consumed_receipts(connection, &source.tenant_id, source.session_id)?
         .contains(&epoch.receipt.funding_id)
+        || material_expansion::consumed_receipts(connection, &source.tenant_id, source.session_id)?
+            .contains(&epoch.receipt.funding_id)
     {
         return Err(transition());
     }
@@ -763,7 +766,8 @@ impl CompanyEntity for AdaptiveWorkFundingReceiptV1 {
             self.issued_at_unix_ms,
             self,
         )?;
-        expired_replacement::require_successor_membership(connection, self)
+        expired_replacement::require_successor_membership(connection, self)?;
+        material_expansion::require_successor_membership(connection, self)
     }
 }
 
@@ -788,6 +792,7 @@ fn read_funding_leaf_with_observer(
         let receipt = expired_replacement::read_sealed_funding(connection, tenant, &key)?;
         if let Some(receipt) = &receipt {
             expired_replacement::require_successor_membership(connection, receipt)?;
+            material_expansion::require_successor_membership(connection, receipt)?;
         }
         after_entity_read()?;
         if receipt.is_none() {
@@ -818,6 +823,7 @@ fn funding_receipts(
             // Discovery shares sealed row/event proofs. Full successor membership
             // is still checked for every tenant receipt before session filtering.
             expired_replacement::require_successor_membership(connection, &receipt)?;
+            material_expansion::require_successor_membership(connection, &receipt)?;
             if receipt.request.source.resume_source.session_id == session_id {
                 receipts.push(receipt);
             }
@@ -1661,6 +1667,7 @@ fn require_unfunded_source_with_candidate(
             _ => None,
         },
         expired_reviewed_replacement: None,
+        material_window_expansion: None,
     };
     source.validate()?;
     scope.finish()?;
@@ -2072,6 +2079,9 @@ impl WorkflowStore {
         if let Some(prior) =
             read_funding_leaf(&transaction, &principal.tenant_id, session_id, operation_id)?
         {
+            if prior.request.source.material_window_expansion.is_some() {
+                return Err(unauthorized());
+            }
             if prior.issuer_principal != *principal
                 || prior.request.source.expired_reviewed_replacement.is_some()
                 || prior.request.source.resume_source.project_id != *project_id
@@ -2121,6 +2131,10 @@ impl WorkflowStore {
         request: &AdaptiveWorkFundingRequestV1,
         now_ms: u64,
     ) -> Result<(bool, AdaptiveWorkFundingReceiptV1), WorkflowError> {
+        // This guard precedes historical replay too; only the dedicated command may issue/replay a material offer.
+        if request.source.material_window_expansion.is_some() {
+            return Err(unauthorized());
+        }
         let source = &request.source.resume_source;
         crate::adaptive_resume_policy::require_resume_policy_operator(
             principal,
@@ -2254,6 +2268,11 @@ fn consumed_validated_receipts(
             return Err(corrupt());
         }
     }
+    for id in material_expansion::consumed_receipts(connection, tenant, session_id)? {
+        if !consumed.insert(id) {
+            return Err(corrupt());
+        }
+    }
     Ok(consumed)
 }
 
@@ -2381,6 +2400,7 @@ mod review_payload_budget_tests {
                 predecessor_receipt_digest: None,
                 supersedes_unused_receipt_digest: None,
                 expired_reviewed_replacement: None,
+                material_window_expansion: None,
             },
             limits: AdaptiveWorkFundingLimitsV1 {
                 additional_model_calls: 2,

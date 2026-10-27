@@ -4,6 +4,8 @@ use sentinel_workflow::{
     AdaptiveWorkFundingLimitsV1, AdaptiveWorkFundingReceiptV1, AdaptiveWorkFundingRequestV1,
 };
 
+mod material_window_expansion;
+
 #[cfg(test)]
 mod tests;
 
@@ -211,13 +213,20 @@ fn supersession_query(path: &str) -> Result<Option<&str>, WorkflowError> {
     Ok(digest)
 }
 
-fn replacement_route(path: &str, method: &str) -> Result<bool, ()> {
+enum FundingRoute {
+    Ordinary,
+    Expired,
+    Material,
+}
+
+fn replacement_route(path: &str, method: &str) -> Result<FundingRoute, ()> {
     let Some((_, query)) = path.split_once('?') else {
-        return Ok(false);
+        return Ok(FundingRoute::Ordinary);
     };
     let mut mode = None;
     let mut seen = std::collections::HashSet::new();
     let mut replacement_parameter = false;
+    let mut material_parameter = false;
     for pair in query.split('&') {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         if key.is_empty() || value.is_empty() || !seen.insert(key) {
@@ -228,6 +237,7 @@ fn replacement_route(path: &str, method: &str) -> Result<bool, ()> {
         }
         match key {
             "mode" => mode = Some(value),
+            "declined_funding_receipt_digest" | "refused_review_id" => material_parameter = true,
             "old_funding_receipt_digest" | "source_only" | "receipt_only" | "replacement_key" => {
                 replacement_parameter = true
             }
@@ -249,11 +259,16 @@ fn replacement_route(path: &str, method: &str) -> Result<bool, ()> {
     }
     match mode {
         Some(super::expired_funding_replacement::EXPIRED_FUNDING_REPLACEMENT_MODE)
-            if !seen.contains("supersedes_unused_receipt_digest") =>
+            if !seen.contains("supersedes_unused_receipt_digest") && !material_parameter =>
         {
-            Ok(true)
+            Ok(FundingRoute::Expired)
         }
-        None if !replacement_parameter => Ok(false),
+        Some("material-window-expansion")
+            if !replacement_parameter && !seen.contains("supersedes_unused_receipt_digest") =>
+        {
+            Ok(FundingRoute::Material)
+        }
+        None if !replacement_parameter && !material_parameter => Ok(FundingRoute::Ordinary),
         _ => Err(()),
     }
 }
@@ -619,8 +634,13 @@ impl WorkflowApi {
             );
         }
         match replacement_route(path, method) {
-            Ok(true) => return self.expired_funding_replacement_http(operator, method, path, body),
-            Ok(false) => {}
+            Ok(FundingRoute::Expired) => {
+                return self.expired_funding_replacement_http(operator, method, path, body)
+            }
+            Ok(FundingRoute::Material) => {
+                return self.material_window_expansion_http(operator, method, path, body)
+            }
+            Ok(FundingRoute::Ordinary) => {}
             Err(()) => {
                 return json_error(
                     400,
@@ -708,6 +728,9 @@ impl WorkflowApi {
                 (request, Some(value))
             }
         };
+        if request.source.material_window_expansion.is_some() {
+            return workflow_error(source_conflict());
+        }
         if let Some(value) = submitted {
             if submission(&request).ok().is_none_or(|fresh| {
                 fresh.schema_version != value.schema_version
@@ -806,6 +829,7 @@ impl WorkflowApi {
         {
             Ok(Some(receipt))
                 if receipt.request.source.resume_source.project_id == project
+                    && receipt.request.source.material_window_expansion.is_none()
                     && receipt
                         .request
                         .source

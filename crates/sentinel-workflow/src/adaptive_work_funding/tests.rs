@@ -8,6 +8,90 @@ use std::collections::BTreeSet;
 
 const NOW: u64 = 1_000_000;
 
+fn material_bounds_fixture() -> (AdaptiveWorkFundingSourceV1, AdaptiveWorkFundingLimitsV1,
+    Vec<AdaptiveWorkFundingBindingLimitsV1>) {
+    let mut value = request();
+    value.source.current_model_call_ceiling = 64;
+    value.source.current_tool_call_ceiling = 64;
+    value.source.predecessor_receipt_digest = Some("a".repeat(64));
+    value.source.resume_source.base_model_calls = 32;
+    value.source.resume_source.base_tool_calls = 29;
+    value.source.resume_source.base_window_count = 32;
+    value.source.resume_source.base_review_count = 54;
+    value.limits.additional_model_calls = 0;
+    value.limits.additional_tool_calls = 0;
+    value.limits.additional_windows = 12;
+    value.limits.additional_reviews = 12;
+    let adopted = AdaptiveWorkFundingBindingLimitsV1 {
+        total_model_call_ceiling: 64, total_tool_call_ceiling: 64,
+        total_review_ceiling: 61, total_window_ceiling: 43,
+        max_window_ms: 300_000, max_call_duration_ms: 120_000,
+        dispatch_margin_ms: 1_000, expires_at_unix_ms: NOW + 600_000,
+    };
+    let declined = AdaptiveWorkFundingBindingLimitsV1 {
+        total_review_ceiling: 57, total_window_ceiling: 36, ..adopted.clone()
+    };
+    (value.source, value.limits, vec![adopted, declined])
+}
+
+#[test]
+fn material_window_limits_preserve_adopted_43_61_not_just_declined_36_57() {
+    let (source, limits, authorities) = material_bounds_fixture();
+    let floor = crate::material_window_floor(&authorities).unwrap();
+    assert_eq!((floor.total_window_ceiling, floor.total_review_ceiling), (43, 61));
+    for (windows, reviews, accepted) in [(37, 58, false), (44, 60, false), (43, 61, false), (44, 61, false), (44, 66, true)] {
+        let mut offer = limits.clone();
+        offer.additional_windows = windows - source.resume_source.base_window_count;
+        offer.additional_reviews = reviews - source.resume_source.base_review_count;
+        assert_eq!(crate::validate_material_window_limits(&source, &offer, &floor, NOW).is_ok(), accepted);
+    }
+    assert_eq!(crate::material_window_floor(&[authorities[1].clone(), authorities[0].clone()]).unwrap(), floor);
+}
+
+#[test]
+fn material_window_limits_reject_call_additions_refunds_and_shorter_timing() {
+    let (source, limits, authorities) = material_bounds_fixture();
+    let floor = crate::material_window_floor(&authorities).unwrap();
+    for change in 0..8 {
+        let mut offer = limits.clone();
+        let mut captured = source.clone();
+        match change {
+            0 => offer.additional_model_calls = 1,
+            1 => offer.additional_tool_calls = 1,
+            2 => offer.max_window_ms -= 1,
+            3 => offer.expires_at_unix_ms = floor.expires_at_unix_ms - 1,
+            4 => offer.additional_windows = u16::MAX,
+            5 => offer.additional_reviews = u16::MAX,
+            6 => captured.predecessor_receipt_digest = None,
+            _ => captured.resume_source.base_model_calls = 64,
+        }
+        assert!(crate::validate_material_window_limits(&captured, &offer, &floor, NOW).is_err(), "{change}");
+    }
+    assert!(crate::validate_material_window_limits(&source, &limits, &floor, limits.expires_at_unix_ms).is_err());
+    assert!(crate::material_window_floor(&[]).is_err());
+}
+
+#[test]
+fn material_window_slot_is_head_bound_not_operation_clock_or_issuer() {
+    let (source, _, _) = material_bounds_fixture();
+    let before = crate::adaptive_material_window_slot(&source.resume_source).unwrap();
+    let mut changed = source.resume_source.clone();
+    changed.head_entry_digest = "9".repeat(64);
+    assert_ne!(crate::adaptive_material_window_slot(&changed).unwrap(), before);
+    changed = source.resume_source.clone();
+    changed.project_id = ProjectId::parse("other-project").unwrap();
+    changed.assignee_authority.project_id = changed.project_id.clone();
+    assert_ne!(crate::adaptive_material_window_slot(&changed).unwrap(), before);
+}
+
+#[test]
+fn material_window_absent_binding_preserves_legacy_source_serialization() {
+    let value = request();
+    let encoded = serde_json::to_value(&value).unwrap();
+    assert!(encoded["source"].get("material_window_expansion").is_none());
+    assert_eq!(serde_json::from_value::<AdaptiveWorkFundingRequestV1>(encoded).unwrap(), value);
+}
+
 fn request() -> AdaptiveWorkFundingRequestV1 {
     let tenant_id = TenantId::parse("tenant-a").unwrap();
     let project_id = ProjectId::parse("project-a").unwrap();
@@ -66,6 +150,7 @@ fn request() -> AdaptiveWorkFundingRequestV1 {
             predecessor_receipt_digest: None,
             supersedes_unused_receipt_digest: None,
             expired_reviewed_replacement: None,
+            material_window_expansion: None,
         },
         limits: AdaptiveWorkFundingLimitsV1 {
             additional_model_calls: 2,

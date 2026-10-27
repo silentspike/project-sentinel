@@ -998,8 +998,12 @@ pub(super) fn bind(f: &mut Fixture, receipt: &AdaptiveWorkFundingReceiptV1, ordi
     let epoch = AdaptiveWorkFundingEpochV1 {
         receipt: receipt.clone(), binding: receipt.binding(ordinal).unwrap(),
     };
-    f.context.evidence_refs.retain(|reference| !reference.starts_with("adaptive-work-funding:"));
+    f.context.evidence_refs.retain(|reference| !reference.starts_with("adaptive-work-funding:")
+        && !reference.starts_with("material-window-offer:"));
     f.context.evidence_refs.push(epoch.evidence_ref().unwrap());
+    if let Some(material) = &epoch.receipt.request.source.material_window_expansion {
+        f.context.evidence_refs.push(material.evidence_ref().unwrap());
+    }
     f.grant.schema_version = 5;
     f.grant.work_funding = Some(Box::new(epoch));
     rebind_budget_evidence(f);
@@ -1082,6 +1086,256 @@ fn funding_operator(f: &Fixture) -> AuthenticatedCompanyPrincipalV1 {
     operator.kind = CompanyPrincipalKindV1::Operator;
     operator.agent_id = None;
     operator
+}
+
+fn material_expansion_fixture() -> (Fixture, crate::AdaptiveMaterialWindowVerificationSourceV1,
+    crate::AdaptiveWorkFundingRequestV1, crate::AdaptiveMaterialWindowUsageProofV1, u64) {
+    let (mut f, adopted, now) = capped_renewal_fixture(5);
+    bind(&mut f, &adopted, adopted.request.source.resume_source.base_review_count + 2);
+    let previous = dispatch(&f, now);
+    f.store.complete_adaptive_leadership_review_call(&f.leader, &defer(&previous), now + 2).unwrap();
+    let operator = funding_operator(&f);
+    let policy = crate::StandingWorkFundingPolicyV1 {
+        schema_version: 1, policy_id: "material-standing-fixture".into(), generation: 1,
+        tenant_id: operator.tenant_id.clone(), issuer_principal_id: operator.principal_id.clone(),
+        epoch_duration_ms: 3_600_000, additional_reviews: 4, additional_windows: 4, max_window_ms: WINDOW_MS,
+    };
+    let declined = f.store.propose_standing_work_funding_with_clock(&operator, &policy,
+        &f.grant.project_id, f.grant.session_id, &session(&f).grant.authority, || now + 3)
+        .unwrap().unwrap().1;
+    budget_context(&mut f, now + 4, "material-independent-standing-review");
+    bind(&mut f, &declined, declined.request.source.resume_source.base_review_count + 1);
+    let dispatched = dispatch(&f, now + 4);
+    let refused = f.store.complete_adaptive_leadership_review_call(&f.leader, &defer(&dispatched), now + 6).unwrap();
+    let at = now + 7;
+    let source = f.store.adaptive_material_window_verification_source(&operator, &f.grant.project_id,
+        f.grant.session_id, &declined.receipt_digest().unwrap(), refused.grant.review_id, at).unwrap();
+    let windows = source.floor.total_window_ceiling + 1;
+    let reviews = source.floor.total_review_ceiling.max(windows)
+        .max(source.resume_source.base_review_count + windows - source.resume_source.base_window_count);
+    let limits = AdaptiveWorkFundingLimitsV1 {
+        additional_model_calls: 0, additional_tool_calls: 0,
+        additional_windows: windows - source.resume_source.base_window_count,
+        additional_reviews: reviews - source.resume_source.base_review_count,
+        max_window_ms: source.floor.max_window_ms, max_call_duration_ms: source.floor.max_call_duration_ms,
+        dispatch_margin_ms: source.floor.dispatch_margin_ms, expires_at_unix_ms: source.floor.expires_at_unix_ms.max(at + 3_600_000),
+    };
+    // Synthetic trusted native-verifier boundary, not provider/NoIO evidence.
+    let proof = crate::AdaptiveMaterialWindowUsageProofV1 {
+        request_id: refused.request_id(), request_digest: refused.dispatch.as_ref().unwrap().request_digest.clone(),
+        usage_event_digest: "a".repeat(64), verified_at_unix_ms: at,
+    };
+    let request = f.store.adaptive_material_window_draft(&operator, &source, Uuid::new_v4(),
+        "material-more-productive-windows", limits, &proof, at).unwrap();
+    (f, source, request, proof, at)
+}
+
+#[test]
+fn material_expansion_rejects_manual_prefix_without_canonical_standing_identity() {
+    for suffix in ["not-a-policy", "fake-policy:1:not-a-uuid", "fake-policy:1:00000000-0000-0000-0000-000000000001"] {
+        let (mut f, adopted, now) = capped_renewal_fixture(5);
+        bind(&mut f, &adopted, adopted.request.source.resume_source.base_review_count + 2);
+        let previous = dispatch(&f, now);
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &defer(&previous), now + 2).unwrap();
+        let mut request = zero_call_renewal_draft(&f, &adopted, now + 3).unwrap();
+        request.reason_ref = format!("standing-funding:{suffix}");
+        let declined = f.store.authorize_adaptive_work_funding(&funding_operator(&f), &request, now + 3).unwrap().1;
+        budget_context(&mut f, now + 4, "manual-label-not-standing-authority");
+        bind(&mut f, &declined, declined.request.source.resume_source.base_review_count + 1);
+        let call = dispatch(&f, now + 4);
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &defer(&call), now + 6).unwrap();
+        let before = rows(&f.store);
+        assert!(f.store.adaptive_material_window_verification_source(&funding_operator(&f),
+            &f.grant.project_id, f.grant.session_id, &declined.receipt_digest().unwrap(),
+            call.grant.review_id, now + 7).is_err());
+        assert_eq!(rows(&f.store), before);
+        assert_eq!(f.store.adaptive_work_funding(&f.leader.tenant_id, f.grant.session_id,
+            request.operation_id).unwrap(), Some(declined));
+    }
+}
+
+#[test]
+fn material_expansion_issuance_and_replay_preserve_defer_counters_and_journal() {
+    let (f, source, request, proof, now) = material_expansion_fixture();
+    let before = session(&f);
+    let project = f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap();
+    let calls = f.store.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id).unwrap();
+    let (replayed, offered) = f.store.authorize_adaptive_material_window(&funding_operator(&f),
+        &request, now, || Ok(proof.clone())).unwrap();
+    assert!(!replayed);
+    assert_eq!(session(&f), before);
+    assert_eq!(f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap(), project);
+    assert_eq!(f.store.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id).unwrap(), calls);
+    assert_eq!(offered.resulting_model_call_ceiling().unwrap(), 64);
+    assert_eq!(offered.resulting_tool_call_ceiling().unwrap(), 64);
+    let after = rows(&f.store);
+    let (replayed, same) = f.store.authorize_adaptive_material_window(&funding_operator(&f), &request,
+        request.limits.expires_at_unix_ms + 1, || panic!("historical replay sampled native proof")).unwrap();
+    assert!(replayed); assert_eq!(same, offered); assert_eq!(rows(&f.store), after);
+    assert!(f.store.authorize_adaptive_work_funding(&funding_operator(&f), &request, now).is_err());
+    assert!(f.store.adaptive_work_funding_draft(&funding_operator(&f), &f.grant.project_id,
+        f.grant.session_id, request.operation_id, &request.reason_ref, request.limits.clone(), now).is_err());
+    let mut changed = request.clone(); changed.operation_id = Uuid::new_v4();
+    assert!(f.store.authorize_adaptive_material_window(&funding_operator(&f), &changed, now,
+        || panic!("used head slot sampled native proof")).is_err());
+    assert_eq!(rows(&f.store), after);
+    assert_eq!(f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+        source.refused.grant.review_id).unwrap(), Some(source.refused));
+}
+
+#[test]
+fn material_expansion_bad_native_proof_and_midwrite_failure_are_atomic() {
+    let (f, _, request, proof, now) = material_expansion_fixture();
+    let before = rows(&f.store);
+    assert!(f.store.authorize_adaptive_material_window(&funding_operator(&f), &request, now,
+        || Err(WorkflowError::new(WorkflowErrorCode::AuthorityConflict, false, "synthetic native unknown"))).is_err());
+    assert_eq!(rows(&f.store), before);
+    let mut wrong = proof.clone(); wrong.usage_event_digest = "b".repeat(64);
+    assert!(f.store.authorize_adaptive_material_window(&funding_operator(&f), &request, now,
+        || Ok(wrong)).is_err());
+    assert_eq!(rows(&f.store), before);
+    f.store.connection.lock().unwrap().execute_batch("CREATE TRIGGER fail_material_fixture BEFORE INSERT ON company_events
+        WHEN NEW.event_type='adaptive_work_funding_material_expansion_issued'
+        BEGIN SELECT RAISE(ABORT,'synthetic material publication failure'); END;").unwrap();
+    assert!(f.store.authorize_adaptive_material_window(&funding_operator(&f), &request, now,
+        || Ok(proof)).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert!(f.store.connection.lock().unwrap().is_autocommit());
+}
+
+#[test]
+fn material_expansion_independent_continue_and_defer_keep_original_authority() {
+    for continue_work in [false, true] {
+        let (mut f, source, request, proof, now) = material_expansion_fixture();
+        let offered = f.store.authorize_adaptive_material_window(&funding_operator(&f), &request, now,
+            || Ok(proof.clone())).unwrap().1;
+        let prior = session(&f);
+        let selected = f.store.adaptive_work_funding_for_review(&f.leader.tenant_id, f.grant.session_id, now + 1).unwrap().unwrap();
+        assert_eq!(selected.receipt, offered);
+        budget_context(&mut f, now + 1, "material-offer-independent-review");
+        bind(&mut f, &offered, selected.binding.ordinal);
+        let call = dispatch(&f, now + 1);
+        let result = if continue_work { continued(&call, now + 3, 2) } else { defer(&call) };
+        let (completion, failures) = validation_scope::with_validation_failures(||
+            f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 3));
+        let completed = completion.unwrap_or_else(|error|
+            panic!("material disposition Continue={continue_work}: {error:?}; proof failures={failures:?}"));
+        if continue_work {
+            let next = session(&f);
+            assert_eq!((next.model_calls, next.tool_calls), (prior.model_calls, prior.tool_calls));
+            assert_eq!(next.version, prior.version + 1);
+            assert!(next.requires_fresh_observation());
+            assert!(completed.continuation.is_some());
+        } else {
+            assert_eq!(session(&f), prior); assert!(completed.continuation.is_none());
+            assert!(f.store.adaptive_work_funding_for_review(&f.leader.tenant_id, f.grant.session_id, now + 4).unwrap().is_none());
+            assert!(f.store.adaptive_material_window_verification_source(&funding_operator(&f), &f.grant.project_id,
+                f.grant.session_id, &offered.receipt_digest().unwrap(), call.grant.review_id, now + 4).is_err());
+        }
+        assert_eq!(f.store.adaptive_work_funding(&f.leader.tenant_id, f.grant.session_id,
+            request.operation_id).unwrap(), Some(offered));
+        assert_eq!(f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+            source.refused.grant.review_id).unwrap(), Some(source.refused));
+    }
+}
+
+#[test]
+fn material_expansion_missing_or_corrupt_relation_breaks_single_and_inventory_reads() {
+    for sql in [
+        "UPDATE company_entities SET version=2 WHERE entity_kind='adaptive_work_funding_material_expansion'",
+        "DELETE FROM company_entities WHERE entity_kind='adaptive_work_funding_material_expansion'",
+        "DELETE FROM company_events WHERE event_type='adaptive_work_funding_material_expansion_issued'",
+    ] {
+        let (f, _, request, proof, now) = material_expansion_fixture();
+        f.store.authorize_adaptive_material_window(&funding_operator(&f), &request, now, || Ok(proof)).unwrap();
+        f.store.connection.lock().unwrap().execute(sql, []).unwrap();
+        assert!(f.store.adaptive_work_funding(&f.leader.tenant_id, f.grant.session_id, request.operation_id).is_err());
+        assert!(f.store.adaptive_work_funding_for_review(&f.leader.tenant_id, f.grant.session_id, now + 1).is_err());
+    }
+}
+
+#[test]
+fn material_expansion_rederives_full_source_before_native_callback() {
+    let (f, _, request, _, now) = material_expansion_fixture();
+    let before = rows(&f.store);
+    for pointer in ["/source/resume_source/head_entry_digest", "/source/resume_source/review_history_digest",
+        "/source/resume_source/project_payload_digest", "/source/material_window_expansion/refused_call_digest",
+        "/source/predecessor_receipt_digest"] {
+        let mut body = serde_json::to_value(&request).unwrap();
+        *body.pointer_mut(pointer).unwrap() = serde_json::json!("f".repeat(64));
+        let changed: crate::AdaptiveWorkFundingRequestV1 = serde_json::from_value(body).unwrap();
+        assert!(f.store.authorize_adaptive_material_window(&funding_operator(&f), &changed, now,
+            || panic!("untrusted source reached native callback: {pointer}")).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+}
+
+#[test]
+fn material_expansion_concurrent_distinct_operations_commit_only_one_head_slot() {
+    let (f, source, request, proof, now) = material_expansion_fixture();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = (0..2).map(|_| {
+        let path = f.path.clone();
+        let operator = funding_operator(&f);
+        let mut request = request.clone();
+        request.operation_id = Uuid::new_v4();
+        let proof = proof.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let store = WorkflowStore::open(path).unwrap();
+            barrier.wait();
+            store.authorize_adaptive_material_window(&operator, &request, now, || Ok(proof))
+        })
+    }).collect();
+    let results: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.as_ref().is_err_and(|error|
+        error.code == WorkflowErrorCode::IdempotencyConflict)).count(), 1);
+    assert_eq!(session(&f), source.session);
+}
+
+#[test]
+fn material_expansion_schema6_recovery_preserves_exact_offer_and_context_reference() {
+    let (mut f, _, request, proof, now) = material_expansion_fixture();
+    let offered = f.store.authorize_adaptive_material_window(&funding_operator(&f), &request,
+        now, || Ok(proof)).unwrap().1;
+    let selected = f.store.adaptive_work_funding_for_review(&f.leader.tenant_id,
+        f.grant.session_id, now + 1).unwrap().unwrap();
+    budget_context(&mut f, now + 1, "material-unreserved-review");
+    bind(&mut f, &offered, selected.binding.ordinal);
+    let old = issue(&f, now + 1).unwrap();
+    let at = old.grant.expires_at_unix_ms;
+    f.store.expire_adaptive_leadership_review_call(&f.leader, old.grant.review_id,
+        old.version, at).unwrap();
+    let source = f.store.adaptive_funded_review_recovery_source(&funding_operator(&f),
+        &f.grant.project_id, f.grant.session_id, old.grant.review_id, at).unwrap();
+    budget_context(&mut f, at, "material-exact-pre-io-recovery");
+    bind(&mut f, &offered, source.ordinal);
+    f.grant.expires_at_unix_ms = at + WINDOW_MS;
+    let recovery = crate::AdaptiveFundedReviewRecoveryRequestV1 {
+        schema_version: 1, operation_id: Uuid::new_v4(),
+        source_digest: source.canonical_digest().unwrap(), source: Box::new(source),
+        release: crate::AdaptiveRecoveryReleaseV1 {
+            schema_version: 1, source_git_sha: "a".repeat(40),
+            release_manifest_digest: "b".repeat(64), gateway_binary_digest: "c".repeat(64),
+        },
+        proof_digest: "d".repeat(64), reason_ref: "synthetic-material-unreserved".into(),
+        expires_at_unix_ms: f.grant.expires_at_unix_ms,
+    };
+    let receipt = f.store.authorize_adaptive_funded_review_recovery(&funding_operator(&f),
+        &recovery, &f.grant, &f.context, at, recovery_evidence).unwrap().1;
+    let bound = receipt.bound_grant().unwrap();
+    assert_eq!(bound.schema_version, 6);
+    assert_eq!(bound.work_funding.as_ref().unwrap().receipt, offered);
+    let stored = f.store.adaptive_leadership_review_call(&f.leader.tenant_id,
+        bound.review_id).unwrap().unwrap();
+    let reference = offered.request.source.material_window_expansion.as_ref().unwrap()
+        .evidence_ref().unwrap();
+    assert!(stored.context.evidence_refs.contains(&reference));
+    stored.context.validate(&bound).unwrap();
+    let mut missing = stored.context.clone();
+    missing.evidence_refs.retain(|value| value != &reference);
+    assert!(missing.validate(&bound).is_err());
 }
 
 fn capped_renewal_fixture(calls: u16) -> (Fixture, AdaptiveWorkFundingReceiptV1, u64) {

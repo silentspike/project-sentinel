@@ -504,6 +504,38 @@ produce a genuine Continue; existing adoption then verifies receipt membership
 and appends `ContinueGoverned` to the same employee journal. A proposal alone
 does not permit provider dispatch, reset a deadline or declare work complete.
 
+### Explicit material window offers
+
+A registered funding operator can explicitly submit a finite material offer
+through `adaptive-work-funding?mode=material-window-expansion` after a genuine,
+completed standing-funded Defer at the same exhausted execution head. GET
+prepares a redacted draft without writes; POST requires its exact scope,
+declined receipt, refused review, operation, limits and source digest. Canonical
+retained-success and scoped usage validation remain mandatory. Caller-supplied
+metadata is not authority, and an absent outbox is not proof of no I/O.
+
+This mode adds no model or tool calls, refunds no spending and changes no
+assignment, session, decision or journal. Its total windows must strictly exceed
+all adopted/current and declined bounds; reviews and expiry cannot be reduced.
+Existing lifetime call, review, window and timing ceilings remain enforced. An
+expiry-only or smaller proposal is not material. One immutable slot per actual
+source head prevents repeated offers after another Defer, independent of new
+operation IDs, clocks or policy generations. Exact historical replay creates
+nothing and never refreshes expiry.
+
+Issuance atomically persists the new funding receipt and its authenticated
+material relation/event. The declined receipt remains validated history but is
+excluded from pending selection. Ordinary funding endpoints cannot create or
+replay this relation. Normal leadership receives the retained Defer reference,
+declined bounds, authoritative floor and offered bounds; it remains free to
+Continue or Defer. Only the ordinary genuine Continue/adoption path creates a
+new finite productive window. Missing or corrupted membership fails closed in
+both exact receipt reads and tenant inventory discovery.
+
+This durable relation changes old-reader compatibility. Before recovery, retain
+all journals and use the independently reviewed compatibility guard; never
+delete funding history or restore a database to make an older binary accept it.
+
 ### Productive workflow service
 
 The daemon exposes the bounded workflow through separate authenticated customer and agent command surfaces. Caller-supplied display names, roles, tenant IDs, assignment IDs, and authority digests are never credentials. A root-owned principal binding maps independent systemd credentials to one tenant, principal kind, company role, and authority generation; the daemon derives the authority digest from the credential bytes and rejects missing, aliased, mutable, or ambiguous bindings.
