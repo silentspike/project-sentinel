@@ -2677,3 +2677,43 @@ fn governed_funding_batch_keeps_receipt_membership_journal_and_adoption_checks()
         assert!(connection.is_autocommit());
     }
 }
+
+/// Reuse the canonical durable lineage without exposing the private fixture type.
+#[cfg(test)]
+pub(crate) fn durable_material_expansion_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    WorkflowStore,
+    AuthenticatedCompanyPrincipalV1,
+    crate::AdaptiveMaterialWindowVerificationSourceV1,
+    crate::AdaptiveWorkFundingRequestV1,
+    crate::AdaptiveMaterialWindowUsageProofV1,
+    u64,
+) {
+    let (f, source, request, proof, now) = material_expansion_fixture();
+    let operator = funding_operator(&f);
+    (f._temp, f.path, f.store, operator, source, request, proof, now)
+}
+
+#[test]
+fn durable_material_expansion_factory_reexport_keeps_reopenable_lineage() {
+    let (temp, path, store, operator, source, request, proof, now) =
+        crate::domain_store::adaptive_leadership_review::material_preview_fixture_for_tests();
+    assert!(path.starts_with(temp.path()) && path.is_file());
+    assert_eq!(source.resume_source.tenant_id, operator.tenant_id);
+    let before = store
+        .adaptive_session_for_authority(&source.session.grant.authority)
+        .unwrap();
+    let reopened = WorkflowStore::open(&path).unwrap();
+    let (replayed, receipt) = reopened
+        .authorize_adaptive_material_window(&operator, &request, now, || Ok(proof.clone()))
+        .unwrap();
+    assert!(!replayed);
+    assert_eq!(receipt.request, request);
+    assert_eq!(
+        reopened
+            .adaptive_session_for_authority(&source.session.grant.authority)
+            .unwrap(),
+        before
+    );
+}

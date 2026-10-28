@@ -107,13 +107,40 @@ fn fixture_with_grant(change_grant: impl FnOnce(&mut AdaptiveSessionGrantV1)) ->
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("company.sqlite");
     let store = Arc::new(WorkflowStore::open(&path).unwrap());
-    let customer = principal("customer", CompanyRoleV1::Customer, None);
-    let sales = principal("sales", CompanyRoleV1::Sales, Some(AgentId(3)));
+    let (pm, project, root) =
+        populate_company(&store, "tenant-company-claim", 100, 0, change_grant);
+    Fixture {
+        _temp: temp,
+        path,
+        store,
+        pm,
+        project,
+        root,
+    }
+}
+
+fn populate_company(
+    store: &Arc<WorkflowStore>,
+    tenant: &str,
+    session_id: u128,
+    operation_base: u128,
+    change_grant: impl FnOnce(&mut AdaptiveSessionGrantV1),
+) -> (
+    AuthenticatedCompanyPrincipalV1,
+    ProjectV1,
+    AdaptiveSessionGrantV1,
+) {
+    let tenant = TenantId::parse(tenant).unwrap();
+    let mut customer = principal("customer", CompanyRoleV1::Customer, None);
+    customer.tenant_id = tenant.clone();
+    let mut sales = principal("sales", CompanyRoleV1::Sales, Some(AgentId(3)));
+    sales.tenant_id = tenant.clone();
     let mut pm = principal("pm", CompanyRoleV1::ProjectManager, Some(AgentId(1)));
+    pm.tenant_id = tenant;
     pm.authority_digest = PrincipalAuthorityV1::derive("pm", 1, &[1; 32])
         .unwrap()
         .authority_digest;
-    let mut operation = 0;
+    let mut operation = operation_base;
     let mut apply = |actor: &AuthenticatedCompanyPrincipalV1, command| {
         operation += 1;
         store
@@ -215,7 +242,7 @@ fn fixture_with_grant(change_grant: impl FnOnce(&mut AdaptiveSessionGrantV1)) ->
     let planning = store
         .authorize_project_planning_call(
             &pm,
-            Uuid::from_u128(10_000),
+            Uuid::from_u128(10_000 + operation_base),
             "company-claim-planning",
             &ProjectPlanningGrantV1 {
                 schema_version: 1,
@@ -358,7 +385,7 @@ fn fixture_with_grant(change_grant: impl FnOnce(&mut AdaptiveSessionGrantV1)) ->
     let allowance = project.subscription_call.as_ref().unwrap();
     let mut root = AdaptiveSessionGrantV1 {
         schema_version: 1,
-        session_id: Uuid::from_u128(100),
+        session_id: Uuid::from_u128(session_id),
         provider_allowance_id: allowance.allowance_id.clone(),
         provider_authority_digest: adaptive_continuation_provider_digest(allowance, &authority)
             .unwrap(),
@@ -377,15 +404,11 @@ fn fixture_with_grant(change_grant: impl FnOnce(&mut AdaptiveSessionGrantV1)) ->
     store
         .begin_adaptive_session(&root, &root.authority, NOW)
         .unwrap();
-    Fixture {
-        _temp: temp,
-        path,
-        store,
-        pm,
-        project,
-        root,
-    }
+    (pm, project, root)
 }
+
+#[path = "leadership_discovery/store_tests.rs"]
+mod leadership_discovery_tests;
 
 fn snapshot(store: &WorkflowStore) -> Snapshot {
     let connection = store.lock().unwrap();

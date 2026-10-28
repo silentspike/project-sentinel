@@ -514,7 +514,7 @@ fn store_call(
     Ok(())
 }
 
-pub(super) fn calls_for_session(
+pub(crate) fn calls_for_session(
     connection: &Connection,
     tenant: &TenantId,
     session_id: Uuid,
@@ -3618,7 +3618,7 @@ mod tests {
             include!("adaptive_accounting_reconsideration/tests.rs");
         }
     }
-    mod work_funding_tests {
+    pub(super) mod work_funding_tests {
         include!("adaptive_leadership_review/work_funding_tests.rs");
 
         mod issue856_funded_local_adoption_tests {
@@ -9037,3 +9037,6 @@ mod tests {
         assert_eq!(decoded.context_digest().unwrap(), digest);
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::work_funding_tests::durable_material_expansion_fixture as material_preview_fixture_for_tests;

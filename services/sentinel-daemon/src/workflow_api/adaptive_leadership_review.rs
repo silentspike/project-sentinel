@@ -1720,6 +1720,14 @@ impl WorkflowApi {
     ) -> Result<Option<AdaptiveLeadershipReviewCallV1>, &'static str> {
         #[cfg(test)]
         tests::record_leadership_selection();
+        self.leadership_review_for_agent_with_clock(agent, now_unix_ms)
+    }
+
+    fn leadership_review_for_agent_with_clock(
+        &self,
+        agent: AgentId,
+        clock: impl FnOnce() -> u64,
+    ) -> Result<Option<AdaptiveLeadershipReviewCallV1>, &'static str> {
         if !self.has_registered_model_role(
             agent,
             None,
@@ -1727,30 +1735,46 @@ impl WorkflowApi {
         ) {
             return Ok(None);
         }
-        let now = now_unix_ms();
-        for project in self
+        let now = clock();
+        let discovery = self
             .store
-            .company_projects()
-            .map_err(|_| "leadership projects unavailable")?
-        {
-            if !project.governance.participants.iter().any(|participant| {
-                participant.agent_id == agent
-                    && matches!(
-                        participant.role,
-                        CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
-                    )
-            }) {
-                continue;
+            .adaptive_leadership_discovery_read(agent)
+            .map_err(|_| "leadership projects unavailable")?;
+        for source in discovery.projects() {
+            let project = source.project();
+            // Preserve review_sessions' all-heads-before-any-policy error order.
+            // Runtime lineage is sampled now, never retained in the SQL facts.
+            let mut sessions = Vec::new();
+            for scope in source.scopes() {
+                let runtime = self
+                    .authority
+                    .as_ref()
+                    .ok_or("leadership runtime unavailable")?;
+                let authority = match runtime.snapshot_from_validated_project(
+                    project,
+                    &project.tenant_id,
+                    &project.project_id,
+                    scope.work_item_id(),
+                    scope.agent_id(),
+                    false,
+                ) {
+                    Ok(authority) => authority,
+                    Err(WorkflowPortError::AuthorityConflict) => continue,
+                    Err(_) => return Err("leadership assignee authority unavailable"),
+                };
+                match scope.session_for_authority(&authority) {
+                    Ok(Some(session)) => sessions.push((scope, session)),
+                    Ok(None) => {}
+                    Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => {}
+                    Err(_) => return Err("leadership session unavailable"),
+                }
             }
-            for session in self.review_sessions(&project)? {
-                let policy_present = self
-                    .store
-                    .adaptive_resume_policy(&project.tenant_id, session.grant.session_id)
-                    .map_err(|_| "resume policy unavailable")?
-                    .is_some();
-                let mut calls = self
-                    .store
-                    .adaptive_leadership_review_calls(&project.tenant_id, session.grant.session_id)
+            for (scope, session) in sessions {
+                let policy_present = scope
+                    .policy_present(session.grant.session_id)
+                    .map_err(|_| "resume policy unavailable")?;
+                let mut calls = scope
+                    .review_calls(session.grant.session_id)
                     .map_err(|_| "leadership calls unavailable")?;
                 let funded_current: Vec<_> = calls
                     .iter()
@@ -1758,7 +1782,7 @@ impl WorkflowApi {
                         call.grant.work_funding.is_some()
                             && call.decision.is_none()
                             && call.retired_at_unix_ms.is_none()
-                            && call.context.source_project == project
+                            && call.context.source_project == *project
                             && call.context.source_session == session
                     })
                     .collect();
@@ -1771,7 +1795,7 @@ impl WorkflowApi {
                     if call.grant.leadership_principal.agent_id == Some(agent)
                         && call.decision.is_none()
                         && call.retired_at_unix_ms.is_none()
-                        && call.context.source_project == project
+                        && call.context.source_project == *project
                         && call.context.source_session == session
                         && call.dispatch.is_none()
                         && now >= call.grant_issued_at_unix_ms
@@ -2669,6 +2693,10 @@ impl WorkflowApi {
 pub(crate) mod tests {
     use super::*;
     use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
+
+    mod leadership_discovery_tests {
+        include!("adaptive_leadership_review/leadership_discovery_tests.rs");
+    }
 
     mod completion_clock_tests {
         include!("tests/leadership_completion_expiry.rs");

@@ -1,5 +1,10 @@
 # Changelog
 
+- Batch leadership discovery's project inventory, assignee heads, resume policies
+  and review histories within one validated SQL snapshot. Preserve independent
+  replay budgets, deferred errors and fresh selected-review/dispatch authority;
+  retain external-write and corruption checks without a new cache (#856).
+
 - Preserve the registered local dependency patch during freshness inspection by
   relocating only its address in an authenticated disposable source snapshot;
   retain original inputs, inspection scope and failure propagation (#856).
