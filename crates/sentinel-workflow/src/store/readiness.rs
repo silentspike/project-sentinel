@@ -6,7 +6,8 @@ mod tests;
 
 pub(super) const EXECUTION_STATES: &str = "SELECT COUNT(*) FROM workflow_execution_outbox WHERE state NOT IN ('not_found','reserved','executing','awaiting_evidence','failed','cancelled','timed_out','unknown_outcome')";
 pub(super) const EXECUTION_PENDING: &str = "SELECT request FROM workflow_execution_outbox WHERE state IN ('not_found','reserved','executing') ORDER BY updated_at_ms, invocation_id LIMIT ?1";
-pub(super) const COMPLETION_STATES: &str = "SELECT COUNT(*) FROM workflow_completion_outbox WHERE state NOT IN ('pending','completed')";
+pub(super) const COMPLETION_STATES: &str =
+    "SELECT COUNT(*) FROM workflow_completion_outbox WHERE state NOT IN ('pending','completed')";
 pub(super) const COMPLETION_PENDING: &str = "SELECT request FROM workflow_completion_outbox WHERE state='pending' ORDER BY updated_at_ms, request_id LIMIT ?1";
 pub(super) const GATE_STATES: &str = "SELECT COUNT(*) FROM workflow_gate_outbox WHERE state NOT IN ('pending','completed','timed_out')";
 pub(super) const GATE_PENDING: &str = "SELECT request FROM workflow_gate_outbox WHERE state='pending' ORDER BY updated_at_ms, request_id LIMIT ?1";
@@ -89,25 +90,45 @@ impl WorkflowStore {
             &mut connection,
             "workflow-readiness-facts",
             |cache, snapshot, eligible| {
-                let pending_execution = self.readiness_field(
-                    WorkflowDiagnosticStage::PendingExecutions,
-                    || pending_count::<PendingExecutionV1>(snapshot, EXECUTION_STATES, EXECUTION_PENDING, limit),
-                );
-                let pending_completion = self.readiness_field(
-                    WorkflowDiagnosticStage::PendingCompletions,
-                    || pending_count::<PendingCompletionEvidenceV1>(snapshot, COMPLETION_STATES, COMPLETION_PENDING, limit),
-                );
-                let pending_gate = self.readiness_field(
-                    WorkflowDiagnosticStage::PendingGates,
-                    || pending_count::<PendingGateEvidenceV1>(snapshot, GATE_STATES, GATE_PENDING, limit),
-                );
+                let pending_execution =
+                    self.readiness_field(WorkflowDiagnosticStage::PendingExecutions, || {
+                        pending_count::<PendingExecutionV1>(
+                            snapshot,
+                            EXECUTION_STATES,
+                            EXECUTION_PENDING,
+                            limit,
+                        )
+                    });
+                let pending_completion =
+                    self.readiness_field(WorkflowDiagnosticStage::PendingCompletions, || {
+                        pending_count::<PendingCompletionEvidenceV1>(
+                            snapshot,
+                            COMPLETION_STATES,
+                            COMPLETION_PENDING,
+                            limit,
+                        )
+                    });
+                let pending_gate =
+                    self.readiness_field(WorkflowDiagnosticStage::PendingGates, || {
+                        pending_count::<PendingGateEvidenceV1>(
+                            snapshot,
+                            GATE_STATES,
+                            GATE_PENDING,
+                            limit,
+                        )
+                    });
                 let mut validating_sessions = false;
                 let adaptive_sessions = if include_adaptive {
                     self.readiness_field(WorkflowDiagnosticStage::AdaptiveInventory, || {
                         let mut validate = || adaptive_facts(snapshot, &mut validating_sessions);
                         match cache {
                             Some(cache) => cache.read_keyed_if(
-                                snapshot, eligible, "adaptive-health-readiness", &[], validate, |_| true,
+                                snapshot,
+                                eligible,
+                                "adaptive-health-readiness",
+                                &[],
+                                validate,
+                                |_| true,
                             ),
                             None => validate(),
                         }
@@ -122,15 +143,15 @@ impl WorkflowStore {
                 } else {
                     Ok(Vec::new())
                 };
-                let canonical_event_cursor = self.readiness_field(
-                    WorkflowDiagnosticStage::CompanyCursor,
-                    || {
+                let canonical_event_cursor =
+                    self.readiness_field(WorkflowDiagnosticStage::CompanyCursor, || {
                         let cursor: i64 = snapshot.query_row(
-                            "SELECT COALESCE(MAX(sequence),0) FROM company_events", [], |row| row.get(0),
+                            "SELECT COALESCE(MAX(sequence),0) FROM company_events",
+                            [],
+                            |row| row.get(0),
                         )?;
                         stored_u64(cursor)
-                    },
-                );
+                    });
                 Ok(WorkflowReadinessFacts {
                     pending_execution,
                     pending_completion,
@@ -180,7 +201,10 @@ fn adaptive_facts(
             ),
             pending_model: match session.cursor {
                 AdaptiveCursorV1::ModelPending { effect } => Some(AdaptivePendingModelHealth {
-                    request_id: format!("company-adaptive-{}-{}", session.grant.session_id, effect.id),
+                    request_id: format!(
+                        "company-adaptive-{}-{}",
+                        session.grant.session_id, effect.id
+                    ),
                     request_digest: effect.request_digest,
                     agent_id: session.grant.authority.agent_id,
                 }),
@@ -200,9 +224,18 @@ fn pending_count<T: DeserializeOwned + StoredSchema>(
     read_pending::<T>(connection, pending_sql, limit).map(|rows| rows.len())
 }
 
-pub(super) fn validate_state_domain(connection: &Connection, sql: &str) -> Result<(), WorkflowError> {
-    let invalid: i64 = connection.query_row(sql, [], |row| row.get(0)).map_err(map_sqlite_error)?;
-    if invalid == 0 { Ok(()) } else { Err(corrupt_store()) }
+pub(super) fn validate_state_domain(
+    connection: &Connection,
+    sql: &str,
+) -> Result<(), WorkflowError> {
+    let invalid: i64 = connection
+        .query_row(sql, [], |row| row.get(0))
+        .map_err(map_sqlite_error)?;
+    if invalid == 0 {
+        Ok(())
+    } else {
+        Err(corrupt_store())
+    }
 }
 
 pub(super) fn read_pending<T: DeserializeOwned + StoredSchema>(

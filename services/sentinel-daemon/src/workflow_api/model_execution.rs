@@ -1168,9 +1168,7 @@ impl WorkflowApi {
             && entry.payload.is_empty()
             && entry.request_digest == request_digest
             && entry.owner_scope
-                == sentinel_common::StateTransferScope::for_agent(
-                    agent_id.to_string(),
-                )
+                == sentinel_common::StateTransferScope::for_agent(agent_id.to_string())
             && entry
                 .last_error
                 .as_deref()
@@ -1180,13 +1178,18 @@ impl WorkflowApi {
     #[cfg(test)]
     pub(super) fn adaptive_models_have_unknown_outcome(&self) -> Result<bool, &'static str> {
         self.adaptive_models_have_unknown_outcome_from_facts(
-            self.store.readiness_facts(MAX_RECONCILE_BATCH, self.model_work_enabled).adaptive_sessions,
+            self.store
+                .readiness_facts(MAX_RECONCILE_BATCH, self.model_work_enabled)
+                .adaptive_sessions,
         )
     }
 
     pub(super) fn adaptive_models_have_unknown_outcome_from_facts(
         &self,
-        inventory: Result<Vec<sentinel_workflow::AdaptiveHealthSession>, sentinel_workflow::AdaptiveHealthReadError>,
+        inventory: Result<
+            Vec<sentinel_workflow::AdaptiveHealthSession>,
+            sentinel_workflow::AdaptiveHealthReadError,
+        >,
     ) -> Result<bool, &'static str> {
         if !self.model_work_enabled {
             return Ok(false);
@@ -1207,7 +1210,9 @@ impl WorkflowApi {
             }
             if let Some(effect) = session.pending_model() {
                 if self.adaptive_provider_request_outcome_unknown(
-                    effect.request_id(), effect.request_digest(), effect.agent_id(),
+                    effect.request_id(),
+                    effect.request_digest(),
+                    effect.agent_id(),
                 )? {
                     unknown = true;
                 }

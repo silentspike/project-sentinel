@@ -70,11 +70,11 @@ mod recovery_admission;
 #[cfg(feature = "llm")]
 use recovery_admission::ProviderRecoveryGuard;
 #[cfg(test)]
-#[path = "workflow_api/tests/reconciliation_status.rs"]
-mod reconciliation_status_tests;
-#[cfg(test)]
 #[path = "workflow_api/readiness_tests.rs"]
 mod readiness_tests;
+#[cfg(test)]
+#[path = "workflow_api/tests/reconciliation_status.rs"]
+mod reconciliation_status_tests;
 #[cfg(all(test, feature = "llm"))]
 mod recovery_admission_tests;
 #[cfg(feature = "llm")]
@@ -6283,15 +6283,19 @@ impl WorkflowApi {
         use sentinel_workflow::WorkflowDiagnosticStage;
         let total_span = self.store.diagnostic_span(WorkflowDiagnosticStage::Health);
         let started = std::time::Instant::now();
-        let store_span = self.store.diagnostic_span(WorkflowDiagnosticStage::HealthStoreFacts);
+        let store_span = self
+            .store
+            .diagnostic_span(WorkflowDiagnosticStage::HealthStoreFacts);
         let store_started = std::time::Instant::now();
         let facts = self.store.readiness_facts(
             MAX_RECONCILE_BATCH,
             cfg!(feature = "llm") && self.model_work_enabled,
         );
         store_span.finish(
-            facts.pending_execution.is_ok() && facts.pending_completion.is_ok()
-                && facts.pending_gate.is_ok() && facts.adaptive_sessions.is_ok()
+            facts.pending_execution.is_ok()
+                && facts.pending_completion.is_ok()
+                && facts.pending_gate.is_ok()
+                && facts.adaptive_sessions.is_ok()
                 && facts.canonical_event_cursor.is_ok(),
         );
         let store_elapsed = store_started.elapsed();
@@ -6388,12 +6392,9 @@ impl WorkflowApi {
             ready,
             dependencies_ready,
             canonical_event_cursor: canonical_event_cursor.ok(),
-            pending_execution: pending_execution
-                .unwrap_or(MAX_RECONCILE_BATCH),
-            pending_completion: pending_completion
-                .unwrap_or(MAX_RECONCILE_BATCH),
-            pending_gate: pending_gate
-                .unwrap_or(MAX_RECONCILE_BATCH),
+            pending_execution: pending_execution.unwrap_or(MAX_RECONCILE_BATCH),
+            pending_completion: pending_completion.unwrap_or(MAX_RECONCILE_BATCH),
+            pending_gate: pending_gate.unwrap_or(MAX_RECONCILE_BATCH),
             delivery_ready,
             delivery_publication_pending: delivery_publication_pending
                 .unwrap_or(MAX_RECONCILE_BATCH),

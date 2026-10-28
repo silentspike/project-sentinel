@@ -838,45 +838,24 @@ impl WorkflowStore {
         &self,
         limit: usize,
     ) -> Result<Vec<PendingExecutionV1>, WorkflowError> {
-        self.validate_state_domain(
-            readiness::EXECUTION_STATES,
-            "execution_outbox",
-        )?;
-        self.read_pending(
-            readiness::EXECUTION_PENDING,
-            limit,
-            "execution_outbox",
-        )
+        self.validate_state_domain(readiness::EXECUTION_STATES, "execution_outbox")?;
+        self.read_pending(readiness::EXECUTION_PENDING, limit, "execution_outbox")
     }
 
     pub fn pending_completion_evidence(
         &self,
         limit: usize,
     ) -> Result<Vec<PendingCompletionEvidenceV1>, WorkflowError> {
-        self.validate_state_domain(
-            readiness::COMPLETION_STATES,
-            "completion_outbox",
-        )?;
-        self.read_pending(
-            readiness::COMPLETION_PENDING,
-            limit,
-            "completion_outbox",
-        )
+        self.validate_state_domain(readiness::COMPLETION_STATES, "completion_outbox")?;
+        self.read_pending(readiness::COMPLETION_PENDING, limit, "completion_outbox")
     }
 
     pub fn pending_gate_evidence(
         &self,
         limit: usize,
     ) -> Result<Vec<PendingGateEvidenceV1>, WorkflowError> {
-        self.validate_state_domain(
-            readiness::GATE_STATES,
-            "gate_outbox",
-        )?;
-        self.read_pending(
-            readiness::GATE_PENDING,
-            limit,
-            "gate_outbox",
-        )
+        self.validate_state_domain(readiness::GATE_STATES, "gate_outbox")?;
+        self.read_pending(readiness::GATE_PENDING, limit, "gate_outbox")
     }
 
     pub(crate) fn execution_work_item(
