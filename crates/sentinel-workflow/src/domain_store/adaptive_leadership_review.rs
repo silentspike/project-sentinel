@@ -2989,6 +2989,9 @@ impl WorkflowStore {
 }
 
 #[cfg(test)]
+pub(crate) use tests::work_funding_tests::durable_material_expansion_fixture as material_preview_fixture_for_tests;
+
+#[cfg(test)]
 mod tests {
     include!("adaptive_leadership_review/tests.rs");
 
@@ -9037,6 +9040,3 @@ mod tests {
         assert_eq!(decoded.context_digest().unwrap(), digest);
     }
 }
-
-#[cfg(test)]
-pub(crate) use tests::work_funding_tests::durable_material_expansion_fixture as material_preview_fixture_for_tests;
