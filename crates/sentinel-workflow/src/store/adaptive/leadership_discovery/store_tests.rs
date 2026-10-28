@@ -242,7 +242,9 @@ fn leadership_discovery_revalidates_excluded_history_after_external_mutation() {
                     .unwrap()
                     .scopes()
                     .iter()
-                    .find(|scope| scope.work_item_id() == &source.session.grant.authority.work_item_id)
+                    .find(|scope| {
+                        scope.work_item_id() == &source.session.grant.authority.work_item_id
+                    })
                     .unwrap();
                 assert_eq!(
                     scope.review_calls(session).unwrap_err().code,
