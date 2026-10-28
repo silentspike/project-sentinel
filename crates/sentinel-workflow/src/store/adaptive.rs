@@ -28,10 +28,14 @@ mod company_claim_tests;
 pub(crate) mod completion_proof;
 #[cfg(test)]
 mod health_inventory_tests;
+mod leadership_discovery;
 mod read_sources;
 mod recovery_lineage;
 pub use adoption_read::{AdaptiveModelAdoptionRead, AdaptiveModelAdoptionReadError};
 pub use completion_proof::AdaptiveSourceCompletionV1;
+pub use leadership_discovery::{
+    AdaptiveLeadershipDiscoveryRead, AdaptiveLeadershipProjectRead, AdaptiveLeadershipScopeRead,
+};
 pub use read_sources::AdaptiveModelPreparationReadSnapshot;
 #[cfg(test)]
 mod rejected_model_tests;
