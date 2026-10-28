@@ -10,6 +10,10 @@ const KIND: &str = "adaptive_work_funding_material_expansion";
 const EVENT: &str = "adaptive_work_funding_material_expansion_issued";
 const DOMAIN: &str = "sentinel.workflow.material-window-relation.v1";
 
+#[cfg(test)]
+#[path = "material_expansion/read_snapshot_tests.rs"]
+mod read_snapshot_tests;
+
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Relation {
@@ -522,7 +526,78 @@ fn request_for(
     Ok(request)
 }
 
+// Only SQL-derived facts are retained. The coordinator-facing source remains
+// non-deserializable; clocks and external authority are never cache authority.
+#[derive(Clone)]
+struct MaterialSourceFacts(AdaptiveMaterialWindowVerificationSourceV1);
+
+impl serde::Serialize for MaterialSourceFacts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(
+            &(
+                &self.0.project,
+                &self.0.session,
+                &self.0.declined,
+                &self.0.refused,
+                &self.0.resume_source,
+                &self.0.floor,
+            ),
+            serializer,
+        )
+    }
+}
+
+fn require_source_clock(
+    source: &AdaptiveMaterialWindowVerificationSourceV1,
+    now: u64,
+) -> Result<(), WorkflowError> {
+    // These are exactly fresh_resume_source's time-dependent predicates. A
+    // byte-identical database is not proof of current window eligibility.
+    if now < source.project.updated_at_unix_ms || now < source.session.updated_at_ms {
+        return Err(unauthorized());
+    }
+    if !source.session.model_window_exhausted_at(now) {
+        return Err(transition());
+    }
+    Ok(())
+}
+
 impl WorkflowStore {
+    #[allow(clippy::too_many_arguments)]
+    fn checked_material_source(
+        &self,
+        connection: &mut Connection,
+        operator: &AuthenticatedCompanyPrincipalV1,
+        project: &ProjectId,
+        session: Uuid,
+        declined_digest: &str,
+        review: Uuid,
+        now: u64,
+    ) -> Result<AdaptiveMaterialWindowVerificationSourceV1, WorkflowError> {
+        let query_key = encode(&(operator, project, session, declined_digest, review))?;
+        let facts = self.validated_read_snapshot(
+            connection,
+            "material-window-source",
+            &query_key,
+            |snapshot| {
+                let scope = validation_scope::enter(snapshot)?;
+                let source = verification_source(
+                    snapshot,
+                    operator,
+                    project,
+                    session,
+                    declined_digest,
+                    review,
+                    now,
+                )?;
+                scope.finish()?;
+                Ok(MaterialSourceFacts(source))
+            },
+        )?;
+        require_source_clock(&facts.0, now)?;
+        Ok(facts.0)
+    }
+
     pub fn adaptive_material_window_verification_source(
         &self,
         operator: &AuthenticatedCompanyPrincipalV1,
@@ -533,19 +608,15 @@ impl WorkflowStore {
         now: u64,
     ) -> Result<AdaptiveMaterialWindowVerificationSourceV1, WorkflowError> {
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let scope = validation_scope::enter(&transaction)?;
-        let source = verification_source(
-            &transaction,
+        self.checked_material_source(
+            &mut connection,
             operator,
             project,
             session,
             declined_digest,
             review,
             now,
-        )?;
-        scope.finish()?;
-        Ok(source)
+        )
     }
 
     pub fn adaptive_material_window_draft(
@@ -559,10 +630,8 @@ impl WorkflowStore {
         now: u64,
     ) -> Result<AdaptiveWorkFundingRequestV1, WorkflowError> {
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let scope = validation_scope::enter(&transaction)?;
-        let fresh = verification_source(
-            &transaction,
+        let fresh = self.checked_material_source(
+            &mut connection,
             operator,
             &source.project.project_id,
             source.session.grant.session_id,
@@ -575,7 +644,6 @@ impl WorkflowStore {
         }
         let request = request_for(&fresh, operation, reason, limits, proof, now)?;
         request.validate_at(operator, now)?;
-        scope.finish()?;
         Ok(request)
     }
 

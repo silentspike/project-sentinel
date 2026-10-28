@@ -13,6 +13,22 @@ mod tests;
 #[path = "adaptive_work_funding/review_snapshot_tests.rs"]
 mod review_snapshot_tests;
 
+struct MaterialPreparationIntent<'a>(&'a AtomicUsize);
+
+impl Drop for MaterialPreparationIntent<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl WorkflowApi {
+    fn material_preparation_intent(&self) -> MaterialPreparationIntent<'_> {
+        self.material_preparation_pending
+            .fetch_add(1, Ordering::AcqRel);
+        MaterialPreparationIntent(&self.material_preparation_pending)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     pub(super) static SOURCE_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
