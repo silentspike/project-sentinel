@@ -70,6 +70,9 @@ mod recovery_admission;
 #[cfg(feature = "llm")]
 use recovery_admission::ProviderRecoveryGuard;
 #[cfg(test)]
+#[path = "workflow_api/readiness_tests.rs"]
+mod readiness_tests;
+#[cfg(test)]
 #[path = "workflow_api/tests/reconciliation_status.rs"]
 mod reconciliation_status_tests;
 #[cfg(all(test, feature = "llm"))]
@@ -6280,23 +6283,37 @@ impl WorkflowApi {
         use sentinel_workflow::WorkflowDiagnosticStage;
         let total_span = self.store.diagnostic_span(WorkflowDiagnosticStage::Health);
         let started = std::time::Instant::now();
-        let (pending_execution, execution_elapsed) = self
-            .measure_health_read(WorkflowDiagnosticStage::PendingExecutions, || {
-                self.store.pending_executions(MAX_RECONCILE_BATCH)
-            });
-        let (pending_completion, completion_elapsed) = self
-            .measure_health_read(WorkflowDiagnosticStage::PendingCompletions, || {
-                self.store.pending_completion_evidence(MAX_RECONCILE_BATCH)
-            });
-        let (pending_gate, gate_elapsed) = self
-            .measure_health_read(WorkflowDiagnosticStage::PendingGates, || {
-                self.store.pending_gate_evidence(MAX_RECONCILE_BATCH)
-            });
+        let store_span = self
+            .store
+            .diagnostic_span(WorkflowDiagnosticStage::HealthStoreFacts);
+        let store_started = std::time::Instant::now();
+        let facts = self.store.readiness_facts(
+            MAX_RECONCILE_BATCH,
+            cfg!(feature = "llm") && self.model_work_enabled,
+        );
+        store_span.finish(
+            facts.pending_execution.is_ok()
+                && facts.pending_completion.is_ok()
+                && facts.pending_gate.is_ok()
+                && facts.adaptive_sessions.is_ok()
+                && facts.canonical_event_cursor.is_ok(),
+        );
+        let store_elapsed = store_started.elapsed();
+        let sentinel_workflow::WorkflowReadinessFacts {
+            pending_execution,
+            pending_completion,
+            pending_gate,
+            adaptive_sessions,
+            canonical_event_cursor,
+        } = facts;
+        // No workflow SQL/snapshot/cache guards survive into these live dependencies.
         #[cfg(feature = "llm")]
         let (unknown_outcome, outcome_elapsed) = self
             .measure_health_read(WorkflowDiagnosticStage::AdaptiveUnknownOutcomes, || {
-                self.adaptive_models_have_unknown_outcome()
+                self.adaptive_models_have_unknown_outcome_from_facts(adaptive_sessions)
             });
+        #[cfg(not(feature = "llm"))]
+        let _ = adaptive_sessions;
         #[cfg(not(feature = "llm"))]
         let outcome_elapsed = std::time::Duration::ZERO;
         #[cfg(feature = "llm")]
@@ -6305,10 +6322,6 @@ impl WorkflowApi {
             Err(reason) => Some(reason.to_owned()),
             Ok(false) => None,
         };
-        let (canonical_event_cursor, cursor_elapsed) = self
-            .measure_health_read(WorkflowDiagnosticStage::CompanyCursor, || {
-                self.store.company_event_cursor()
-            });
         let (delivery_result, delivery_elapsed) =
             self.measure_health_read(WorkflowDiagnosticStage::DeliveryReadiness, || {
                 self.delivery
@@ -6360,11 +6373,8 @@ impl WorkflowApi {
             // This is attribution evidence, not a readiness or performance claim.
             tracing::info!(
                 total_us = elapsed.as_micros(),
-                pending_execution_us = execution_elapsed.as_micros(),
-                pending_completion_us = completion_elapsed.as_micros(),
-                pending_gate_us = gate_elapsed.as_micros(),
+                store_facts_us = store_elapsed.as_micros(),
                 adaptive_outcome_us = outcome_elapsed.as_micros(),
-                company_cursor_us = cursor_elapsed.as_micros(),
                 delivery_us = delivery_elapsed.as_micros(),
                 "Slow workflow health phases finished",
             );
@@ -6382,15 +6392,9 @@ impl WorkflowApi {
             ready,
             dependencies_ready,
             canonical_event_cursor: canonical_event_cursor.ok(),
-            pending_execution: pending_execution
-                .map(|value| value.len())
-                .unwrap_or(MAX_RECONCILE_BATCH),
-            pending_completion: pending_completion
-                .map(|value| value.len())
-                .unwrap_or(MAX_RECONCILE_BATCH),
-            pending_gate: pending_gate
-                .map(|value| value.len())
-                .unwrap_or(MAX_RECONCILE_BATCH),
+            pending_execution: pending_execution.unwrap_or(MAX_RECONCILE_BATCH),
+            pending_completion: pending_completion.unwrap_or(MAX_RECONCILE_BATCH),
+            pending_gate: pending_gate.unwrap_or(MAX_RECONCILE_BATCH),
             delivery_ready,
             delivery_publication_pending: delivery_publication_pending
                 .unwrap_or(MAX_RECONCILE_BATCH),

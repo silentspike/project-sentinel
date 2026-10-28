@@ -1140,12 +1140,25 @@ impl WorkflowApi {
             "company-adaptive-{}-{}",
             session.grant.session_id, effect.id
         );
+        self.adaptive_provider_request_outcome_unknown(
+            &request_id,
+            &effect.request_digest,
+            session.grant.authority.agent_id,
+        )
+    }
+
+    fn adaptive_provider_request_outcome_unknown(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        agent_id: AgentId,
+    ) -> Result<bool, &'static str> {
         let Some(events) = self.event_store.as_ref() else {
             return Ok(false);
         };
         let (outcome, _) = self.measure_health_read(
             sentinel_workflow::WorkflowDiagnosticStage::PendingModelOutcome,
-            || events.get_llm_completion(&request_id),
+            || events.get_llm_completion(request_id),
         );
         let Some(entry) = outcome.map_err(|_| "adaptive provider outcome unavailable")? else {
             return Ok(false);
@@ -1153,26 +1166,35 @@ impl WorkflowApi {
         Ok(entry.request_id == request_id
             && entry.status == "failed"
             && entry.payload.is_empty()
-            && entry.request_digest == effect.request_digest
+            && entry.request_digest == request_digest
             && entry.owner_scope
-                == sentinel_common::StateTransferScope::for_agent(
-                    session.grant.authority.agent_id.to_string(),
-                )
+                == sentinel_common::StateTransferScope::for_agent(agent_id.to_string())
             && entry
                 .last_error
                 .as_deref()
                 .is_some_and(|reason| reason.starts_with("UnknownOutcome:")))
     }
 
+    #[cfg(test)]
     pub(super) fn adaptive_models_have_unknown_outcome(&self) -> Result<bool, &'static str> {
+        self.adaptive_models_have_unknown_outcome_from_facts(
+            self.store
+                .readiness_facts(MAX_RECONCILE_BATCH, self.model_work_enabled)
+                .adaptive_sessions,
+        )
+    }
+
+    pub(super) fn adaptive_models_have_unknown_outcome_from_facts(
+        &self,
+        inventory: Result<
+            Vec<sentinel_workflow::AdaptiveHealthSession>,
+            sentinel_workflow::AdaptiveHealthReadError,
+        >,
+    ) -> Result<bool, &'static str> {
         if !self.model_work_enabled {
             return Ok(false);
         }
-        let (inventory, _) = self.measure_health_read(
-            sentinel_workflow::WorkflowDiagnosticStage::AdaptiveInventory,
-            || self.store.adaptive_health_inventory(),
-        );
-        let (projects, sessions) = inventory.map_err(|error| match error {
+        let sessions = inventory.map_err(|error| match error {
             sentinel_workflow::AdaptiveHealthReadError::Projects(_) => {
                 "adaptive projects unavailable"
             }
@@ -1180,30 +1202,22 @@ impl WorkflowApi {
                 "adaptive sessions unavailable"
             }
         })?;
-        let project_ids: BTreeSet<_> = projects
-            .into_iter()
-            .map(|project| (project.tenant_id, project.project_id))
-            .collect();
         // Health reads durable effect lineage, not permission to perform new work.
         let mut unknown = false;
         for session in sessions {
-            if !project_ids.contains(&(
-                session.grant.authority.tenant_id.clone(),
-                session.grant.authority.project_id.clone(),
-            )) {
+            if !session.project_present() {
                 return Err("adaptive project unavailable");
             }
-            match &session.cursor {
-                AdaptiveCursorV1::ModelUnknown { .. } | AdaptiveCursorV1::ToolUnknown { .. } => {
+            if let Some(effect) = session.pending_model() {
+                if self.adaptive_provider_request_outcome_unknown(
+                    effect.request_id(),
+                    effect.request_digest(),
+                    effect.agent_id(),
+                )? {
                     unknown = true;
                 }
-                AdaptiveCursorV1::ModelPending { effect }
-                    if self.adaptive_provider_outcome_unknown(&session, effect)? =>
-                {
-                    unknown = true;
-                }
-                _ => {}
             }
+            unknown |= session.unknown_outcome();
         }
         Ok(unknown)
     }
