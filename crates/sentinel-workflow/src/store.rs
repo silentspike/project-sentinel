@@ -25,6 +25,8 @@ pub use adaptive::{
     AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot, AdaptiveSourceCompletionV1,
 };
 mod read_cache;
+mod readiness;
+pub use readiness::{AdaptiveHealthSession, AdaptivePendingModelHealth, WorkflowReadinessFacts};
 mod revisions;
 pub(crate) use revisions::require_completed_source;
 pub use revisions::ExecutionRevisionV1;
@@ -34,6 +36,7 @@ const MAX_NOT_FOUND_RECONCILES: u16 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowDiagnosticStage {
     Health,
+    HealthStoreFacts,
     PendingExecutions,
     PendingCompletions,
     PendingGates,
@@ -52,6 +55,7 @@ impl WorkflowDiagnosticStage {
     fn label(self) -> &'static str {
         match self {
             Self::Health => "health",
+            Self::HealthStoreFacts => "health_store_facts",
             Self::PendingExecutions => "pending_executions",
             Self::PendingCompletions => "pending_completions",
             Self::PendingGates => "pending_gates",
@@ -835,11 +839,11 @@ impl WorkflowStore {
         limit: usize,
     ) -> Result<Vec<PendingExecutionV1>, WorkflowError> {
         self.validate_state_domain(
-            "SELECT COUNT(*) FROM workflow_execution_outbox WHERE state NOT IN ('not_found','reserved','executing','awaiting_evidence','failed','cancelled','timed_out','unknown_outcome')",
+            readiness::EXECUTION_STATES,
             "execution_outbox",
         )?;
         self.read_pending(
-            "SELECT request FROM workflow_execution_outbox WHERE state IN ('not_found','reserved','executing') ORDER BY updated_at_ms, invocation_id LIMIT ?1",
+            readiness::EXECUTION_PENDING,
             limit,
             "execution_outbox",
         )
@@ -850,11 +854,11 @@ impl WorkflowStore {
         limit: usize,
     ) -> Result<Vec<PendingCompletionEvidenceV1>, WorkflowError> {
         self.validate_state_domain(
-            "SELECT COUNT(*) FROM workflow_completion_outbox WHERE state NOT IN ('pending','completed')",
+            readiness::COMPLETION_STATES,
             "completion_outbox",
         )?;
         self.read_pending(
-            "SELECT request FROM workflow_completion_outbox WHERE state='pending' ORDER BY updated_at_ms, request_id LIMIT ?1",
+            readiness::COMPLETION_PENDING,
             limit,
             "completion_outbox",
         )
@@ -865,11 +869,11 @@ impl WorkflowStore {
         limit: usize,
     ) -> Result<Vec<PendingGateEvidenceV1>, WorkflowError> {
         self.validate_state_domain(
-            "SELECT COUNT(*) FROM workflow_gate_outbox WHERE state NOT IN ('pending','completed','timed_out')",
+            readiness::GATE_STATES,
             "gate_outbox",
         )?;
         self.read_pending(
-            "SELECT request FROM workflow_gate_outbox WHERE state='pending' ORDER BY updated_at_ms, request_id LIMIT ?1",
+            readiness::GATE_PENDING,
             limit,
             "gate_outbox",
         )
@@ -1269,32 +1273,13 @@ impl WorkflowStore {
         domain: &'static str,
     ) -> Result<Vec<T>, WorkflowError> {
         self.with_outbox_connection(domain, "pending_rows", |connection| {
-            let mut statement = connection.prepare(sql).map_err(map_sqlite_error)?;
-            let rows = statement
-                .query_map([limit.clamp(1, 100) as i64], |row| row.get::<_, Vec<u8>>(0))
-                .map_err(map_sqlite_error)?;
-            let mut values = Vec::new();
-            for row in rows {
-                let value: T = decode(&row.map_err(map_sqlite_error)?)?;
-                if value.schema_version() != WORKFLOW_SCHEMA_VERSION {
-                    return Err(corrupt_store());
-                }
-                values.push(value);
-            }
-            Ok(values)
+            readiness::read_pending(connection, sql, limit)
         })
     }
 
     fn validate_state_domain(&self, sql: &str, domain: &'static str) -> Result<(), WorkflowError> {
         self.with_outbox_connection(domain, "state_domain", |connection| {
-            let invalid: i64 = connection
-                .query_row(sql, [], |row| row.get(0))
-                .map_err(map_sqlite_error)?;
-            if invalid == 0 {
-                Ok(())
-            } else {
-                Err(corrupt_store())
-            }
+            readiness::validate_state_domain(connection, sql)
         })
     }
 
