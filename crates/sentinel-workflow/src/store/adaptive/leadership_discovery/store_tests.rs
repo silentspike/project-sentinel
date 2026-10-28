@@ -1,7 +1,9 @@
 use super::*;
 
 fn discovery(store: &WorkflowStore) -> Arc<AdaptiveLeadershipDiscoveryRead> {
-    store.adaptive_leadership_discovery_read(AgentId(1)).unwrap()
+    store
+        .adaptive_leadership_discovery_read(AgentId(1))
+        .unwrap()
 }
 
 fn assert_matches_separate_reads(store: &WorkflowStore) {
@@ -12,16 +14,42 @@ fn assert_matches_separate_reads(store: &WorkflowStore) {
         let project = source.project();
         assert!(projects.contains(project));
         for scope in source.scopes() {
-            let paired = store.adaptive_project_snapshot(
-                &project.tenant_id, &project.project_id, scope.work_item_id(), scope.agent_id(),
-            ).unwrap().unwrap();
-            let authority = paired.heads.as_ref().unwrap().first().unwrap().grant.authority.clone();
+            let paired = store
+                .adaptive_project_snapshot(
+                    &project.tenant_id,
+                    &project.project_id,
+                    scope.work_item_id(),
+                    scope.agent_id(),
+                )
+                .unwrap()
+                .unwrap();
+            let authority = paired
+                .heads
+                .as_ref()
+                .unwrap()
+                .first()
+                .unwrap()
+                .grant
+                .authority
+                .clone();
             let expected = paired.session_for_authority(&authority).unwrap().unwrap();
-            assert_eq!(scope.session_for_authority(&authority).unwrap(), Some(expected.clone()));
-            assert_eq!(scope.policy_present(expected.grant.session_id).unwrap(),
-                store.adaptive_resume_policy(&project.tenant_id, expected.grant.session_id).unwrap().is_some());
-            assert_eq!(scope.review_calls(expected.grant.session_id).unwrap(),
-                store.adaptive_leadership_review_calls(&project.tenant_id, expected.grant.session_id).unwrap());
+            assert_eq!(
+                scope.session_for_authority(&authority).unwrap(),
+                Some(expected.clone())
+            );
+            assert_eq!(
+                scope.policy_present(expected.grant.session_id).unwrap(),
+                store
+                    .adaptive_resume_policy(&project.tenant_id, expected.grant.session_id)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                scope.review_calls(expected.grant.session_id).unwrap(),
+                store
+                    .adaptive_leadership_review_calls(&project.tenant_id, expected.grant.session_id)
+                    .unwrap()
+            );
         }
     }
     assert_eq!(snapshot(store), before);
@@ -37,7 +65,12 @@ fn leadership_discovery_matches_separate_reads_multitenant_multisession_and_reop
         assert_matches_separate_reads(&fixture.store);
     }
     assert_matches_separate_reads(&WorkflowStore::open(&fixture.path).unwrap());
-    assert!(fixture.store.adaptive_leadership_discovery_read(AgentId(99)).unwrap().projects().is_empty());
+    assert!(fixture
+        .store
+        .adaptive_leadership_discovery_read(AgentId(99))
+        .unwrap()
+        .projects()
+        .is_empty());
 }
 
 #[test]
@@ -45,7 +78,10 @@ fn leadership_discovery_warm_batch_reuses_shared_facts_but_not_runtime_authority
     let fixture = fixture();
     let before = snapshot(&fixture.store);
     let first = discovery(&fixture.store);
-    let (second, validations) = crate::domain_store::validation_scope::with_completed_validations(|| discovery(&fixture.store));
+    let (second, validations) =
+        crate::domain_store::validation_scope::with_completed_validations(|| {
+            discovery(&fixture.store)
+        });
     assert!(validations.is_empty());
     assert!(Arc::ptr_eq(&first, &second));
     let scope = &second.projects()[0].scopes()[0];
@@ -60,7 +96,11 @@ fn leadership_discovery_warm_batch_reuses_shared_facts_but_not_runtime_authority
             "principal" => authority.principal.principal_generation += 1,
             _ => unreachable!(),
         }
-        assert_eq!(scope.session_for_authority(&authority).unwrap_err().code, WorkflowErrorCode::AuthorityConflict, "{change}");
+        assert_eq!(
+            scope.session_for_authority(&authority).unwrap_err().code,
+            WorkflowErrorCode::AuthorityConflict,
+            "{change}"
+        );
     }
     assert_eq!(snapshot(&fixture.store), before);
 }
@@ -70,18 +110,30 @@ fn leadership_discovery_external_head_mutation_is_deferred_not_cached_or_hidden(
     let fixture = fixture();
     let first = discovery(&fixture.store);
     let other = Connection::open(&fixture.path).unwrap();
-    other.execute("UPDATE workflow_adaptive_heads SET version=version+1", []).unwrap();
+    other
+        .execute("UPDATE workflow_adaptive_heads SET version=version+1", [])
+        .unwrap();
     let before = snapshot(&fixture.store);
     for _ in 0..2 {
         let view = discovery(&fixture.store);
         assert!(!Arc::ptr_eq(&first, &view));
-        assert_eq!(view.projects()[0].scopes()[0].session_for_authority(&fixture.root.authority).unwrap_err().code,
-            WorkflowErrorCode::CorruptStore);
+        assert_eq!(
+            view.projects()[0].scopes()[0]
+                .session_for_authority(&fixture.root.authority)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
     }
     assert_eq!(snapshot(&fixture.store), before);
     // A different leader must still validate the complete project inventory,
     // but unrelated adaptive heads are not an authority dependency.
-    assert!(fixture.store.adaptive_leadership_discovery_read(AgentId(99)).unwrap().projects().is_empty());
+    assert!(fixture
+        .store
+        .adaptive_leadership_discovery_read(AgentId(99))
+        .unwrap()
+        .projects()
+        .is_empty());
 }
 
 #[test]
@@ -99,8 +151,14 @@ fn leadership_discovery_policy_failure_does_not_hide_heads_or_get_retained() {
     drop(connection);
     let view = discovery(&fixture.store);
     let scope = &view.projects()[0].scopes()[0];
-    assert!(scope.session_for_authority(&fixture.root.authority).unwrap().is_some());
-    assert_eq!(scope.policy_present(session).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    assert!(scope
+        .session_for_authority(&fixture.root.authority)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        scope.policy_present(session).unwrap_err().code,
+        WorkflowErrorCode::CorruptStore
+    );
     assert!(scope.review_calls(session).unwrap().is_empty());
     let next = discovery(&fixture.store);
     assert!(!Arc::ptr_eq(&view, &next));
@@ -113,9 +171,20 @@ fn leadership_discovery_deleted_project_and_changed_schema_invalidate_warm_facts
         discovery(&fixture.store);
         let other = Connection::open(&fixture.path).unwrap();
         match change {
-            "delete" => { other.execute("DELETE FROM company_entities WHERE entity_kind='project'", []).unwrap(); }
-            "schema" => other.execute_batch("CREATE TABLE unexpected(value TEXT)").unwrap(),
-            "corrupt" => { other.execute("UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind='project'", []).unwrap(); }
+            "delete" => {
+                other
+                    .execute(
+                        "DELETE FROM company_entities WHERE entity_kind='project'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "schema" => other
+                .execute_batch("CREATE TABLE unexpected(value TEXT)")
+                .unwrap(),
+            "corrupt" => {
+                other.execute("UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind='project'", []).unwrap();
+            }
             _ => unreachable!(),
         }
         let before = snapshot(&fixture.store);
@@ -123,7 +192,10 @@ fn leadership_discovery_deleted_project_and_changed_schema_invalidate_warm_facts
             "delete" => assert!(discovery(&fixture.store).projects().is_empty()),
             // Unsupported cache schemas bypass reuse; they do not invent a domain error.
             "schema" => assert_eq!(discovery(&fixture.store).projects().len(), 1),
-            "corrupt" => assert!(fixture.store.adaptive_leadership_discovery_read(AgentId(1)).is_err()),
+            "corrupt" => assert!(fixture
+                .store
+                .adaptive_leadership_discovery_read(AgentId(1))
+                .is_err()),
             _ => unreachable!(),
         }
         assert_eq!(snapshot(&fixture.store), before);
@@ -134,41 +206,88 @@ fn leadership_discovery_deleted_project_and_changed_schema_invalidate_warm_facts
 fn leadership_discovery_outer_transaction_rollback_does_not_reuse_transient_facts() {
     let fixture = fixture();
     let original = discovery(&fixture.store);
-    fixture.store.lock().unwrap().execute_batch("BEGIN; DELETE FROM company_entities WHERE entity_kind='project'").unwrap();
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .execute_batch("BEGIN; DELETE FROM company_entities WHERE entity_kind='project'")
+        .unwrap();
     assert!(discovery(&fixture.store).projects().is_empty());
     assert!(!fixture.store.lock().unwrap().is_autocommit());
-    fixture.store.lock().unwrap().execute_batch("ROLLBACK").unwrap();
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .execute_batch("ROLLBACK")
+        .unwrap();
     let current = discovery(&fixture.store);
-    assert_eq!(current.projects()[0].project(), original.projects()[0].project());
+    assert_eq!(
+        current.projects()[0].project(),
+        original.projects()[0].project()
+    );
     assert!(!Arc::ptr_eq(&current, &original));
 }
 
 #[test]
 fn leadership_discovery_head_limit_preserves_independent_scopes_and_conflict() {
     let fixture = fixture();
-    let (_, _, other_root) = populate_company(&fixture.store, "zzz-independent", 300, 40_000, |_| {});
+    let (_, _, other_root) =
+        populate_company(&fixture.store, "zzz-independent", 300, 40_000, |_| {});
     for index in 1..=MAX_SCOPED_ADAPTIVE_HEADS {
         let mut grant = fixture.root.clone();
         grant.session_id = Uuid::from_u128(1_000 + index as u128);
         grant.authority.assignment_version += index as u64;
-        fixture.store.begin_adaptive_session(&grant, &grant.authority, NOW).unwrap();
+        fixture
+            .store
+            .begin_adaptive_session(&grant, &grant.authority, NOW)
+            .unwrap();
         if index < MAX_SCOPED_ADAPTIVE_HEADS {
             let mut other = other_root.clone();
             other.session_id = Uuid::from_u128(2_000 + index as u128);
             other.authority.assignment_version += index as u64;
-            fixture.store.begin_adaptive_session(&other, &other.authority, NOW).unwrap();
+            fixture
+                .store
+                .begin_adaptive_session(&other, &other.authority, NOW)
+                .unwrap();
         }
         if index == MAX_SCOPED_ADAPTIVE_HEADS - 1 {
             let view = discovery(&fixture.store);
-            assert_eq!(view.projects()[0].scopes()[0].session_for_authority(&fixture.root.authority).unwrap().unwrap().grant, fixture.root);
-            assert_eq!(view.projects()[1].scopes()[0].session_for_authority(&other_root.authority).unwrap().unwrap().grant, other_root);
+            assert_eq!(
+                view.projects()[0].scopes()[0]
+                    .session_for_authority(&fixture.root.authority)
+                    .unwrap()
+                    .unwrap()
+                    .grant,
+                fixture.root
+            );
+            assert_eq!(
+                view.projects()[1].scopes()[0]
+                    .session_for_authority(&other_root.authority)
+                    .unwrap()
+                    .unwrap()
+                    .grant,
+                other_root
+            );
         }
     }
     let view = discovery(&fixture.store);
-    assert_eq!(view.projects()[0].scopes()[0].session_for_authority(&fixture.root.authority).unwrap_err().code, WorkflowErrorCode::AuthorityConflict);
+    assert_eq!(
+        view.projects()[0].scopes()[0]
+            .session_for_authority(&fixture.root.authority)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::AuthorityConflict
+    );
     assert_eq!(view.projects().len(), 2);
     assert_eq!(view.projects()[1].scopes().len(), 1);
-    assert_eq!(view.projects()[1].scopes()[0].session_for_authority(&other_root.authority).unwrap().unwrap().grant, other_root);
+    assert_eq!(
+        view.projects()[1].scopes()[0]
+            .session_for_authority(&other_root.authority)
+            .unwrap()
+            .unwrap()
+            .grant,
+        other_root
+    );
 }
 
 #[test]
@@ -181,16 +300,36 @@ fn leadership_discovery_rejects_raw_index_damage_with_unchanged_table_rows() {
     let (root, page_size): (u32, u32) = {
         let connection = fixture.store.lock().unwrap();
         (
-            connection.query_row("SELECT rootpage FROM sqlite_schema WHERE name='discovery_probe'", [], |row| row.get(0)).unwrap(),
-            connection.query_row("PRAGMA page_size", [], |row| row.get(0)).unwrap(),
+            connection
+                .query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE name='discovery_probe'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            connection
+                .query_row("PRAGMA page_size", [], |row| row.get(0))
+                .unwrap(),
         )
     };
     let before = snapshot(&fixture.store);
-    fixture.store.lock().unwrap().execute_batch("PRAGMA shrink_memory").unwrap();
-    let mut file = std::fs::OpenOptions::new().write(true).open(&fixture.path).unwrap();
-    file.seek(SeekFrom::Start(u64::from(root-1)*u64::from(page_size))).unwrap();
-    file.write_all(&vec![0;page_size as usize]).unwrap();
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .execute_batch("PRAGMA shrink_memory")
+        .unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fixture.path)
+        .unwrap();
+    file.seek(SeekFrom::Start(u64::from(root - 1) * u64::from(page_size)))
+        .unwrap();
+    file.write_all(&vec![0; page_size as usize]).unwrap();
     file.sync_all().unwrap();
     assert_eq!(snapshot(&fixture.store), before);
-    assert!(fixture.store.adaptive_leadership_discovery_read(AgentId(1)).is_err());
+    assert!(fixture
+        .store
+        .adaptive_leadership_discovery_read(AgentId(1))
+        .is_err());
 }

@@ -1746,7 +1746,10 @@ impl WorkflowApi {
             // Runtime lineage is sampled now, never retained in the SQL facts.
             let mut sessions = Vec::new();
             for scope in source.scopes() {
-                let runtime = self.authority.as_ref().ok_or("leadership runtime unavailable")?;
+                let runtime = self
+                    .authority
+                    .as_ref()
+                    .ok_or("leadership runtime unavailable")?;
                 let authority = match runtime.snapshot_from_validated_project(
                     project,
                     &project.tenant_id,
@@ -1767,9 +1770,11 @@ impl WorkflowApi {
                 }
             }
             for (scope, session) in sessions {
-                let policy_present = scope.policy_present(session.grant.session_id)
+                let policy_present = scope
+                    .policy_present(session.grant.session_id)
                     .map_err(|_| "resume policy unavailable")?;
-                let mut calls = scope.review_calls(session.grant.session_id)
+                let mut calls = scope
+                    .review_calls(session.grant.session_id)
                     .map_err(|_| "leadership calls unavailable")?;
                 let funded_current: Vec<_> = calls
                     .iter()
@@ -2689,9 +2694,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
 
-    mod leadership_discovery_tests {
-        include!("adaptive_leadership_review/leadership_discovery_tests.rs");
-    }
+    #[path = "../adaptive_leadership_review/leadership_discovery_tests.rs"]
+    mod leadership_discovery_tests;
 
     mod completion_clock_tests {
         include!("tests/leadership_completion_expiry.rs");

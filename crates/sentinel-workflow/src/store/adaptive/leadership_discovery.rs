@@ -39,9 +39,10 @@ impl AdaptiveLeadershipDiscoveryRead {
         self.projects.iter().all(|project| {
             project.scopes.iter().all(|scope| {
                 scope.heads.is_ok()
-                    && scope.reviews.iter().all(|review| {
-                        review.policy_present.is_ok() && review.calls.is_ok()
-                    })
+                    && scope
+                        .reviews
+                        .iter()
+                        .all(|review| review.policy_present.is_ok() && review.calls.is_ok())
             })
         })
     }
@@ -79,7 +80,9 @@ impl AdaptiveLeadershipScopeRead {
             return Err(authority_conflict());
         }
         select_scoped_adaptive_head(
-            self.heads.as_ref().map_err(DeferredHeadReadError::restore)?,
+            self.heads
+                .as_ref()
+                .map_err(DeferredHeadReadError::restore)?,
             current,
         )
     }
@@ -156,7 +159,10 @@ fn leadership_discovery_on_connection(
                     CompanyRoleV1::Developer | CompanyRoleV1::Designer
                 )
         }) {
-            let mut assignments = work.assignments.iter().filter(|assignment| assignment.active);
+            let mut assignments = work
+                .assignments
+                .iter()
+                .filter(|assignment| assignment.active);
             let Some(assignment) = assignments.next() else {
                 continue;
             };
@@ -175,18 +181,23 @@ fn leadership_discovery_on_connection(
             if let Ok(heads) = &heads {
                 for session in heads {
                     let session_id = session.grant.session_id;
-                    let policy_present = crate::domain_store::validation_scope::with_scope(tx, || {
-                        read_resume_policy_leaf(tx, &project.tenant_id, session_id)
-                    })
-                    .map(|policy| policy.is_some())
-                    .map_err(DeferredHeadReadError::capture);
+                    let policy_present =
+                        crate::domain_store::validation_scope::with_scope(tx, || {
+                            read_resume_policy_leaf(tx, &project.tenant_id, session_id)
+                        })
+                        .map(|policy| policy.is_some())
+                        .map_err(DeferredHeadReadError::capture);
                     let calls = crate::domain_store::adaptive_leadership_review::calls_for_session(
                         tx,
                         &project.tenant_id,
                         session_id,
                     )
                     .map_err(DeferredHeadReadError::capture);
-                    reviews.push(SessionReviews { session_id, policy_present, calls });
+                    reviews.push(SessionReviews {
+                        session_id,
+                        policy_present,
+                        calls,
+                    });
                 }
             }
             scopes.push(AdaptiveLeadershipScopeRead {
@@ -202,4 +213,3 @@ fn leadership_discovery_on_connection(
     }
     Ok(AdaptiveLeadershipDiscoveryRead { projects: result })
 }
-
