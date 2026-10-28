@@ -1,5 +1,10 @@
 # Changelog
 
+- Read workflow readiness facts from one validated SQL snapshot and retain only
+  compact historical health metadata. Preserve full corruption and currentness
+  checks, live provider/delivery outcomes, and guard-free external reads. Omit
+  ended leadership records only after validating their complete history (#856).
+
 - Let background workflow reconciliation yield at its next durable boundary to
   material-offer preparation. Reuse fully input- and integrity-checked SQL facts
   across source discovery and draft verification while retaining the exclusive

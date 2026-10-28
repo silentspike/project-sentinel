@@ -1,3 +1,4 @@
+use super::super::leadership_discovery::pending_review_calls;
 use super::*;
 
 fn discovery(store: &WorkflowStore) -> Arc<AdaptiveLeadershipDiscoveryRead> {
@@ -49,10 +50,231 @@ fn assert_matches_separate_reads(store: &WorkflowStore) {
                 store
                     .adaptive_leadership_review_calls(&project.tenant_id, expected.grant.session_id)
                     .unwrap()
+                    .into_iter()
+                    .filter(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
+                    .collect::<Vec<_>>()
             );
         }
     }
     assert_eq!(snapshot(store), before);
+}
+
+fn projected_material_calls(
+    view: &AdaptiveLeadershipDiscoveryRead,
+    source: &AdaptiveMaterialWindowVerificationSourceV1,
+) -> Vec<AdaptiveLeadershipReviewCallV1> {
+    view.projects()
+        .iter()
+        .find(|project| {
+            project.project().tenant_id == source.project.tenant_id
+                && project.project().project_id == source.project.project_id
+        })
+        .unwrap()
+        .scopes()
+        .iter()
+        .find(|scope| {
+            scope.work_item_id() == &source.session.grant.authority.work_item_id
+                && scope.agent_id() == source.session.grant.authority.agent_id
+        })
+        .unwrap()
+        .review_calls(source.session.grant.session_id)
+        .unwrap()
+}
+
+#[test]
+fn leadership_discovery_projection_does_not_decide_eligibility_or_hide_ambiguity() {
+    let (_temp, _path, store, _operator, source, _request, _proof, _now) =
+        crate::domain_store::adaptive_leadership_review::material_preview_fixture_for_tests();
+    let before = snapshot(&store);
+    let terminal = source.refused.clone();
+    assert!(terminal.decision.is_some());
+    assert!(terminal.dispatch.is_some());
+    let mut pending = terminal.clone();
+    pending.decision = None;
+    pending.retired_at_unix_ms = None;
+    // Pure projection inputs, not forged persisted grants or authorization proof.
+    let mut candidates = Vec::new();
+    for variant in 0..7 {
+        let mut call = pending.clone();
+        match variant {
+            0 => call.dispatch = None,
+            1 => call.grant.leadership_principal.agent_id = Some(AgentId(999)),
+            2 => call.grant_issued_at_unix_ms = u64::MAX,
+            3 => call.grant.expires_at_unix_ms = 1,
+            4 => call.context.source_session.version += 1,
+            5 => call.context.source_project.tenant_id = TenantId::parse("foreign").unwrap(),
+            _ => {}
+        }
+        candidates.push(call);
+    }
+    assert!(pending.grant.work_funding.is_some());
+    // Duplicate-sensitive: even two matching funded calls must reach ambiguity
+    // detection; a projection must neither select one nor deduplicate them.
+    candidates.push(pending.clone());
+    candidates.push(pending.clone());
+    let mut retired = pending;
+    retired.retired_at_unix_ms = Some(1);
+    let mut input = vec![terminal.clone(), retired];
+    input.extend(candidates.clone());
+    input.insert(5, terminal);
+    assert_eq!(pending_review_calls(input), candidates);
+    assert_eq!(snapshot(&store), before);
+}
+
+#[test]
+fn leadership_discovery_projects_durable_history_without_changing_history_api_or_reopen() {
+    let (_temp, path, store, _operator, source, _request, _proof, _now) =
+        crate::domain_store::adaptive_leadership_review::material_preview_fixture_for_tests();
+    let leader = source.refused.grant.leadership_principal.agent_id.unwrap();
+    let tenant = &source.project.tenant_id;
+    let session = source.session.grant.session_id;
+    let history = store
+        .adaptive_leadership_review_calls(tenant, session)
+        .unwrap();
+    let expected: Vec<_> = history
+        .iter()
+        .filter(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
+        .cloned()
+        .collect();
+    assert!(expected.len() < history.len());
+    let before = snapshot(&store);
+    let first = store.adaptive_leadership_discovery_read(leader).unwrap();
+    assert_eq!(projected_material_calls(&first, &source), expected);
+    store.company_projects().unwrap();
+    store.adaptive_health_inventory().unwrap();
+    let (second, validations) =
+        crate::domain_store::validation_scope::with_completed_validations(|| {
+            store.adaptive_leadership_discovery_read(leader).unwrap()
+        });
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(validations.is_empty());
+    assert_eq!(
+        store
+            .adaptive_leadership_review_calls(tenant, session)
+            .unwrap(),
+        history
+    );
+    assert!(store
+        .adaptive_leadership_discovery_read(AgentId(999))
+        .unwrap()
+        .projects()
+        .is_empty());
+    assert_eq!(snapshot(&store), before);
+    let reopened = WorkflowStore::open(&path).unwrap();
+    let cold = reopened.adaptive_leadership_discovery_read(leader).unwrap();
+    assert_eq!(projected_material_calls(&cold, &source), expected);
+    assert_eq!(
+        reopened
+            .adaptive_leadership_review_calls(tenant, session)
+            .unwrap(),
+        history
+    );
+    assert_eq!(snapshot(&reopened), before);
+
+    // Same retained view, with only the historical calls restored, measures the
+    // deterministic serialization delta, not latency, cache eviction or readiness.
+    let mut old = serde_json::to_value(first.as_ref()).unwrap();
+    let mut replaced = 0;
+    for project in old["projects"].as_array_mut().unwrap() {
+        for scope in project["scopes"].as_array_mut().unwrap() {
+            for review in scope["reviews"].as_array_mut().unwrap() {
+                if review["session_id"] == serde_json::to_value(session).unwrap() {
+                    review["calls"]["Ok"] = serde_json::to_value(&history).unwrap();
+                    replaced += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(replaced, 1);
+    assert!(
+        serde_json::to_vec(first.as_ref()).unwrap().len() < serde_json::to_vec(&old).unwrap().len()
+    );
+}
+
+#[test]
+fn leadership_discovery_revalidates_excluded_history_after_external_mutation() {
+    let (_temp, path, store, _operator, source, _request, _proof, _now) =
+        crate::domain_store::adaptive_leadership_review::material_preview_fixture_for_tests();
+    let leader = source.refused.grant.leadership_principal.agent_id.unwrap();
+    let tenant = &source.project.tenant_id;
+    let session = source.session.grant.session_id;
+    let terminal = &source.refused;
+    assert!(terminal.decision.is_some());
+    let original = store.adaptive_leadership_discovery_read(leader).unwrap();
+    let history = store
+        .adaptive_leadership_review_calls(tenant, session)
+        .unwrap();
+    let other = Connection::open(&path).unwrap();
+    let key = terminal.grant.review_id.to_string();
+    let digest: String = other
+        .query_row(
+            "SELECT payload_digest FROM company_entities WHERE tenant_id=?1 AND entity_kind='adaptive_leadership_review_call' AND entity_id=?2",
+            rusqlite::params![tenant.0, key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        other
+            .execute(
+                "UPDATE company_entities SET payload_digest='invalid' WHERE tenant_id=?1 AND entity_kind='adaptive_leadership_review_call' AND entity_id=?2",
+                rusqlite::params![tenant.0, key],
+            )
+            .unwrap(),
+        1
+    );
+    let damaged = snapshot(&store);
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .adaptive_leadership_review_calls(tenant, session)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
+        match store.adaptive_leadership_discovery_read(leader) {
+            Err(error) => assert_eq!(error.code, WorkflowErrorCode::CorruptStore),
+            Ok(view) => {
+                assert!(!Arc::ptr_eq(&original, &view));
+                let scope = view
+                    .projects()
+                    .iter()
+                    .find(|project| project.project().project_id == source.project.project_id)
+                    .unwrap()
+                    .scopes()
+                    .iter()
+                    .find(|scope| {
+                        scope.work_item_id() == &source.session.grant.authority.work_item_id
+                    })
+                    .unwrap();
+                assert_eq!(
+                    scope.review_calls(session).unwrap_err().code,
+                    WorkflowErrorCode::CorruptStore
+                );
+            }
+        }
+    }
+    assert_eq!(snapshot(&store), damaged);
+    assert_eq!(
+        other
+            .execute(
+                "UPDATE company_entities SET payload_digest=?3 WHERE tenant_id=?1 AND entity_kind='adaptive_leadership_review_call' AND entity_id=?2",
+                rusqlite::params![tenant.0, key, digest],
+            )
+            .unwrap(),
+        1
+    );
+    let restored = store.adaptive_leadership_discovery_read(leader).unwrap();
+    assert!(!Arc::ptr_eq(&original, &restored));
+    assert_eq!(
+        projected_material_calls(&restored, &source),
+        pending_review_calls(history.clone())
+    );
+    assert_eq!(
+        store
+            .adaptive_leadership_review_calls(tenant, session)
+            .unwrap(),
+        history
+    );
 }
 
 #[test]
