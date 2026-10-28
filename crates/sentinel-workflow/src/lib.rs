@@ -55,11 +55,11 @@ pub use request_provider::*;
 pub use sentinel_common::AgentId;
 pub use standing_work_funding::*;
 pub use store::{
-    AdaptiveHealthReadError, AdaptiveLeadershipDiscoveryRead, AdaptiveLeadershipProjectRead,
+    AdaptiveHealthReadError, AdaptiveHealthSession, AdaptiveLeadershipDiscoveryRead, AdaptiveLeadershipProjectRead,
     AdaptiveLeadershipScopeRead, AdaptiveModelAdoptionRead, AdaptiveModelAdoptionReadError,
-    AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot, AdaptiveSourceCompletionV1,
-    ExecutionRevisionV1, WorkflowDiagnosticSpan, WorkflowDiagnosticStage, WorkflowStore,
-    WORKFLOW_STORE_SCHEMA_VERSION,
+    AdaptiveModelPreparationReadSnapshot, AdaptivePendingModelHealth, AdaptiveProjectReadSnapshot,
+    AdaptiveSourceCompletionV1, ExecutionRevisionV1, WorkflowDiagnosticSpan, WorkflowDiagnosticStage,
+    WorkflowReadinessFacts, WorkflowStore, WORKFLOW_STORE_SCHEMA_VERSION,
 };
 
 pub const WORKFLOW_SCHEMA_VERSION: u16 = 1;

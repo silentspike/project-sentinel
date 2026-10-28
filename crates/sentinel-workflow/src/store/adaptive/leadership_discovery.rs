@@ -30,6 +30,15 @@ struct SessionReviews {
     calls: Result<Vec<AdaptiveLeadershipReviewCallV1>, DeferredHeadReadError>,
 }
 
+pub(super) fn pending_review_calls(
+    mut calls: Vec<AdaptiveLeadershipReviewCallV1>,
+) -> Vec<AdaptiveLeadershipReviewCallV1> {
+    // Only project fully validated history. Leader, clock, context and dispatch
+    // eligibility (including funded ambiguity) remain the caller's fresh work.
+    calls.retain(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none());
+    calls
+}
+
 impl AdaptiveLeadershipDiscoveryRead {
     pub fn projects(&self) -> &[AdaptiveLeadershipProjectRead] {
         &self.projects
@@ -95,6 +104,8 @@ impl AdaptiveLeadershipScopeRead {
             .map_err(DeferredHeadReadError::restore)
     }
 
+    /// Undecided, unretired calls in original history order, not dispatch authority.
+    /// The all-history store API remains separate and validates the same history.
     pub fn review_calls(
         &self,
         session_id: Uuid,
@@ -192,6 +203,7 @@ fn leadership_discovery_on_connection(
                         &project.tenant_id,
                         session_id,
                     )
+                    .map(pending_review_calls)
                     .map_err(DeferredHeadReadError::capture);
                     reviews.push(SessionReviews {
                         session_id,
