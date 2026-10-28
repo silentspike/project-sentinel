@@ -107,10 +107,16 @@ fn fixture_with_grant(change_grant: impl FnOnce(&mut AdaptiveSessionGrantV1)) ->
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("company.sqlite");
     let store = Arc::new(WorkflowStore::open(&path).unwrap());
-    let (pm, project, root) = populate_company(
-        &store, "tenant-company-claim", 100, 0, change_grant,
-    );
-    Fixture { _temp: temp, path, store, pm, project, root }
+    let (pm, project, root) =
+        populate_company(&store, "tenant-company-claim", 100, 0, change_grant);
+    Fixture {
+        _temp: temp,
+        path,
+        store,
+        pm,
+        project,
+        root,
+    }
 }
 
 fn populate_company(
@@ -119,7 +125,11 @@ fn populate_company(
     session_id: u128,
     operation_base: u128,
     change_grant: impl FnOnce(&mut AdaptiveSessionGrantV1),
-) -> (AuthenticatedCompanyPrincipalV1, ProjectV1, AdaptiveSessionGrantV1) {
+) -> (
+    AuthenticatedCompanyPrincipalV1,
+    ProjectV1,
+    AdaptiveSessionGrantV1,
+) {
     let tenant = TenantId::parse(tenant).unwrap();
     let mut customer = principal("customer", CompanyRoleV1::Customer, None);
     customer.tenant_id = tenant.clone();
@@ -397,9 +407,8 @@ fn populate_company(
     (pm, project, root)
 }
 
-mod leadership_discovery_tests {
-    include!("leadership_discovery/store_tests.rs");
-}
+#[path = "leadership_discovery/store_tests.rs"]
+mod leadership_discovery_tests;
 
 fn snapshot(store: &WorkflowStore) -> Snapshot {
     let connection = store.lock().unwrap();
