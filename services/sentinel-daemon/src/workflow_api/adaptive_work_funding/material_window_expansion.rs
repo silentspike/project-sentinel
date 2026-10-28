@@ -4,6 +4,10 @@ use sentinel_workflow::{
     AdaptiveMaterialWindowUsageProofV1, AdaptiveMaterialWindowVerificationSourceV1,
 };
 
+#[cfg(test)]
+#[path = "material_window_expansion/scheduling_tests.rs"]
+mod scheduling_tests;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct MaterialSubmission {
@@ -188,6 +192,9 @@ impl WorkflowApi {
         )
         .entered();
         let _total = FundingPhase::start("material_request_total");
+        // Existing background owners yield only after their current durable step.
+        // Keep the exclusive fence through every source/native check and commit.
+        let _intent = self.material_preparation_intent();
         let wait = FundingPhase::start("material_mutation_fence_wait");
         let Ok(_fence) = self.mutation_fence.write() else {
             return workflow_error(workflow_unavailable());

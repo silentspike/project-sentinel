@@ -3397,6 +3397,7 @@ pub struct WorkflowApi {
     #[cfg(feature = "llm")]
     provider_recovery_pending: AtomicBool,
     completion_adoption_pending: AtomicUsize,
+    material_preparation_pending: AtomicUsize,
     #[cfg(feature = "llm")]
     provider_admission: Arc<RwLock<bool>>,
     #[cfg(feature = "llm")]
@@ -3473,6 +3474,7 @@ impl WorkflowApi {
     fn background_work_should_yield(&self) -> bool {
         self.provider_recovery_is_pending()
             || self.completion_adoption_pending.load(Ordering::Acquire) > 0
+            || self.material_preparation_pending.load(Ordering::Acquire) > 0
     }
 
     #[cfg(feature = "llm")]
@@ -3670,6 +3672,7 @@ impl WorkflowApi {
             #[cfg(feature = "llm")]
             provider_recovery_pending: AtomicBool::new(false),
             completion_adoption_pending: AtomicUsize::new(0),
+            material_preparation_pending: AtomicUsize::new(0),
             #[cfg(feature = "llm")]
             provider_admission: Arc::new(RwLock::new(true)),
             #[cfg(feature = "llm")]
@@ -3731,6 +3734,7 @@ impl WorkflowApi {
             #[cfg(feature = "llm")]
             provider_recovery_pending: AtomicBool::new(false),
             completion_adoption_pending: AtomicUsize::new(0),
+            material_preparation_pending: AtomicUsize::new(0),
             #[cfg(feature = "llm")]
             provider_admission: Arc::new(RwLock::new(false)),
             #[cfg(feature = "llm")]
