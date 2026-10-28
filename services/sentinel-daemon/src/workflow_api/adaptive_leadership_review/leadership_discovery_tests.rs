@@ -197,7 +197,9 @@ fn leadership_discovery_selected_review_is_reauthorized_after_warm_selection() {
         let selected = api.leadership_review_for_agent(agent).unwrap().unwrap();
         api.leadership_review_for_agent(agent).unwrap().unwrap();
         match change {
-            "project" => record_independent_decision(&api, &context.source.source_project),
+            "project" => {
+                record_independent_decision(&api, &context.source.source_project);
+            }
             "head" => {
                 sentinel_limbo::rusqlite::Connection::open(&path)
                     .unwrap()
