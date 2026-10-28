@@ -11,7 +11,7 @@ pub struct AdaptiveModelPreparationReadSnapshot {
 }
 
 impl DeferredHeadReadError {
-    fn capture(error: WorkflowError) -> Self {
+    pub(super) fn capture(error: WorkflowError) -> Self {
         Self {
             code: error.code,
             retryable: error.retryable,
@@ -19,7 +19,7 @@ impl DeferredHeadReadError {
         }
     }
 
-    fn restore(&self) -> WorkflowError {
+    pub(super) fn restore(&self) -> WorkflowError {
         WorkflowError::new(self.code, self.retryable, self.message)
     }
 }

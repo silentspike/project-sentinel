@@ -20,6 +20,7 @@ use crate::{
 pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 3;
 pub(crate) mod adaptive;
 pub use adaptive::{
+    AdaptiveLeadershipDiscoveryRead, AdaptiveLeadershipProjectRead, AdaptiveLeadershipScopeRead,
     AdaptiveModelAdoptionRead, AdaptiveModelAdoptionReadError,
     AdaptiveModelPreparationReadSnapshot, AdaptiveProjectReadSnapshot, AdaptiveSourceCompletionV1,
 };
