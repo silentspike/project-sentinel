@@ -1,5 +1,10 @@
 # Changelog
 
+- Let background workflow reconciliation yield at its next durable boundary to
+  material-offer preparation. Reuse fully input- and integrity-checked SQL facts
+  across source discovery and draft verification while retaining the exclusive
+  fence, fresh clock checks and final runtime/native authorization (#856).
+
 - Batch leadership discovery's project inventory, assignee heads, resume policies
   and review histories within one validated SQL snapshot. Preserve independent
   replay budgets, deferred errors and fresh selected-review/dispatch authority;
