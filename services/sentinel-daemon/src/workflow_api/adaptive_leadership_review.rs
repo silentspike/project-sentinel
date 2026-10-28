@@ -2694,8 +2694,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
 
-    #[path = "../adaptive_leadership_review/leadership_discovery_tests.rs"]
-    mod leadership_discovery_tests;
+    mod leadership_discovery_tests {
+        include!("adaptive_leadership_review/leadership_discovery_tests.rs");
+    }
 
     mod completion_clock_tests {
         include!("tests/leadership_completion_expiry.rs");
