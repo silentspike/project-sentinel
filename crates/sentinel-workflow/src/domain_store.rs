@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod adaptive_accounting_reconsideration;
 mod adaptive_funded_review_recovery;
 mod adaptive_leadership_local_adoption;
-mod adaptive_leadership_review;
+pub(crate) mod adaptive_leadership_review;
 pub(crate) mod adaptive_resume_policy;
 pub(crate) mod adaptive_work_funding;
 pub use adaptive_leadership_review::{

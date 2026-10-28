@@ -514,7 +514,7 @@ fn store_call(
     Ok(())
 }
 
-pub(super) fn calls_for_session(
+pub(crate) fn calls_for_session(
     connection: &Connection,
     tenant: &TenantId,
     session_id: Uuid,
