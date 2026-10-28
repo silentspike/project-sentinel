@@ -353,16 +353,7 @@ impl WorkflowStore {
             &mut connection,
             "adaptive-project-health-inventory",
             &[],
-            |tx| {
-                // Preserve the separate per-project validation budgets.
-                let projects = crate::domain_store::validated_company_projects_in_snapshot(tx)?;
-                validating_sessions = true;
-                let sessions = crate::domain_store::validation_scope::with_scope(tx, || {
-                    adaptive_health_inventory(tx)
-                })?;
-                validating_sessions = false;
-                Ok((projects, sessions))
-            },
+            |tx| adaptive_health_inventory_in_snapshot(tx, &mut validating_sessions),
         )
         .map_err(|error| {
             if validating_sessions {
@@ -2199,6 +2190,20 @@ fn health_scope(session: &AdaptiveSessionV1) -> Result<HealthScope, WorkflowErro
         i64::from(authority.agent_id.0),
         authority.canonical_digest()?,
     ))
+}
+
+pub(super) fn adaptive_health_inventory_in_snapshot(
+    connection: &Connection,
+    validating_sessions: &mut bool,
+) -> Result<(Vec<crate::ProjectV1>, Vec<AdaptiveSessionV1>), WorkflowError> {
+    // Preserve the separate per-project budgets and all historical journal checks.
+    let projects = crate::domain_store::validated_company_projects_in_snapshot(connection)?;
+    *validating_sessions = true;
+    let sessions = crate::domain_store::validation_scope::with_scope(connection, || {
+        adaptive_health_inventory(connection)
+    })?;
+    *validating_sessions = false;
+    Ok((projects, sessions))
 }
 
 fn adaptive_health_inventory(
