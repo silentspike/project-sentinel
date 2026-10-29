@@ -5466,7 +5466,10 @@ mod tests {
         assert!(!runtime.handles.contains_key(&handle.workload_id));
         assert!(!runtime.workloads.contains_key(&handle.workload_id));
         assert!(!runtime.exchanges[&handle.workload_id].cleanup_pending);
-        assert_eq!(runtime.health(handle).unwrap().state, NanoHealthState::Stopped);
+        assert_eq!(
+            runtime.health(handle).unwrap().state,
+            NanoHealthState::Stopped
+        );
         let after_cleanup = signal_attempts.load(std::sync::atomic::Ordering::Acquire);
         let replay = runtime
             .exec(
@@ -5529,7 +5532,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         release.wait();
-        assert_eq!(duplicate, Some(ProtocolSupervisionFailure::ProtocolViolation));
+        assert_eq!(
+            duplicate,
+            Some(ProtocolSupervisionFailure::ProtocolViolation)
+        );
         wait_for_autonomous_quiescence(&runtime, workload_id);
         assert_safe_protocol_failure_replay(
             &mut runtime,
@@ -5691,7 +5697,10 @@ mod tests {
         let pending = runtime.processes[workload_id].protocol_supervision_snapshot();
         let failure = runtime.processes[workload_id].protocol_start_failure();
         release.wait();
-        assert_eq!(failure, Some(ProtocolSupervisionFailure::OutputLimitExceeded));
+        assert_eq!(
+            failure,
+            Some(ProtocolSupervisionFailure::OutputLimitExceeded)
+        );
         assert!(pending.failure.is_none());
         assert!(!pending.terminal_finalized);
         assert!(!pending.process_reaped);
