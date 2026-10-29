@@ -3117,6 +3117,9 @@ impl NanoRuntime for BwrapNanoRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sentinel_common::{
+        WorkbenchErrorClass, WorkbenchErrorInfo, WorkbenchProgressStage, WorkbenchResourceUsage,
+    };
 
     fn fixture_workload(workload_id: &str, agent_name: &str) -> NanoWorkloadSpec {
         NanoWorkloadSpec {
@@ -5412,17 +5415,101 @@ mod tests {
         assert_eq!(replay.to_string(), terminal.to_string());
     }
 
+    fn valid_cumulative_output_frames(invocation_id: &str, input_digest: &str) -> [String; 3] {
+        let mut progress = serde_json::to_string(&WorkbenchMessage::Progress {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: invocation_id.to_string(),
+            stage: WorkbenchProgressStage::Executing,
+            elapsed_ms: 1,
+        })
+        .unwrap();
+        // JSON whitespace counts toward the raw-byte cap without adding fields.
+        progress.push_str(&" ".repeat(MAX_WORKBENCH_OUTPUT_BYTES / 3));
+        let result = serde_json::to_string(&WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: invocation_id.to_string(),
+            input_digest: input_digest.to_string(),
+            outcome: WorkbenchOutcome::Succeeded,
+            resources: WorkbenchResourceUsage::default(),
+            artifacts: Vec::new(),
+            output: [(
+                "private_fixture".to_string(),
+                "x".repeat(MAX_WORKBENCH_OUTPUT_BYTES / 3),
+            )]
+            .into_iter()
+            .collect(),
+            error: None,
+        })
+        .unwrap();
+        let frames = [progress.clone(), progress, result];
+        for frame in &frames {
+            serde_json::from_str::<WorkbenchMessage>(frame).unwrap();
+            assert!(frame.len() < MAX_WORKBENCH_OUTPUT_BYTES);
+        }
+        assert!(frames[..2].iter().map(String::len).sum::<usize>() <= MAX_WORKBENCH_OUTPUT_BYTES);
+        assert!(frames.iter().map(String::len).sum::<usize>() > MAX_WORKBENCH_OUTPUT_BYTES);
+        frames
+    }
+
+    fn assert_safe_protocol_failure_replay(
+        runtime: &mut BwrapNanoRuntime,
+        handle: &NanoHandle,
+        invocation_id: &str,
+        expected: NanoExecErrorCode,
+        private_sentinel: &str,
+    ) {
+        let signal_attempts = runtime.processes[&handle.workload_id].termination_signal_counter();
+        let error = poll_until_error(runtime, handle, invocation_id);
+        assert_exec_error(&error, expected);
+        assert!(!error.to_string().contains(private_sentinel));
+        assert!(!runtime.processes.contains_key(&handle.workload_id));
+        assert!(!runtime.handles.contains_key(&handle.workload_id));
+        assert!(!runtime.workloads.contains_key(&handle.workload_id));
+        assert!(!runtime.exchanges[&handle.workload_id].cleanup_pending);
+        assert_eq!(runtime.health(handle).unwrap().state, NanoHealthState::Stopped);
+        let after_cleanup = signal_attempts.load(std::sync::atomic::Ordering::Acquire);
+        let replay = runtime
+            .exec(
+                handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(replay.to_string(), error.to_string());
+        assert_eq!(
+            signal_attempts.load(std::sync::atomic::Ordering::Acquire),
+            after_cleanup,
+            "retained failure replay must not signal an old numeric PID"
+        );
+    }
+
     #[test]
     fn duplicate_terminal_and_output_overflow_fail_with_typed_safe_errors() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2913";
-        let terminal =
-            format!(r#"{{"kind":"error","schema_version":1,"invocation_id":"{invocation_id}"}}"#);
-        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
-        let handle = insert_protocol_fixture(
-            &mut runtime,
-            "protocol-duplicate-terminal",
-            &[&terminal, &terminal],
+        let terminal = serde_json::to_string(&WorkbenchMessage::Error {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: Some(invocation_id.to_string()),
+            error: WorkbenchErrorInfo {
+                class: WorkbenchErrorClass::Protocol,
+                code: "fixture_error".to_string(),
+                safe_message: "fixture terminal error".to_string(),
+                retryable: false,
+            },
+        })
+        .unwrap();
+        serde_json::from_str::<WorkbenchMessage>(&terminal).unwrap();
+        let observed = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let process = AgentProcess::launch_protocol_fixture(&[&terminal, &terminal]).unwrap();
+        process.install_pre_quiescence_barrier(
+            std::sync::Arc::clone(&observed),
+            std::sync::Arc::clone(&release),
         );
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let workload_id = "protocol-duplicate-terminal";
+        let handle = insert_protocol_process(&mut runtime, workload_id, process);
         runtime
             .exec(
                 &handle,
@@ -5432,25 +5519,218 @@ mod tests {
                 },
             )
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let error = poll_until_error(&mut runtime, &handle, invocation_id);
-        assert_exec_error(&error, NanoExecErrorCode::ProtocolViolation);
+        observed.wait();
+        let mut duplicate = None;
+        for _ in 0..600 {
+            duplicate = runtime.processes[workload_id].protocol_start_failure();
+            if duplicate.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        release.wait();
+        assert_eq!(duplicate, Some(ProtocolSupervisionFailure::ProtocolViolation));
+        wait_for_autonomous_quiescence(&runtime, workload_id);
+        assert_safe_protocol_failure_replay(
+            &mut runtime,
+            &handle,
+            invocation_id,
+            NanoExecErrorCode::ProtocolViolation,
+            "fixture terminal error",
+        );
 
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2914";
-        let output_chunk = serde_json::json!({
-            "kind": "progress",
-            "schema_version": 1,
-            "invocation_id": invocation_id,
-            "stage": "running",
-            "padding": "x".repeat(MAX_WORKBENCH_OUTPUT_BYTES / 3)
-        })
-        .to_string();
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
+        let frames = valid_cumulative_output_frames(invocation_id, &frame_digest(&start));
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
         let handle = insert_protocol_fixture(
             &mut runtime,
             "protocol-output-overflow",
-            &[&output_chunk, &output_chunk, &output_chunk, &output_chunk],
+            &[&frames[0], &frames[1], &frames[2]],
         );
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start,
+                },
+            )
+            .unwrap();
+        assert_safe_protocol_failure_replay(
+            &mut runtime,
+            &handle,
+            invocation_id,
+            NanoExecErrorCode::OutputLimitExceeded,
+            &"x".repeat(32),
+        );
+    }
+
+    #[test]
+    fn cumulative_output_limit_survives_early_valid_frame_drain() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2960";
+        let workload_id = "protocol-output-early-drain";
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
+        let frames = valid_cumulative_output_frames(invocation_id, &frame_digest(&start));
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("valid-prefix.jsonl");
+        let overflow = temp.path().join("valid-overflow.jsonl");
+        std::fs::write(&prefix, format!("{}\n{}\n", frames[0], frames[1])).unwrap();
+        std::fs::write(&overflow, format!("{}\n", frames[2])).unwrap();
+        let script = format!(
+            "IFS= read -r execute; /bin/cat '{}'; IFS= read -r release; /bin/cat '{}'; IFS= read -r done",
+            prefix.display(),
+            overflow.display()
+        );
+        let process = AgentProcess::launch_raw_protocol_fixture(&script).unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, workload_id, process);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start,
+                },
+            )
+            .unwrap();
+        let mut drained = None;
+        for _ in 0..600 {
+            let poll = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_poll".to_string(),
+                        input: poll_frame(invocation_id),
+                    },
+                )
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&poll.output).unwrap();
+            if value["messages"].as_array().unwrap().len() == 2 {
+                drained = Some(value);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let drained = drained.expect("both valid prefix frames must drain before overflow release");
+        assert_eq!(drained["state"], "pending");
+        for message in drained["messages"].as_array().unwrap() {
+            assert!(matches!(
+                serde_json::from_value::<WorkbenchMessage>(message.clone()).unwrap(),
+                WorkbenchMessage::Progress { .. }
+            ));
+        }
+        let observed = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        runtime.processes[workload_id].install_pre_quiescence_barrier(
+            std::sync::Arc::clone(&observed),
+            std::sync::Arc::clone(&release),
+        );
+        runtime
+            .processes
+            .get_mut(workload_id)
+            .unwrap()
+            .send_protocol_line("fixture-release-overflow")
+            .unwrap();
+        observed.wait();
+        let before_quiescence = runtime.processes[workload_id].protocol_supervision_snapshot();
+        let pending = runtime.exec(
+            &handle,
+            NanoExecRequest {
+                operation: "workbench_poll".to_string(),
+                input: poll_frame(invocation_id),
+            },
+        );
+        release.wait();
+        assert!(before_quiescence.failure.is_none());
+        assert!(!before_quiescence.terminal_finalized);
+        assert!(!before_quiescence.process_reaped);
+        let pending: serde_json::Value = serde_json::from_str(&pending.unwrap().output).unwrap();
+        assert_eq!(pending["state"], "pending");
+        assert_eq!(pending["messages"].as_array().unwrap().len(), 2);
+        let closed = wait_for_autonomous_quiescence(&runtime, workload_id);
+        assert_eq!(
+            closed.failure,
+            Some(ProtocolSupervisionFailure::OutputLimitExceeded)
+        );
+        assert_safe_protocol_failure_replay(
+            &mut runtime,
+            &handle,
+            invocation_id,
+            NanoExecErrorCode::OutputLimitExceeded,
+            &"x".repeat(32),
+        );
+    }
+
+    #[test]
+    fn cumulative_output_limit_reader_first_waits_for_owned_quiescence() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2961";
+        let workload_id = "protocol-output-reader-first";
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
+        let frames = valid_cumulative_output_frames(invocation_id, &frame_digest(&start));
+        let observed = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let process =
+            AgentProcess::launch_protocol_fixture(&[&frames[0], &frames[1], &frames[2]]).unwrap();
+        process.install_pre_quiescence_barrier(
+            std::sync::Arc::clone(&observed),
+            std::sync::Arc::clone(&release),
+        );
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle = insert_protocol_process(&mut runtime, workload_id, process);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start,
+                },
+            )
+            .unwrap();
+        observed.wait();
+        let pending = runtime.processes[workload_id].protocol_supervision_snapshot();
+        let failure = runtime.processes[workload_id].protocol_start_failure();
+        release.wait();
+        assert_eq!(failure, Some(ProtocolSupervisionFailure::OutputLimitExceeded));
+        assert!(pending.failure.is_none());
+        assert!(!pending.terminal_finalized);
+        assert!(!pending.process_reaped);
+        let closed = wait_for_autonomous_quiescence(&runtime, workload_id);
+        assert_eq!(
+            closed.failure,
+            Some(ProtocolSupervisionFailure::OutputLimitExceeded)
+        );
+        assert_safe_protocol_failure_replay(
+            &mut runtime,
+            &handle,
+            invocation_id,
+            NanoExecErrorCode::OutputLimitExceeded,
+            &"x".repeat(32),
+        );
+    }
+
+    #[test]
+    fn malformed_output_below_limit_remains_invalid_frame_with_safe_replay() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2962";
+        let workload_id = "protocol-malformed-below-cap";
+        let private_sentinel = "private-fixture-value-must-not-escape";
+        let malformed = serde_json::json!({
+            "kind": "progress",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "stage": "running",
+            "padding": private_sentinel
+        })
+        .to_string();
+        assert!(malformed.len() < MAX_WORKBENCH_OUTPUT_BYTES);
+        assert!(serde_json::from_str::<WorkbenchMessage>(&malformed).is_err());
+        let script = format!(
+            "IFS= read -r execute; printf '%s\\n' '{}'; IFS= read -r done",
+            malformed
+        );
+        let process = AgentProcess::launch_raw_protocol_fixture(&script).unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle = insert_protocol_process(&mut runtime, workload_id, process);
         runtime
             .exec(
                 &handle,
@@ -5460,9 +5740,13 @@ mod tests {
                 },
             )
             .unwrap();
-        let error = poll_until_error(&mut runtime, &handle, invocation_id);
-        assert_exec_error(&error, NanoExecErrorCode::OutputLimitExceeded);
-        assert!(!error.to_string().contains(&"x".repeat(32)));
+        assert_safe_protocol_failure_replay(
+            &mut runtime,
+            &handle,
+            invocation_id,
+            NanoExecErrorCode::InvalidFrame,
+            private_sentinel,
+        );
     }
 
     #[test]
