@@ -402,11 +402,45 @@ mod tests {
         assert_eq!(report.mode, MonitoringMode::Userspace);
     }
 
+    #[cfg(not(feature = "ebpf"))]
     #[test]
     fn init_returns_userspace_without_feature() {
         // Without the ebpf feature, init() always returns Userspace
         // (even if kernel has capabilities, probes aren't compiled in).
         let result = init();
         assert_eq!(result.mode, MonitoringMode::Userspace);
+    }
+
+    #[cfg(feature = "ebpf")]
+    #[test]
+    fn init_mode_matches_loaded_probes_with_feature() {
+        let report = detect_capabilities();
+        // Capability detection alone does not prove that the kernel accepts
+        // these probes. Drop the independent load before exercising real init.
+        let probes_loadable = report.mode == MonitoringMode::Kernel && load_ebpf_probes().is_ok();
+        let result = init();
+        eprintln!(
+            "eBPF init: probe_load_preflight={probes_loadable}, mode={}",
+            result.mode
+        );
+        assert_eq!(result.probes.is_some(), result.mode == MonitoringMode::Kernel);
+        if probes_loadable {
+            assert_eq!(
+                result.mode,
+                MonitoringMode::Kernel,
+                "real init must retain kernel mode when the probes load successfully"
+            );
+        }
+        match result.probes {
+            Some(probes) => {
+                assert_eq!(result.mode, MonitoringMode::Kernel);
+                assert!(probes.agent_health.map("AGENT_HEALTH").is_some());
+                assert!(probes.io_profile.map("IO_STATS").is_some());
+                assert!(probes.network.map("TCP_EVENTS").is_some());
+            }
+            None => {
+                assert_eq!(result.mode, MonitoringMode::Userspace);
+            }
+        }
     }
 }
