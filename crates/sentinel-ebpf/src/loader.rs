@@ -423,7 +423,10 @@ mod tests {
             "eBPF init: probe_load_preflight={probes_loadable}, mode={}",
             result.mode
         );
-        assert_eq!(result.probes.is_some(), result.mode == MonitoringMode::Kernel);
+        assert_eq!(
+            result.probes.is_some(),
+            result.mode == MonitoringMode::Kernel
+        );
         if probes_loadable {
             assert_eq!(
                 result.mode,
