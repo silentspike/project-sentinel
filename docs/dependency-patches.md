@@ -35,10 +35,16 @@ It preserves the cache implementation and does not exempt any advisory.
 
 ### Wasmtime Cache Security Backport (#856)
 
-The vendored basis is the published `wasmtime-internal-cache` 49.0.4 archive,
-SHA-256 `96e4469e885ac50f8dc06337245f9905b22c68d55416267f9afd07f7f76687be`,
-with release source commit `2c2970205fe05d6bbf15b9bff6f1e67874b2db5c`.
+The vendored basis is the published `wasmtime-internal-cache` 49.0.5 archive,
+SHA-256 `85f1bafc5f2237c5fb6f8babc77b5db2eee8128766b8f1cfe52e771ebbcbed89`,
+with release source commit `805a0f15320e8836cf2b9f001b53d884bf866c89`.
 All Rust source, tests, the build script and VCS packaging metadata are unchanged.
+The direct Wasmtime and WASI pins move together to 49.0.5, the patched 49.x
+release for RUSTSEC-2026-0422, RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
+The cache is rebased on that published release, not renamed from an older
+package. This version update does not suppress advisories or change package-gate
+severity, integrity or scanner policy. The upstream 49.0.5 cache still declares
+zstd 0.13.0, so the bounded manifest backport remains necessary.
 `LICENSE` retains the exact Apache-2.0 WITH LLVM-exception text and copyright.
 The original 12,243-byte license, SHA-256
 `268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5`,
@@ -65,7 +71,7 @@ separate license EOF normalization. Original normalized manifest, license and
 lock bytes remain available for independent review.
 
 The unchanged upstream build script uses the enclosing Git HEAD and executable
-mtime when Git metadata is present, or package version 49.0.4 without mtime in
+mtime when Git metadata is present, or package version 49.0.5 without mtime in
 a Git-free source snapshot. Vendoring can therefore select a different cache
 namespace in those two build contexts. Source and functional compatibility do
 not establish identical warm-cache identity or cache-hit performance. Preserve
@@ -101,14 +107,14 @@ schema_version = 2
 id = "cargo-wasmtime-cache-zstd-security-856"
 ecosystem = "cargo"
 package = "wasmtime-internal-cache"
-version = "49.0.4"
+version = "49.0.5"
 kind = "PATCH_UPSTREAM"
 manifest = "Cargo.toml"
 override_key = "patch:Cargo.toml:crates-io:wasmtime-internal-cache"
 source = "path=vendor/wasmtime-internal-cache"
 reason = "Preserve the complete Wasmtime 49 cache while replacing the vulnerable zstd 0.13 dependency closure; manifest-only upstream backport, no API or security-policy waiver"
 evidence = "https://github.com/silentspike/project-sentinel/issues/856"
-upstream_basis = "Published wasmtime-internal-cache 49.0.4, SHA256 96e4469e885ac50f8dc06337245f9905b22c68d55416267f9afd07f7f76687be; release commit 2c2970205fe05d6bbf15b9bff6f1e67874b2db5c"
+upstream_basis = "Published wasmtime-internal-cache 49.0.5, SHA256 85f1bafc5f2237c5fb6f8babc77b5db2eee8128766b8f1cfe52e771ebbcbed89; release commit 805a0f15320e8836cf2b9f001b53d884bf866c89"
 diff_lines = 6
 upstream_pr = "https://github.com/bytecodealliance/wasmtime/pull/15003"
 owner = "component:runtime"

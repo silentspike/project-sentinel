@@ -79,7 +79,7 @@ class CargoOutdatedTests(unittest.TestCase):
         self.write("member/Cargo.toml", '[package]\nname = "member"\nversion = "1.0.0"\n')
         self.write("member/src/lib.rs", "pub fn member() {}\n")
         self.write("vendor/wasmtime-internal-cache/Cargo.toml",
-                   '[package]\nname = "wasmtime-internal-cache"\nversion = "49.0.4"\n')
+                   '[package]\nname = "wasmtime-internal-cache"\nversion = "49.0.5"\n')
         self.write("vendor/wasmtime-internal-cache/src/lib.rs", "pub fn authentic() {}\n")
         self.git("init", "-q")
         self.git("config", "user.name", "Fixture")
@@ -176,18 +176,26 @@ class CargoOutdatedTests(unittest.TestCase):
         self.assertFalse(self.record.exists())
 
     def test_patch_package_identity_and_ambiguous_serialization_reject(self):
-        self.write(caller.VENDOR + "/Cargo.toml", '[package]\nname = "other"\nversion = "49.0.4"\n')
+        self.write(caller.VENDOR + "/Cargo.toml", '[package]\nname = "other"\nversion = "49.0.5"\n')
         self.commit()
         result = self.invoke()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("identity changed", result.stderr)
         self.assertFalse(self.record.exists())
-        self.write(caller.VENDOR + "/Cargo.toml", '[package]\nname = "wasmtime-internal-cache"\nversion = "49.0.4"\n')
+        self.write(caller.VENDOR + "/Cargo.toml", '[package]\nname = "wasmtime-internal-cache"\nversion = "49.0.5"\n')
         self.write("Cargo.toml", MANIFEST + "\n# " + caller.ENTRY + "\n")
         self.commit()
         result = self.invoke()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ambiguous", result.stderr)
+
+    def test_previous_cache_version_cannot_satisfy_current_patch(self):
+        self.write(caller.VENDOR + "/Cargo.toml", '[package]\nname = "wasmtime-internal-cache"\nversion = "49.0.4"\n')
+        self.commit()
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("identity changed", result.stderr)
+        self.assertFalse(self.record.exists())
 
     def test_symlink_or_external_ancestor_cannot_supply_patch_bytes(self):
         path = self.source / caller.VENDOR / "src/lib.rs"
