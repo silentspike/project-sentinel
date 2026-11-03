@@ -102,7 +102,7 @@ def relocate_patch(root):
     vendor = root / VENDOR
     require(vendor.resolve(strict=True) == vendor and vendor.is_dir(), "patch target is missing or linked")
     package = tomllib.loads((vendor / "Cargo.toml").read_text())["package"]
-    require(package.get("name") == PATCH and package.get("version") == "49.0.4", "patch package identity changed")
+    require(package.get("name") == PATCH and package.get("version") == "49.0.5", "patch package identity changed")
     require(VENDOR in before["workspace"].get("exclude", []), "patch workspace membership changed")
     require(raw.count(ENTRY.encode()) == 1, "ambiguous patch serialization")
     replacement = f"{PATCH} = {{ path = {json.dumps(str(vendor))} }}".encode()
