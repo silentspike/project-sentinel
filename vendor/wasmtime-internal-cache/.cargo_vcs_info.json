@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "2c2970205fe05d6bbf15b9bff6f1e67874b2db5c"
+    "sha1": "805a0f15320e8836cf2b9f001b53d884bf866c89"
   },
   "path_in_vcs": "crates/cache"
 }

@@ -1,5 +1,9 @@
 # Changelog
 
+- Update Wasmtime/WASI to the patched 49.0.5 release while preserving the bounded
+  Zstd cache backport. Add advisory regressions and portable kernel/sandbox test
+  fixtures without changing production isolation requirements (#856).
+
 - Read workflow readiness facts from one validated SQL snapshot and retain only
   compact historical health metadata. Preserve full corruption and currentness
   checks, live provider/delivery outcomes, and guard-free external reads. Omit
