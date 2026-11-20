@@ -26,7 +26,7 @@ name: sentinel-demo
 
 services:
   nats:
-    image: nats:2.10-alpine
+    image: nats:2.15-alpine
     container_name: sentinel-demo-nats
     command: ["-c", "/etc/nats/nats.conf"]
     volumes:
