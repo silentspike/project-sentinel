@@ -1,7 +1,7 @@
 # Issue #75 Full-Cage Live Evidence
 
 Issue: `#75`
-Deployment VM: `ubuntu@10.0.0.240` (`sentinel-ubuntu-2404`)
+Deployment target: Ubuntu VM
 Release binary SHA-256: `ade509a933cb46bdd438f05a84ac346e743401132966819b42f651dfb928fa65`
 
 All Rust compilation and tests were run through `cargo remote -c --`. Runtime
@@ -28,7 +28,7 @@ unique_agent_netns=26 shared_with_daemon=0 loopback_only_agents=26
 All 26 network namespace inode values are pairwise distinct. Every namespace
 contains only `lo`; none shares the daemon namespace. The obsolete, memberless
 `br-sentinel` artifact had no configuration reference or attached link and was
-removed. Its `10.42.0.0/16` route disappeared with it; no veth or `vp-*` links
+removed. Its bridge subnet route disappeared with it; no veth or `vp-*` links
 remain.
 
 The 60-cage VM stress test exercises the same `BwrapConfig::for_agent` plus
@@ -159,7 +159,7 @@ VM with all 26 agents active; the thirty-minute soak captured the accompanying
 
 Both language editions already describe the accepted target correctly:
 
-- German SSOT: `/home/jan/togaf-llm-architecture-guide.html`
+- German SSOT: `$HOME/togaf-llm-architecture-guide.html`
 - English repository edition: `docs/architecture/togaf-architecture-guide.html`
 
 Each specifies `--unshare-all`, loopback-only agent cages, no `--share-net`, and
@@ -167,3 +167,5 @@ daemon-to-gateway proxying. No TOGAF edit was needed for this closeout. Stale
 public README, demo, governance, workshop, limitations, and example-policy text
 was aligned with that target, and the obsolete bridge/veth/nftables VM setup
 script was removed.
+
+Host addresses shown here use documentation addresses.

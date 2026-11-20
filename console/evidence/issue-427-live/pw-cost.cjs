@@ -3,15 +3,15 @@
 // localhost). CostView uses REST (apiJson GET /api/cost), so it works without WebTransport.
 const { chromium } = require("playwright");
 
-const OUT = "/work/company/ps-427-cost/console/evidence/issue-427-live";
+const path = require("node:path");
+const { runPrivateSmoke } = require("../private-browser-smoke.cjs");
 
-(async () => {
-  const browser = await chromium.launch({ headless: true });
+runPrivateSmoke(chromium, async ({ browser, key, output, url }) => {
   const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 2400, height: 1000 } });
   const page = await ctx.newPage();
-  await page.goto("https://localhost:8001/", { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.goto(url.href, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-  await page.getByTestId("login-key").fill(process.env.DKEY || "");
+  await page.getByTestId("login-key").fill(key);
   await page.getByTestId("login-submit").click();
   await page.waitForTimeout(2500);
 
@@ -28,16 +28,11 @@ const OUT = "/work/company/ps-427-cost/console/evidence/issue-427-live";
     .map((s) => s.trim()).filter((s) => s && s !== "0");
   const sparkPoints = await page.locator('[data-testid="cost-sparkline"] polyline').getAttribute("points");
 
-  await page.screenshot({ path: OUT + "/pw-cost-view.png", fullPage: true });
+  await page.screenshot({ path: path.join(output, "pw-cost-view.png"), fullPage: true });
 
   console.log("AGENT_ROWS=" + agentRows);
   console.log("TIER_ROWS=" + tierRows);
-  console.log("CACHE_READ_NONZERO=" + cacheReads.length + " sample=" + JSON.stringify(cacheReads.slice(0, 4)));
-  console.log("CACHE_CREATION_NONZERO=" + cacheCreations.length + " sample=" + JSON.stringify(cacheCreations.slice(0, 4)));
+  console.log("CACHE_READ_NONZERO=" + cacheReads.length);
+  console.log("CACHE_CREATION_NONZERO=" + cacheCreations.length);
   console.log("SPARKLINE_POINTS_LEN=" + ((sparkPoints || "").length));
-
-  await browser.close();
-})().catch((e) => {
-  console.error("ERR " + e.message);
-  process.exit(1);
-});
+}, { tunnelUrl: "https://localhost:8001/" });

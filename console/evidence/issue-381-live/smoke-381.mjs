@@ -1,31 +1,53 @@
-// Issue #381 live smoke: Profiling-Panel auf der Deploy-VM (https://10.0.0.240:8001).
+// Issue #381 live smoke: Profiling-Panel auf der Deploy-VM.
 // Ausfuehrung AUF der VM (playwright + chromium dort installiert), Muster issue-433-pr-d.
 //
-//   DASHBOARD_KEY=<operator-key> node smoke-381.mjs
+// Load BASE_URL and DASHBOARD_KEY from the private configuration before running.
 //
 // Schritte: Login -> Profiling-Panel oeffnen -> auf phase-row-persist warten
 // -> Screenshots (Panel + Fullpage). Screenshots werden von der Hauptsession
-// visuell gesichtet + funktional bedient (Maintainer-Regel) und hier committed.
+// visuell gesichtet und funktional bedient. Aufnahmen echter Deployments bleiben privat.
 
 import { chromium } from "playwright";
 import fs from "node:fs/promises";
 import path from "node:path";
 
 const key = process.env.DASHBOARD_KEY;
-if (!key) throw new Error("DASHBOARD_KEY is required");
+if (!key?.trim()) throw new Error("DASHBOARD_KEY is required");
 
-const baseUrl = process.env.BASE_URL ?? "https://10.0.0.240:8001";
+const baseUrl = process.env.BASE_URL;
+if (!baseUrl?.trim()) throw new Error("BASE_URL is required");
+let endpoint;
+try {
+  endpoint = new URL(baseUrl);
+} catch {
+  throw new Error("BASE_URL must be an HTTP or HTTPS URL");
+}
+if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password) {
+  throw new Error("BASE_URL must be an HTTP or HTTPS URL");
+}
 const outDir = process.env.OUT_DIR ?? "/tmp/issue-381-screens";
-const chromePath = process.env.CHROME_PATH
-  ?? "/home/ubuntu/.cache/ms-playwright/chromium-1223/chrome-linux64/chrome";
+const chromePath = process.env.CHROME_PATH || chromium.executablePath();
 
-await fs.mkdir(outDir, { recursive: true });
+try {
+  await fs.mkdir(outDir, { recursive: true, mode: 0o700 });
+  const output = await fs.lstat(outDir);
+  if (!output.isDirectory() || output.uid !== process.getuid() || (output.mode & 0o077)) {
+    throw new Error();
+  }
+} catch {
+  throw new Error("OUT_DIR must be a private directory owned by the current user");
+}
 
-const browser = await chromium.launch({
-  executablePath: chromePath,
-  headless: true,
-  args: ["--no-sandbox", "--disable-dev-shm-usage"],
-});
+let browser;
+try {
+  browser = await chromium.launch({
+    executablePath: chromePath,
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
+  });
+} catch {
+  throw new Error("Chromium could not start. Check the Playwright installation or CHROME_PATH.");
+}
 
 try {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
@@ -51,8 +73,10 @@ try {
   await page.screenshot({ path: path.join(outDir, "profiling-fullpage.png"), fullPage: true });
 
   const rows = await page.locator("[data-testid^=phase-row-]").count();
-  console.log(JSON.stringify({ ok: true, phase_rows: rows, out: outDir }));
-  if (rows < 10) throw new Error(`expected 10 phase rows, got ${rows}`);
+  if (rows < 10) throw new Error("Profiling panel has fewer than 10 phase rows");
+  console.log(JSON.stringify({ ok: true, phase_rows: rows }));
+} catch {
+  throw new Error("Profiling smoke failed. Verify the endpoint, operator access, and that the panel has at least 10 phase rows.");
 } finally {
   await browser.close();
 }

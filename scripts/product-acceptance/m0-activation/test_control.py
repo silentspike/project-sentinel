@@ -500,9 +500,11 @@ class ControlTests(unittest.TestCase):
         self.root = base / "project-sentinel-cdx1-650-activation" / str(uuid.uuid4())
         self.fixture = Fixture(self.root)
         self.runner = FakeRunner(self.fixture)
-        self.lock_patch = mock.patch.object(
-            control, "CONTROL_LOCK", self.root / ".m0-activation-control.lock"
-        )
+        self.lock = self.root / control.CONTROL_LOCK_BASENAME
+        self.lock_config = self.root / "activation-control.env"
+        self.lock_config.write_text(f"{control.CONTROL_LOCK_VARIABLE}={self.lock}\n", encoding="utf-8")
+        self.lock_config.chmod(0o600)
+        self.lock_patch = mock.patch.object(control, "CONTROL_LOCK_CONFIG", self.lock_config)
         self.lock_patch.start()
         self.environment_patch = mock.patch.dict(os.environ, {
             "OPERATOR_TOKEN": "operator-secret-value",
@@ -515,6 +517,26 @@ class ControlTests(unittest.TestCase):
         self.environment_patch.stop()
         self.lock_patch.stop()
         shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_lock_config_rejects_missing_and_group_readable_files(self) -> None:
+        self.lock_config.chmod(0o640)
+        with self.assertRaisesRegex(control.ControlError, "^activation_lock_config_file_unsafe$"):
+            with control.controller_lock():
+                self.fail("unsafe config allowed mutation")
+        self.lock_config.unlink()
+        with self.assertRaisesRegex(control.ControlError, "^activation_lock_config_file_unavailable$"):
+            with control.controller_lock():
+                self.fail("missing config allowed mutation")
+        self.assertFalse(self.lock.exists())
+
+    def test_lock_config_rejects_duplicate_and_relative_paths(self) -> None:
+        prefix = f"{control.CONTROL_LOCK_VARIABLE}="
+        self.lock_config.write_text(f"{prefix}{self.lock}\n{prefix}{self.lock}\n", encoding="utf-8")
+        with self.assertRaisesRegex(control.ControlError, "^activation_lock_config_invalid$"):
+            control.configured_control_lock()
+        self.lock_config.write_text(f"{prefix}{control.CONTROL_LOCK_BASENAME}\n", encoding="utf-8")
+        with self.assertRaisesRegex(control.ControlError, "^activation_lock_path_invalid$"):
+            control.configured_control_lock()
 
     def test_activation_success_starts_target_and_current_oneshots(self) -> None:
         result = self.fixture.activate(self.runner)

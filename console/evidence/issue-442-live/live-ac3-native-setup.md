@@ -1,7 +1,7 @@
 # AC-3 Native Setup Interview
 
 Date: 2026-07-18
-Node: `10.0.0.241`
+Node: `192.0.2.14`
 
 Command shape:
 
@@ -71,3 +71,5 @@ invalid_exit=1
 invalid_output=Error: GaiaSpec contains unknown fields: mission
 gaia_loop_active=active
 ```
+
+Host addresses shown here use documentation addresses.

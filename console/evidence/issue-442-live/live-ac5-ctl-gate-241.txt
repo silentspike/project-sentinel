@@ -1,4 +1,4 @@
-$ ssh ubuntu@10.0.0.241 <AC-5 sentinel-ctl mutation gate>
+$ ssh sentinel-lab-a <AC-5 sentinel-ctl mutation gate>
 before_task_events 0
 before_max_id 111433
 sentinel_ctl_exit=2
@@ -8,7 +8,7 @@ For more information, try '--help'.
 after_task_events 0
 after_max_id 111433
 recent_matching_task_events []
-$ ssh ubuntu@10.0.0.241 <AC-5 sentinel-ctl mutation gate valid args>
+$ ssh sentinel-lab-a <AC-5 sentinel-ctl mutation gate valid args>
 before_task_events 0
 before_max_id 111433
 sentinel_ctl_exit=2

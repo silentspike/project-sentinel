@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! Build (remote):  cargo remote -c -- build -p sentinel-limbo --release --bench dead_branch_gc
-//! Run (Deploy-VM): scp target/release/deps/dead_branch_gc-* ubuntu@10.0.0.240:/tmp/ && ./dead_branch_gc-*
+//! Run (Deploy-VM): scp target/release/deps/dead_branch_gc-* "${SENTINEL_DEPLOY_SSH_ALIAS}":/tmp/ && ./dead_branch_gc-*
 //!                  parallel mit Sidecars: vmstat 1 / iostat -x 1 / mpstat 1
 //! ```
 //!

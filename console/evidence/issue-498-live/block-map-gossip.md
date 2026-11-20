@@ -15,8 +15,8 @@ stream in 4b.
 ## Cluster
 
 Two dedicated test VMs (NOT the prod sim VM 1069):
-- node-0 `test-node-0` = 10.0.0.241 (seed), `control_bind 0.0.0.0:8085`, peer test-node-1
-- node-1 `test-node-1` = 10.0.0.242, peer test-node-0
+- node-0 `test-node-0` = 192.0.2.14 (seed), `control_bind 0.0.0.0:8085`, peer test-node-1
+- node-1 `test-node-1` = 192.0.2.15, peer test-node-0
 - pinned cert fingerprints exchanged out-of-band (V10) from the #496/#569 setup.
 
 #498 binary `sha256 5adde2ebffeb767a0e0ed644bcff47ff38675d2a50c08257b314323ace3b4c0c`
@@ -73,3 +73,5 @@ that is the byte path (4b). Register line: `sentinel-fs-distributed-cas (#498 4a
 Both test VMs now run the #498 binary (the build under review); the controlled test blob
 remains in node-0's CAS (harmless, uniquely named). Rollback binary at
 `/tmp/sentinel-daemon-pre498.bak` on each VM. VM 1069 (prod sim) was never touched.
+
+Host addresses shown here use documentation addresses.

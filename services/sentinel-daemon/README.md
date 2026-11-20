@@ -25,4 +25,4 @@ cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings
 cargo remote -c -- build -p sentinel-daemon --release
 ```
 
-Service changes require deploy-VM verification on `10.0.0.240` with the actual systemd `ExecStart` path checked before replacing binaries.
+Service changes require verification on the deployment VM with the actual systemd `ExecStart` path checked before replacing binaries.

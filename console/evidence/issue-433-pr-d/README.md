@@ -2,7 +2,7 @@
 
 Date: 2026-06-02
 Branch: feat/issue-433-pr-d-proxy-views
-VM: ubuntu@10.0.0.240
+VM: ubuntu@192.0.2.13
 
 ## Scope
 
@@ -65,3 +65,5 @@ After parity screenshots, the old Bun fallback was removed from source and then 
   - Control status: `Gateway offline`
   - Timetravel status: `166 Snapshots`
   - Snapshot detail panel rendered: yes
+
+Host addresses shown here use documentation addresses.

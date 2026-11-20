@@ -23,6 +23,6 @@ Worker PR scope: no TOGAF HTML edits and no `docs/gaia-console-architecture.md` 
 Update Cluster 04b / Gaia Console wording in both TOGAF copies, language-separated and fact-verified:
 
 - EN repo copy: `docs/architecture/togaf-architecture-guide.html`
-- DE SSOT copy: `/home/jan/togaf-llm-architecture-guide.html`
+- DE SSOT copy: `$HOME/togaf-llm-architecture-guide.html`
 
 The update should describe Gaia Console readiness as token-free/subscription-and-scan based, and explicit Deep/Setup sessions as safe-mode, admission-controlled, budget/timeout-capped native Claude Code invocations initiated by an authenticated operator. Live accepted-session costs were USD 0.0206505 for the two-turn Deep/resume flow, USD 0.0197928 for complete Setup generation, and USD 0.004407 for the dashboard stream proof.

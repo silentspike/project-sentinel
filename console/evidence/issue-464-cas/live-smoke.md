@@ -1,7 +1,7 @@
 # Issue #464 Live Evidence
 
 Date: 2026-06-02
-Target: `ubuntu@10.0.0.240`, dashboard backend on `https://127.0.0.1:8001`
+Target: `ubuntu@192.0.2.13`, dashboard backend on `https://127.0.0.1:8001`
 
 ## WebTransport CAS Smoke
 
@@ -50,3 +50,5 @@ health_service=inactive
 ```
 
 No panic lines were found in `sentinel-dashboard-backend` journal after the live smoke. Gateway/Prometheus degradation warnings were expected because the token-sensitive upstream services stayed inactive.
+
+Host addresses shown here use documentation addresses.

@@ -866,10 +866,7 @@ class TopologyTests(unittest.TestCase):
             self.assertNotIn("After=sentinel.target", text)
         self.assertNotIn("ExecCondition=", health_service)
         self.assertIn("After=nats-server.service sentinel-daemon.service", health_service)
-        self.assertIn(
-            "ReadWritePaths=/opt/sentinel/data /work/tmp/project-sentinel",
-            health_service,
-        )
+        self.assertIn("ReadWritePaths=/opt/sentinel/data\n", health_service)
         self.assertIn("After=nats-server.service sentinel-daemon.service", health_timer)
         self.assertIn("After=sentinel-daemon.service", nightrun_timer)
         self.assertNotIn("Requires=sentinel-daemon.service", nightrun_timer)
@@ -909,29 +906,11 @@ check_service nats nats-server.service nats '' '' 5 observe
         self.assertEqual(result.stdout.splitlines(), ["restart:sentinel-judge.service"])
 
     def test_health_monitor_restart_and_activation_are_mutually_exclusive(self) -> None:
-        source = (REPO_ROOT / "deploy/scripts/sentinel-health-monitor.sh").read_text(
-            encoding="utf-8"
-        )
-        activation_control = (
-            REPO_ROOT / "scripts/product-acceptance/m0-activation/control.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn('SAFE_ROOT = Path("/work/tmp/project-sentinel")', activation_control)
-        self.assertIn(
-            'CONTROL_LOCK = SAFE_ROOT / ".m0-activation-control.lock"',
-            activation_control,
-        )
+        script = REPO_ROOT / "deploy/scripts/sentinel-health-monitor.sh"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             root.chmod(0o700)
             lock = root / ".m0-activation-control.lock"
-            script = root / "sentinel-health-monitor.sh"
-            rendered = source.replace(
-                'readonly ACTIVATION_CONTROL_LOCK="/work/tmp/project-sentinel/.m0-activation-control.lock"',
-                f'readonly ACTIVATION_CONTROL_LOCK="{lock}"',
-            )
-            self.assertNotEqual(rendered, source)
-            script.write_text(rendered, encoding="utf-8")
-            script.chmod(0o700)
 
             descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
             try:
@@ -941,6 +920,7 @@ check_service nats nats-server.service nats '' '' 5 observe
                         "/bin/bash",
                         "-c",
                         f'''source "{script}"
+resolve_activation_lock() {{ printf "%s\n" "{lock}"; }}
 log_info() {{ :; }}
 log_error() {{ printf 'error:%s\n' "$*"; }}
 systemctl() {{ printf 'unexpected-restart\n'; }}
@@ -967,10 +947,11 @@ printf 'count:%s\n' "${{CURR_RESTARTS[daemon]:-0}}"
                     "/bin/bash",
                     "-c",
                     f'''source "{script}"
+resolve_activation_lock() {{ printf "%s\n" "{lock}"; }}
 log_info() {{ :; }}
 log_error() {{ printf 'error:%s\n' "$*"; }}
 systemctl() {{
-    if flock --exclusive --nonblock "$ACTIVATION_CONTROL_LOCK" -c true; then
+    if flock --exclusive --nonblock "{lock}" -c true; then
         printf 'controller:acquired\n'
     else
         printf 'controller:blocked\n'

@@ -1,6 +1,6 @@
 # #497 — per-container snapshot/restore: 2-VM AC-5 + benchmark (live evidence)
 
-**Date:** 2026-06-26 · **Test cluster:** node-0 `10.0.0.241` / node-1 `10.0.0.242` (VM1071/1072, i5-1235U-class, 2 vCPU, Ubuntu 24.04). **VM 1069 (prod) untouched.** Build only `cargo remote -c --` (.155); the harness binary is standalone (`crates/sentinel-ecs/src/bin/per_container_transfer.rs`), it builds its own fresh world and never touches the running daemon/redb.
+**Date:** 2026-06-26 · **Test cluster:** node-0 `192.0.2.14` / node-1 `192.0.2.15` (VM1071/1072, i5-1235U-class, 2 vCPU, Ubuntu 24.04). **VM 1069 (prod) untouched.** Build only `cargo remote -c --` (.155); the harness binary is standalone (`crates/sentinel-ecs/src/bin/per_container_transfer.rs`), it builds its own fresh world and never touches the running daemon/redb.
 
 ## Scope (honest)
 
@@ -41,4 +41,6 @@ Sidecar `vmstat` during the run: r≈0, us 0–2 %, id 98–100 % (the per-agent
 - **µs-class** snapshot (p50 ≈ 2 µs) and restore (p50 ≈ 7–8 µs).
 - **Size-stable across the tick sweep:** the ECS-native per-agent component set is *fixed-size*, so ticking drifts values but not size. A true memory-size sweep would require growing the bounded `EventQueue`/`Relationships`; for the Track-A bounded class these stay small. The realistic per-agent figure is ~1.8 KB.
 
-Register: `sentinel-daemon-per-container-transfer (#497)` in `/work/company/BENCHMARK-REGISTER.md`.
+Register: `sentinel-daemon-per-container-transfer (#497)` in the private benchmark register.
+
+Host addresses shown here use documentation addresses.

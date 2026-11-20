@@ -1,7 +1,7 @@
 # Issue #442 Gaia Console Readiness Idle Benchmark
 
 Date: 2026-07-18
-Node: `ubuntu@10.0.0.241`
+Node: `ubuntu@192.0.2.14`
 
 The benchmark ran directly on the test VM, never through `cargo remote`. `.240`
 was not contacted. The readiness service remained active and no explicit Gaia
@@ -10,7 +10,7 @@ session was submitted during the measurement.
 Command:
 
 ```bash
-ssh ubuntu@10.0.0.241 'bash -s' <<'EOF'
+ssh ubuntu@192.0.2.14 'bash -s' <<'EOF'
 out=/tmp/issue442-idle-1h.tsv
 printf 'sample\tepoch_s\tpid\tcpu_ticks\trss_kb\tclaude_count\n' > "$out"
 for sample in $(seq 0 60); do
@@ -89,3 +89,5 @@ failed_pre_fix_diagnostic_cost_usd=0.0642571
 
 The failed pre-fix diagnostic is reported for cost transparency and excluded
 from accepted-session benchmark metrics.
+
+Host addresses shown here use documentation addresses.

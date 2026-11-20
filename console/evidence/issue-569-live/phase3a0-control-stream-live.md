@@ -1,6 +1,6 @@
 # #569 Phase 3a0 — QUIC Control Stream, Live 2-Node Verification (2026-06-25)
 
-**Cluster:** node-0 (10.0.0.241, `4026ff7a…`) + node-1 (10.0.0.242, `72d2f8b3…`), control stream on `:8085` (QUIC/UDP). Each node persists its control cert (stable fingerprint across restarts). Pins exchanged out-of-band into each node's `[daemon.cluster].control_peers`.
+**Cluster:** node-0 (192.0.2.14, `4026ff7a…`) + node-1 (192.0.2.15, `72d2f8b3…`), control stream on `:8085` (QUIC/UDP). Each node persists its control cert (stable fingerprint across restarts). Pins exchanged out-of-band into each node's `[daemon.cluster].control_peers`.
 
 ## AC-by-AC (Operator API `POST /operator/control/query` → cross-host QUIC RPC)
 
@@ -15,10 +15,12 @@
 | cert persistence | PASS | fingerprints `4026ff7a`/`72d2f8b3` stable across the multiple restarts in this run |
 | unknown peer reject | PASS | unknown `peer_alias` → `{"error":"unknown control peer …"}` |
 
-## Bench (→ /work/company/BENCHMARK-REGISTER.md)
+## Bench (→ privates Benchmark-Register)
 Cross-host RefQuery, 20 runs, distinct keys: **p50=7.2ms, p95=7.4ms, max=7.4ms** (incl. operator HTTP + fresh QUIC connection per RPC; connection-reuse = Track-G optimization).
 
 ## Notes
 - In-process integration test (part 2) covers the wrong-cert reject in BOTH directions rigorously; this run confirms it live cross-host plus the happy path + idempotency.
 - Peer-pin distribution is manual/config here (out-of-band, like the SSH host-key pin); automatic cert distribution via membership is Track-D2.
 - Handlers are the `StubHandler` (referenced/pinned=false); the real owner/GC answers come from #496/#499.
+
+Host addresses shown here use documentation addresses.

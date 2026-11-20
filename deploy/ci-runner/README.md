@@ -8,7 +8,7 @@ kept the runner cgroup busy -> node-reboot required, plus 136G of accumulated Co
 
 > Part A (this directory + the runbook) is repo-feasible and ships in the PR.
 > The **live migration** of CT 150 to ephemeral runners is Part B (manual ops on
-> Proxmox 10.0.0.106) and is tracked step-by-step in `docs/ci-runner-runbook.md`.
+> Proxmox 192.0.2.10) and is tracked step-by-step in `docs/ci-runner-runbook.md`.
 > Issue #435 stays open until Part B is verified.
 
 ## Files
@@ -68,3 +68,5 @@ versioned directory (the PR is fully reviewable without secrets).
 - `.github/workflows/*.yml` -- every workflow already carries the `RUNNER_MODE` switch
   (`runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}`),
   so `RUNNER_MODE=hosted` is a working emergency fallback for the whole CI matrix.
+
+Host addresses shown here use documentation addresses.

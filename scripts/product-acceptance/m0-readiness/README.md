@@ -26,3 +26,26 @@ unit after `sentinel.target`, which avoids a target dependency cycle.
 This source phase performs no deployment or runtime verification. The later
 authorized `.240` run supplies systemd credentials and exercises the installed
 helper through the activation controller.
+
+### Activation lock configuration
+
+Before activation, install `/etc/sentinel/activation-control.env` as a regular
+root-owned file with mode `0600`. Use one literal assignment with an absolute
+path, for example:
+
+```dotenv
+SENTINEL_ACTIVATION_CONTROL_LOCK=/opt/sentinel/.m0-activation-control.lock
+```
+
+The activation controller creates and locks this file. The health monitor
+resolves the same path through the controller and opens the existing lock
+read-only for its shared lock. A missing or unsafe configuration prevents
+activation and automatic restarts. Health observations continue.
+
+For an upgrade, configure the path to the lock from the installed release
+before changing either component. Keep that lock inode throughout the
+transition. Update the controller first and verify that `lock-path` resolves
+to the existing lock. Then install the updated health monitor and its unit
+and reload systemd. To change the lock location later, stop the monitor
+timer and wait for both the controller and health monitor to finish before
+switching the configuration.

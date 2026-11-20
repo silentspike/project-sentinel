@@ -171,7 +171,7 @@ pub struct ControlPeer {
     pub node_id: NodeId,
     /// Human-readable alias of the peer node.
     pub alias: String,
-    /// The peer's control-stream socket address (e.g. `"10.0.0.242:8085"`).
+    /// The peer's control-stream socket address (e.g. `"192.0.2.10:8085"`).
     pub addr: String,
     /// The peer's SHA-256 cert fingerprint (64-hex), pinned out-of-band (V10).
     pub cert_fingerprint: String,

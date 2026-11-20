@@ -178,7 +178,7 @@ mod tests {
     fn allow(id: &str, expires_at: i64) -> PendingBareNode {
         PendingBareNode {
             pending_target_id: id.into(),
-            target_ip: "10.0.0.242".into(),
+            target_ip: "192.0.2.242".into(),
             expected_host_key: "ssh-ed25519 AAAA...".into(),
             expected_image_id: None,
             expected_hostname: None,
@@ -245,7 +245,7 @@ mod tests {
             validate_pending_target(&list, "bare-1", 1_000)
                 .unwrap()
                 .target_ip,
-            "10.0.0.242"
+            "192.0.2.242"
         );
         // Unknown target → rejected (host never from the request).
         assert_eq!(

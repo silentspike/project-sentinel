@@ -187,7 +187,7 @@ class Fixture:
 
 class ReleasePackageTests(unittest.TestCase):
     def setUp(self) -> None:
-        runner_temp = Path(os.environ.get("RUNNER_TEMP", "/work/tmp/project-sentinel/cdx3-650-release"))
+        runner_temp = Path(os.environ.get("RUNNER_TEMP", "/work/tmp/project-sentinel/test-release-package"))
         runner_temp.mkdir(mode=0o700, parents=True, exist_ok=True)
         runner_temp.chmod(0o700)
         self.case = runner_temp / f"release-{uuid.uuid4()}"

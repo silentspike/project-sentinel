@@ -2,14 +2,14 @@
 
 Dates: 2026-06-27 and 2026-07-18
 
-Rust build, test, and clippy verification was executed on the remote build host `root@10.0.0.155` through `cargo remote`.
+Rust build, test, and clippy verification was executed on the remote build host `root@192.0.2.12` through `cargo remote`.
 
 ## sentinel-gaia-loop Tests
 
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-gaia-loop
 ```
 
 Output excerpt:
@@ -32,7 +32,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop -p sentinel-dashboard-backend
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-gaia-loop -p sentinel-dashboard-backend
 ```
 
 Output excerpt:
@@ -53,7 +53,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
 ```
 
 Output excerpt:
@@ -69,7 +69,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-gaia-loop -p sentinel-dashboard-backend -p sentinel-gaia -p sentinel-ctl --release
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build -p sentinel-gaia-loop -p sentinel-dashboard-backend -p sentinel-gaia -p sentinel-ctl --release
 ```
 
 Output excerpt:
@@ -110,7 +110,7 @@ Live native-client tests exposed three integration requirements that fake proces
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-gaia-loop
 ```
 
 Output excerpt:
@@ -130,7 +130,7 @@ data, and removing an unused turn-count setting, the affected remote suites were
 rerun:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-gaia-loop
 ```
 
 Output:
@@ -147,7 +147,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop -p sentinel-dashboard-backend
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-gaia-loop -p sentinel-dashboard-backend
 ```
 
 Output excerpt:
@@ -193,7 +193,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build --release -p sentinel-gaia-loop
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build --release -p sentinel-gaia-loop
 ```
 
 Output excerpt:
@@ -208,7 +208,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
 ```
 
 Output excerpt:
@@ -229,7 +229,7 @@ The LLM-facing inline JSON path rejects unknown top-level, department, and cultu
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia --test cli
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-gaia --test cli
 ```
 
 Output:
@@ -255,7 +255,7 @@ CARGO_REMOTE_EXIT=0
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-dashboard-backend gaia
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-dashboard-backend gaia
 ```
 
 Output excerpt:
@@ -278,7 +278,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-gaia-loop -p sentinel-dashboard-backend -p sentinel-ctl -p sentinel-gaia --release
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build -p sentinel-gaia-loop -p sentinel-dashboard-backend -p sentinel-ctl -p sentinel-gaia --release
 ```
 
 Output excerpt:
@@ -294,7 +294,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
 ```
 
 Output excerpt:
@@ -327,7 +327,7 @@ After live target inspection showed that `.241/.242` do not have `nats-server` i
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-gaia-loop
 ```
 
 Output excerpt:
@@ -351,7 +351,7 @@ Live AC-1 on `.241` exposed that a fresh readiness service could lag behind a la
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-gaia-loop
 ```
 
 Output excerpt:
@@ -376,7 +376,7 @@ Live AC-3 exposed that `sentinel-gaia init --output-dir config --daemon-dry-run`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia -p sentinel-gaia-loop
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-gaia -p sentinel-gaia-loop
 ```
 
 Output excerpt:
@@ -399,7 +399,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-gaia -p sentinel-ctl -p sentinel-gaia-loop --release
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build -p sentinel-gaia -p sentinel-ctl -p sentinel-gaia-loop --release
 ```
 
 Output excerpt:
@@ -413,7 +413,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
 ```
 
 Output excerpt:
@@ -427,7 +427,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-gaia-loop --release
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build -p sentinel-gaia-loop --release
 ```
 
 Output excerpt:
@@ -441,7 +441,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
 ```
 
 Output excerpt:
@@ -455,7 +455,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-gaia-loop --release
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build -p sentinel-gaia-loop --release
 ```
 
 Output excerpt:
@@ -469,7 +469,7 @@ Exit status: `0`
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
 ```
 
 Output excerpt:
@@ -492,3 +492,5 @@ Output:
 ```
 
 Exit status: `0`
+
+Host addresses shown here use documentation addresses.

@@ -14,8 +14,8 @@
 //! ```text
 //! Build (remote):  cargo remote -c -- build -p sentinel-fs --release --bench cas_manifest_savings
 //! Run (idle bench VM .241/.242 — NEVER .240/VM1069 prod-sim, NEVER cargo remote):
-//!   scp target/release/deps/cas_manifest_savings-* ubuntu@10.0.0.241:/tmp/
-//!   ssh ubuntu@10.0.0.241 '/tmp/cas_manifest_savings-*'   # parallel: vmstat 1 / mpstat 1 / iostat -x 1
+//!   scp target/release/deps/cas_manifest_savings-* "${SENTINEL_DEPLOY_SSH_ALIAS}":/tmp/
+//!   ssh "${SENTINEL_DEPLOY_SSH_ALIAS}" '/tmp/cas_manifest_savings-*'   # parallel: vmstat 1 / mpstat 1 / iostat -x 1
 //! ```
 
 use std::collections::HashSet;

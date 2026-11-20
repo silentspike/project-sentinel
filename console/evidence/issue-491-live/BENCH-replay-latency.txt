@@ -33,5 +33,5 @@ gives coarser slider granularity. A dedicated fresh-first-hour rig was not run b
 latency is restore-dominated and range-insensitive — the storage table above is the decision
 input. (First-hour *event* retention that keeps the window replayable = #250.)
 
-(d) Internal register: see /work/company/BENCHMARK-REGISTER.md line
+(d) Internal register: see the private benchmark register line
     "sentinel-daemon-arbitrary-replay (#491)".

@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! Build (remote):  cargo remote -c -- build -p sentinel-fs --release --bench snapshot_pin_gc
-//! Run (Deploy-VM): scp target/release/deps/snapshot_pin_gc-* ubuntu@10.0.0.240:/tmp/ && ./snapshot_pin_gc-*
+//! Run (Deploy-VM): scp target/release/deps/snapshot_pin_gc-* "${SENTINEL_DEPLOY_SSH_ALIAS}":/tmp/ && ./snapshot_pin_gc-*
 //!                  parallel mit Sidecars: vmstat 1 / iostat -x 1 / mpstat 1
 //! ```
 //!

@@ -808,7 +808,7 @@ mod tests {
     fn pending(id: &str, host_key: &str) -> PendingBareNode {
         PendingBareNode {
             pending_target_id: id.into(),
-            target_ip: "10.0.0.242".into(),
+            target_ip: "192.0.2.242".into(),
             expected_host_key: host_key.into(),
             expected_image_id: None,
             expected_hostname: None,
@@ -1012,11 +1012,11 @@ mod tests {
             alias: "test-node-1".into(),
             cluster_id: Uuid::new_v4(),
             target_control_bind: "0.0.0.0:8085".into(),
-            target_control_addr: "10.0.0.242:8085".into(),
+            target_control_addr: "192.0.2.242:8085".into(),
             seed_peer: ControlPeer {
                 node_id: NodeId::new(),
                 alias: "test-node-0".into(),
-                addr: "10.0.0.241:8085".into(),
+                addr: "192.0.2.241:8085".into(),
                 cert_fingerprint:
                     "2222222222222222222222222222222222222222222222222222222222222222".into(),
             },
@@ -1404,7 +1404,7 @@ mod tests {
         assert!(toml.contains("control_bind = \"0.0.0.0:8085\""));
         assert!(toml.contains("[[daemon.cluster.control_peers]]"));
         assert!(toml.contains(&format!("node_id = \"{}\"", plan.seed_peer.node_id)));
-        assert!(toml.contains("addr = \"10.0.0.241:8085\""));
+        assert!(toml.contains("addr = \"192.0.2.241:8085\""));
         assert!(toml.contains(&plan.seed_peer.cert_fingerprint));
         assert!(!toml.contains("seed_endpoint"));
         // It must parse back as a valid daemon cluster config.

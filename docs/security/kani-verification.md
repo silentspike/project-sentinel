@@ -9,7 +9,7 @@ Status: baseline for issue #393.
 Kani is intentionally not assumed to be part of a normal Rust toolchain. The
 verified build-server preflight for this baseline is:
 
-- Host: `10.0.0.155`
+- Host role: Rust build service
 - `cargo-kani 0.67.0`
 - `CBMC 6.8.0`
 - A trivial smoke harness completed with `VERIFICATION:- SUCCESSFUL`.

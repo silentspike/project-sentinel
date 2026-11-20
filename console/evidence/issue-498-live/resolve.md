@@ -9,10 +9,10 @@ hit with no extra pull. Builds on 4b's byte path (#601) and 4a's block map (#597
 ## Cluster
 
 Same two dedicated test VMs (NOT the prod sim VM 1069), now running the **#498 4c daemon**:
-- node-0 `sentinel-test-node-0` = 10.0.0.241 (seed, holder), control `:8085`, block-pull `:8086`,
+- node-0 `sentinel-test-node-0` = 192.0.2.14 (seed, holder), control `:8085`, block-pull `:8086`,
   control fingerprint `4026ff7a2f0ab2c6a4bd8b30b286e36ac23f9d918a29cee982ade65c056311b8` (unchanged
   across the redeploy — the cert is persisted, so the probe's pin still matches).
-- node-1 `sentinel-test-node-1` = 10.0.0.242 (puller), presents its control cert (pinned by node-0).
+- node-1 `sentinel-test-node-1` = 192.0.2.15 (puller), presents its control cert (pinned by node-0).
 
 #498 4c daemon `sha256 92024d0db08481a8b28e4e76ae80051af5810cb7de39c1a47e69715fe96d28ba`,
 probe `sha256 d4f5261016cdb2b328da99415032f8eebd5ab721d39852ecec10a16d4d0ff478`, both scp'd +
@@ -42,7 +42,7 @@ design), verifies + durably stores, and the read retries against the now-local s
 
 ```
 # node-1 (.242), dest /tmp/probe-resolve-dest starts non-existent (guaranteed empty):
-$ sudo block_pull_probe resolve 10.0.0.241:8086 4026ff7a…311b8 14d5…81ec 52 /opt/sentinel/data /tmp/probe-resolve-dest
+$ sudo block_pull_probe resolve 192.0.2.14:8086 4026ff7a…311b8 14d5…81ec 52 /opt/sentinel/data /tmp/probe-resolve-dest
 RESOLVE ok: hash=14d5…81ec content_len=52 cached_before=false pulls=1
 SECOND-READ content_len=52 pulls=1 (no extra pull)
 # the resolved blob is durable on node-1:
@@ -66,3 +66,5 @@ Both test VMs run the #498 4c daemon (under review); the resolved blob remains i
 throwaway `/tmp/probe-resolve-dest` (not the daemon CAS). Rollback binary at
 `/tmp/sentinel-daemon-pre4c.bak` on each VM. VM 1069 (prod sim) was never touched.
 Register line: `sentinel-fs-distributed-cas-pull (#498 4c read-path resolution)`.
+
+Host addresses shown here use documentation addresses.

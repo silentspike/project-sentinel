@@ -3,15 +3,15 @@
 // (apiJson GET /api/config/agents), so it works without WebTransport.
 const { chromium } = require("playwright");
 
-const OUT = "/work/company/ps-424-org-chart/console/evidence/issue-424-live";
+const path = require("node:path");
+const { runPrivateSmoke } = require("../private-browser-smoke.cjs");
 
-(async () => {
-  const browser = await chromium.launch({ headless: true });
+runPrivateSmoke(chromium, async ({ browser, key, output, url }) => {
   const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1600, height: 1000 } });
   const page = await ctx.newPage();
-  await page.goto("https://localhost:8001/", { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.goto(url.href, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-  await page.getByTestId("login-key").fill(process.env.DKEY || "");
+  await page.getByTestId("login-key").fill(key);
   await page.getByTestId("login-submit").click();
   await page.waitForTimeout(2500);
 
@@ -31,7 +31,7 @@ const OUT = "/work/company/ps-424-org-chart/console/evidence/issue-424-live";
   const tiers = (await page.locator('[data-testid="org-tier"]').allTextContents()).map((s) => s.trim());
   const dashCount = tiers.filter((t) => t.includes("—")).length;
 
-  await page.screenshot({ path: OUT + "/pw-org-chart.png", fullPage: true });
+  await page.screenshot({ path: path.join(output, "pw-org-chart.png"), fullPage: true });
 
   // AC-3: click the first agent node -> Agent Editor opens pre-selected. Measure click->editor latency.
   const firstNode = page.locator('[data-testid="org-agent-node"]').first();
@@ -46,19 +46,13 @@ const OUT = "/work/company/ps-424-org-chart/console/evidence/issue-424-live";
     { timeout: 15000 },
   );
   const clickMs = Date.now() - c0;
-  const preselected = await page.locator('[data-testid="ae-select"]').inputValue();
 
-  await page.screenshot({ path: OUT + "/pw-org-chart-editor.png", fullPage: true });
+  await page.screenshot({ path: path.join(output, "pw-org-chart-editor.png"), fullPage: true });
 
   console.log("AGENT_NODES=" + agentNodes);
   console.log("DEPT_COUNT=" + deptCount + " ROLE_COUNT=" + roleCount);
   console.log("TIER_DASH_COUNT=" + dashCount + " of " + tiers.length);
   console.log("RENDER_MS=" + renderMs);
   console.log("CLICK_TO_EDITOR_MS=" + clickMs);
-  console.log("EDITOR_PRESELECTED_ID=" + preselected);
-
-  await browser.close();
-})().catch((e) => {
-  console.error("ERR " + e.message);
-  process.exit(1);
-});
+  console.log("EDITOR_PRESELECTED=true");
+}, { tunnelUrl: "https://localhost:8001/" });

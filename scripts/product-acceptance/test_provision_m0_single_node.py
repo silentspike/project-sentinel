@@ -160,9 +160,9 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
     def setUp(self) -> None:
         runner_root = os.environ.get("RUNNER_TEMP")
         if runner_root:
-            parent = Path(runner_root) / "project-sentinel-cdx1-650-provision-tests"
+            parent = Path(runner_root) / "project-sentinel-test-provision-single-node"
         else:
-            parent = Path("/work/tmp/project-sentinel/cdx1-650-provision-tests")
+            parent = Path("/work/tmp/project-sentinel/test-provision-single-node")
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         parent.chmod(0o700)
         self.case = parent / str(uuid.uuid4())

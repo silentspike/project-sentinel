@@ -1,7 +1,7 @@
 # Issue #433 PR-B Push Views Evidence
 
 Date: 2026-06-02
-VM: `ubuntu@10.0.0.240`
+VM: `ubuntu@192.0.2.13`
 Branch: `feat/issue-433-pr-b-push-views`
 
 ## Scope
@@ -93,3 +93,5 @@ The first new screenshot pass found and fixed three UI issues before this eviden
 - Agents progress showed `231%` when `agent_live` contained 60 rows.
 - Metrics showed raw epoch bucket text.
 - Cockpit SLO/incident layout clipped in narrow tiles.
+
+Host addresses shown here use documentation addresses.

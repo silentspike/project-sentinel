@@ -739,7 +739,7 @@ mod tests {
 
     #[test]
     fn pull_addr_is_control_port_plus_one() {
-        let ctrl: SocketAddr = "10.0.0.242:8085".parse().unwrap();
+        let ctrl: SocketAddr = "192.0.2.242:8085".parse().unwrap();
         let pull = pull_addr_of(ctrl);
         assert_eq!(pull.port(), 8086, "block-pull rides control port + 1");
         assert_eq!(pull.ip(), ctrl.ip(), "same host");
@@ -790,8 +790,8 @@ mod tests {
         let peer = ResolvedPeer {
             node_id,
             alias: "node-2".into(),
-            addr: "10.0.0.243:8085".parse().unwrap(),
-            pull_addr: "10.0.0.243:8086".parse().unwrap(),
+            addr: "192.0.2.243:8085".parse().unwrap(),
+            pull_addr: "192.0.2.243:8086".parse().unwrap(),
             fingerprint: CertFingerprint([7; 32]),
         };
         let peers = BTreeMap::from([(node_id, peer.clone())]);

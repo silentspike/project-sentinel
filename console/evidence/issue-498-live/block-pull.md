@@ -7,9 +7,9 @@ read paths + single-flight/negative-cache is PR3 (4c). Builds on 4a's block map 
 ## Cluster
 
 Two dedicated test VMs (NOT the prod sim VM 1069), stacked-4b daemon:
-- node-0 `test-node-0` = 10.0.0.241 (seed), control `:8085`, **block-pull `:8086`**,
+- node-0 `test-node-0` = 192.0.2.14 (seed), control `:8085`, **block-pull `:8086`**,
   control fingerprint `4026ff7a2f0ab2c6a4bd8b30b286e36ac23f9d918a29cee982ade65c056311b8`
-- node-1 `test-node-1` = 10.0.0.242, presents its control cert (pinned by node-0).
+- node-1 `test-node-1` = 192.0.2.15, presents its control cert (pinned by node-0).
 
 #498 4b daemon `sha256 68ad2fcac8604f0c4b7b92e083055f6f856d326a3e0bd965bdca72a6bfc48f1b`,
 probe `sha256 e36d4d8417b58cb46899535b18cbd64287edadcecc2c0ecab52e781bb003e1b0`, both scp'd +
@@ -26,7 +26,7 @@ disk = 1 prefix + 52 raw).
 
 ```
 # node-1 (.242):
-$ block_pull_probe pull 10.0.0.241:8086 4026ff7a…311b8 14d5…81ec 52 /opt/sentinel/data /tmp/probe-dest
+$ block_pull_probe pull 192.0.2.14:8086 4026ff7a…311b8 14d5…81ec 52 /opt/sentinel/data /tmp/probe-dest
 PULL ok: hash=14d5…81ec wire_bytes=53 verified+durable=true cached_before=false
 SECOND-READ local_hit=true (no pull needed)
 # the pulled blob is durable on node-1:
@@ -42,7 +42,7 @@ the content was SHA-256-verified and durably published; a second read is a local
 `block_pull_probe integrity` pulls the real bytes, flips one content byte, then verifies:
 
 ```
-$ block_pull_probe integrity 10.0.0.241:8086 4026ff7a…311b8 14d5…81ec 52 /opt/sentinel/data
+$ block_pull_probe integrity 192.0.2.14:8086 4026ff7a…311b8 14d5…81ec 52 /opt/sentinel/data
 INTEGRITY ok: corrupt blob rejected, not published: pulled blob digest mismatch:
   got efabea8f…5090d9 want 14d5…81ec — rejected, not published
 ```
@@ -56,7 +56,7 @@ Durable publish is shown by AC-2 (`verified+durable=true`, the blob lands on dis
 fsync(file) → atomic rename → fsync(dir)). Pull-by-hash latency, 200 cross-host iters:
 
 ```
-$ block_pull_probe bench 10.0.0.241:8086 4026ff7a…311b8 14d5…81ec 52 /opt/sentinel/data 200
+$ block_pull_probe bench 192.0.2.14:8086 4026ff7a…311b8 14d5…81ec 52 /opt/sentinel/data 200
 BENCH pull-by-hash size=52 wire_bytes=53 iters=200: p50=1597 p95=1682 p99=1919 max=3047 us
 ```
 
@@ -71,3 +71,5 @@ the 4c/perf pass. Register line: `sentinel-fs-distributed-cas-pull (#498 4b)`.
 Both test VMs run the #498 4b daemon (under review); the pulled blob remains in node-1's
 `/tmp/probe-dest` (a throwaway dest, not the daemon CAS). Rollback binary at
 `/tmp/sentinel-daemon-pre4b.bak` on each VM. VM 1069 (prod sim) was never touched.
+
+Host addresses shown here use documentation addresses.

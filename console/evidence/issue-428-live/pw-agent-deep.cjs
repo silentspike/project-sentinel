@@ -6,16 +6,16 @@
 // /api/events), which tunnels fine. No lifecycle clicks here (Start/Stop/Remove verified via curl).
 const { chromium } = require("playwright");
 
-const OUT = "/work/company/ps-428-agent-deep-view/console/evidence/issue-428-live";
-const AGENT_ID = process.env.DEEP_AGENT_ID || "8";
+const path = require("node:path");
+const { runPrivateSmoke } = require("../private-browser-smoke.cjs");
 
-(async () => {
-  const browser = await chromium.launch({ headless: true });
+runPrivateSmoke(chromium, async ({ browser, key, output, url, agentId }) => {
+  url.hash = "deep=" + encodeURIComponent(agentId);
   const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1600, height: 1000 } });
   const page = await ctx.newPage();
-  await page.goto("https://localhost:8001/#deep=" + AGENT_ID, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.goto(url.href, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-  await page.getByTestId("login-key").fill(process.env.DKEY || "");
+  await page.getByTestId("login-key").fill(key);
   await page.getByTestId("login-submit").click();
   await page.waitForTimeout(2500);
 
@@ -26,8 +26,6 @@ const AGENT_ID = process.env.DEEP_AGENT_ID || "8";
   await page.waitForSelector('[data-testid="deep-agent-name"]', { timeout: 15000 });
   const openMs = Date.now() - t0;
 
-  const agentName = (await page.locator('[data-testid="deep-agent-name"]').textContent())?.trim();
-  const statusText = (await page.locator('[data-testid="deep-status"]').textContent())?.trim();
 
   // Activity: sparkline polyline points + tool-donut legend entries from real event data.
   await page.waitForFunction(
@@ -46,18 +44,12 @@ const AGENT_ID = process.env.DEEP_AGENT_ID || "8";
   const fsEntries = await page.locator('[data-testid="fs-entry"]').count();
   const dedupText = (await page.locator('[data-testid="fs-dedup"]').textContent().catch(() => "")) || "";
 
-  await page.screenshot({ path: OUT + "/pw-agent-deep.png", fullPage: true });
+  await page.screenshot({ path: path.join(output, "pw-agent-deep.png"), fullPage: true });
 
   console.log("OPEN_MS=" + openMs);
-  console.log("AGENT_NAME=" + agentName);
-  console.log("STATUS_TEXT=" + statusText);
+  console.log("AGENT_VIEW_LOADED=true");
   console.log("SPARK_POINTS_LEN=" + sparkPoints);
   console.log("DONUT_LEGEND=" + donutLegend + " DONUT_CIRCLES=" + donutSegments);
   console.log("FS_ENTRIES=" + fsEntries);
-  console.log("FS_DEDUP=" + dedupText.trim());
-
-  await browser.close();
-})().catch((e) => {
-  console.error("ERR " + e.message);
-  process.exit(1);
-});
+  console.log("FS_DEDUP_PRESENT=" + Boolean(dedupText.trim()));
+}, { tunnelUrl: "https://localhost:8001/", agent: true });

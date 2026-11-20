@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! Build (remote): cargo remote -c -- build -p sentinel-ebpf --release --bench exporter_format
-//! Run (deploy VM): scp target/release/deps/exporter_format-* ubuntu@10.0.0.240:/tmp/ && ./exporter_format
+//! Run (deploy VM): scp target/release/deps/exporter_format-* "${SENTINEL_DEPLOY_SSH_ALIAS}":/tmp/ && ./exporter_format
 //!                  with sidecars: vmstat 1 / mpstat 1 / iostat -x 1
 //! ```
 //!

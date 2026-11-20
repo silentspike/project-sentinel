@@ -31,9 +31,19 @@ async fn main() -> anyhow::Result<()> {
     // plus hash pinning; provided-cert mode disables pinning by leaving cert_hash_b64 empty.
     let cert_dir = std::env::var("SENTINEL_DASHBOARD_CERT_DIR")
         .unwrap_or_else(|_| "/opt/sentinel/console-cert".into());
+    let extra_tls_names = std::env::var("SENTINEL_DASHBOARD_TLS_NAMES").unwrap_or_default();
+    let tls_names: Vec<&str> = ["localhost", "127.0.0.1"]
+        .into_iter()
+        .chain(
+            extra_tls_names
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty()),
+        )
+        .collect();
     let cert = tls::resolve_dashboard_cert(
         std::path::Path::new(&cert_dir),
-        &["localhost", "127.0.0.1", "10.0.0.240"],
+        &tls_names,
         config.tls_cert_path.as_deref(),
         config.tls_key_path.as_deref(),
     )?;

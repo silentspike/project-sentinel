@@ -3,7 +3,7 @@
 This Worker PR intentionally contains no TOGAF HTML edits:
 
 - No edit to `docs/architecture/togaf-architecture-guide.html`
-- No edit to `/home/jan/togaf-llm-architecture-guide.html`
+- No edit to `$HOME/togaf-llm-architecture-guide.html`
 - No copy between language-specific TOGAF sources
 
 ## Implemented Scope

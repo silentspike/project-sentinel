@@ -24,7 +24,9 @@ from typing import Any, Callable
 
 SCHEMA_VERSION = 1
 SAFE_ROOT = Path("/work/tmp/project-sentinel")
-CONTROL_LOCK = SAFE_ROOT / ".m0-activation-control.lock"
+CONTROL_LOCK_CONFIG = Path("/etc/sentinel/activation-control.env")
+CONTROL_LOCK_VARIABLE = "SENTINEL_ACTIVATION_CONTROL_LOCK"
+CONTROL_LOCK_BASENAME = ".m0-activation-control.lock"
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_TIMEOUT_SECONDS = 30.0
@@ -270,7 +272,9 @@ def pinned_directory(path: Path):
             os.close(descriptor)
 
 
-def read_regular(path: Path, label: str, maximum: int = MAX_JSON_BYTES) -> bytes:
+def read_regular(
+    path: Path, label: str, maximum: int = MAX_JSON_BYTES, *, owner_only: bool = False
+) -> bytes:
     if path.name in {"", ".", ".."}:
         fail(f"{label}_file_unsafe")
     with pinned_directory(path.parent) as parent_fd:
@@ -283,6 +287,7 @@ def read_regular(path: Path, label: str, maximum: int = MAX_JSON_BYTES) -> bytes
                 or before.st_nlink != 1
                 or before.st_uid not in {0, os.geteuid()}
                 or mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | 0o022)
+                or (owner_only and (before.st_uid != os.geteuid() or mode != 0o600))
             ):
                 fail(f"{label}_file_unsafe")
             fd = os.open(
@@ -372,14 +377,39 @@ def atomic_json(path: Path, value: Any) -> str:
     return digest_bytes(data)
 
 
+def configured_control_lock() -> Path:
+    raw = read_regular(CONTROL_LOCK_CONFIG, "activation_lock_config", 4096, owner_only=True)
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeError as exc:
+        raise ControlError("activation_lock_config_invalid") from exc
+    prefix = f"{CONTROL_LOCK_VARIABLE}="
+    if len(lines) != 1 or not lines[0].startswith(prefix):
+        fail("activation_lock_config_invalid")
+    value = lines[0].removeprefix(prefix)
+    path = Path(value)
+    if (
+        not path.is_absolute()
+        or ".." in path.parts
+        or path.as_posix() != value
+        or value.startswith("//")
+        or "\x00" in value
+        or path.name != CONTROL_LOCK_BASENAME
+    ):
+        fail("activation_lock_path_invalid")
+    return path
+
+
 @contextmanager
 def controller_lock():
-    safe_output_path(CONTROL_LOCK, "control_lock")
-    with pinned_directory(CONTROL_LOCK.parent) as parent_fd:
+    lock = configured_control_lock()
+    with pinned_directory(lock.parent) as parent_fd:
+        if os.fstat(parent_fd).st_uid != os.geteuid():
+            fail("control_lock_unsafe")
         fd = -1
         try:
             fd = os.open(
-                CONTROL_LOCK.name,
+                lock.name,
                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
                 0o600,
                 dir_fd=parent_fd,
@@ -1441,12 +1471,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     restart.add_argument("--restart-control", type=Path, required=True)
     restart.add_argument("--expected-restart-control-sha256", required=True)
     restart.add_argument("--output", type=Path, required=True)
+    commands.add_parser("lock-path", help="Resolve the configured lock for the local health monitor.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None, runner: Runner = production_runner) -> int:
     try:
         args = parse_args(sys.argv[1:] if argv is None else argv)
+        if args.command == "lock-path":
+            lock = configured_control_lock()
+            with pinned_directory(lock.parent) as directory:
+                if os.fstat(directory).st_uid != os.geteuid():
+                    fail("control_lock_unsafe")
+            print(lock)
+            return 0
         preflight = parsed_preflight(args)
         if args.command == "activate":
             result = activate(

@@ -1,5 +1,5 @@
-$ ssh ubuntu@10.0.0.241/242 <2-VM Gaia loop smoke, exact claude process check>
-== 10.0.0.241 ==
+$ ssh sentinel-lab-a and sentinel-lab-b <2-VM Gaia loop smoke, exact claude process check>
+== sentinel-lab-a ==
 node=sentinel-test-node-0
 date=2026-06-27T17:50:49+00:00
 service=active
@@ -33,7 +33,7 @@ Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49
 Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.806784Z  WARN sentinel_gaia_loop::readiness: Gaia readiness NATS unavailable; continuing with scheduled EventStore scans only error=connect NATS nats://127.0.0.1:4222
 Jun 27 17:50:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:50:21.807982Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
 Jun 27 17:50:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:50:21.808657Z  INFO sentinel_gaia_loop::readiness: Gaia readiness scheduled scan complete alerts_created=1 duplicates_skipped=0 last_event_row_id=111352
-== 10.0.0.242 ==
+== sentinel-lab-b ==
 node=sentinel-test-node-1
 date=2026-06-27T17:50:50+00:00
 service=active

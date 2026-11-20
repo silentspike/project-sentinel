@@ -5,15 +5,15 @@ Date: 2026-06-27
 ## Scope
 
 - Repository branch: `feat/issue-473-tls-strategy`
-- Deploy VM: `ubuntu@10.0.0.240`
-- Build host: `root@10.0.0.155`
+- Deploy VM: `ubuntu@192.0.2.13`
+- Build host: `root@192.0.2.12`
 - Runtime service: `sentinel-dashboard-backend`
 - Gateway/Judge remained inactive during live verification.
 
 ## Build And Test
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-dashboard-backend
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build -p sentinel-dashboard-backend
 ```
 
 ```text
@@ -21,7 +21,7 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.31s
 ```
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-dashboard-backend
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-dashboard-backend
 ```
 
 ```text
@@ -35,7 +35,7 @@ Doc-tests sentinel_dashboard_backend: 0 passed
 ```
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-dashboard-backend --release
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build -p sentinel-dashboard-backend --release
 ```
 
 ```text
@@ -45,7 +45,7 @@ Finished `release` profile [optimized] target(s) in 5m 13s
 ## Deploy
 
 ```bash
-ssh ubuntu@10.0.0.240 "systemctl cat sentinel-dashboard-backend | grep -E 'ExecStart|EnvironmentFile'"
+ssh ubuntu@192.0.2.13 "systemctl cat sentinel-dashboard-backend | grep -E 'ExecStart|EnvironmentFile'"
 ```
 
 ```text
@@ -60,7 +60,7 @@ installed sha256: d2d3f47821239f708afd8279e4f8d994d74f952d35695bbadad7f4fd561146
 ```
 
 ```bash
-ssh ubuntu@10.0.0.240 "systemctl is-active sentinel-dashboard-backend"
+ssh ubuntu@192.0.2.13 "systemctl is-active sentinel-dashboard-backend"
 ```
 
 ```text
@@ -190,7 +190,7 @@ Summary:
 The service was restored to Zero-Config after AC-2 and benchmarks.
 
 ```bash
-ssh ubuntu@10.0.0.240 "curl -sk https://127.0.0.1:8001/api/cert-hash"
+ssh ubuntu@192.0.2.13 "curl -sk https://127.0.0.1:8001/api/cert-hash"
 ```
 
 ```text
@@ -198,11 +198,13 @@ ssh ubuntu@10.0.0.240 "curl -sk https://127.0.0.1:8001/api/cert-hash"
 ```
 
 ```bash
-ssh ubuntu@10.0.0.240 "systemctl is-active cortex-gateway"
-ssh ubuntu@10.0.0.240 "systemctl is-active sentinel-judge"
+ssh ubuntu@192.0.2.13 "systemctl is-active cortex-gateway"
+ssh ubuntu@192.0.2.13 "systemctl is-active sentinel-judge"
 ```
 
 ```text
 inactive
 inactive
 ```
+
+Host addresses shown here use documentation addresses.

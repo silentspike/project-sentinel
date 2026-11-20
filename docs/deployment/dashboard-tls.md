@@ -10,8 +10,7 @@ The mode is selected entirely by environment variables.
 | Zero-Config | unset | generated 13-day self-signed cert | `hash` is a base64 SHA-256 value | `serverCertificateHashes` pinning | first page load shows the usual self-signed warning |
 | Production | `SENTINEL_DASHBOARD_TLS_CERT` and `SENTINEL_DASHBOARD_TLS_KEY` set | deployer-provided PEM files | `hash` is `null` | normal CA validation, no pinning | no certificate warning when the issuing CA is trusted |
 
-Zero-Config remains the default. Do not set any TLS env variables when you want
-the current self-signed behavior.
+Zero-Config is the default when both certificate file variables are unset.
 
 Production mode is for a hostname and a certificate chain that the operator
 browser trusts. The backend does not obtain or renew certificates; it only loads
@@ -24,6 +23,7 @@ the files you provide.
 | `SENTINEL_DASHBOARD_TLS_CERT` | Production only | PEM certificate path. Use a full chain when the CA issues intermediates. |
 | `SENTINEL_DASHBOARD_TLS_KEY` | Production only | PEM private-key path for the certificate. |
 | `SENTINEL_DASHBOARD_HOSTNAME` | Optional | Human-readable deployment hostname for logs and operator docs. The browser still validates the SANs in the certificate. |
+| `SENTINEL_DASHBOARD_TLS_NAMES` | Optional in Zero-Config | Comma-separated DNS names and IPs to add to the generated certificate. |
 
 `SENTINEL_DASHBOARD_TLS_CERT` and `SENTINEL_DASHBOARD_TLS_KEY` must be set
 together. If only one is set, startup fails instead of silently falling back to
@@ -42,6 +42,15 @@ more than a clean browser trust chain.
 sudo systemctl unset-environment SENTINEL_DASHBOARD_TLS_CERT
 sudo systemctl unset-environment SENTINEL_DASHBOARD_TLS_KEY
 sudo systemctl restart sentinel-dashboard-backend
+```
+
+The generated certificate always includes the local names `localhost` and
+`127.0.0.1`. For access from another device, set the names or IPs used by
+operators in the service's private environment file. Existing installations
+should preserve their current dashboard addresses when deploying this change.
+
+```text
+SENTINEL_DASHBOARD_TLS_NAMES=dashboard.example.invalid,192.0.2.10
 ```
 
 Expected checks:
@@ -75,7 +84,7 @@ cat > dashboard.ext <<'EOF'
 basicConstraints = CA:FALSE
 keyUsage = critical,digitalSignature,keyEncipherment
 extendedKeyUsage = serverAuth
-subjectAltName = DNS:sentinel.lab,IP:10.0.0.240
+subjectAltName = DNS:sentinel.lab,IP:192.0.2.10
 EOF
 
 openssl x509 -req -in dashboard.csr -CA root.pem -CAkey root.key \
@@ -142,11 +151,11 @@ Restart and verify:
 ```bash
 sudo systemctl restart sentinel-dashboard-backend
 
-curl --cacert root.pem --resolve sentinel.lab:8001:10.0.0.240 \
+curl --cacert root.pem --resolve sentinel.lab:8001:192.0.2.10 \
   https://sentinel.lab:8001/api/health
 # {"service":"sentinel-dashboard-backend","status":"ok"}
 
-curl --cacert root.pem --resolve sentinel.lab:8001:10.0.0.240 \
+curl --cacert root.pem --resolve sentinel.lab:8001:192.0.2.10 \
   https://sentinel.lab:8001/api/cert-hash
 # {"algorithm":"sha-256","hash":null}
 ```

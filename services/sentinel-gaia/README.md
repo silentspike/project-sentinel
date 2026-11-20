@@ -38,7 +38,7 @@ cargo remote -- clippy -p sentinel-gaia --all-targets -- -D warnings
 cargo remote -- build -p sentinel-gaia --release
 ```
 
-End-to-end changes require a Deploy-VM smoke on `10.0.0.240`: generate a config
+End-to-end changes require a smoke test on the deployment VM: generate a config
 tree under `/tmp`, run `sentinel-gaia validate`, then run
 `sentinel-daemon --config <generated>/daemon.toml --dry-run` against the same
 tree with the Gateway inactive.

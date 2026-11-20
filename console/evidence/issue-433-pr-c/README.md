@@ -2,7 +2,7 @@
 
 Date: 2026-06-02
 Branch: feat/issue-433-pr-c-event-views
-VM: ubuntu@10.0.0.240
+VM: ubuntu@192.0.2.13
 
 ## Scope
 
@@ -70,3 +70,5 @@ After screenshot parity verification, the old Bun paths for Activity, Chaos, and
   - `sentinel-judge`: inactive
   - `sentinel-health-monitor.timer`: inactive
   - `sentinel-health-monitor.service`: inactive
+
+Host addresses shown here use documentation addresses.

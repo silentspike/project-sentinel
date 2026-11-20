@@ -14,7 +14,7 @@ ephemeral one (one job per runner, then self-destruct + re-provision).
 
 | Item | Value |
 |------|-------|
-| Runner host (current, persistent) | CT 150, LXC on Proxmox `10.0.0.106`, IP `10.0.0.127` |
+| Runner host (current, persistent) | CT 150, LXC on Proxmox `192.0.2.10`, IP `192.0.2.11` |
 | Runner instances (current) | `/opt/actions-runner` + `-2`, `-3`, `-4` (persistent) |
 | Organization | `silentspike` |
 | Runner group | Default group, `allows_public_repositories: false` (private repos only) |
@@ -88,7 +88,7 @@ Part A (the assets + this runbook) ships in the PR. **Part B is the live migrati
 the runner host and is what actually closes #435.** Until Part B is verified, #435 stays
 open (no `status:verified` on Part A alone - "code exists" is not "feature live").
 
-1. On Proxmox `10.0.0.106` / CT 150: provision the token helper
+1. On Proxmox `192.0.2.10` / CT 150: provision the token helper
    (`/opt/actions-runner/get-token.sh`, mode `0600`), backed by a GitHub App key
    (preferred) or a fine-grained PAT.
 2. Replace the persistent instances (`/opt/actions-runner{-2,-3,-4}`) with the ephemeral
@@ -123,3 +123,5 @@ Once the ephemeral runners are verified (Part B, AC-5), decommission CT 150 in a
 zombie/cgroup state (may require a final node reboot of `.106` if zombies are still
 unreapable), reclaim the disk (136 GB CodeQL cruft), and remove CT 150 from the runner
 registration.
+
+Host addresses shown here use documentation addresses.

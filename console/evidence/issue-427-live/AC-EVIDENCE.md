@@ -1,4 +1,4 @@
-# #427 Live-Verifikation (Deploy-VM 10.0.0.240) — Evidence
+# #427 Live-Verifikation (Deploy-VM 192.0.2.13) — Evidence
 
 Deployt: cortex-gateway (go) + sentinel-daemon + sentinel-dashboard-backend +
 sentinel-projection (alle Release, `install -m755`, Backups `.bak-427-*`), Console-Bundle
@@ -31,11 +31,11 @@ PASS
 
 ## AC-4 — UI zeigt Kosten/Tokens pro agent+tier, cache-aware, mit Zeitreihe (echte Daten)
 playwright (SSH-Tunnel -L 8001 + ignoreHTTPSErrors, Console loopback-only) gegen die LIVE-VM
-(`pw-cost.cjs`, `pw-cost-view.png`):
+(`pw-cost.cjs`, nach Sichtprüfung):
 ```
 AGENT_ROWS=23  TIER_ROWS=2
-CACHE_READ_NONZERO=20  sample=["1.2k","800","200","200"]
-CACHE_CREATION_NONZERO=20  sample=["480","320","80","80"]
+CACHE_READ_NONZERO=20
+CACHE_CREATION_NONZERO=20
 SPARKLINE_POINTS_LEN=50   (5 Minuten-Buckets)
 ```
 Visuell gesichtet: Cost-Panel rendert Zeitreihen-Sparkline + "Kosten/Tokens pro Agent" (7 Spalten:
@@ -71,3 +71,5 @@ wiederhergestellt + Gate-Test (start ohne allow-llm -> inactive). Summe echter T
 gateway=inactive (ConditionPathExists token-gate restored), judge=inactive, daemon/projection/dashboard
 =active, allow-llm fehlt, fake-claude entfernt, CLAUDE_CODE_BINARY-Override entfernt (default claude),
 config base_url revertiert. Cost-Projektion persistiert (24 agents, 8 buckets).
+
+Host addresses shown here use documentation addresses.

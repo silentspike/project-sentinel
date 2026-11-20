@@ -286,7 +286,7 @@ Command:
 
 ```bash
 awk 'NR>=2398 && NR<=2448 {printf "%d:%s\n", NR, $0}' docs/architecture/togaf-architecture-guide.html
-awk 'NR>=2398 && NR<=2448 {printf "%d:%s\n", NR, $0}' /home/jan/togaf-llm-architecture-guide.html
+awk 'NR>=2398 && NR<=2448 {printf "%d:%s\n", NR, $0}' $HOME/togaf-llm-architecture-guide.html
 ```
 
 Output excerpt:
@@ -296,23 +296,23 @@ docs/architecture/togaf-architecture-guide.html:2406 includes "redb hot state (1
 docs/architecture/togaf-architecture-guide.html:2408-2411 omit api_patterns from the listed redb tables
 docs/architecture/togaf-architecture-guide.html:2420 includes "ActiveSmells, RoomPhysicsState"
 docs/architecture/togaf-architecture-guide.html:2445 includes "all 11 tables"
-/home/jan/togaf-llm-architecture-guide.html:2406 includes "redb Hot-State (11 Tables)"
-/home/jan/togaf-llm-architecture-guide.html:2408-2411 omit api_patterns from the listed redb tables
-/home/jan/togaf-llm-architecture-guide.html:2420 includes "ActiveSmells, RoomPhysicsState"
-/home/jan/togaf-llm-architecture-guide.html:2445 includes "alle 11 Tables"
+$HOME/togaf-llm-architecture-guide.html:2406 includes "redb Hot-State (11 Tables)"
+$HOME/togaf-llm-architecture-guide.html:2408-2411 omit api_patterns from the listed redb tables
+$HOME/togaf-llm-architecture-guide.html:2420 includes "ActiveSmells, RoomPhysicsState"
+$HOME/togaf-llm-architecture-guide.html:2445 includes "alle 11 Tables"
 ```
 
 Command:
 
 ```bash
-rg -n "Soft affinity|Soft-Affinity|nano-container is the unit|Nano-Container ist die Einheit" docs/architecture/togaf-architecture-guide.html /home/jan/togaf-llm-architecture-guide.html
+rg -n "Soft affinity|Soft-Affinity|nano-container is the unit|Nano-Container ist die Einheit" docs/architecture/togaf-architecture-guide.html $HOME/togaf-llm-architecture-guide.html
 ```
 
 Output:
 
 ```text
-/home/jan/togaf-llm-architecture-guide.html:2548:                <!-- Live-Migration (Fenced State Transfer) + Soft-Affinity -->
-/home/jan/togaf-llm-architecture-guide.html:2556:                            <strong>Soft-Affinity:</strong> der Nano-Container ist die Einheit, nicht die Firma
+$HOME/togaf-llm-architecture-guide.html:2548:                <!-- Live-Migration (Fenced State Transfer) + Soft-Affinity -->
+$HOME/togaf-llm-architecture-guide.html:2556:                            <strong>Soft-Affinity:</strong> der Nano-Container ist die Einheit, nicht die Firma
 docs/architecture/togaf-architecture-guide.html:2548:                <!-- Live-Migration (Fenced State Transfer) + Soft-Affinity -->
 docs/architecture/togaf-architecture-guide.html:2556:                            <strong>Soft affinity:</strong> the nano-container is the unit, not the company
 ```
@@ -330,7 +330,7 @@ cargo remote -c -- doc --no-deps -p sentinel-common
 Output:
 
 ```text
-2026-06-26 17:57:40,004 INFO  [cargo_remote] Project dir: "/work/company/ps-486-snapshot-coverage"
+2026-06-26 17:57:40,004 INFO  [cargo_remote] Project dir: "<private checkout>"
 2026-06-26 17:57:40,004 ERROR [cargo_remote] No remote build server was defined (use config file or the --remote flags)
 ```
 

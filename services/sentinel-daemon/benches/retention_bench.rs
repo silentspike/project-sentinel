@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! Build (remote):  cargo remote -c -- build -p sentinel-daemon --release --bench retention_bench
-//! Run (Deploy-VM): scp target/release/deps/retention_bench-* ubuntu@10.0.0.240:/tmp/ && ./retention_bench
+//! Run (Deploy-VM): scp target/release/deps/retention_bench-* "${SENTINEL_DEPLOY_SSH_ALIAS}":/tmp/ && ./retention_bench
 //!                  parallel mit Sidecars: vmstat 1 / mpstat 1 / iostat -x 1
 //! ```
 //!

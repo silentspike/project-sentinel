@@ -1,4 +1,4 @@
-$ ssh ubuntu@10.0.0.241 <AC-1 readiness live script after catch-up fix>
+$ ssh sentinel-lab-a <AC-1 readiness live script after catch-up fix>
 node=sentinel-test-node-0
 date=2026-06-27T17:50:00+00:00
 service=active

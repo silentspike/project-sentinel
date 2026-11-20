@@ -1,6 +1,6 @@
 # #495 Chunk 4c — Live Cross-Node Verification (2026-06-25)
 
-**Cluster:** test-node-0 (VM 1071, 10.0.0.241, GenesisSeed) + test-node-1 (VM 1072, 10.0.0.242, Member), both i5-1235U on Proxmox .69. Binary built from `main 03d1e32` + fix `fix/provisionnode-member-bootstrap` (PR #566). VM 1069 (prod) never touched.
+**Cluster:** test-node-0 (VM 1071, 192.0.2.14, GenesisSeed) + test-node-1 (VM 1072, 192.0.2.15, Member), both i5-1235U on Proxmox .69. Binary built from `main 03d1e32` + fix `fix/provisionnode-member-bootstrap` (PR #566). VM 1069 (prod) never touched.
 
 ## AC-by-AC (Command → Result)
 
@@ -28,7 +28,7 @@
 | AC-4 | PASS | both daemons `active`; gateway/judge inactive |
 | AC-7 | PASS | token-gate keeps gateway/judge inactive without allow-llm (both nodes) |
 | AC-DX | NOTE | both same-CPU-class (i5-1235U) + identical binary/toolchain (#494). A meaningful STRICT/CORE hash compare needs agents+ticks (0-agent bring-up here); migration = state-transfer not replay, so cross-class is correct regardless |
-| NodeProvisioned event | PASS | events.db id=518 `node_provisioned` aggregate=cluster payload{node_id,alias,pending_target_id,target_ip=10.0.0.242,duration_ms=31786} |
+| NodeProvisioned event | PASS | events.db id=518 `node_provisioned` aggregate=cluster payload{node_id,alias,pending_target_id,target_ip=192.0.2.15,duration_ms=31786} |
 
 ## Bugs found + fixed (PR #566)
 1. RenderingConfig scp'd config/unit/drop-ins directly to root-owned paths as ubuntu → Permission denied → now staged to /tmp + `sudo install`.
@@ -43,3 +43,5 @@
 
 ## Net baseline (Tier-1, → BENCHMARK-REGISTER.md)
 iperf3 node-0→node-1: 1KB 4.52 / 64KB 23.4 / 1MB 29.6 Gbit/s (0 retransmits); RTT 0.43ms. Bootstrap ~31s (838MB debug-binary scp dominated).
+
+Host addresses shown here use documentation addresses.

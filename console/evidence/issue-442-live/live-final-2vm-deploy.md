@@ -1,7 +1,7 @@
 # Issue #442 Final Two-VM Deploy Readback
 
 Date: 2026-07-18
-Nodes: `10.0.0.241`, `10.0.0.242`
+Nodes: `192.0.2.14`, `192.0.2.15`
 
 `.240` was not contacted. The deploy stopped and restarted only
 `sentinel-gaia-loop` and `sentinel-dashboard-backend`. `sentinel-daemon` was not
@@ -84,7 +84,7 @@ daemon start timestamps remained `2026-06-27 17:20:52 UTC` on `.241` and
 `2026-06-27 17:21:26 UTC` on `.242`. `.240` was not contacted.
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build \
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build \
   -p sentinel-gaia-loop -p sentinel-dashboard-backend \
   -p sentinel-gaia -p sentinel-ctl --release
 ```
@@ -101,3 +101,5 @@ both: Claude Code 2.1.214 native ELF; node_present=no; npm_present=no
 
 both: claude_processes=0 gaia_panic_fatal=0 dashboard_panic_fatal=0
 ```
+
+Host addresses shown here use documentation addresses.

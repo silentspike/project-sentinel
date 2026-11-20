@@ -4,7 +4,7 @@
 The console binds **loopback-only** (127.0.0.1:8001, #474 hardening) and its data layer is
 WebTransport (QUIC/UDP, cert-pinned). External playwright can't reach it directly. The working path:
 - **SSH TCP tunnel** `-L 8001:127.0.0.1:8001` to the VM (the console's self-signed cert SAN already
-  lists `localhost, 127.0.0.1, 10.0.0.240`, so no name mismatch over the tunnel).
+  lists `localhost, 127.0.0.1, 192.0.2.13`, so no name mismatch over the tunnel).
 - A **local playwright (chromium) node script** (`pw-synthesis.cjs`) launched with
   `ignoreHTTPSErrors: true` (accepts the self-signed cert). The SynthesisView uses REST (`apiJson`),
   not WebTransport, so it works over the TCP tunnel.
@@ -33,3 +33,5 @@ The agent-level judge join (numeric agent_id -> AGENT-NN -> events.db aggregate_
 - The console vitest test (`synthesis.test.ts`): numeric `7` -> `AGENT-07` joins the drift alert and
   renders in `inspector-judge`.
 The screenshot's two visible rows were healthy agents (empty judge cell = correct "healthy" state).
+
+Host addresses shown here use documentation addresses.

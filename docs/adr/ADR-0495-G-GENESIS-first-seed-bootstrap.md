@@ -102,7 +102,7 @@ AC-GEN-1..5, verified on a fresh test VM:
 ## Benchmarks
 
 Genesis time (bare VM → `GenesisSeed`) recorded as part of #495's bootstrap-time
-baseline in the internal register `/work/company/BENCHMARK-REGISTER.md`. Not a tuning
+baseline in the private benchmark register. Not a tuning
 loop — a baseline.
 
 ## Backward Compatibility

@@ -1,4 +1,4 @@
-$ ssh ubuntu@10.0.0.241 <AC-3 deterministic setup generator dry-run final>
+$ ssh sentinel-lab-a <AC-3 deterministic setup generator dry-run final>
 node=sentinel-test-node-0
 date=2026-06-27T17:57:59+00:00
 daemon_bin_check=sentinel-daemon 0.1.0

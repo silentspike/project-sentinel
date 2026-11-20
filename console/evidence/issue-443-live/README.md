@@ -6,8 +6,8 @@ Scope:
 
 - New standalone crate: `crates/sentinel-gaia-memory`
 - Binary: `sentinel-gaia-memory`
-- Live VM verification: `ubuntu@10.0.0.240`
-- Benchmark VM: `ubuntu@10.0.0.241`
+- Live VM verification: `ubuntu@192.0.2.13`
+- Benchmark VM: `ubuntu@192.0.2.14`
 - No daemon restart, no daemon hook, no token, no write to `/opt/sentinel/data`
 - No TOGAF HTML edits in this worker PR
 
@@ -16,7 +16,7 @@ Scope:
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-memory
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-gaia-memory
 ```
 
 Relevant output:
@@ -31,7 +31,7 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-hippocampus readonly
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- test -p sentinel-hippocampus readonly
 ```
 
 Relevant output:
@@ -43,7 +43,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 107 filtered out; fi
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
 ```
 
 Relevant output:
@@ -55,7 +55,7 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 27.02s
 Command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-gaia-memory --release
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build -p sentinel-gaia-memory --release
 ```
 
 Relevant output:
@@ -69,7 +69,7 @@ Finished `release` profile [optimized] target(s) in 54.52s
 Build command:
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- bench -p sentinel-gaia-memory --no-run
+cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- bench -p sentinel-gaia-memory --no-run
 ```
 
 Relevant output:
@@ -82,8 +82,8 @@ Executable benches/gaia_memory_bench.rs (target/release/deps/gaia_memory_bench-2
 Execution command on `.241`:
 
 ```bash
-scp target/release/deps/gaia_memory_bench-25080a1cb72cfa0a ubuntu@10.0.0.241:/tmp/issue-443-gaia-memory-bench-bin
-ssh ubuntu@10.0.0.241 'rm -rf /tmp/issue-443-gaia-memory-bench-run && mkdir -p /tmp/issue-443-gaia-memory-bench-run && cd /tmp/issue-443-gaia-memory-bench-run && chmod +x /tmp/issue-443-gaia-memory-bench-bin && /tmp/issue-443-gaia-memory-bench-bin --bench --noplot --format pretty'
+scp target/release/deps/gaia_memory_bench-25080a1cb72cfa0a ubuntu@192.0.2.14:/tmp/issue-443-gaia-memory-bench-bin
+ssh ubuntu@192.0.2.14 'rm -rf /tmp/issue-443-gaia-memory-bench-run && mkdir -p /tmp/issue-443-gaia-memory-bench-run && cd /tmp/issue-443-gaia-memory-bench-run && chmod +x /tmp/issue-443-gaia-memory-bench-bin && /tmp/issue-443-gaia-memory-bench-bin --bench --noplot --format pretty'
 ```
 
 Relevant output, units normalized to ASCII `us`:
@@ -213,3 +213,5 @@ Files created by the live verification were all under `/tmp/issue-443-gaia-memor
 /tmp/issue-443-gaia-memory-live/rehydrate.strace 754
 /tmp/issue-443-gaia-memory-live/sentinel-gaia-memory 4156200
 ```
+
+Host addresses shown here use documentation addresses.

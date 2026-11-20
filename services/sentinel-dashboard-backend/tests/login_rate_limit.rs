@@ -65,12 +65,12 @@ async fn post_login(
 async fn n_failures_return_401_then_429_with_retry_after() {
     let state = test_state(); // max_fails = 3
     for i in 1..=3 {
-        let (status, cookie, _) = post_login(&state, "wrong", Some("10.0.0.1")).await;
+        let (status, cookie, _) = post_login(&state, "wrong", Some("192.0.2.1")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {i} -> 401");
         assert!(!cookie, "no cookie on failure");
     }
     // 4th attempt is blocked.
-    let (status, cookie, retry) = post_login(&state, "wrong", Some("10.0.0.1")).await;
+    let (status, cookie, retry) = post_login(&state, "wrong", Some("192.0.2.1")).await;
     assert_eq!(
         status,
         StatusCode::TOO_MANY_REQUESTS,
@@ -86,10 +86,10 @@ async fn n_failures_return_401_then_429_with_retry_after() {
 async fn correct_key_during_block_still_429_no_cookie() {
     let state = test_state();
     for _ in 0..3 {
-        post_login(&state, "wrong", Some("10.0.0.2")).await;
+        post_login(&state, "wrong", Some("192.0.2.2")).await;
     }
     // Even the CORRECT key is rejected while blocked (no oracle) and mints no session.
-    let (status, cookie, _) = post_login(&state, CORRECT_KEY, Some("10.0.0.2")).await;
+    let (status, cookie, _) = post_login(&state, CORRECT_KEY, Some("192.0.2.2")).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert!(
         !cookie,
@@ -101,10 +101,10 @@ async fn correct_key_during_block_still_429_no_cookie() {
 async fn other_ip_unaffected_by_block() {
     let state = test_state();
     for _ in 0..3 {
-        post_login(&state, "wrong", Some("10.0.0.3")).await;
+        post_login(&state, "wrong", Some("192.0.2.3")).await;
     }
     // A different IP can still log in with the correct key.
-    let (status, cookie, _) = post_login(&state, CORRECT_KEY, Some("10.0.0.4")).await;
+    let (status, cookie, _) = post_login(&state, CORRECT_KEY, Some("192.0.2.4")).await;
     assert_eq!(status, StatusCode::OK, "other IP unaffected");
     assert!(cookie, "successful login sets the session cookie");
 }
@@ -114,15 +114,15 @@ async fn success_resets_counter() {
     let state = test_state();
     // 2 failures (below the threshold of 3).
     for _ in 0..2 {
-        post_login(&state, "wrong", Some("10.0.0.5")).await;
+        post_login(&state, "wrong", Some("192.0.2.5")).await;
     }
     // A success resets the counter...
-    let (status, cookie, _) = post_login(&state, CORRECT_KEY, Some("10.0.0.5")).await;
+    let (status, cookie, _) = post_login(&state, CORRECT_KEY, Some("192.0.2.5")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(cookie);
     // ...so it takes a full 3 new failures to block again (the next 2 stay 401, not 429).
     for _ in 0..2 {
-        let (status, _, _) = post_login(&state, "wrong", Some("10.0.0.5")).await;
+        let (status, _, _) = post_login(&state, "wrong", Some("192.0.2.5")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "counter was reset");
     }
 }

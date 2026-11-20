@@ -31,7 +31,7 @@ The checked-in toolchain pin, not the build account's unrelated global default, 
 effective in the isolated Cargo Remote project:
 
 ```console
-$ ssh root@10.0.0.155 'cd /tmp/builds/issue-442-security/378810692033878248 && cat rust-toolchain.toml && rustc --version && cargo --version && rustup show active-toolchain'
+$ ssh root@192.0.2.12 'cd /tmp/builds/issue-442-security/378810692033878248 && cat rust-toolchain.toml && rustc --version && cargo --version && rustup show active-toolchain'
 [toolchain]
 channel = "1.97.1"
 components = ["rustfmt", "clippy"]
@@ -143,8 +143,8 @@ between the two nodes was blocked; the pinned SSH bootstrap path remained availa
 ```console
 $ sudo systemctl disable --now sentinel-daemon.service  # .242
 $ sudo rm -f /opt/sentinel/config/daemon.toml /opt/sentinel/data/control-node-{cert,key}.der /opt/sentinel/bin/sentinel-daemon /etc/systemd/system/sentinel-daemon.service
-$ sudo iptables -I INPUT 1 -p udp -s 10.0.0.241 --dport 8085 -m comment --comment issue-442-live-provision-join-fail -j DROP
-$ sudo iptables -I OUTPUT 1 -p udp -d 10.0.0.241 --dport 8085 -m comment --comment issue-442-live-provision-join-fail -j DROP
+$ sudo iptables -I INPUT 1 -p udp -s 192.0.2.14 --dport 8085 -m comment --comment issue-442-live-provision-join-fail -j DROP
+$ sudo iptables -I OUTPUT 1 -p udp -d 192.0.2.14 --dport 8085 -m comment --comment issue-442-live-provision-join-fail -j DROP
 TARGET_RESET_AT=2026-07-19T14:01:23Z
 DAEMON_ACTIVE=inactive
 
@@ -248,8 +248,8 @@ A 15-second UDP/8085 partition was applied only between `.242` and `.241`. An `E
 trap removed both rules, and the residual rule count was checked explicitly.
 
 ```console
-$ sudo iptables -I INPUT 1 -p udp -s 10.0.0.241 --dport 8085 -m comment --comment issue-442-live-provision-final-membership -j DROP
-$ sudo iptables -I OUTPUT 1 -p udp -d 10.0.0.241 --dport 8085 -m comment --comment issue-442-live-provision-final-membership -j DROP
+$ sudo iptables -I INPUT 1 -p udp -s 192.0.2.14 --dport 8085 -m comment --comment issue-442-live-provision-final-membership -j DROP
+$ sudo iptables -I OUTPUT 1 -p udp -d 192.0.2.14 --dport 8085 -m comment --comment issue-442-live-provision-final-membership -j DROP
 PARTITION_START=2026-07-19T14:04:55Z
 PARTITION_END=2026-07-19T14:05:10Z
 RESIDUAL_RULES=0
@@ -327,3 +327,5 @@ $ curl -fsS localhost:8084/operator/runtime-health
   mutate owner state, and a holder advertisement must name its authenticated sender.
 - Bidirectional membership, partition detection, healing, runtime health, and the
   original Zenoh/restart-noise regressions are clean on both lab nodes.
+
+Host addresses shown here use documentation addresses.

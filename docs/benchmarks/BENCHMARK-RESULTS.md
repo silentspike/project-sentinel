@@ -26,7 +26,7 @@ Date: 2026-07-18
 Infrastructure:
 
 - Remote Rust gates and release builds ran through `cargo remote` on `.155`.
-- Runtime benchmarks ran directly on `ubuntu@10.0.0.241`; `.240` was not used.
+- Runtime benchmarks ran directly on `ubuntu@192.0.2.14`; `.240` was not used.
 - Native Claude Code `2.1.214` (ELF) was used; Node.js/npm were absent.
 
 Results:
@@ -60,8 +60,8 @@ Scope:
 
 Infrastructure:
 
-- Build artifact: `cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- bench -p sentinel-gaia-memory --no-run`
-- Benchmark VM: `ubuntu@10.0.0.241`
+- Build artifact: `cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- bench -p sentinel-gaia-memory --no-run`
+- Benchmark VM: `ubuntu@192.0.2.14`
 - Benchmark command: `./gaia_memory_bench --bench --noplot --format pretty`
 - `.240` was not used for benchmark execution.
 - `cargo-remote` was not used to execute benchmarks.
@@ -90,7 +90,7 @@ Date: 2026-06-27
 
 Scope:
 
-- `sentinel-dashboard-backend` live on `ubuntu@10.0.0.240`
+- `sentinel-dashboard-backend` live on `ubuntu@192.0.2.13`
 - TLS handshake latency through `curl` `time_appconnect`
 - WebTransport connect latency through browser `WebTransport.ready`
 - Zero-Config mode with self-signed certificate hash pinning
@@ -98,8 +98,8 @@ Scope:
 
 Infrastructure:
 
-- Build artifact: `cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-dashboard-backend --release`
-- Benchmark VM: `ubuntu@10.0.0.240`
+- Build artifact: `cargo remote -H root@192.0.2.12 -t /tmp/builds -c -- build -p sentinel-dashboard-backend --release`
+- Benchmark VM: `ubuntu@192.0.2.13`
 - `cargo-remote` was not used to execute benchmarks.
 - Browser for benchmark: Playwright 1.61.1, Chrome for Testing 149.0.7827.55.
 - Production test CA root was imported into `sql:/tmp/issue-473-live/chromium-ca-home/.pki/nssdb` and `/usr/local/share/ca-certificates/sentinel-issue473-root.crt`.
@@ -121,3 +121,5 @@ Notes:
 - Production `curl --cacert /tmp/issue-473-live/production-ca/root.pem https://localhost:8001/api/health` returned HTTP 200.
 
 Evidence snippets, screenshots, setup scripts, and raw benchmark JSON are committed under `console/evidence/issue-473-live/`.
+
+Host addresses shown here use documentation addresses.

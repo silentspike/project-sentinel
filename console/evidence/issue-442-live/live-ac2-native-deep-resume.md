@@ -1,7 +1,7 @@
 # AC-2 Native Deep Session And Resume
 
 Date: 2026-07-18
-Node: `10.0.0.241`
+Node: `192.0.2.14`
 
 The test used native Claude Code 2.1.214 with `haiku`, safe mode, a strict empty MCP configuration, Bash allowlisting, an explicit USD budget, a process timeout, and closed child stdin.
 
@@ -80,3 +80,5 @@ Output:
 ```
 
 Accepted AC-2 turns cost USD 0.0206505 total. A pre-fix diagnostic run consumed USD 0.0642571 after inherited stdin exposed the need for `Stdio::null()`; that run failed and is excluded from the accepted-session benchmark, but its cost is reported here rather than hidden.
+
+Host addresses shown here use documentation addresses.

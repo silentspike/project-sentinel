@@ -1,6 +1,6 @@
 # #427 — TOGAF-Handoff (HAUPTSESSION-ONLY, NICHT im Worker-PR)
 
-Dieser Worker-PR enthaelt **keinen** TOGAF-HTML-Edit (weder DE-SSOT `/home/jan/togaf-llm-architecture-guide.html`
+Dieser Worker-PR enthaelt **keinen** TOGAF-HTML-Edit (weder DE-SSOT `$HOME/togaf-llm-architecture-guide.html`
 noch Repo-Kopie `docs/architecture/togaf-architecture-guide.html`). Der TOGAF-Owner ist die Hauptsession
 ([[feedback-togaf-html-owner]]); ich uebergebe die Entscheidung an Control.
 

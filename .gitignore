@@ -112,7 +112,6 @@ docs/images/*
 !docs/images/opengraph-preview.png
 docs/screenshots/
 # Keep the one screenshot referenced from CHANGELOG.md
-!docs/screenshots/issue380-dashboard-ebpf.png
 docs/user-testing-report.md
 /AGENTS.md
 /hooks/

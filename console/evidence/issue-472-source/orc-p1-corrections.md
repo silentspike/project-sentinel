@@ -72,16 +72,16 @@ Cargo/Rust was not used and the global cargo-remote configuration was not
 changed. The command family was explicit throughout:
 
 ```text
-cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- fmt --all -- --check
-cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- check --workspace --all-targets
-cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- test --workspace
-cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- test -p sentinel-wasm
-cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- test -p sentinel-wasm --features wasm
-cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- clippy --workspace --all-targets -- -D warnings
-cargo remote -b 'RUST_BACKTRACE=1 RUSTDOCFLAGS=-Dwarnings' -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- doc --workspace --no-deps
-cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c release/sentinel-daemon -- build --workspace --release
-cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- deny check
-cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- audit --ignore RUSTSEC-2023-0071
+cargo remote -t "$REMOTE_TARGET_DIR" -c .rustc_info.json -- fmt --all -- --check
+cargo remote -t "$REMOTE_TARGET_DIR" -c .rustc_info.json -- check --workspace --all-targets
+cargo remote -t "$REMOTE_TARGET_DIR" -c .rustc_info.json -- test --workspace
+cargo remote -t "$REMOTE_TARGET_DIR" -c .rustc_info.json -- test -p sentinel-wasm
+cargo remote -t "$REMOTE_TARGET_DIR" -c .rustc_info.json -- test -p sentinel-wasm --features wasm
+cargo remote -t "$REMOTE_TARGET_DIR" -c .rustc_info.json -- clippy --workspace --all-targets -- -D warnings
+cargo remote -b 'RUST_BACKTRACE=1 RUSTDOCFLAGS=-Dwarnings' -t "$REMOTE_TARGET_DIR" -c .rustc_info.json -- doc --workspace --no-deps
+cargo remote -t "$REMOTE_TARGET_DIR" -c release/sentinel-daemon -- build --workspace --release
+cargo remote -t "$REMOTE_TARGET_DIR" -c .rustc_info.json -- deny check
+cargo remote -t "$REMOTE_TARGET_DIR" -c .rustc_info.json -- audit --ignore RUSTSEC-2023-0071
 ```
 
 The completed matrix on the reviewed code head is PASS:
@@ -115,7 +115,7 @@ The returned release daemon is `60,675,104` bytes with SHA-256
   `d12290fbb4d8bd95d815d5dc17891853d67889d2`; its final source gates PASS.
   This evidence-only commit follows that reviewed code head and does not
   invalidate its source, dependency, or Rust-gate results.
-- Benchmark register: `/work/company/BENCHMARK-REGISTER.md`.
+- Measured results were recorded in the private benchmark register.
 - Hard-coded live CPU/RAM claims: none.
 
 ## Acceptance mapping

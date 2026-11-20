@@ -9,7 +9,7 @@ No command in this verification touched `.240`.
 The native updater was run immediately before final verification:
 
 ```bash
-for host in 10.0.0.241 10.0.0.242; do
+for host in 192.0.2.14 192.0.2.15; do
   ssh ubuntu@$host '/opt/sentinel/bin/claude update; /opt/sentinel/bin/claude --version; readlink -f /opt/sentinel/bin/claude'
 done
 ```
@@ -27,7 +27,7 @@ Claude Code is up to date (2.1.214)
 Command:
 
 ```bash
-for host in 10.0.0.241 10.0.0.242; do
+for host in 192.0.2.14 192.0.2.15; do
   ssh ubuntu@$host '/opt/sentinel/bin/claude --version; file -L /opt/sentinel/bin/claude; /opt/sentinel/bin/claude auth status --json | <redacted-field-filter>; command -v node || true; command -v npm || true'
 done
 ```
@@ -35,7 +35,7 @@ done
 Output:
 
 ```text
-HOST=10.0.0.241
+HOST=192.0.2.14
 2.1.214 (Claude Code)
 /opt/sentinel/bin/claude: ELF 64-bit LSB executable, x86-64, dynamically linked
 logged_in=true
@@ -43,7 +43,7 @@ auth_method=claude.ai
 subscription_type=max
 node_present=no
 npm_present=no
-HOST=10.0.0.242
+HOST=192.0.2.15
 2.1.214 (Claude Code)
 /opt/sentinel/bin/claude: ELF 64-bit LSB executable, x86-64, dynamically linked
 logged_in=true
@@ -56,8 +56,8 @@ npm_present=no
 Minimal native smoke output:
 
 ```text
-10.0.0.241 result=ISSUE442_NATIVE_OK total_cost_usd=0.013909
-10.0.0.242 result=ISSUE442_NATIVE_OK total_cost_usd=0.013579
+192.0.2.14 result=ISSUE442_NATIVE_OK total_cost_usd=0.013909
+192.0.2.15 result=ISSUE442_NATIVE_OK total_cost_usd=0.013579
 ```
 
 The native smoke cost was USD 0.027488 total. These were explicit operator tests; the readiness service did not invoke Claude.
@@ -98,3 +98,5 @@ Accepted native-client verification cost is USD 0.0767773 in total across the
 two installation smokes, Deep/resume AC, Setup AC, dashboard-stream AC, and this
 final hardening smoke. The failed pre-fix diagnostic cost of USD 0.0642571 is
 reported separately and excluded from accepted-session metrics.
+
+Host addresses shown here use documentation addresses.

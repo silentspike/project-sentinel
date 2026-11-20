@@ -37,7 +37,7 @@ justification.
 
 ## cargo-geiger Evidence
 
-Tooling was installed and run on the build server `10.0.0.155`:
+Tooling was installed and run on the Rust build service:
 
 - `cargo-geiger 0.13.0`
 - Workspace root run is not usable because `cargo-geiger` rejects the virtual

@@ -4,8 +4,8 @@ Cooperative cross-node ownership handoff, verified on the live 2-node test clust
 Ground-truth via the `/operator/owner-check` diagnostic (a real `OwnerRegistry::validate`
 probe per node, not a cached value) + cross-node `/operator/handoff` + journal timestamps.
 
-**Cluster:** node-0 = `10.0.0.241` / VM 1071 (seed, alias `test-node-0`, node_id
-`5016f6e4-…`, control fp `4026ff7a…`); node-1 = `10.0.0.242` / VM 1072 (member, alias
+**Cluster:** node-0 = `192.0.2.14` / VM 1071 (seed, alias `test-node-0`, node_id
+`5016f6e4-…`, control fp `4026ff7a…`); node-1 = `192.0.2.15` / VM 1072 (member, alias
 `bare-node-1`/peer-alias `test-node-1`, node_id `6435ca03-…`, control fp `72d2f8b3…`).
 Binary md5 `5083db99…` on both. Control stream QUIC/UDP :8085, peers pinned both ways.
 **VM 1069 (prod) untouched.** Build only via `cargo remote -c --`; pre-snapshots
@@ -125,7 +125,7 @@ node-1: {"epoch":1,"is_owner":true,"local_retired":false,"own_write_validates":t
 ## AC-4 — V2 partition (no steal): PASS
 
 Setup: AGENT-08 handed node-0 → node-1 (node-0 retired @1, node-1 owns @2); AGENT-09 left
-non-retired on node-0. Then the .241↔.242 link is cut (`iptables -I … 10.0.0.242 DROP`,
+non-retired on node-0. Then the .241↔.242 link is cut (`iptables -I … 192.0.2.15 DROP`,
 both directions; RefQuery → `HTTP 000`).
 ```
 # handoff AGENT-08 back (source = test-node-1, now unreachable), during the partition:
@@ -223,3 +223,5 @@ only) ~93–98% idle; `ss -s` 161/159 sockets unchanged before==after → no soc
 (`PrepareHandoff → durable SourceRetiredAck → OwnerCommit`); there is no lease/heartbeat
 timeout in the handoff path (the #495 membership heartbeats are liveness-only, V2/V38, and
 do not drive the handoff). Lease/forced-failover is Track D (G-D0).
+
+Host addresses shown here use documentation addresses.

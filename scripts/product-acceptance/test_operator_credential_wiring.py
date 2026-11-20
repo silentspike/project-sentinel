@@ -48,7 +48,7 @@ class OperatorCredentialWiringTests(unittest.TestCase):
         runner_root = Path(
             os.environ.get(
                 "RUNNER_TEMP",
-                "/work/tmp/project-sentinel/cdx3-650-operator-credential-tests",
+                "/work/tmp/project-sentinel/test-operator-credentials",
             )
         )
         runner_root.mkdir(mode=0o700, parents=True, exist_ok=True)

@@ -1,7 +1,7 @@
 # AC-4 Authenticated Dashboard Stream
 
 Date: 2026-07-18
-Node: `10.0.0.241`
+Node: `192.0.2.14`
 
 A random temporary operator key and `haiku`/USD 0.03 cap were installed as a test-only systemd drop-in. The key was never printed and the drop-in was removed immediately after the run.
 
@@ -82,3 +82,5 @@ Platform LLM Analyzer initialisiert enabled=false
 sentinel-daemon.service=active
 daemon_source_diff_lines=0
 ```
+
+Host addresses shown here use documentation addresses.

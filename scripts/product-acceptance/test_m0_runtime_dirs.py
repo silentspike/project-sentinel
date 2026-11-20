@@ -27,7 +27,7 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
         base = Path(
             os.environ.get(
                 "RUNNER_TEMP",
-                "/work/tmp/project-sentinel/orc-650-runtime-dir-tests",
+                "/work/tmp/project-sentinel/test-runtime-dirs",
             )
         )
         base.mkdir(mode=0o700, parents=True, exist_ok=True)

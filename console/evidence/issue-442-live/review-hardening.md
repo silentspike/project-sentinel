@@ -1,7 +1,7 @@
 # Issue #442 Review Hardening Evidence
 
 Date: 2026-07-18
-Nodes: `10.0.0.241`, `10.0.0.242`
+Nodes: `192.0.2.14`, `192.0.2.15`
 
 The deploy touched only `sentinel-dashboard-backend`, `sentinel-gaia-loop`, the
 console bundle, their units/scripts, persistent dashboard auth, and the native
@@ -11,11 +11,11 @@ contacted.
 ## Remote toolchain and verification
 
 ```bash
-cargo remote -H root@10.0.0.155 -t /tmp/builds -d 1.95.0 -c -- \
+cargo remote -H root@192.0.2.12 -t /tmp/builds -d 1.95.0 -c -- \
   test -p sentinel-gaia-loop -p sentinel-dashboard-backend
-cargo remote -H root@10.0.0.155 -t /tmp/builds -d 1.95.0 -c -- \
+cargo remote -H root@192.0.2.12 -t /tmp/builds -d 1.95.0 -c -- \
   clippy --workspace --all-targets -- -D warnings
-cargo remote -H root@10.0.0.155 -t /tmp/builds -d 1.95.0 -c -- \
+cargo remote -H root@192.0.2.12 -t /tmp/builds -d 1.95.0 -c -- \
   build -p sentinel-gaia-loop -p sentinel-dashboard-backend --release
 ```
 
@@ -165,3 +165,5 @@ Post-login live token cost was USD 0.068058 total across the three distinct
 sessions. Retries did not add provider cost. Persistent dashboard auth,
 token-free API gates, native provider execution, and Setup generation are now
 deployed and live-verified.
+
+Host addresses shown here use documentation addresses.

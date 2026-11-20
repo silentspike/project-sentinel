@@ -1,7 +1,7 @@
 # Issue #433 PR-A Backend Foundation Evidence
 
 Date: 2026-06-02
-VM: `ubuntu@10.0.0.240`
+VM: `ubuntu@192.0.2.13`
 Branch: `feat/issue-433-pr-a-backend-foundation`
 
 ## Remote Build Gates
@@ -86,7 +86,7 @@ Gateway/Judge remained inactive for the smoke. Gateway-dependent read surfaces d
 
 ## WebTransport Topic Smoke
 
-The ignored Rust live test was compiled through `cargo remote`. The build server can SSH to the VM, but direct UDP/QUIC to `10.0.0.240:8001` is blocked, and an SSH TCP forward is not sufficient for WebTransport. The cargo-remote-built test binary was therefore copied to the deploy VM and executed against loopback `https://127.0.0.1:8001`.
+The ignored Rust live test was compiled through `cargo remote`. The build server can SSH to the VM, but direct UDP/QUIC to `192.0.2.13:8001` is blocked, and an SSH TCP forward is not sufficient for WebTransport. The cargo-remote-built test binary was therefore copied to the deploy VM and executed against loopback `https://127.0.0.1:8001`.
 
 ```text
 /tmp/live_wt_topics-pr-a --ignored --nocapture
@@ -179,3 +179,5 @@ ActiveEnterTimestamp=Tue 2026-06-02 00:07:00 UTC
 ```
 
 No panic, backtrace, permission, segmentation, fatal, or thread panic entries were found since the final service start.
+
+Host addresses shown here use documentation addresses.

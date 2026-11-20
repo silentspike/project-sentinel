@@ -3,6 +3,9 @@
 //! Connects to the deployed dashboard backend and verifies that the WebTransport
 //! connect snapshot contains the expected topic frames. Kept ignored so normal
 //! test runs do not depend on the live VM.
+//! Load SENTINEL_LIVE_HTTP_ORIGIN and SENTINEL_LIVE_WT_URL from private
+//! infrastructure configuration. Set SENTINEL_LIVE_CERT_HASH_B64 and
+//! SENTINEL_LIVE_SESSION_COOKIE from the deployment-specific configuration.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -15,7 +18,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use wtransport::{ClientConfig, Endpoint};
 
 fn env_required(name: &str) -> anyhow::Result<String> {
-    std::env::var(name).map_err(|_| anyhow::anyhow!("{name} is required"))
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{name} is required"))
 }
 
 fn client_endpoint(
@@ -81,13 +87,17 @@ async fn fetch_ticket(origin: &str, session_cookie: &str) -> anyhow::Result<Stri
             format!("{}={session_cookie}", auth::SESSION_COOKIE),
         )
         .send()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
     anyhow::ensure!(
         resp.status().is_success(),
         "ticket request failed with {}",
         resp.status()
     );
-    let body = resp.json::<Value>().await?;
+    let body = resp
+        .json::<Value>()
+        .await
+        .map_err(reqwest::Error::without_url)?;
     body.get("ticket")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
@@ -97,10 +107,8 @@ async fn fetch_ticket(origin: &str, session_cookie: &str) -> anyhow::Result<Stri
 #[tokio::test]
 #[ignore = "requires deployed VM and a live dashboard session cookie"]
 async fn live_vm_connect_snapshot_contains_room_live_and_kpi() -> anyhow::Result<()> {
-    let origin = std::env::var("SENTINEL_LIVE_HTTP_ORIGIN")
-        .unwrap_or_else(|_| "https://10.0.0.240:8001".into());
-    let wt_url =
-        std::env::var("SENTINEL_LIVE_WT_URL").unwrap_or_else(|_| "https://10.0.0.240:8001".into());
+    let origin = env_required("SENTINEL_LIVE_HTTP_ORIGIN")?;
+    let wt_url = env_required("SENTINEL_LIVE_WT_URL")?;
     let cert_hash_b64 = env_required("SENTINEL_LIVE_CERT_HASH_B64")?;
     let session_cookie = env_required("SENTINEL_LIVE_SESSION_COOKIE")?;
     let ticket = fetch_ticket(&origin, &session_cookie).await?;
@@ -109,7 +117,7 @@ async fn live_vm_connect_snapshot_contains_room_live_and_kpi() -> anyhow::Result
     let conn = client
         .connect(format!("{wt_url}?t={ticket}"))
         .await
-        .map_err(|e| anyhow::anyhow!("connect live WT: {e}"))?;
+        .map_err(|_| anyhow::anyhow!("connect live WT failed"))?;
 
     let mut frames = BTreeMap::new();
     for _ in 0..4 {
@@ -145,10 +153,8 @@ async fn live_vm_connect_snapshot_contains_room_live_and_kpi() -> anyhow::Result
 #[tokio::test]
 #[ignore = "requires deployed VM and a live dashboard session cookie"]
 async fn live_vm_event_log_cas_bi_stream_reassembles_events() -> anyhow::Result<()> {
-    let origin = std::env::var("SENTINEL_LIVE_HTTP_ORIGIN")
-        .unwrap_or_else(|_| "https://10.0.0.240:8001".into());
-    let wt_url =
-        std::env::var("SENTINEL_LIVE_WT_URL").unwrap_or_else(|_| "https://10.0.0.240:8001".into());
+    let origin = env_required("SENTINEL_LIVE_HTTP_ORIGIN")?;
+    let wt_url = env_required("SENTINEL_LIVE_WT_URL")?;
     let cert_hash_b64 = env_required("SENTINEL_LIVE_CERT_HASH_B64")?;
     let session_cookie = env_required("SENTINEL_LIVE_SESSION_COOKIE")?;
     let ticket = fetch_ticket(&origin, &session_cookie).await?;
@@ -157,7 +163,7 @@ async fn live_vm_event_log_cas_bi_stream_reassembles_events() -> anyhow::Result<
     let conn = client
         .connect(format!("{wt_url}?t={ticket}"))
         .await
-        .map_err(|e| anyhow::anyhow!("connect live WT: {e}"))?;
+        .map_err(|_| anyhow::anyhow!("connect live WT failed"))?;
 
     let (mut send, mut recv) = conn
         .open_bi()

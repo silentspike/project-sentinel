@@ -17,11 +17,12 @@ set -uo pipefail
 readonly SCRIPT_NAME="sentinel-health-monitor"
 readonly STATE_FILE="/opt/sentinel/data/health-monitor.state"
 readonly EVENT_STORE_DB="/opt/sentinel/data/events.db"
-readonly ACTIVATION_CONTROL_LOCK="/work/tmp/project-sentinel/.m0-activation-control.lock"
+readonly ACTIVATION_CONTROLLER="/opt/sentinel/scripts/product-acceptance/m0-activation/control.py"
 RESTART_LOCK_FD=""
 
 # --- Defaults (overridable via env file) ---
-NTFY_SERVER="${NTFY_SERVER:-https://<ntfy-server>}"
+NTFY_SERVER="${NTFY_SERVER:-}"
+NTFY_CA_FILE="${NTFY_CA_FILE:-}"
 NTFY_TOPIC="${NTFY_TOPIC:-sentinel-health}"
 LAG_WARN="${LAG_WARN:-500}"
 LAG_CRIT="${LAG_CRIT:-5000}"
@@ -76,12 +77,22 @@ save_state() {
 
 send_ntfy() {
     local title="$1" message="$2" priority="${3:-3}" tags="${4:-warning}"
-    curl -sk \
+    local -a certificate_args=()
+
+    # Alert delivery is optional. The service checks still run independently.
+    [[ -n "$NTFY_SERVER" ]] || return 0
+    if [[ -n "$NTFY_CA_FILE" ]]; then
+        certificate_args=(--cacert "$NTFY_CA_FILE")
+    fi
+    if ! printf '%s' "$message" | curl --silent --fail \
+        --proto '=https,http' --connect-timeout 3 --max-time "$CURL_TIMEOUT" \
+        "${certificate_args[@]}" \
         -H "Title: $title" \
         -H "Priority: $priority" \
         -H "Tags: $tags" \
-        -d "$message" \
-        "$NTFY_SERVER/$NTFY_TOPIC" 2>/dev/null || true
+        --data-binary @- --url "${NTFY_SERVER%/}/$NTFY_TOPIC" >/dev/null 2>&1; then
+        log_error "ntfy notification could not be delivered"
+    fi
 }
 
 alert_down() {
@@ -169,11 +180,19 @@ check_projection_lag() {
     echo "$lag"
 }
 
+resolve_activation_lock() {
+    /usr/bin/python3 "$ACTIVATION_CONTROLLER" lock-path
+}
+
 acquire_restart_authority() {
-    local parent owner mode previous_umask
+    local lock parent owner mode
     local file_owner file_mode file_links file_device file_inode
     local path_device path_inode
-    parent=${ACTIVATION_CONTROL_LOCK%/*}
+    if ! lock=$(resolve_activation_lock 2>/dev/null) || [[ -z "$lock" ]]; then
+        log_error "restart authority unavailable: activation lock configuration is missing or unsafe"
+        return 1
+    fi
+    parent=${lock%/*}
 
     if [ ! -d "$parent" ] || [ -L "$parent" ]; then
         log_error "restart authority unavailable: activation lock parent is unsafe"
@@ -187,19 +206,15 @@ acquire_restart_authority() {
         log_error "restart authority unavailable: activation lock parent ownership or mode is unsafe"
         return 1
     fi
-    if [ -L "$ACTIVATION_CONTROL_LOCK" ]; then
-        log_error "restart authority unavailable: activation lock is a symlink"
+    if [ ! -f "$lock" ] || [ -L "$lock" ]; then
+        log_error "restart authority unavailable: activation lock is missing or unsafe"
         return 1
     fi
 
-    previous_umask=$(umask)
-    umask 077
-    if ! exec {RESTART_LOCK_FD}<>"$ACTIVATION_CONTROL_LOCK"; then
-        umask "$previous_umask"
+    if ! exec {RESTART_LOCK_FD}<"$lock"; then
         log_error "restart authority unavailable: activation lock cannot be opened"
         return 1
     fi
-    umask "$previous_umask"
 
     IFS='|' read -r file_owner file_mode file_links file_device file_inode < <(
         stat -Lc '%u|%a|%h|%d|%i' -- "/proc/self/fd/$RESTART_LOCK_FD"
@@ -210,7 +225,7 @@ acquire_restart_authority() {
         return 1
     }
     read -r path_device path_inode < <(
-        stat -Lc '%d %i' -- "$ACTIVATION_CONTROL_LOCK"
+        stat -Lc '%d %i' -- "$lock"
     ) || {
         exec {RESTART_LOCK_FD}>&-
         RESTART_LOCK_FD=""

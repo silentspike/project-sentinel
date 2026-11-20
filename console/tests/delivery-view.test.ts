@@ -465,8 +465,8 @@ describe("DeliveryView", () => {
   it("rejects DTOs containing credential-shaped values or internal identifiers", () => {
     const value = snapshot();
     value.projectLabel = "secret=project-key";
-    value.nodes[0].label = "token=abc123 from 10.0.0.240";
-    value.blockers = ["read /work/company/private.txt"];
+    value.nodes[0].label = "token=abc123 from 192.0.2.240";
+    value.blockers = ["read /srv/sample-workspace/private.txt"];
     const { getByTestId, queryByTestId } = render(() =>
       DeliveryView({ snapshot: value }),
     );

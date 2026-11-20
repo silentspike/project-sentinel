@@ -81,12 +81,12 @@ $ /tmp/sentinel-daemon.issue442 --config /tmp/daemon.toml.issue442 --dry-run
 $ grep -nE '^control_|^node_id|^alias|^addr|^cert_fingerprint' /tmp/daemon.toml.issue442
 .241:
 15:control_bind = "0.0.0.0:8085"
-16:control_advertise = "10.0.0.241:8085"
+16:control_advertise = "192.0.2.14:8085"
 17:node_id = "5016f6e4-3e5c-483b-ae5f-24feeaf39b02"
 20:alias = "test-node-0"
 85:node_id = "6435ca03-1306-461b-a667-2f21711a176b"
 86:alias = "test-node-1"
-87:addr = "10.0.0.242:8085"
+87:addr = "192.0.2.15:8085"
 88:cert_fingerprint = "72d2f8b3baefb425f3ec50c34419aeef8767f9db7853be9b969dcdb1776130b6"
 
 .242:
@@ -95,7 +95,7 @@ $ grep -nE '^control_|^node_id|^alias|^addr|^cert_fingerprint' /tmp/daemon.toml.
 10:alias = "bare-node-1"
 13:node_id = "5016f6e4-3e5c-483b-ae5f-24feeaf39b02"
 14:alias = "test-node-0"
-15:addr = "10.0.0.241:8085"
+15:addr = "192.0.2.14:8085"
 16:cert_fingerprint = "4026ff7a2f0ab2c6a4bd8b30b286e36ac23f9d918a29cee982ade65c056311b8"
 
 $ sudo sha256sum /opt/sentinel/bin/sentinel-daemon
@@ -159,8 +159,8 @@ A 15-second `.241`/`.242` UDP partition was applied on `.242`. The shell install
 `EXIT/INT/TERM` trap before inserting the rules and removed both rules at the end.
 
 ```console
-$ sudo iptables -I INPUT 1 -p udp -s 10.0.0.241 -j DROP
-$ sudo iptables -I OUTPUT 1 -p udp -d 10.0.0.241 -j DROP
+$ sudo iptables -I INPUT 1 -p udp -s 192.0.2.14 -j DROP
+$ sudo iptables -I OUTPUT 1 -p udp -d 192.0.2.14 -j DROP
 PARTITION_ACTIVE 2026-07-19T10:33:21Z
 
 $ journalctl -u sentinel-daemon --since '2026-07-19 10:33:20' --no-pager | grep 'membership peer state changed'
@@ -229,3 +229,5 @@ fatals.
   ADR-2 explicitly does not claim crash-durable exactly-once behavior.
 - Bidirectional membership, partition detection, healing, Zenoh isolation, and clean
   service restart counters are verified on `.241` and `.242`.
+
+Host addresses shown here use documentation addresses.

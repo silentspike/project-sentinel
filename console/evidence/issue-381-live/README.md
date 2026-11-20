@@ -21,9 +21,13 @@ double quantile resolution; percentiles quantize to bucket boundaries).
   the lazy filter hides phase histograms until the first tick was recorded).
 - **AC-3:** run `smoke-381.mjs` ON the VM (playwright/chromium there, pattern of
   `issue-433-pr-d/smoke-pr-d.mjs`), then review the screenshots **visually** and
-  operate the panel functionally. Screenshots get committed into this directory.
+  operate the panel functionally. Keep deployment screenshots in a private directory.
 
 ```bash
-# on the VM:
-DASHBOARD_KEY=<operator-key> node smoke-381.mjs
+# On the VM after loading BASE_URL from private infrastructure configuration
+# and DASHBOARD_KEY from the deployment-specific credential file.
+node smoke-381.mjs
 ```
+
+`OUT_DIR` can point to a private directory owned by the current user.
+`CHROME_PATH` is optional if Playwright's managed Chromium is installed.

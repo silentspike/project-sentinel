@@ -28,11 +28,11 @@ The nodes discovered each other's loopback-only Zenoh listener over LAN multicas
 retried every eight seconds:
 
 ```console
-$ ssh ubuntu@10.0.0.241 'sudo journalctl -u sentinel-daemon --since "2026-07-19 07:00:00 UTC" --until "2026-07-19 07:11:20 UTC" --no-pager | grep "Unable to connect to any locator of scouted peer" | head -2'
+$ ssh ubuntu@192.0.2.14 'sudo journalctl -u sentinel-daemon --since "2026-07-19 07:00:00 UTC" --until "2026-07-19 07:11:20 UTC" --no-pager | grep "Unable to connect to any locator of scouted peer" | head -2'
 Jul 19 07:00:00 sentinel-test-node-0 sentinel-daemon[69325]: 2026-07-19T07:00:00.618140Z  WARN zenoh::net::runtime::orchestrator: Unable to connect to any locator of scouted peer 337d181568ca17869c5becdcdf5073eb: [tcp/127.0.0.1:33819]
 Jul 19 07:00:08 sentinel-test-node-0 sentinel-daemon[69325]: 2026-07-19T07:00:08.618779Z  WARN zenoh::net::runtime::orchestrator: Unable to connect to any locator of scouted peer 337d181568ca17869c5becdcdf5073eb: [tcp/127.0.0.1:33819]
 
-$ ssh ubuntu@10.0.0.242 'sudo journalctl -u sentinel-daemon --since "2026-07-19 07:00:00 UTC" --until "2026-07-19 07:10:20 UTC" --no-pager | grep "Unable to connect to any locator of scouted peer" | head -2'
+$ ssh ubuntu@192.0.2.15 'sudo journalctl -u sentinel-daemon --since "2026-07-19 07:00:00 UTC" --until "2026-07-19 07:10:20 UTC" --no-pager | grep "Unable to connect to any locator of scouted peer" | head -2'
 Jul 19 07:00:00 sentinel-test-node-1 sentinel-daemon[84474]: 2026-07-19T07:00:00.617448Z  WARN zenoh::net::runtime::orchestrator: Unable to connect to any locator of scouted peer 164a9a7ab40fafffdbd2682068b6bdaf: [tcp/127.0.0.1:38171]
 Jul 19 07:00:08 sentinel-test-node-1 sentinel-daemon[84474]: 2026-07-19T07:00:08.618325Z  WARN zenoh::net::runtime::orchestrator: Unable to connect to any locator of scouted peer 164a9a7ab40fafffdbd2682068b6bdaf: [tcp/127.0.0.1:38171]
 ```
@@ -41,17 +41,17 @@ The provisioned `.242` member inherited default monitored services that are not
 installed on a daemon-only member:
 
 ```console
-$ ssh ubuntu@10.0.0.242 'sudo journalctl _COMM=systemctl --since "2026-07-19 07:00:00 UTC" --until "2026-07-19 07:10:20 UTC" --no-pager | grep -E "Failed to (restart|reset failed) sentinel-(judge|projection)" | head -4'
+$ ssh ubuntu@192.0.2.15 'sudo journalctl _COMM=systemctl --since "2026-07-19 07:00:00 UTC" --until "2026-07-19 07:10:20 UTC" --no-pager | grep -E "Failed to (restart|reset failed) sentinel-(judge|projection)" | head -4'
 Jul 19 07:00:14 sentinel-test-node-1 systemctl[370602]: Failed to restart sentinel-judge.service: Unit sentinel-judge.service not found.
 Jul 19 07:01:14 sentinel-test-node-1 systemctl[370608]: Failed to restart sentinel-judge.service: Unit sentinel-judge.service not found.
 Jul 19 07:01:14 sentinel-test-node-1 systemctl[370610]: Failed to restart sentinel-projection.service: Unit sentinel-projection.service not found.
 Jul 19 07:02:14 sentinel-test-node-1 systemctl[370616]: Failed to restart sentinel-judge.service: Unit sentinel-judge.service not found.
 
-$ ssh ubuntu@10.0.0.241 'sudo grep -nE "^\[daemon.platform_controlplane\]|^monitored_services" /opt/sentinel/config/daemon.toml'
+$ ssh ubuntu@192.0.2.14 'sudo grep -nE "^\[daemon.platform_controlplane\]|^monitored_services" /opt/sentinel/config/daemon.toml'
 65:[daemon.platform_controlplane]
 79:monitored_services = []
 
-$ ssh ubuntu@10.0.0.242 'sudo grep -nE "^\[daemon.platform_controlplane\]|^monitored_services" /opt/sentinel/config/daemon.toml'
+$ ssh ubuntu@192.0.2.15 'sudo grep -nE "^\[daemon.platform_controlplane\]|^monitored_services" /opt/sentinel/config/daemon.toml'
 17:[daemon.platform_controlplane]
 ```
 
@@ -280,12 +280,12 @@ $ grep -nE '^\[daemon\.cluster\]|^control_bind|^node_id|^cluster_id|^\[\[daemon\
 .241 control_bind = "0.0.0.0:8085"
 .241 node_id = "5016f6e4-3e5c-483b-ae5f-24feeaf39b02"
 .241 cluster_id = "039e153d-6551-4cf1-9e12-6a1ed9769175"
-.241 peer addr = "10.0.0.242:8085"
+.241 peer addr = "192.0.2.15:8085"
 .241 peer cert_fingerprint = "72d2f8b3baefb425f3ec50c34419aeef8767f9db7853be9b969dcdb1776130b6"
 .242 control_bind = "0.0.0.0:8085"
 .242 node_id = "6435ca03-1306-461b-a667-2f21711a176b"
 .242 cluster_id = "039e153d-6551-4cf1-9e12-6a1ed9769175"
-.242 peer addr = "10.0.0.241:8085"
+.242 peer addr = "192.0.2.14:8085"
 .242 peer cert_fingerprint = "4026ff7a2f0ab2c6a4bd8b30b286e36ac23f9d918a29cee982ade65c056311b8"
 ```
 
@@ -304,8 +304,8 @@ dropping UDP/8085 to and from `.241`. A 45-second transient systemd cleanup time
 armed before waiting; the rules were then removed explicitly after both TTL stages.
 
 ```console
-$ sudo iptables -I INPUT 1 -p udp -s 10.0.0.241 --dport 8085 -m comment --comment issue-442-membership-ac -j DROP
-$ sudo iptables -I OUTPUT 1 -p udp -d 10.0.0.241 --dport 8085 -m comment --comment issue-442-membership-ac -j DROP
+$ sudo iptables -I INPUT 1 -p udp -s 192.0.2.14 --dport 8085 -m comment --comment issue-442-membership-ac -j DROP
+$ sudo iptables -I OUTPUT 1 -p udp -d 192.0.2.14 --dport 8085 -m comment --comment issue-442-membership-ac -j DROP
 PARTITION_START=2026-07-19T09:07:28Z
 
 $ journalctl -u sentinel-daemon --since '2026-07-19 09:07:28 UTC' --no-pager | grep 'membership peer state changed'
@@ -314,8 +314,8 @@ $ journalctl -u sentinel-daemon --since '2026-07-19 09:07:28 UTC' --no-pager | g
 .242 09:07:32 previous=Alive current=Suspect peer=.241
 .242 09:07:38 previous=Suspect current=Dead peer=.241
 
-$ sudo iptables -D INPUT  -p udp -s 10.0.0.241 --dport 8085 -m comment --comment issue-442-membership-ac -j DROP
-$ sudo iptables -D OUTPUT -p udp -d 10.0.0.241 --dport 8085 -m comment --comment issue-442-membership-ac -j DROP
+$ sudo iptables -D INPUT  -p udp -s 192.0.2.14 --dport 8085 -m comment --comment issue-442-membership-ac -j DROP
+$ sudo iptables -D OUTPUT -p udp -d 192.0.2.14 --dport 8085 -m comment --comment issue-442-membership-ac -j DROP
 HEAL_START=2026-07-19T09:08:12Z
 INPUT_RULE_ABSENT
 OUTPUT_RULE_ABSENT
@@ -369,3 +369,5 @@ configuration warnings and one simultaneous-start QUIC handshake abort; this evi
 does not relabel that window as warning-free. None recurred in the post-heal soak, and
 the required Zenoh warning and multicast-socket counts stayed zero throughout. No
 Claude request was made, token cost was USD 0, and `.240` was not contacted.
+
+Host addresses shown here use documentation addresses.
