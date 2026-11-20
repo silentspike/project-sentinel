@@ -2,8 +2,6 @@ module github.com/silentspike/project-sentinel/services/sentinel-nats-bridge
 
 go 1.26.10
 
-toolchain go1.26.10
-
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/nats-io/nats.go v1.48.0
@@ -13,7 +11,7 @@ require (
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
