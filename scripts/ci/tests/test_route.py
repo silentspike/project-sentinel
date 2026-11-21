@@ -1,6 +1,10 @@
 import copy
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -30,6 +34,21 @@ class RouteTests(unittest.TestCase):
         for name in route.JOBS:
             needs[name]["result"] = "skipped"
         route.evaluate(needs)
+
+    def test_full_inventory_enables_all_gates_without_old_commit(self):
+        script = ROOT / "scripts/ci/route.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "outputs"
+            subprocess.run(
+                [sys.executable, str(script), "classify", "--full"],
+                cwd=tmp,
+                env={**os.environ, "GITHUB_OUTPUT": str(output)},
+                check=True,
+            )
+            self.assertEqual(
+                output.read_text(encoding="ascii").splitlines(),
+                [f"{key}=true" for key in route.FLAGS],
+            )
 
     def test_classifier_failure_or_missing_outputs_fails(self):
         for result in ("failure", "cancelled", "skipped", "", None):

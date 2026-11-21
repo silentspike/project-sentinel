@@ -42,7 +42,13 @@ jobs:
         env:
           CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 scripts/ci/route.py classify --base "$CI_BASE" --head "$CI_HEAD"
+          CI_FULL: ${{ github.event_name == 'push' && (github.event.forced || github.event.created) }}
+        run: |
+          if [[ "$CI_FULL" == "true" ]]; then
+            python3 scripts/ci/route.py classify --full
+          else
+            python3 scripts/ci/route.py classify --base "$CI_BASE" --head "$CI_HEAD"
+          fi
 
   # ──────────────────────────────────────────────
   # Always runs - fast checks (<30s)

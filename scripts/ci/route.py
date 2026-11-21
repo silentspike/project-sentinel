@@ -68,22 +68,27 @@ def evaluate(needs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("classify", "evaluate"))
-    parser.add_argument("--base")
+    inventory = parser.add_mutually_exclusive_group()
+    inventory.add_argument("--base")
+    inventory.add_argument("--full", action="store_true")
     parser.add_argument("--head", default="HEAD")
     args = parser.parse_args()
     try:
         if args.command == "evaluate":
             evaluate(json.loads(os.environ["CI_NEEDS"]))
             print("All required CI jobs succeeded.")
+            return 0
+        if args.full:
+            outputs = dict.fromkeys(FLAGS, "true")
         else:
             if not args.base or set(args.base) == {"0"}:
                 raise ValueError("missing comparison base")
             raw = subprocess.check_output(["git", "diff", "--name-only", "--no-renames", "-z", args.base, args.head, "--"])
             paths = [path.decode("utf-8", errors="strict") for path in raw.split(b"\0") if path]
             outputs = classify(paths)
-            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as stream:
-                for key, value in outputs.items():
-                    stream.write(f"{key}={value}\n")
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as stream:
+            for key, value in outputs.items():
+                stream.write(f"{key}={value}\n")
     except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError) as exc:
         print(f"CI routing failed: {exc}", file=sys.stderr)
         return 1
